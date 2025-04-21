@@ -1,8 +1,6 @@
 import torch
 
-
-_active_model = None
-
+from . import _active_model
 
 class Model:
     def __init__(self):
@@ -18,15 +16,6 @@ class Model:
     def __exit__(self, exc_type, exc_val, exc_tb):
         global _active_model
         _active_model = None
-
-    # def register_param(self, name, init_value):
-    #     param = torch.tensor(init_value, dtype=torch.float32)
-    #     self.params[name] = param
-    #     return param
-
-    # def register_observed(self, name, dist, observed):
-    #     self.observed_vars[name] = {'dist': dist, 'observed': observed}
-    #     self.vars.append(self.observed_vars[name])
 
     def log_prob(self, theta: dict[str, torch.Tensor]) -> torch.Tensor:
         logp = 0.0
@@ -51,19 +40,6 @@ class Model:
                     if pname in grads:
                         grads[pname] += grad_val
         return grads
-
-
-class Parameter:
-    def __init__(self, name, distribution, init=None, observed=None):
-        self.name = name
-        self.distribution = distribution
-        self.observed = observed
-        self.init_value = init
-
-        if _active_model is not None:
-            _active_model.vars.append(self)
-            if observed is None:
-                _active_model.params[name] = init
 
 
 class PosteriorWrapper:
