@@ -6,10 +6,14 @@ from collections import namedtuple
 Tree = namedtuple("Tree", ["theta_minus", "r_minus", "grad_minus", "theta_plus", "r_plus", "grad_plus", "theta_prime", "grad_prime", "log_prob_prime", "n_prime", "s_prime", "alpha_prime", "n_prime_alpha"])
 
 class NUTS:
-    def __init__(self, distribution):
-        self.log_target = distribution._log_prob_unconstrained
-        self.gradient = distribution._log_prob_grad_unconstrained
-        self.inverse_transformation = distribution.transform.inverse
+    # def __init__(self, distribution):
+    def __init__(self, log_target, gradient, inverse_transformation):
+        # self.log_target = distribution._log_prob_unconstrained
+        # self.gradient = distribution._log_prob_grad_unconstrained
+        # self.inverse_transformation = distribution.transform.inverse
+        self.log_target = log_target
+        self.gradient = gradient
+        self.inverse_transformation = inverse_transformation
         self.gamma = 0.05
         self.t0 = 10
         self.kappa = 0.75

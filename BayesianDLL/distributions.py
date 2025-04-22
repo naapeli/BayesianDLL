@@ -109,3 +109,72 @@ class Exponential(Distribution):
     #     n = x.numel()
     #     grad_rate = n / self.rate - x.sum()
     #     return {'rate': grad_rate}
+
+class Uniform(Distribution):
+    def __init__(self, low, high):
+        super().__init__(LogitTransform(low=low, high=high))
+        self.low = low
+        self.high = high
+    
+    def pdf(self, x):
+        x = torch.as_tensor(x)
+        return torch.where((self.low <= x) & (x <= self.high), torch.tensor([1 / (self.high - self.low)], dtype=x.dtype), torch.tensor([0], dtype=x.dtype))
+    
+    def log_pdf(self, x):
+        x = torch.as_tensor(x)
+        return torch.where((self.low <= x) & (x <= self.high), -torch.tensor([self.high - self.low], dtype=x.dtype), torch.tensor([-float("inf")], dtype=x.dtype))
+    
+    def log_pdf_grad(self, x):
+        x = torch.as_tensor(x)
+        return torch.tensor([0], dtype=x.dtype)
+
+class Bernoulli(Distribution):
+    def __init__(self, p):
+        super().__init__(IdentityTransform())
+        self.p = torch.as_tensor(p).clamp(1e-7, 1 - 1e-7)
+
+    def pdf(self, x):
+        x = torch.as_tensor(x, dtype=torch.float32)
+        return self.p ** x * (1 - self.p) ** (1 - x)
+
+    def log_pdf(self, x):
+        x = torch.as_tensor(x, dtype=torch.float32)
+        return x * torch.log(self.p) + (1 - x) * torch.log(1 - self.p)
+
+    def log_pdf_grad(self, x):
+        raise NotImplementedError()
+        # x = torch.as_tensor(x, dtype=torch.float32)
+        # return (x / self.p - (1 - x) / (1 - self.p)) * self.p * (1 - self.p)
+
+    def log_pdf_param_grads(self, x):
+        x = torch.as_tensor(x, dtype=torch.float32)
+        return x / self.p - (1 - x) / (1 - self.p)
+
+class Binomial(Distribution):
+    def __init__(self, n, p):
+        super().__init__(LogitTransform(low=0.0, high=1.0))
+        self.n = n
+        self.p = torch.as_tensor(p).clamp(1e-7, 1 - 1e-7)
+        self._log_p = torch.log(self.p)
+        self._log_1mp = torch.log(1 - self.p)
+
+    def _log_binom_coeff(self, x):
+        x = torch.as_tensor(x, dtype=torch.float32)
+        n = torch.tensor(self.n, dtype=torch.float32, device=x.device)
+        return torch.lgamma(n + 1) - torch.lgamma(x + 1) - torch.lgamma(n - x + 1)
+
+    def pdf(self, x):
+        return self.log_pdf(x).exp()
+
+    def log_pdf(self, x):
+        x = torch.as_tensor(x, dtype=torch.float32)
+        return self._log_binom_coeff(x) + x * self._log_p + (self.n - x) * self._log_1mp
+
+    def log_pdf_grad(self, x):
+        raise NotImplementedError()
+        # x = torch.as_tensor(x, dtype=torch.float32)
+        # return self._log_p - self._log_1mp
+    
+    def log_pdf_param_grads(self, x):
+        x = torch.as_tensor(x, dtype=torch.float32)
+        return x / self.p - (self.n - x) / (1 - self.p)
