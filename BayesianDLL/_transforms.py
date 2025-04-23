@@ -25,12 +25,11 @@ class LogTransform(Transform):
         self.side = side
 
     def forward(self, x_constrained):
-        eps = 1e-100
         if self.side == "larger":
-            x = (x_constrained - self.border).clamp(min=eps)
+            x = (x_constrained - self.border).clamp(min=1e-8)
             return torch.log(x)
         else:
-            x = (self.border - x_constrained).clamp(min=eps)
+            x = (self.border - x_constrained).clamp(min=1e-8)
             return torch.log(x)
 
     def inverse(self, x_unconstrained):
@@ -53,7 +52,7 @@ class LogitTransform(Transform):
         self.scale = high - low
     
     def forward(self, x_constrained):
-        x_constrained = x_constrained.clamp(self.low + 1e-100, self.high - 1e-100)
+        x_constrained = x_constrained.clamp(self.low + 1e-8, self.high - 1e-8)
         x_scaled = (x_constrained - self.low) / self.scale
         return torch.log(x_scaled) - torch.log(1 - x_scaled)
     
@@ -62,13 +61,13 @@ class LogitTransform(Transform):
 
     def derivative(self, x_unconstrained):
         x = self.inverse(x_unconstrained)
-        x = x.clamp(self.low + 1e-100, self.high - 1e-100)
+        x = x.clamp(self.low + 1e-8, self.high - 1e-8)
         x_scaled = (x - self.low) / self.scale
         return self.scale * x_scaled * (1 - x_scaled)
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         x = self.inverse(x_unconstrained)
-        x = x.clamp(self.low + 1e-100, self.high - 1e-100)
+        x = x.clamp(self.low + 1e-8, self.high - 1e-8)
         x_scaled = (x - self.low) / self.scale
         return 1 - 2 * x_scaled
 
