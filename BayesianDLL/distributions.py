@@ -6,7 +6,6 @@ from .parameters import Parameter
 from ._transforms import IdentityTransform, LogitTransform, LogTransform
 
 
-
 class Distribution(ABC):
     def __init__(self, transform=IdentityTransform()):
         self.transform = transform
@@ -23,9 +22,9 @@ class Distribution(ABC):
     def log_pdf_grad(self, x_constrained):
         pass
 
-    # @abstractmethod
-    # def log_pdf_param_grads(self, x_constrained):
-    #     pass
+    @abstractmethod
+    def log_pdf_param_grads(self, x_constrained):
+        pass
 
     def _log_prob_unconstrained(self, x_unconstrained):
         x_constrained = self.transform.inverse(x_unconstrained)
@@ -38,77 +37,80 @@ class Distribution(ABC):
         return log_pdf_grad_x * dx_dz + d_log_det_jacobian
 
 class Normal(Distribution):
-    def __init__(self, mu, sigma):
+    def __init__(self, mu, variance):
         super().__init__(IdentityTransform())
-        self.mu = mu
-        self.sigma = sigma
-    
+        self.mu = torch.as_tensor(mu)
+        self.variance = torch.as_tensor(variance)
+
     def pdf(self, x):
         x = torch.as_tensor(x)
-        return torch.exp(-0.5 * ((x - self.mu) / self.sigma) ** 2) / (self.sigma * math.sqrt(2 * math.pi))
-    
+        return torch.exp(-0.5 * (x - self.mu) ** 2 / self.variance) / torch.sqrt(2 * math.pi * self.variance)
+
     def log_pdf(self, x):
         x = torch.as_tensor(x)
-        return -0.5 * ((x - self.mu) / self.sigma) ** 2 - math.log(self.sigma) - 0.5 * math.log(2 * math.pi)
-    
+        return -0.5 * (x - self.mu) ** 2 / self.variance - 0.5 * torch.log(2 * math.pi * self.variance)
+
     def log_pdf_grad(self, x):
         x = torch.as_tensor(x)
-        return -(x - self.mu) / (self.sigma ** 2)
-    
-    # def log_pdf_param_grads(self, x):
-    #     x = torch.as_tensor(x)
-    #     grad_mu = ((x - self.mu).sum()) / (self.sigma ** 2)
-    #     grad_sigma = (-len(x) / self.sigma) + (((x - self.mu) ** 2).sum()) / (self.sigma ** 3)
-    #     return {'mu': grad_mu, 'sigma': grad_sigma}
+        return -(x - self.mu) / self.variance
+
+    def log_pdf_param_grads(self, x):
+        x = torch.as_tensor(x)
+        diff = x - self.mu
+        grad_mu = diff / self.variance
+        grad_var = 0.5 * (diff ** 2 / self.variance ** 2 - 1 / self.variance)
+        return {"mean": grad_mu, "variance": grad_var}
 
 class Beta(Distribution):
     def __init__(self, a, b):
         super().__init__(LogitTransform(low=0, high=1))
-        self.a = a
-        self.b = b
-        self._beta = torch.lgamma(torch.as_tensor(a)).exp() * torch.lgamma(torch.as_tensor(b)).exp() / torch.lgamma(torch.as_tensor(a + b)).exp()
+        self.a = torch.as_tensor(a)
+        self.b = torch.as_tensor(b)
+        self._beta = torch.as_tensor(torch.math.gamma(a) * torch.math.gamma(b) / torch.math.gamma(a + b))
         self._betaln = self._beta.log()
 
     def pdf(self, x):
-        x = torch.as_tensor(x).clamp(1e-7, 1-1e-7)
+        x = torch.as_tensor(x).clamp(1e-8, 1 - 1e-8)
         return (x ** (self.a - 1) * (1 - x) ** (self.b - 1)) / self._beta
     
     def log_pdf(self, x):
-        x = torch.as_tensor(x).clamp(1e-7, 1-1e-7)
+        x = torch.as_tensor(x).clamp(1e-8, 1 - 1e-8)
         return (self.a - 1) * torch.log(x) + (self.b - 1) * torch.log(1 - x) - self._betaln
     
     def log_pdf_grad(self, x):
-        x = torch.as_tensor(x).clamp(1e-7, 1-1e-7)
+        x = torch.as_tensor(x).clamp(1e-8, 1 - 1e-8)
         return (self.a - 1)/x - (self.b - 1)/(1 - x)
     
-    # def log_pdf_param_grads(self, x):
-    #     x = torch.as_tensor(x).clamp(1e-7, 1-1e-7)
-    #     grad_a = torch.log(x) - torch.digamma(self.a) + torch.digamma(self.a + self.b)
-    #     grad_b = torch.log(1 - x) - torch.digamma(self.b) + torch.digamma(self.a + self.b)
-    #     return {'a': grad_a.sum(), 'b': grad_b.sum()}
+    def log_pdf_param_grads(self, x):
+        raise NotImplementedError()
+        x = torch.as_tensor(x).clamp(1e-8, 1 - 1e-8)
+        grad_a = torch.log(x) - torch.digamma(self.a) + torch.digamma(self.a + self.b)
+        grad_b = torch.log(1 - x) - torch.digamma(self.b) + torch.digamma(self.a + self.b)
+        return {'a': grad_a.sum(), 'b': grad_b.sum()}
 
 class Exponential(Distribution):
     def __init__(self, rate):
         super().__init__(LogTransform(border=0, side="larger"))
-        self.rate = rate
+        self.rate = torch.as_tensor(rate)
 
     def pdf(self, x):
-        x = torch.as_tensor(x).clamp(min=1e-10)
+        x = torch.as_tensor(x).clamp(min=1e-8)
         return self.rate * torch.exp(-self.rate * x)
     
     def log_pdf(self, x):
-        x = torch.as_tensor(x).clamp(min=1e-10)
-        return torch.log(torch.tensor(self.rate)) - self.rate * x
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        return torch.log(self.rate) - self.rate * x
 
     def log_pdf_grad(self, x):
-        x = torch.as_tensor(x).clamp(min=1e-10)
+        x = torch.as_tensor(x).clamp(min=1e-8)
         return -self.rate * torch.ones_like(x)
 
-    # def log_pdf_param_grads(self, x):
-    #     x = torch.as_tensor(x).clamp(min=1e-10)
-    #     n = x.numel()
-    #     grad_rate = n / self.rate - x.sum()
-    #     return {'rate': grad_rate}
+    def log_pdf_param_grads(self, x):
+        raise NotImplementedError()
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        n = x.numel()
+        grad_rate = n / self.rate - x.sum()
+        return {'rate': grad_rate}
 
 class Uniform(Distribution):
     def __init__(self, low, high):
@@ -127,11 +129,14 @@ class Uniform(Distribution):
     def log_pdf_grad(self, x):
         x = torch.as_tensor(x)
         return torch.tensor([0], dtype=x.dtype)
+    
+    def log_pdf_param_grads(self, x):
+        raise NotImplementedError()
 
 class Bernoulli(Distribution):
     def __init__(self, p):
         super().__init__(IdentityTransform())
-        self.p = torch.as_tensor(p).clamp(1e-7, 1 - 1e-7)
+        self.p = torch.as_tensor(p).clamp(1e-8, 1 - 1e-8)
 
     def pdf(self, x):
         x = torch.as_tensor(x, dtype=torch.float32)
@@ -143,18 +148,18 @@ class Bernoulli(Distribution):
 
     def log_pdf_grad(self, x):
         raise NotImplementedError()
-        # x = torch.as_tensor(x, dtype=torch.float32)
-        # return (x / self.p - (1 - x) / (1 - self.p)) * self.p * (1 - self.p)
+        x = torch.as_tensor(x, dtype=torch.float32)
+        return (x / self.p - (1 - x) / (1 - self.p)) * self.p * (1 - self.p)
 
     def log_pdf_param_grads(self, x):
         x = torch.as_tensor(x, dtype=torch.float32)
-        return x / self.p - (1 - x) / (1 - self.p)
+        return {"p": x / self.p - (1 - x) / (1 - self.p)}
 
 class Binomial(Distribution):
     def __init__(self, n, p):
         super().__init__(LogitTransform(low=0.0, high=1.0))
         self.n = n
-        self.p = torch.as_tensor(p).clamp(1e-7, 1 - 1e-7)
+        self.p = torch.as_tensor(p).clamp(1e-8, 1 - 1e-8)
         self._log_p = torch.log(self.p)
         self._log_1mp = torch.log(1 - self.p)
 
@@ -172,9 +177,55 @@ class Binomial(Distribution):
 
     def log_pdf_grad(self, x):
         raise NotImplementedError()
-        # x = torch.as_tensor(x, dtype=torch.float32)
-        # return self._log_p - self._log_1mp
+        x = torch.as_tensor(x, dtype=torch.float32)
+        return self._log_p - self._log_1mp
     
     def log_pdf_param_grads(self, x):
         x = torch.as_tensor(x, dtype=torch.float32)
-        return x / self.p - (self.n - x) / (1 - self.p)
+        return {"p": x / self.p - (self.n - x) / (1 - self.p)}
+
+class InvGamma(Distribution):
+    def __init__(self, alpha, beta):
+        super().__init__(LogTransform(border=0, side="larger"))
+        self.alpha = alpha
+        self.beta = beta
+        self._log_gamma_alpha = torch.lgamma(torch.as_tensor(self.alpha))
+
+    def pdf(self, x):
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        return (self.beta ** self.alpha / torch.exp(self._log_gamma_alpha)) * x ** (-self.alpha - 1) * torch.exp(-self.beta / x)
+
+    def log_pdf(self, x):
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        return self.alpha * math.log(self.beta) - self._log_gamma_alpha - (self.alpha + 1) * torch.log(x) - self.beta / x
+
+    def log_pdf_grad(self, x):
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        return -(self.alpha + 1) / x + self.beta / x ** 2
+    
+    def log_pdf_param_grads(self, x):
+        raise NotImplementedError()
+
+class HalfCauchy(Distribution):
+    def __init__(self, scale):
+        super().__init__(LogTransform(border=0, side="larger"))
+        self.scale = torch.as_tensor(scale).clamp(min=1e-8)
+
+    def pdf(self, x):
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        denom = math.pi * self.scale * (1 + (x / self.scale) ** 2)
+        return 2.0 / denom
+
+    def log_pdf(self, x):
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        return math.log(2.0) - math.log(math.pi) - torch.log(self.scale) - torch.log(1 + (x / self.scale) ** 2)
+
+    def log_pdf_grad(self, x):
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        return -2 * x / (self.scale ** 2 + x ** 2)
+
+    def log_pdf_param_grads(self, x):
+        raise NotImplementedError()
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        d_log_pdf_dscale = -1 / self.scale + 2 * (x ** 2) / (self.scale * (x ** 2 + self.scale ** 2))
+        return {'scale': d_log_pdf_dscale}
