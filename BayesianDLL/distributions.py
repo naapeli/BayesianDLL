@@ -27,10 +27,14 @@ class Distribution(ABC):
         pass
 
     def _log_prob_unconstrained(self, x_unconstrained):
+        # x_unconstrained.shape = (n_features,) or (n_samples, n_features)
         x_constrained = self.transform.inverse(x_unconstrained)
-        return self.log_pdf(x_constrained) + self.transform.derivative(x_unconstrained).abs().log()
+        log_det_abs_jacobian = self.transform.derivative(x_unconstrained).abs().log()
+        log_det_abs_jacobian = log_det_abs_jacobian.sum(dim=1) if x_unconstrained.ndim == 2 else log_det_abs_jacobian.sum()
+        return self.log_pdf(x_constrained).squeeze() + log_det_abs_jacobian
     
     def _log_prob_grad_unconstrained(self, x_unconstrained):
+        # x_unconstrained.shape = (n_features,) or (n_samples, n_features)
         log_pdf_grad_x = self.log_pdf_grad(self.transform.inverse(x_unconstrained))
         dx_dz = self.transform.derivative(x_unconstrained)
         d_log_det_jacobian = self.transform.grad_log_abs_det_jacobian(x_unconstrained)
@@ -60,6 +64,40 @@ class Normal(Distribution):
         grad_mu = diff / self.variance
         grad_var = 0.5 * (diff ** 2 / self.variance ** 2 - 1 / self.variance)
         return {"mean": grad_mu, "variance": grad_var}
+
+class MultivariateNormal(Distribution):
+    def __init__(self, mu, covariance):
+        super().__init__(IdentityTransform())
+        self.mu = mu
+        self.covariance = covariance
+        self._dim = len(mu)
+        self._inv_cov = torch.linalg.inv(self.covariance)
+        self._norm_const = -0.5 * (self._dim * math.log(2 * math.pi) + torch.logdet(self.covariance))
+
+    def pdf(self, x):
+        x = torch.as_tensor(x)
+        diff = x - self.mu
+        exponent = -0.5 * (diff @ self._inv_cov @ diff)
+        return torch.exp(exponent) / torch.exp(self._norm_const)
+
+    def log_pdf(self, x):
+        x = torch.as_tensor(x)
+        diff = x - self.mu
+        exponent = -0.5 * (diff @ self._inv_cov @ diff)
+        return self._norm_const + exponent
+
+    def log_pdf_grad(self, x):
+        x = torch.as_tensor(x)
+        diff = x - self.mu
+        return -self._inv_cov @ diff
+
+    def log_pdf_param_grads(self, x):
+        x = torch.as_tensor(x)
+        diff = x - self.mu
+        grad_mu = self._inv_cov @ diff
+        outer = torch.ger(diff, diff)
+        grad_cov = 0.5 * (self._inv_cov @ outer @ self._inv_cov - self._inv_cov)
+        return {"mean": grad_mu, "covariance": grad_cov}
 
 class Beta(Distribution):
     def __init__(self, a, b):
@@ -124,7 +162,7 @@ class Uniform(Distribution):
     
     def log_pdf(self, x):
         x = torch.as_tensor(x)
-        return torch.where((self.low <= x) & (x <= self.high), -torch.tensor([self.high - self.low], dtype=x.dtype), torch.tensor([-float("inf")], dtype=x.dtype))
+        return torch.where((self.low <= x) & (x <= self.high), -torch.tensor([self.high - self.low], dtype=x.dtype).log(), torch.tensor([-float("inf")], dtype=x.dtype).log())
     
     def log_pdf_grad(self, x):
         x = torch.as_tensor(x)
