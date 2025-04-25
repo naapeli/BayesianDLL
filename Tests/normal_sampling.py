@@ -10,7 +10,7 @@ from BayesianDLL.sampler import NUTS
 plt.figure(figsize=(6, 6))
 plt.subplot(3, 3, 1)
 distribution = Beta(2, 2)
-x = torch.linspace(-5, 5, 100)
+x = torch.linspace(-5, 5, 100).unsqueeze(1)  # make _log_prob_unconstrained and _log_prob_grad_unconstrained understand that 100 is n_samples and not n_features
 plt.plot(x.numpy(), distribution._log_prob_unconstrained(x).numpy(), label='log_pdf')
 plt.plot(x.numpy(), distribution._log_prob_grad_unconstrained(x).numpy(), label='log_pdf_grad')
 plt.legend()
@@ -58,6 +58,7 @@ n = 10000
 bins = 30
 
 plt.figure(figsize=(6, 6))
+
 plt.subplot(3, 3, 1)
 distribution = Normal(0, 1)
 sampler = NUTS(distribution._log_prob_unconstrained, distribution._log_prob_grad_unconstrained, distribution.transform.inverse)

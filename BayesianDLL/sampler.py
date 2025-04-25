@@ -1,5 +1,6 @@
 import torch
 import math
+from tqdm import tqdm
 from collections import namedtuple
 
 
@@ -95,7 +96,11 @@ class NUTS:
         step_size_bar = 1
         H_bar = 0
 
-        for m in range(1, M + M_adapt):
+        progress_bar = tqdm(range(1, M + M_adapt))
+        for m in progress_bar:
+            if m < M_adapt: progress_bar.set_description(f"Warmup")
+            else: progress_bar.set_description(f"Sample")
+            
             r0 = torch.randn(D, dtype=theta_init.dtype)
             joint = log_prob - 0.5 * r0 @ r0
             log_u = joint + torch.log(torch.rand(1))
