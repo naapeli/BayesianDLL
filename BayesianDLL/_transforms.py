@@ -33,10 +33,8 @@ class LogTransform(Transform):
             return torch.log(x)
 
     def inverse(self, x_unconstrained):
-        if self.side == "larger":
-            return self.border + torch.exp(x_unconstrained)
-        else:
-            return self.border - torch.exp(x_unconstrained)
+        sign = 1 if self.side == "larger" else -1
+        return self.border + sign * torch.exp(x_unconstrained)
 
     def derivative(self, x_unconstrained):
         sign = 1 if self.side == "larger" else -1
@@ -44,6 +42,34 @@ class LogTransform(Transform):
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.ones_like(x_unconstrained)
+    
+# class InverseSoftPlusTransform(Transform):  # TODO: SAMPLING NOT WORKING YET WITH THIS TRANSFORM, BUT SHOULD BE NUMERICALLY MORE STABLE THAN LogTransform
+#     def __init__(self, border=0, side="larger"):
+#         self.border = border
+#         self.side = side
+
+#     def forward(self, x_constrained):
+#         if self.side == "larger":
+#             x = (x_constrained - self.border).clamp(min=1e-8)
+#         else:
+#             x = (self.border - x_constrained).clamp(min=1e-8)
+#         return torch.log(torch.exp(x) - 1)
+
+#     def inverse(self, x_unconstrained):
+#         sign = 1 if self.side == "larger" else -1
+#         if self.side == "larger":
+#             return self.border + torch.log(1 + torch.exp(sign * x_unconstrained))
+#         else:
+#             return self.border - torch.log(1 + torch.exp(sign * x_unconstrained))
+
+#     def derivative(self, x_unconstrained):
+#         sign = 1 if self.side == "larger" else -1
+#         return torch.sigmoid(sign * x_unconstrained)
+
+#     def grad_log_abs_det_jacobian(self, x_unconstrained):
+#         sign = 1 if self.side == "larger" else -1
+#         sigmoid = torch.sigmoid(sign * x_unconstrained)
+#         return -sigmoid.log() / sigmoid.log().abs() * sign * (1 - sigmoid)
 
 class LogitTransform(Transform):
     def __init__(self, low=0, high=1):

@@ -8,12 +8,12 @@ from BayesianDLL.distributions import Normal, HalfCauchy
 torch.manual_seed(7)
 
 # Generate synthetic data
-N = 100
+N = 500
 true_intercept = 1.0
 true_slope = 2.5
-true_sigma = 1.0
+true_variance = 0.5  # NOTE: Stability of the sampler depends a lot on the original variance. If this is too large, the sampler might get stuck and one needs to use less data points.
 x = torch.linspace(0, 1, N)
-y = true_intercept + true_slope * x + torch.normal(0, true_sigma, size=(N,))
+y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size=(N,))
 
 # Priors
 prior_intercept = Normal(0, 20)
@@ -92,6 +92,7 @@ plt.plot(sigma_samples, label="sigma")
 plt.legend()
 plt.title("Trace Plots")
 plt.tight_layout()
+plt.savefig("Tests/bayesian_regression/linear_trace_plots_and_posteriors.png")
 
 
 y_preds = slope_samples[:, None] * x[None, :] + intercept_samples[:, None]
@@ -108,5 +109,6 @@ plt.xlabel("x")
 plt.ylabel("y")
 plt.legend()
 plt.tight_layout()
+plt.savefig("Tests/bayesian_regression/linear_fit.png")
 
 plt.show()
