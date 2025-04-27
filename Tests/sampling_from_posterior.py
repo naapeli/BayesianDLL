@@ -1,9 +1,9 @@
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL.sampler import NUTS
-from BayesianDLL.distributions import Beta, Bernoulli, Binomial
-from BayesianDLL._transforms import LogitTransform
+from BayesianDLL.Samplers import NUTS
+from BayesianDLL.Distributions import Beta, Bernoulli, Binomial
+from BayesianDLL.Distributions._transforms import LogitTransform
 
 
 torch.manual_seed(0)

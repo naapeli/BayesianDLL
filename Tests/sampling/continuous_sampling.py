@@ -2,8 +2,8 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
-from BayesianDLL.distributions import Normal, Beta, Exponential, Uniform, InvGamma, HalfCauchy
-from BayesianDLL.sampler import NUTS
+from BayesianDLL.Distributions import Normal, Beta, Exponential, Uniform, InvGamma, HalfCauchy
+from BayesianDLL.Samplers import NUTS
 
 
 # ================== DISTRIBUTIONS IN UNRESTRICTED SPACEES ==================

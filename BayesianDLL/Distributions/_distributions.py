@@ -2,7 +2,7 @@ import torch
 import math
 from abc import ABC, abstractmethod
 
-from .parameters import Parameter
+from ..parameters import Parameter
 from ._transforms import IdentityTransform, LogitTransform, LogTransform
 
 
@@ -267,3 +267,23 @@ class HalfCauchy(Distribution):
         x = torch.as_tensor(x).clamp(min=1e-8)
         d_log_pdf_dscale = -1 / self.scale + 2 * (x ** 2) / (self.scale * (x ** 2 + self.scale ** 2))
         return {'scale': d_log_pdf_dscale}
+
+class Geometric(Distribution):
+    def __init__(self, p):
+        super().__init__(LogTransform(border=0, side="larger"))
+        self.p = torch.as_tensor(p).clamp(min=1e-8)
+
+    def pdf(self, x):
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        return (1 - self.p) ** (x - 1) * self.p
+
+    def log_pdf(self, x):
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        return (x - 1) * (1 - self.p).log() + self.p.log()
+
+    def log_pdf_grad(self, x):
+        x = torch.as_tensor(x).clamp(min=1e-8)
+        return (1 - self.p).log()
+
+    def log_pdf_param_grads(self, x):
+        raise NotImplementedError()

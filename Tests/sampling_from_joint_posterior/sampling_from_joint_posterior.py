@@ -1,8 +1,8 @@
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL.sampler import NUTS
-from BayesianDLL.distributions import Normal, InvGamma
+from BayesianDLL.Samplers import NUTS
+from BayesianDLL.Distributions import Normal, InvGamma
 
 
 torch.manual_seed(7)
