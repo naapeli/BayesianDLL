@@ -1,8 +1,8 @@
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL.sampler import NUTS
-from BayesianDLL.distributions import Normal, HalfCauchy
+from BayesianDLL.Samplers import NUTS
+from BayesianDLL.Distributions import Normal, HalfCauchy
 
 
 torch.manual_seed(7)
