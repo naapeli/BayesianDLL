@@ -1,8 +1,10 @@
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL.Samplers import NUTS
+from BayesianDLL.Samplers import Metropolis
 from BayesianDLL.Distributions import MultivariateNormal, HalfCauchy, Normal
+from BayesianDLL.Distributions._state_space import ContinuousReal
+
 
 torch.manual_seed(7)
 
@@ -39,34 +41,15 @@ def log_posterior(theta):
 
     return prior + likelihood
 
-def log_posterior_derivative(theta):
-    coeffs_unconstrained = theta[:D + 1]
-    variance_unconstrained = theta[D + 1]
-
-    coeffs = prior_coeffs.transform.inverse(coeffs_unconstrained)
-    variance = prior_variance.transform.inverse(variance_unconstrained)
-
-    mu = phi_x @ coeffs
-
-    normal_dist = Normal(mu, variance)
-    grads = normal_dist.log_pdf_param_grads(y)
-
-    grad_coeffs = phi_x.T @ grads["mean"] * prior_coeffs.transform.derivative(coeffs_unconstrained)
-    grad_coeffs += prior_coeffs._log_prob_grad_unconstrained(coeffs_unconstrained)
-
-    d_variance = grads["variance"].sum() * prior_variance.transform.derivative(variance_unconstrained)
-    grad_variance = prior_variance._log_prob_grad_unconstrained(variance_unconstrained) + d_variance.item()
-
-    return torch.cat([grad_coeffs, torch.tensor([grad_variance], dtype=theta.dtype)])
-
 def inverse_transformation(theta):
     coeffs = prior_coeffs.transform.inverse(theta[:, :D + 1])
     variance = prior_variance.transform.inverse(theta[:, D + 1])
     return torch.cat([coeffs, variance.unsqueeze(-1)], dim=-1)
 
 initial_point = torch.zeros(D + 2, dtype=torch.float64)
-sampler = NUTS(log_posterior, log_posterior_derivative, inverse_transformation)
-samples, _, _ = sampler.sample(1000, initial_point, 100)
+initial_point[1] = 2.5  # as sampling takes a long time with the metropolis algorithm, give a little better initial guess to speed up the sampling
+sampler = Metropolis(log_posterior, ContinuousReal(), 1e-3)
+samples = inverse_transformation(sampler.sample(10000, initial_point, 50000))
 
 coeff_samples = [samples[:, i] for i in range(D + 1)]
 coeff_means = [coeff.mean() for coeff in coeff_samples]
@@ -83,7 +66,7 @@ plt.subplot(2, (D + 2) // 2 + 1, D + 2)
 plt.hist(variance_samples.numpy(), bins=50, density=True)
 plt.title("Posterior of σ")
 plt.tight_layout()
-plt.savefig("Tests/bayesian_regression/polynomial_posteriors.png")
+plt.savefig("Tests/bayesian_regression/polynomial_posteriors_with_Metropolis.png")
 
 plt.figure(figsize=(12, 6))
 for i, cs in enumerate(coeff_samples):
@@ -94,7 +77,7 @@ plt.subplot(2, (D + 2) // 2 + 1, D + 2)
 plt.plot(variance_samples.numpy())
 plt.title("Posterior of σ")
 plt.tight_layout()
-plt.savefig("Tests/bayesian_regression/polynomial_trace_plots.png")
+plt.savefig("Tests/bayesian_regression/polynomial_trace_plots_with_Metropolis.png")
 
 plt.figure(figsize=(10, 6))
 plt.plot(x, y, 'o', label="Observed data", alpha=0.6)
@@ -113,6 +96,6 @@ plt.xlabel("x")
 plt.ylabel("y")
 plt.legend()
 plt.tight_layout()
-plt.savefig("Tests/bayesian_regression/polynomial_fit.png")
+plt.savefig("Tests/bayesian_regression/polynomial_fit_with_Metropolis.png")
 
 plt.show()
