@@ -1,8 +1,8 @@
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL.sampler import NUTS
-from BayesianDLL.distributions import Normal, InvGamma
+from BayesianDLL.Samplers import NUTS
+from BayesianDLL.Distributions import Normal, InvGamma
 
 
 torch.manual_seed(7)
@@ -29,22 +29,6 @@ def log_posterior_derivative(theta):
     mean_derivative = prior_mean._log_prob_grad_unconstrained(mean) + likelihood_derivative_mean * prior_mean.transform.derivative(mean)
     std_derivative = prior_variance._log_prob_grad_unconstrained(variance) + likelihood_derivative_variance * prior_variance.transform.derivative(variance)
     return torch.tensor([mean_derivative.item(), std_derivative.item()], dtype=theta.dtype)
-
-def test_log_posterior_derivative():
-    for point in [torch.normal(0, 10, size=(2,)) for _ in range(10)]:
-        theta = torch.tensor(point, dtype=torch.float64, requires_grad=True)
-
-        lp = log_posterior(theta)
-        lp.backward()
-        autograd_grad = theta.grad.clone()
-
-        theta = theta.detach()
-        manual_grad = log_posterior_derivative(theta)
-
-        print(autograd_grad, manual_grad)
-        assert torch.allclose(autograd_grad, manual_grad, atol=1e-5), f"Autograd: {autograd_grad}, Manual: {manual_grad}"
-
-# test_log_posterior_derivative()
 
 def inverse_transformation(theta):
     mean, std = theta[:, 0], theta[:, 1]
@@ -78,5 +62,5 @@ plt.plot(torch.ones_like(variance_samples) * variance_samples.mean().item())
 plt.title("variance")
 
 plt.tight_layout()
-plt.savefig("Tests/sampling_from_joint_posterior/posteriors.png")
+plt.savefig("Tests/sampling_from_joint_posterior/posteriors_with_NUTS.png")
 plt.show()

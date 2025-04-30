@@ -1,17 +1,29 @@
-import torch
-import math
-
-from . import _active_model
+from ._active_model import _active_model
 
 
-class Parameter:
-    def __init__(self, name, distribution, init=None, observed=None):
+class RandomParameter:
+    def __init__(self, name, distribution, initial_value):
         self.name = name
         self.distribution = distribution
-        self.observed = observed
-        self.init_value = init
+        self.constrained_value = initial_value
+        self.unconstrained_value = self.distribution.transform.forward(initial_value)
 
-        if _active_model is not None:
-            _active_model.vars.append(self)
-            if observed is None:
-                _active_model.params[name] = init
+        if _active_model._active_model is not None:
+            _active_model._active_model.params[name] = self
+        else:
+            raise RuntimeError("One should select an active model before creating random variables.")
+
+    def set_unconstrained_value(self, unconstrained_value):
+        self.unconstrained_value = unconstrained_value
+        self.constrained_value = self.distribution.transform.inverse(unconstrained_value)
+
+class ObservedParameter:
+    def __init__(self, name, distribution, observed_values):
+        self.name = name
+        self.distribution = distribution
+        self.observed_values = observed_values
+
+        if _active_model._active_model is not None:
+            _active_model._active_model.observed_params[name] = self
+        else:
+            raise RuntimeError("One should select an active model before creating random variables.")

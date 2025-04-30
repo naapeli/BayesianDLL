@@ -83,8 +83,8 @@ class NUTS:
             raise ValueError("theta_init should be a one dimensional tensor.")
         
         D = len(theta_init)
-        samples = torch.empty((M + M_adapt, D), dtype=theta_init.dtype)
-        lnprob = torch.empty((M + M_adapt,), dtype=theta_init.dtype)
+        samples = torch.empty((M + M_adapt + 1, D), dtype=theta_init.dtype)
+        lnprob = torch.empty((M + M_adapt + 1,), dtype=theta_init.dtype)
 
         log_prob, gradient = self.log_target(theta_init), self.gradient(theta_init)
         samples[0] = theta_init
@@ -96,7 +96,7 @@ class NUTS:
         step_size_bar = 1
         H_bar = 0
 
-        progress_bar = tqdm(range(1, M + M_adapt))
+        progress_bar = tqdm(range(1, M + M_adapt + 1))
         for m in progress_bar:
             if m < M_adapt: progress_bar.set_description(f"Warmup")
             else: progress_bar.set_description(f"Sample")
@@ -145,3 +145,72 @@ class NUTS:
         samples = self.inverse_transformation(samples[M_adapt:])
         lnprob = lnprob[M_adapt:]
         return samples, lnprob, step_size
+
+    def step(self, theta, warmup=False):
+        if theta.ndim != 1:
+            raise ValueError("theta should be a one-dimensional tensor.")
+        
+        D = len(theta)
+        if not hasattr(self, "step_size"):
+            log_prob = self.log_target(theta)
+            gradient = self.gradient(theta)
+            self.step_size = self.find_reasonable_step_size(theta, gradient, log_prob)
+            self.gradient_cache = gradient
+            self.log_prob_cache = log_prob
+            self.m = 1
+            self.mu = math.log(10 * self.step_size)
+            self.step_size_bar = 1
+            self.H_bar = 0
+            self.delta = 0.6
+
+        r0 = torch.randn(D, dtype=theta.dtype)
+        joint = self.log_prob_cache - 0.5 * r0 @ r0
+        log_u = joint + torch.log(torch.rand(1))
+
+        theta_minus = theta
+        theta_plus = theta
+        r_minus = r0
+        r_plus = r0
+        grad_minus = self.gradient_cache
+        grad_plus = self.gradient_cache
+        j, n, s = 0, 1, 1
+
+        new_theta = theta
+        new_log_prob = self.log_prob_cache
+        new_gradient = self.gradient_cache
+
+        while s == 1:
+            v = 1 if torch.rand(1) < 0.5 else -1
+            if v == -1:
+                tree = self.build_tree(theta_minus, r_minus, grad_minus, log_u, v, j, self.step_size, joint)
+                theta_minus, r_minus, grad_minus = tree.theta_minus, tree.r_minus, tree.grad_minus
+            else:
+                tree = self.build_tree(theta_plus, r_plus, grad_plus, log_u, v, j, self.step_size, joint)
+                theta_plus, r_plus, grad_plus = tree.theta_plus, tree.r_plus, tree.grad_plus
+            
+            _tmp = min(1, tree.n_prime / n)
+            if tree.s_prime == 1 and torch.rand(1) < _tmp:
+                new_theta = tree.theta_prime
+                new_log_prob = tree.log_prob_prime
+                new_gradient = tree.grad_prime
+            n += tree.n_prime
+            s = tree.s_prime * self._uturn(theta_minus, theta_plus, r_minus, r_plus)
+            j += 1
+        
+        eta = 1 / (self.m + self.t0)
+        self.H_bar = (1 - eta) * self.H_bar + eta * (self.delta - tree.alpha_prime / tree.n_prime_alpha)
+        if warmup:
+            self.step_size = math.exp(self.mu - math.sqrt(self.m) / self.gamma * self.H_bar)
+            eta = self.m ** -self.kappa
+            self.step_size_bar = math.exp((1 - eta) * math.log(self.step_size_bar) + eta * math.log(self.step_size))
+        else:
+            self.step_size = self.step_size_bar
+
+        self.gradient_cache = new_gradient
+        self.log_prob_cache = new_log_prob
+        self.m += 1
+
+        return new_theta
+
+    def init_sampler(self):
+        pass
