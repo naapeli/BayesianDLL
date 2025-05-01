@@ -18,6 +18,10 @@ class NUTS:
         self.gamma = 0.05
         self.t0 = 10
         self.kappa = 0.75
+        self.step_size_bar = 1
+        self.H_bar = 0
+        self.delta = 0.6
+        self.max_depth = 10
 
     def leapfrog(self, theta, r, grad, step_size):
         r_prime = r +  0.5 * step_size * grad
@@ -115,7 +119,7 @@ class NUTS:
             grad_plus = gradient
             j, n, s = 0, 1, 1
 
-            while s == 1:
+            while s == 1 and j <= self.max_depth:
                 v = 1 if torch.rand(1) < 0.5 else -1
                 if v == -1:
                     tree = self.build_tree(theta_minus, r_minus, grad_minus, log_u, v, j, step_size, joint)
@@ -134,9 +138,9 @@ class NUTS:
                 s = tree.s_prime * self._uturn(theta_minus, theta_plus, r_minus, r_plus)
                 j += 1
             
-            eta = 1 / (m + self.t0)
-            H_bar = (1 - eta) * H_bar + eta * (delta - tree.alpha_prime / tree.n_prime_alpha)
             if m <= M_adapt:
+                eta = 1 / (m + self.t0)
+                H_bar = (1 - eta) * H_bar + eta * (delta - tree.alpha_prime / tree.n_prime_alpha)
                 step_size = math.exp(mu - math.sqrt(m) / self.gamma * H_bar)
                 eta = m ** -self.kappa
                 step_size_bar = math.exp((1 - eta) * math.log(step_size_bar) + eta * math.log(step_size))
@@ -155,13 +159,10 @@ class NUTS:
             log_prob = self.log_target(theta)
             gradient = self.gradient(theta)
             self.step_size = self.find_reasonable_step_size(theta, gradient, log_prob)
+            self.mu = math.log(10 * self.step_size)
             self.gradient_cache = gradient
             self.log_prob_cache = log_prob
             self.m = 1
-            self.mu = math.log(10 * self.step_size)
-            self.step_size_bar = 1
-            self.H_bar = 0
-            self.delta = 0.6
 
         r0 = torch.randn(D, dtype=theta.dtype)
         joint = self.log_prob_cache - 0.5 * r0 @ r0
@@ -179,7 +180,7 @@ class NUTS:
         new_log_prob = self.log_prob_cache
         new_gradient = self.gradient_cache
 
-        while s == 1:
+        while s == 1 and j <= self.max_depth:
             v = 1 if torch.rand(1) < 0.5 else -1
             if v == -1:
                 tree = self.build_tree(theta_minus, r_minus, grad_minus, log_u, v, j, self.step_size, joint)
@@ -197,9 +198,9 @@ class NUTS:
             s = tree.s_prime * self._uturn(theta_minus, theta_plus, r_minus, r_plus)
             j += 1
         
-        eta = 1 / (self.m + self.t0)
-        self.H_bar = (1 - eta) * self.H_bar + eta * (self.delta - tree.alpha_prime / tree.n_prime_alpha)
         if warmup:
+            eta = 1 / (self.m + self.t0)
+            self.H_bar = (1 - eta) * self.H_bar + eta * (self.delta - tree.alpha_prime / tree.n_prime_alpha)
             self.step_size = math.exp(self.mu - math.sqrt(self.m) / self.gamma * self.H_bar)
             eta = self.m ** -self.kappa
             self.step_size_bar = math.exp((1 - eta) * math.log(self.step_size_bar) + eta * math.log(self.step_size))

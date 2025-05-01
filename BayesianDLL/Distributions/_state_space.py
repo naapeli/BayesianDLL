@@ -43,6 +43,12 @@ class DiscreteRange(DiscreteSpace):
     def __iter__(self):
         for i in range(len(self.values)):
             yield self.values[i].item()
+    
+    def __len__(self):
+        return len(self.values)
+
+    def __getitem__(self, index):
+        return self.values[index].item()
 
 class DiscretePositive(DiscreteSpace):
     def contains(self, state):
