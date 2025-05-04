@@ -16,13 +16,14 @@ y = sum(c * x ** i for i, c in enumerate(true_coeffs)) + torch.normal(0, true_va
 
 # Degree of the polynomial to be fitted
 D = 5
-phi_x = torch.stack([x ** i for i in range(D + 1)], dim=1).to(torch.float64)
+# Create Chebyshev basis (the sampling is way faster in this basis 0.5 iter / s vs 40 iter / s)
+x_scaled = (x - xmin) / (xmax - xmin) * 2 - 1  # Scaling to [-1, 1] for Chebyshev
+phi_x = torch.stack([torch.cos(i * torch.acos(x_scaled)) for i in range(D + 1)], dim=1).to(torch.float64)
 
 with Model() as polynomial_model:
     # Priors
-    prior_variance = 20
     prior_mean = torch.zeros(D + 1, dtype=torch.float64)
-    prior_cov = prior_variance * torch.eye(D + 1, dtype=torch.float64)
+    prior_cov = torch.eye(D + 1, dtype=torch.float64)
     prior_coeffs = RandomParameter("coeffs", MultivariateNormal(prior_mean, prior_cov), torch.zeros_like(prior_mean, dtype=torch.float64), sampler="auto")
     prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.ones(1, dtype=torch.float64), sampler="auto")
 
@@ -64,7 +65,8 @@ plt.figure(figsize=(10, 6))
 plt.plot(x, y, 'o', label="Observed data", alpha=0.6)
 
 x = torch.linspace(xmin, xmax, 100)
-phi_x = torch.stack([x ** i for i in range(D + 1)], dim=1).to(torch.float64)
+x_scaled = (x - xmin) / (xmax - xmin) * 2 - 1  # Scaling to [-1, 1] for Chebyshev
+phi_x = torch.stack([torch.cos(i * torch.acos(x_scaled)) for i in range(D + 1)], dim=1).to(torch.float64)
 y_preds = samples["coeffs"] @ phi_x.T
 y_mean = y_preds.mean(dim=0)
 y_lower = y_preds.quantile(0.025, dim=0)
