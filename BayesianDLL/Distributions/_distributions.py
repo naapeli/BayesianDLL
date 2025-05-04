@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 
 from ._transforms import IdentityTransform, LogitTransform, LogTransform
 from ._state_space import ContinuousReal, ContinuousPositive, ContinuousRange, DiscretePositive, DiscreteRange
-from .._parameters import RandomParameter
+from .._parameters import RandomParameter, DeterministicParameter
 
 
 class Distribution(ABC):
@@ -13,6 +13,7 @@ class Distribution(ABC):
         self.state_space = state_space
         self.transformed_state_space = transformed_state_space
         self.random_parameters = set()  # used to store the random variables the distribution depends on
+        self.deterministic_parameters = set()
 
     @abstractmethod
     def pdf(self, x_constrained):
@@ -50,18 +51,21 @@ class Distribution(ABC):
     def resolve(self, parameter):
         if isinstance(parameter, torch.Tensor):
             return parameter
-        elif isinstance(parameter, RandomParameter):
-            self.random_parameters.add(parameter.name)  # store the dependencies of the model
+        elif isinstance(parameter, RandomParameter | DeterministicParameter):
             return parameter.constrained_value
         elif isinstance(parameter, int | float):
             return torch.as_tensor(parameter)
         else:
-            raise RuntimeError(f"Parameter {parameter} is not of type int, float or RandomParameter.")
+            raise RuntimeError(f"Parameter {parameter} is not of type int, float, RandomParameter or DeterministicParameter.")
     
     def resolve_name(self, name, parameter):
-        if isinstance(parameter, RandomParameter):
+        if isinstance(parameter, RandomParameter | DeterministicParameter):
             return parameter.name
         return name
+    
+    def add_dependecy(self, parameter):
+        if isinstance(parameter, RandomParameter): self.random_parameters.add(parameter.name)
+        if isinstance(parameter, DeterministicParameter): self.deterministic_parameters.add(parameter.name)
 
 
 # ========================= CONTINUOUS =========================
@@ -70,6 +74,8 @@ class Normal(Distribution):
         super().__init__()
         self.mu = mu
         self.variance = variance
+        self.add_dependecy(mu)
+        self.add_dependecy(variance)
 
     def pdf(self, x):
         x = torch.as_tensor(x)
@@ -136,8 +142,10 @@ class MultivariateNormal(Distribution):
 # class MultivariateNormal(Distribution):
 #     def __init__(self, mu, covariance):
 #         super().__init__()
-#         self.mu = mu
-#         self.covariance = covariance
+#             self.mu = mu
+#             self.covariance = covariance
+#             self.add_dependecy(mu)
+#             self.add_dependecy(covariance)
 
 #     def pdf(self, x):
 #         x = torch.as_tensor(x)
