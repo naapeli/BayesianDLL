@@ -26,7 +26,7 @@ def sample(n_samples, warmup_length, model=None):
             model.params[name].set_unconstrained_value(new_theta)
             trace[name].append(model.params[name].constrained_value)
 
-    trace = {name: torch.tensor(samples[warmup_length:]) for name, samples in trace.items()}
+    trace = {name: torch.stack(samples[warmup_length:]) for name, samples in trace.items()}
     return trace
 
 def _decide_step(model, parameter):
@@ -34,12 +34,12 @@ def _decide_step(model, parameter):
 
     state_space = parameter.distribution.transformed_state_space
 
-    if state_space.is_continuous():
+    if state_space.is_continuous() and (parameter.sampler == "auto" or parameter.sampler == "nuts"):
         sampler = NUTS(_log_prob_func, partial(model.grad_log_prob, parameter.name), lambda x: x)
-    elif state_space.is_discrete():
+    elif (state_space.is_discrete() or state_space.is_continuous()) and (parameter.sampler == "auto" or parameter.sampler == "metropolis"):
         sampler = Metropolis(_log_prob_func, state_space)
     else:
-        raise RuntimeError("A distribution must be either discrete or continuous.")
+        raise RuntimeError("A distribution is incompatable with the chosen sampler. NUTS can only be used with continuous distributions.")
     
     sampler.init_sampler()
     return sampler
