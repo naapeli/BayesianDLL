@@ -3,7 +3,8 @@ import math
 from abc import ABC, abstractmethod
 
 from ._transforms import IdentityTransform, LogitTransform, LogTransform
-from ._state_space import DiscreteSpace, ContinuousSpace, ContinuousReal, ContinuousPositive, ContinuousRange, DiscretePositive, DiscreteRange
+from ._state_space import ContinuousReal, ContinuousPositive, ContinuousRange, DiscretePositive, DiscreteRange
+from .._parameters import RandomParameter, DeterministicParameter
 
 
 class Distribution(ABC):
@@ -11,6 +12,8 @@ class Distribution(ABC):
         self.transform = transform
         self.state_space = state_space
         self.transformed_state_space = transformed_state_space
+        self.random_parameters = set()  # used to store the random variables the distribution depends on
+        self.deterministic_parameters = set()
 
     @abstractmethod
     def pdf(self, x_constrained):
@@ -28,6 +31,9 @@ class Distribution(ABC):
     def log_pdf_param_grads(self, x_constrained):
         pass
 
+    def _depends_on_random_variable(self, name):
+        return name in self.random_parameters
+
     def _log_prob_unconstrained(self, x_unconstrained):
         # x_unconstrained.shape = (n_features,) or (n_samples, n_features)
         x_constrained = self.transform.inverse(x_unconstrained)
@@ -41,33 +47,63 @@ class Distribution(ABC):
         dx_dz = self.transform.derivative(x_unconstrained)
         d_log_det_jacobian = self.transform.grad_log_abs_det_jacobian(x_unconstrained)
         return log_pdf_grad_x * dx_dz + d_log_det_jacobian
+    
+    def resolve(self, parameter):
+        if isinstance(parameter, torch.Tensor):
+            return parameter
+        elif isinstance(parameter, RandomParameter | DeterministicParameter):
+            return parameter.constrained_value
+        elif isinstance(parameter, int | float):
+            return torch.as_tensor(parameter)
+        else:
+            raise RuntimeError(f"Parameter {parameter} is not of type int, float, RandomParameter or DeterministicParameter.")
+    
+    def resolve_name(self, name, parameter):
+        if isinstance(parameter, RandomParameter | DeterministicParameter):
+            return parameter.name
+        return name
+    
+    def add_dependecy(self, parameter):
+        if isinstance(parameter, RandomParameter): self.random_parameters.add(parameter.name)
+        if isinstance(parameter, DeterministicParameter): self.deterministic_parameters.add(parameter.name)
 
 
 # ========================= CONTINUOUS =========================
 class Normal(Distribution):
     def __init__(self, mu, variance):
         super().__init__()
-        self.mu = torch.as_tensor(mu)
-        self.variance = torch.as_tensor(variance)
+        self.mu = mu
+        self.variance = variance
+        self.add_dependecy(mu)
+        self.add_dependecy(variance)
 
     def pdf(self, x):
         x = torch.as_tensor(x)
-        return torch.exp(-0.5 * (x - self.mu) ** 2 / self.variance) / torch.sqrt(2 * math.pi * self.variance)
+        mu = self.resolve(self.mu)
+        variance = self.resolve(self.variance)
+        return torch.exp(-0.5 * (x - mu) ** 2 / variance) / torch.sqrt(2 * math.pi * variance)
 
     def log_pdf(self, x):
         x = torch.as_tensor(x)
-        return -0.5 * (x - self.mu) ** 2 / self.variance - 0.5 * torch.log(2 * math.pi * self.variance)
+        mu = self.resolve(self.mu)
+        variance = self.resolve(self.variance)
+        return -0.5 * (x - mu) ** 2 / variance - 0.5 * torch.log(2 * math.pi * variance)
 
     def log_pdf_grad(self, x):
         x = torch.as_tensor(x)
-        return -(x - self.mu) / self.variance
+        mu = self.resolve(self.mu)
+        variance = self.resolve(self.variance)
+        return -(x - mu) / variance
 
     def log_pdf_param_grads(self, x):
         x = torch.as_tensor(x)
-        diff = x - self.mu
-        grad_mu = diff / self.variance
-        grad_var = 0.5 * (diff ** 2 / self.variance ** 2 - 1 / self.variance)
-        return {"mean": grad_mu, "variance": grad_var}
+        mu = self.resolve(self.mu)
+        variance = self.resolve(self.variance)
+        diff = x - mu
+        grad_mu = diff / variance
+        grad_var = 0.5 * (diff ** 2 / variance ** 2 - 1 / variance)
+        # return {"mean": grad_mu, "variance": grad_var}
+        return {self.resolve_name("mean", self.mu): grad_mu, self.resolve_name("variance", self.variance): grad_var}
 
 class MultivariateNormal(Distribution):
     def __init__(self, mu, covariance):
@@ -102,6 +138,54 @@ class MultivariateNormal(Distribution):
         outer = torch.ger(diff, diff)
         grad_cov = 0.5 * (self._inv_cov @ outer @ self._inv_cov - self._inv_cov)
         return {"mean": grad_mu, "covariance": grad_cov}
+    
+# class MultivariateNormal(Distribution):
+#     def __init__(self, mu, covariance):
+#         super().__init__()
+#             self.mu = mu
+#             self.covariance = covariance
+#             self.add_dependecy(mu)
+#             self.add_dependecy(covariance)
+
+#     def pdf(self, x):
+#         x = torch.as_tensor(x)
+#         mu = self.resolve(self.mu)
+#         covariance = self.resolve(self.covariance)
+#         diff = x - mu
+#         exponent = -0.5 * (diff @ torch.cholesky_solve(diff.unsqueeze(-1), torch.linalg.cholesky(covariance)).squeeze(-1))
+#         denominator = (2 * math.pi) ** (-len(diff) / 2) * torch.det(self.covariance) ** -0.5
+#         return torch.exp(exponent) / denominator
+
+#     def log_pdf(self, x):
+#         x = torch.as_tensor(x)
+#         mu = self.resolve(self.mu)
+#         covariance = self.resolve(self.covariance)
+#         diff = x - mu
+#         exponent = -0.5 * (diff @ torch.cholesky_solve(diff.unsqueeze(-1), torch.linalg.cholesky(covariance)).squeeze(-1))
+#         denominator = (2 * math.pi) ** (-len(diff) / 2) * torch.det(self.covariance) ** -0.5
+#         return exponent + denominator
+
+#     def log_pdf_grad(self, x):
+#         x = torch.as_tensor(x)
+#         mu = self.resolve(self.mu)
+#         covariance = self.resolve(self.covariance)
+#         diff = x - mu
+#         grad = -torch.cholesky_solve(diff.unsqueeze(-1), torch.linalg.cholesky(covariance)).squeeze(-1)
+#         return grad
+
+#     def log_pdf_param_grads(self, x):
+#         x = torch.as_tensor(x)
+#         mu = self.resolve(self.mu)
+#         covariance = self.resolve(self.covariance)
+#         diff = x - mu
+#         L = torch.linalg.cholesky(covariance)
+#         inv_diff = torch.cholesky_solve(diff.unsqueeze(-1), L).squeeze(-1)
+#         grad_mu = inv_diff
+
+#         outer = inv_diff.unsqueeze(1) @ inv_diff.unsqueeze(0)
+#         inv_cov = torch.cholesky_inverse(L)
+#         grad_cov = 0.5 * (outer - inv_cov)
+#         return {"mean": grad_mu, "covariance": grad_cov}
 
 class Beta(Distribution):
     def __init__(self, a, b):
