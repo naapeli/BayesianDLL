@@ -42,6 +42,8 @@ class ObservedParameter:
         self.name = name
         self.distribution = distribution
         self.observed_values = observed_values
+        self.sampler = "metropolis"  # for predicative sampling
+        self.sampler_params = {}
 
         if _active_model._active_model is not None:
             _active_model._active_model.observed_params[name] = self
