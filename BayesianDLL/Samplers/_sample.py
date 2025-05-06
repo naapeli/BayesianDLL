@@ -35,9 +35,9 @@ def _decide_step(model, parameter):
     state_space = parameter.distribution.transformed_state_space
 
     if state_space.is_continuous() and (parameter.sampler == "auto" or parameter.sampler == "nuts"):
-        sampler = NUTS(_log_prob_func, partial(model.grad_log_prob, parameter.name), lambda x: x)
+        sampler = NUTS(_log_prob_func, partial(model.grad_log_prob, parameter.name), lambda x: x, **parameter.sampler_params)
     elif (state_space.is_discrete() or state_space.is_continuous()) and (parameter.sampler == "auto" or parameter.sampler == "metropolis"):
-        sampler = Metropolis(_log_prob_func, state_space)
+        sampler = Metropolis(_log_prob_func, state_space, **parameter.sampler_params)
     else:
         raise RuntimeError("A distribution is incompatable with the chosen sampler. NUTS can only be used with continuous distributions.")
     

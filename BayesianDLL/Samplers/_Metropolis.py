@@ -4,13 +4,13 @@ from tqdm import tqdm
 
 
 class Metropolis:
-    def __init__(self, log_target, state_space):
+    def __init__(self, log_target, state_space, proposal_variance=1, adapt_rate=0.1, acceptance_low=0.2, acceptance_high=0.5):
         self.log_target = log_target
         self.state_space = state_space
-        self.proposal_variance = 1
-        self.adapt_rate = 0.1
-        self.acceptance_low = 0.2
-        self.acceptance_high = 0.5
+        self.proposal_variance = proposal_variance
+        self.adapt_rate = adapt_rate
+        self.acceptance_low = acceptance_low
+        self.acceptance_high = acceptance_high
         self.m = 0
         self.n_accepted = 0
 

@@ -4,7 +4,7 @@ from ._active_model import _active_model
 
 
 class RandomParameter:
-    def __init__(self, name, distribution, initial_value, sampler="auto"):
+    def __init__(self, name, distribution, initial_value, sampler="auto", **sampler_params):
         """
         A random variable following a spesific distribution.
 
@@ -22,6 +22,7 @@ class RandomParameter:
         self.constrained_value = initial_value
         self.unconstrained_value = self.distribution.transform.forward(initial_value)
         self.sampler = sampler
+        self.sampler_params = sampler_params
 
         if _active_model._active_model is not None:
             _active_model._active_model.params[name] = self
