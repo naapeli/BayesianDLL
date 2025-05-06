@@ -7,17 +7,17 @@ from collections import namedtuple
 Tree = namedtuple("Tree", ["theta_minus", "r_minus", "grad_minus", "theta_plus", "r_plus", "grad_plus", "theta_prime", "grad_prime", "log_prob_prime", "n_prime", "s_prime", "alpha_prime", "n_prime_alpha"])
 
 class NUTS:
-    def __init__(self, log_target, gradient, inverse_transformation):
+    def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0):
         self.log_target = log_target
         self.gradient = gradient
         self.inverse_transformation = inverse_transformation
-        self.gamma = 0.05
-        self.t0 = 10
-        self.kappa = 0.75
-        self.step_size_bar = 1
-        self.H_bar = 0
-        self.delta = 0.6
-        self.max_depth = 10
+        self.gamma = gamma
+        self.t0 = t0
+        self.kappa = kappa
+        self.step_size_bar = step_size_bar
+        self.H_bar = H_bar
+        self.delta = delta
+        self.max_depth = max_depth
 
     def leapfrog(self, theta, r, grad, step_size):
         r_prime = r +  0.5 * step_size * grad
