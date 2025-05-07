@@ -1,12 +1,12 @@
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL.Samplers import NUTS
 from BayesianDLL.Distributions import Normal, InvGamma
+from BayesianDLL import Model, RandomParameter, ObservedParameter, sample
 
 
 torch.manual_seed(7)
-N = 100  # Due to numerical instability, one cannot use much larger N (If one use torch.float32 in the initial point for the sampler, N can only be about 5)
+N = 100
 mu0 = 0
 tau = 10
 a = 2
@@ -14,53 +14,58 @@ b = 2
 true_mean, true_variance = 5, 3
 data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N,))
 print(data.mean(), data.var())
-prior_mean = Normal(mu0, tau)
-prior_variance = InvGamma(a, b)
-def log_posterior(theta):
-    mean, variance = theta[0], theta[1]
-    prior = prior_mean._log_prob_unconstrained(mean) + prior_variance._log_prob_unconstrained(variance)
-    likelihood = Normal(prior_mean.transform.inverse(mean), prior_variance.transform.inverse(variance)).log_pdf(data).sum()
-    return prior + likelihood
 
-def log_posterior_derivative(theta):
-    mean, variance = theta[0], theta[1]
-    likelihood_derivatives = Normal(prior_mean.transform.inverse(mean), prior_variance.transform.inverse(variance)).log_pdf_param_grads(data)
-    likelihood_derivative_mean, likelihood_derivative_variance = likelihood_derivatives["mean"].sum(), likelihood_derivatives["variance"].sum()
-    mean_derivative = prior_mean._log_prob_grad_unconstrained(mean) + likelihood_derivative_mean * prior_mean.transform.derivative(mean)
-    std_derivative = prior_variance._log_prob_grad_unconstrained(variance) + likelihood_derivative_variance * prior_variance.transform.derivative(variance)
-    return torch.tensor([mean_derivative.item(), std_derivative.item()], dtype=theta.dtype)
+with Model() as model:
+    prior_mean = RandomParameter("mean", Normal(mu0, tau), torch.zeros(1, dtype=torch.float64), sampler="nuts")
+    prior_variance = RandomParameter("variance", InvGamma(a, b), torch.ones(1, dtype=torch.float64), sampler="nuts")
 
-def inverse_transformation(theta):
-    mean, std = theta[:, 0], theta[:, 1]
-    return torch.stack([prior_mean.transform.inverse(mean), prior_variance.transform.inverse(std)], dim=-1)
-
-sampler = NUTS(log_posterior, log_posterior_derivative, inverse_transformation)
-samples, _, _ = sampler.sample(2000, torch.tensor([0, 0], dtype=torch.float64), 500)
-mean_samples = samples[:, 0]
-variance_samples = samples[:, 1]
+    likelihood = ObservedParameter("likelihood", Normal(prior_mean, prior_variance), data)
+    samples = sample(20000, 500)
 
 
-plt.figure(figsize=(6, 6))
+mean_samples, variance_samples = samples["mean"], samples["variance"]
+
+colors = {
+    "posterior": "blue",
+    "true": "orange",
+    "data": "green"
+}
+
+plt.figure(figsize=(12, 8))
+
 plt.subplot(2, 2, 1)
-plt.hist(mean_samples.numpy(), bins=50, density=True)
-plt.title("Posterior of μ")
+plt.hist(mean_samples.numpy(), bins=50, density=True, color="lightgray")
+plt.axvline(mean_samples.mean().item(), color=colors["posterior"], label="posterior mean")
+plt.axvline(true_mean, color=colors["true"], label="true mean")
+plt.axvline(data.mean(), color=colors["data"], label="data mean")
+plt.legend(loc="upper right")
+plt.title("Posterior of Mean")
 
 plt.subplot(2, 2, 2)
-plt.hist(variance_samples.numpy(), bins=50, density=True)
-plt.title("Posterior of σ²")
+plt.hist(variance_samples.numpy(), bins=50, density=True, color="lightgray")
+plt.axvline(variance_samples.mean().item(), color=colors["posterior"], label="posterior variance")
+plt.axvline(true_variance, color=colors["true"], label="true variance")
+plt.axvline(data.var(), color=colors["data"], label="data variance")
+plt.legend(loc="upper right")
+plt.title("Posterior of Variance")
 
 plt.subplot(2, 2, 3)
-plt.plot(mean_samples)
+plt.plot(mean_samples, color="lightgray", label="samples")
 print("Posterior mean: ", mean_samples.mean().item())
-plt.plot(torch.ones_like(mean_samples) * mean_samples.mean().item())
-plt.title("mean")
+plt.plot(torch.ones_like(mean_samples) * mean_samples.mean().item(), color=colors["posterior"], label="posterior mean")
+plt.plot(torch.ones_like(mean_samples) * true_mean, color=colors["true"], label="true mean")
+plt.plot(torch.ones_like(mean_samples) * data.mean(), color=colors["data"], label="data mean")
+plt.legend(loc="upper right")
+plt.title("Trace of Mean")
 
 plt.subplot(2, 2, 4)
-plt.plot(variance_samples)
+plt.plot(variance_samples, color="lightgray", label="samples")
 print("Posterior variance: ", variance_samples.mean().item())
-plt.plot(torch.ones_like(variance_samples) * variance_samples.mean().item())
-plt.title("variance")
-
-plt.tight_layout()
+plt.plot(torch.ones_like(mean_samples) * variance_samples.mean().item(), color=colors["posterior"], label="posterior variance")
+plt.plot(torch.ones_like(mean_samples) * true_variance, color=colors["true"], label="true variance")
+plt.plot(torch.ones_like(mean_samples) * data.var(), color=colors["data"], label="data variance")
+plt.legend(loc="upper right")
+plt.title("Trace of Variance")
 plt.savefig("Tests/sampling_from_joint_posterior/posteriors_with_NUTS.png")
+plt.tight_layout()
 plt.show()

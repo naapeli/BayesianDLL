@@ -16,9 +16,8 @@ y = sum(c * x ** i for i, c in enumerate(true_coeffs)) + torch.normal(0, true_va
 
 # Degree of the polynomial to be fitted
 D = 5
-# Create Chebyshev basis (the sampling is way faster in this basis 0.5 iter / s vs 40 iter / s)
 x_scaled = (x - xmin) / (xmax - xmin) * 2 - 1  # Scaling to [-1, 1] for Chebyshev
-phi_x = torch.stack([torch.cos(i * torch.acos(x_scaled)) for i in range(D + 1)], dim=1).to(torch.float64)
+phi_x = torch.stack([torch.cos(i * torch.acos(x_scaled)) for i in range(D + 1)], dim=1).to(torch.float64)  # Chebysev basis functions
 
 with Model() as polynomial_model:
     # Priors
@@ -43,23 +42,23 @@ plt.figure(figsize=(12, 6))
 for i, cs in enumerate(coeff_samples.T):
     plt.subplot(2, (D + 2) // 2 + 1, i + 1)
     plt.hist(cs.numpy(), bins=50, density=True)
-    plt.title(f"Posterior of θ{i}")
+    plt.title(f"Posterior of $\\theta_{i}$")
 plt.subplot(2, (D + 2) // 2 + 1, D + 2)
 plt.hist(variance_samples.numpy(), bins=50, density=True)
-plt.title("Posterior of σ")
+plt.title(f"Posterior of $\\sigma$")
 plt.tight_layout()
-plt.savefig("Tests/sampling_with_model/polynomial_posteriors.png")
+plt.savefig("Tests/bayesian_regression/polynomial_posteriors.png")
 
 plt.figure(figsize=(12, 6))
 for i, cs in enumerate(coeff_samples.T):
     plt.subplot(2, (D + 2) // 2 + 1, i + 1)
     plt.plot(cs.numpy())
-    plt.title(f"Posterior of θ{i}")
+    plt.title(f"Posterior of $\\theta_{i}$")
 plt.subplot(2, (D + 2) // 2 + 1, D + 2)
 plt.plot(variance_samples.numpy())
-plt.title("Posterior of σ")
+plt.title(f"Posterior of $\\sigma$")
 plt.tight_layout()
-plt.savefig("Tests/sampling_with_model/polynomial_trace.png")
+plt.savefig("Tests/bayesian_regression/polynomial_trace.png")
 
 plt.figure(figsize=(10, 6))
 plt.plot(x, y, 'o', label="Observed data", alpha=0.6)
@@ -79,6 +78,6 @@ plt.xlabel("x")
 plt.ylabel("y")
 plt.legend()
 plt.tight_layout()
-plt.savefig("Tests/sampling_with_model/polynomial_fit.png")
+plt.savefig("Tests/bayesian_regression/polynomial_fit.png")
 
 plt.show()
