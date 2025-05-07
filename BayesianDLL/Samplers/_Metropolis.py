@@ -31,7 +31,7 @@ class Metropolis:
     
     def step(self, theta, warmup=False):
         theta_proposal = self.get_proposal(theta)
-        acceptance_ratio = min(1, torch.exp(self.log_target(theta_proposal) - self.log_target(theta)))
+        acceptance_ratio = min(torch.ones(1), torch.exp(self.log_target(theta_proposal) - self.log_target(theta)))
         if torch.rand(1) < acceptance_ratio:
             theta = theta_proposal
             self.n_accepted += 1
@@ -39,7 +39,7 @@ class Metropolis:
 
         if warmup:
             if self.state_space.is_continuous(): self.adapt_proposal_variance()
-        return theta
+        return theta, self.proposal_variance, acceptance_ratio.item()
     
     def get_proposal(self, theta):
         if self.state_space.is_discrete():

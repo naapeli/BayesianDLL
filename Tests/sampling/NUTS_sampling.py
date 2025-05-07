@@ -3,14 +3,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from BayesianDLL.Distributions import Normal, Beta, Exponential, Uniform, InvGamma, HalfCauchy
-from BayesianDLL.Samplers import NUTS
+from BayesianDLL import Model, RandomParameter, sample
 
 
-# ================== DISTRIBUTIONS IN UNRESTRICTED SPACEES ==================
+# ================== DISTRIBUTIONS IN UNRESTRICTED SPACES ==================
 plt.figure(figsize=(6, 6))
 plt.subplot(3, 3, 1)
 distribution = Beta(2, 2)
-x = torch.linspace(-5, 5, 100).unsqueeze(1)  # make _log_prob_unconstrained and _log_prob_grad_unconstrained understand that 100 is n_samples and not n_features
+x = torch.linspace(-5, 5, 100).unsqueeze(1)
 plt.plot(x.numpy(), distribution._log_prob_unconstrained(x).numpy(), label='log_pdf')
 plt.plot(x.numpy(), distribution._log_prob_grad_unconstrained(x).numpy(), label='log_pdf_grad')
 plt.legend()
@@ -61,9 +61,10 @@ plt.figure(figsize=(6, 6))
 
 plt.subplot(3, 3, 1)
 distribution = Normal(0, 1)
-sampler = NUTS(distribution._log_prob_unconstrained, distribution._log_prob_grad_unconstrained, distribution.transform.inverse)
 theta_init = torch.tensor([0.1], dtype=torch.float64)
-samples, lnprob, _ = sampler.sample(n, theta_init, 100)
+with Model() as model:
+    RandomParameter("sample", distribution, theta_init, sampler="nuts")
+    samples = sample(n, 1000)["sample"]
 plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(-10, 20, 1000)
 y = distribution.pdf(x)
@@ -71,9 +72,10 @@ plt.plot(x, y)
 plt.title("Normal")
 
 distribution = Normal(5, 3)
-sampler = NUTS(distribution._log_prob_unconstrained, distribution._log_prob_grad_unconstrained, distribution.transform.inverse)
 theta_init = torch.tensor([0.1], dtype=torch.float64)
-samples, _, _ = sampler.sample(n, theta_init, 100)
+with Model() as model:
+    RandomParameter("sample", distribution, theta_init, sampler="nuts")
+    samples = sample(n, 1000)["sample"]
 plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(-10, 20, 1000)
 y = distribution.pdf(x)
@@ -82,9 +84,10 @@ plt.xlim(-5, 15)
 
 plt.subplot(3, 3, 2)
 distribution = Beta(2, 5)
-sampler = NUTS(distribution._log_prob_unconstrained, distribution._log_prob_grad_unconstrained, distribution.transform.inverse)
-theta_init = torch.tensor([0.0], dtype=torch.float64)
-samples, _, _ = sampler.sample(n, theta_init, 100)
+theta_init = torch.tensor([0.5], dtype=torch.float64)
+with Model() as model:
+    RandomParameter("sample", distribution, theta_init, sampler="nuts")
+    samples = sample(n, 1000)["sample"]
 plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0, 1, 100)
 y = distribution.pdf(x)
@@ -92,9 +95,10 @@ plt.plot(x, y)
 plt.title("Beta")
 
 distribution = Beta(0.5, 0.5)
-sampler = NUTS(distribution._log_prob_unconstrained, distribution._log_prob_grad_unconstrained, distribution.transform.inverse)
-theta_init = torch.tensor([0.0], dtype=torch.float64)
-samples, _, _ = sampler.sample(n, theta_init, 100)
+theta_init = torch.tensor([0.5], dtype=torch.float64)
+with Model() as model:
+    RandomParameter("sample", distribution, theta_init, sampler="nuts")
+    samples = sample(n, 1000)["sample"]
 plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0.01, 0.99, 100)
 y = distribution.pdf(x)
@@ -103,9 +107,10 @@ plt.xlim(0, 1)
 
 plt.subplot(3, 3, 3)
 distribution = Exponential(0.3)
-sampler = NUTS(distribution._log_prob_unconstrained, distribution._log_prob_grad_unconstrained, distribution.transform.inverse)
-theta_init = torch.tensor([10], dtype=torch.float64)
-samples, _, _ = sampler.sample(n, theta_init, 100)
+theta_init = torch.tensor([2], dtype=torch.float64)
+with Model() as model:
+    RandomParameter("sample", distribution, theta_init, sampler="nuts")
+    samples = sample(n, 1000)["sample"]
 plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0, 20, 100)
 y = distribution.pdf(x)
@@ -115,9 +120,10 @@ plt.title("Exponential")
 
 plt.subplot(3, 3, 4)
 distribution = Uniform(2, 5)
-sampler = NUTS(distribution._log_prob_unconstrained, distribution._log_prob_grad_unconstrained, distribution.transform.inverse)
-theta_init = torch.tensor([10], dtype=torch.float64)
-samples, _, _ = sampler.sample(n, theta_init, 100)
+theta_init = torch.tensor([3], dtype=torch.float64)
+with Model() as model:
+    RandomParameter("sample", distribution, theta_init, sampler="nuts")
+    samples = sample(n, 1000)["sample"]
 plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0, 7, 1000)
 y = distribution.pdf(x)
@@ -127,9 +133,10 @@ plt.title("Uniform")
 
 plt.subplot(3, 3, 5)
 distribution = InvGamma(3, 6)
-sampler = NUTS(distribution._log_prob_unconstrained, distribution._log_prob_grad_unconstrained, distribution.transform.inverse)
-theta_init = torch.tensor([0], dtype=torch.float64)
-samples, lnprob, _ = sampler.sample(n, theta_init, 100)
+theta_init = torch.tensor([1], dtype=torch.float64)
+with Model() as model:
+    RandomParameter("sample", distribution, theta_init, sampler="nuts")
+    samples = sample(n, 1000)["sample"]
 plt.xscale("log")
 plt.yscale("log")
 xmin = samples.min().item()
@@ -143,9 +150,10 @@ plt.title("Inverse gamma")
 
 plt.subplot(3, 3, 6)
 distribution = HalfCauchy(2)
-sampler = NUTS(distribution._log_prob_unconstrained, distribution._log_prob_grad_unconstrained, distribution.transform.inverse)
 theta_init = torch.tensor([0], dtype=torch.float64)
-samples, lnprob, _ = sampler.sample(n, theta_init, 100)
+with Model() as model:
+    RandomParameter("sample", distribution, theta_init, sampler="nuts")
+    samples = sample(n, 1000)["sample"]
 plt.xscale("log")
 plt.yscale("log")
 xmin = samples.min().item()

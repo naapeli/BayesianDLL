@@ -207,7 +207,7 @@ class NUTS:
         self.log_prob_cache = new_log_prob
         self.m += 1
 
-        return new_theta
+        return new_theta, self.step_size, torch.as_tensor(tree.alpha_prime / tree.n_prime_alpha).item()
 
     def init_sampler(self):
         pass

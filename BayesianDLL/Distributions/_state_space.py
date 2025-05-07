@@ -1,5 +1,6 @@
 import torch
 from abc import ABC, abstractmethod
+from ._resolve import resolve
 
 
 class StateSpace(ABC):
@@ -34,21 +35,39 @@ class ContinuousSpace(StateSpace, ABC):
         return False
 
 class DiscreteRange(DiscreteSpace):
-    def __init__(self, low, high, values=None):
-        self.values = torch.arange(low, high + 1) if values is None else torch.as_tensor(values)
+    def __init__(self, low, high):
+        self.low = low
+        self.high = high
 
     def contains(self, state):
-        return state in self.values
+        low = resolve(self.low)
+        high = resolve(self.high)
+        values = torch.arange(low, high + 1)
+        return state in values
     
     def __iter__(self):
-        for i in range(len(self.values)):
-            yield self.values[i].item()
+        low = resolve(self.low)
+        high = resolve(self.high)
+        values = torch.arange(low, high + 1)
+        for i in range(len(values)):
+            yield values[i].item()
     
     def __len__(self):
-        return len(self.values)
+        low = resolve(self.low).item()
+        high = resolve(self.high).item()
+        return high - low + 1
 
     def __getitem__(self, index):
-        return self.values[index].item()
+        low = resolve(self.low)
+        high = resolve(self.high)
+        values = torch.arange(low, high + 1)
+        return values[index].item()
+    
+    @property
+    def values(self):
+        low = resolve(self.low)
+        high = resolve(self.high)
+        return torch.arange(low, high + 1)
 
 class DiscretePositive(DiscreteSpace):
     def contains(self, state):

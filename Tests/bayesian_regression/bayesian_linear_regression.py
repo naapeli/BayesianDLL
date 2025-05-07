@@ -1,8 +1,8 @@
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL.Samplers import NUTS
 from BayesianDLL.Distributions import Normal, HalfCauchy
+from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, sample
 
 
 torch.manual_seed(7)
@@ -11,65 +11,25 @@ torch.manual_seed(7)
 N = 500
 true_intercept = 1.0
 true_slope = 2.5
-true_variance = 0.5  # NOTE: Stability of the sampler depends a lot on the original variance. If this is too large, the sampler might get stuck and one needs to use less data points.
-x = torch.linspace(0, 1, N)
+true_variance = 0.5
+x = torch.linspace(0, 1, N).double()
 y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size=(N,))
 
-# Priors
-prior_intercept = Normal(0, 20)
-prior_slope = Normal(0, 20)
-prior_sigma = HalfCauchy(10)
+with Model() as linear_model:
+    # Priors
+    prior_intercept = RandomParameter("intercept", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto", gamma=5)
+    prior_slope = RandomParameter("slope", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto", gamma=5)
+    prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.tensor([1], dtype=torch.float64), sampler="auto", gamma=5)
 
-def log_posterior(theta):
-    intercept, slope, sigma_unconstrained = theta[0], theta[1], theta[2]
-    sigma = prior_sigma.transform.inverse(sigma_unconstrained)
+    # make the transform for the predicted line
+    mu = DeterministicParameter("mu", lambda b, m, x: m * x + b, lambda b, m, x: {"slope": x.unsqueeze(1), "intercept": torch.ones_like(x).unsqueeze(1)}, [prior_intercept, prior_slope, x])
     
-    prior = (
-        prior_intercept._log_prob_unconstrained(intercept) +
-        prior_slope._log_prob_unconstrained(slope) +
-        prior_sigma._log_prob_unconstrained(sigma_unconstrained)
-    )
+    likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
+    samples = sample(10000, 1000)
 
-    mu = prior_intercept.transform.inverse(intercept) + prior_slope.transform.inverse(slope) * x
-    likelihood = Normal(mu, sigma).log_pdf(y).sum()
-    
-    return prior + likelihood
-
-def log_posterior_derivative(theta):
-    intercept, slope, sigma_unconstrained = theta[0], theta[1], theta[2]
-    intercept_real = prior_intercept.transform.inverse(intercept)
-    slope_real = prior_slope.transform.inverse(slope)
-    sigma = prior_sigma.transform.inverse(sigma_unconstrained)
-
-    mu = intercept_real + slope_real * x
-    normal_dist = Normal(mu, sigma)
-    grads = normal_dist.log_pdf_param_grads(y)
-    
-    d_intercept = grads["mean"].sum() * prior_intercept.transform.derivative(intercept)
-    d_slope = (grads["mean"] * x).sum() * prior_slope.transform.derivative(slope)
-    d_sigma = grads["variance"].sum() * prior_sigma.transform.derivative(sigma_unconstrained)
-
-    grad = torch.tensor([
-        prior_intercept._log_prob_grad_unconstrained(intercept) + d_intercept.item(),
-        prior_slope._log_prob_grad_unconstrained(slope) + d_slope.item(),
-        prior_sigma._log_prob_grad_unconstrained(sigma_unconstrained) + d_sigma.item()
-    ], dtype=theta.dtype)
-
-    return grad
-
-def inverse_transformation(theta):
-    intercept = prior_intercept.transform.inverse(theta[:, 0])
-    slope = prior_slope.transform.inverse(theta[:, 1])
-    sigma = prior_sigma.transform.inverse(theta[:, 2])
-    return torch.stack([intercept, slope, sigma], dim=-1)
-
-initial_point = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float64)
-sampler = NUTS(log_posterior, log_posterior_derivative, inverse_transformation)
-samples, _, _ = sampler.sample(3000, initial_point, 500)
-
-intercept_samples = samples[:, 0]
-slope_samples = samples[:, 1]
-sigma_samples = samples[:, 2]
+intercept_samples = samples["intercept"].squeeze()
+slope_samples = samples["slope"].squeeze()
+sigma_samples = samples["sigma"].squeeze()
 
 # Plotting
 plt.figure(figsize=(10, 6))
@@ -83,7 +43,7 @@ plt.title("Posterior of Slope")
 
 plt.subplot(2, 2, 3)
 plt.hist(sigma_samples.numpy(), bins=50, density=True)
-plt.title("Posterior of σ")
+plt.title("Posterior of Sigma")
 
 plt.subplot(2, 2, 4)
 plt.plot(intercept_samples, label="intercept")
