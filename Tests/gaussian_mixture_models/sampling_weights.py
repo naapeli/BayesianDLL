@@ -13,7 +13,11 @@ data = torch.cat([
 
 with Model() as model:
     K = 2
-    weights = RandomParameter("weights", Dirichlet(torch.ones(K)), torch.tensor([0.5], dtype=torch.float64), sampler="metropolis")
+    alpha = 1.5 * torch.ones(K, dtype=torch.float64)
+    theta_init = torch.ones(K, dtype=torch.float64)
+    theta_init[0], theta_init[1] = 2, 3  # make the initial point not uniform to stabilize the sampling
+    theta_init = torch.softmax(theta_init, dim=0)
+    weights = RandomParameter("weights", Dirichlet(alpha), theta_init, sampler="metropolis")
 
     means = [torch.tensor([-2.0], dtype=torch.float64), torch.tensor([2.0], dtype=torch.float64)]
     covs = [torch.eye(1, dtype=torch.float64) * 0.5 ** 2, torch.eye(1, dtype=torch.float64) * 0.5 ** 2]

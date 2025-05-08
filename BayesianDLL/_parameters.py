@@ -44,14 +44,14 @@ class RandomParameter:
         self.unconstrained_value = unconstrained_value
         self.constrained_value = self.distribution.transform.inverse(unconstrained_value)
     
-    def set_constrained_value(self, constrained_value):
-        if not isinstance(constrained_value, torch.Tensor):
-            raise TypeError("constrained_value should be a torch.Tensor.")
-        if constrained_value.ndim != 2:
-            raise ValueError("constrained_value.shape should be (n_samples, n_features).")
+    # def set_constrained_value(self, constrained_value):
+    #     if not isinstance(constrained_value, torch.Tensor):
+    #         raise TypeError("constrained_value should be a torch.Tensor.")
+    #     if constrained_value.ndim != 2:
+    #         raise ValueError("constrained_value.shape should be (n_samples, n_features).")
 
-        self.constrained_value = constrained_value
-        self.unconstrained_value = self.distribution.transform.forward(constrained_value)
+    #     self.constrained_value = constrained_value
+    #     self.unconstrained_value = self.distribution.transform.forward(constrained_value)
 
 class ObservedParameter:
     def __init__(self, name, distribution, observed_values):

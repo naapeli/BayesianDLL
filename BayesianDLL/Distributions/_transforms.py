@@ -1,5 +1,6 @@
 import torch
 from abc import ABC, abstractmethod
+from warnings import warn
 
 
 class Transform(ABC):
@@ -38,12 +39,12 @@ class LogTransform(Transform):
 
     def derivative(self, x_unconstrained):
         sign = 1 if self.side == "larger" else -1
-        return sign * torch.exp(x_unconstrained)
+        return torch.diag_embed(sign * torch.exp(x_unconstrained))
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.ones_like(x_unconstrained)
     
-# class InverseSoftPlusTransform(Transform):  # TODO: SAMPLING NOT WORKING YET WITH THIS TRANSFORM, BUT SHOULD BE NUMERICALLY MORE STABLE THAN LogTransform
+# class InverseSoftPlusTransform(Transform):  # TODO: SAMPLING NOT WORKING YET WITH THIS TRANSFORM, BUT COULD BE NUMERICALLY MORE STABLE THAN LogTransform
 #     def __init__(self, border=0, side="larger"):
 #         self.border = border
 #         self.side = side
@@ -64,7 +65,7 @@ class LogTransform(Transform):
 
 #     def derivative(self, x_unconstrained):
 #         sign = 1 if self.side == "larger" else -1
-#         return torch.sigmoid(sign * x_unconstrained)
+#         return torch.diag_embed(torch.sigmoid(sign * x_unconstrained))
 
 #     def grad_log_abs_det_jacobian(self, x_unconstrained):
 #         sign = 1 if self.side == "larger" else -1
@@ -89,7 +90,7 @@ class LogitTransform(Transform):
         x = self.inverse(x_unconstrained)
         x = x.clamp(self.low + 1e-8, self.high - 1e-8)
         x_scaled = (x - self.low) / self.scale
-        return self.scale * x_scaled * (1 - x_scaled)
+        return torch.diag_embed(self.scale * x_scaled * (1 - x_scaled))
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         x = self.inverse(x_unconstrained)
@@ -105,7 +106,7 @@ class IdentityTransform(Transform):
         return x_unconstrained
     
     def derivative(self, x_unconstrained):
-        return torch.ones_like(x_unconstrained)
+        return torch.diag_embed(torch.ones_like(x_unconstrained))
     
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.zeros_like(x_unconstrained)
@@ -115,6 +116,8 @@ class SoftMaxTransform(Transform):
         self.dim = dim
 
     def forward(self, x_constrained):
+        # TODO: add this warning to docs once I make them
+        # warn("The forward method of the SoftMaxTransform is not the true inverse of inverse because softmax maps to a lower-dimensional manifold (the simplex). Hence, inverse(forward(x)) == x, but forward(inverse(x)) != x in general.")
         x_constrained = x_constrained.clamp(min=1e-8)
         return torch.log(x_constrained)
 
@@ -124,7 +127,7 @@ class SoftMaxTransform(Transform):
 
     def derivative(self, x_unconstrained):
         sm = self.inverse(x_unconstrained)
-        return sm * (1 - sm)
+        return torch.diag_embed(sm) - sm.unsqueeze(-1) @ sm.unsqueeze(-2)
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.zeros_like(x_unconstrained)
