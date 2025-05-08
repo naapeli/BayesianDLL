@@ -59,6 +59,6 @@ class Model:
         
         return grad
     
-    def set_parameter_values(self, constrained_parameters: dict[str, torch.Tensor]):
-        for name, value in constrained_parameters.items():
-            self.params[name].set_constrained_value(value)
+    # def set_parameter_values(self, constrained_parameters: dict[str, torch.Tensor]):
+    #     for name, value in constrained_parameters.items():
+    #         self.params[name].set_constrained_value(value)

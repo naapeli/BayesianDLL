@@ -35,6 +35,28 @@ class Distribution(ABC):
     def _depends_on_random_variable(self, name):
         return name in self.random_parameters
 
+    # def _log_prob_unconstrained(self, x_unconstrained):
+    #     if not isinstance(x_unconstrained, torch.Tensor):
+    #         raise TypeError("x_unconstrained should be a torch.Tensor.")
+    #     if x_unconstrained.ndim != 2:
+    #         raise ValueError("x_unconstrained.shape should be (n_samples, n_features).")
+
+    #     x_constrained = self.transform.inverse(x_unconstrained)
+    #     log_det_abs_jacobian = self.transform.derivative(x_unconstrained).abs().log()
+    #     log_det_abs_jacobian = log_det_abs_jacobian.sum(dim=1) if x_unconstrained.ndim == 2 else log_det_abs_jacobian.sum()
+    #     return self.log_pdf(x_constrained).squeeze() + log_det_abs_jacobian
+    
+    # def _log_prob_grad_unconstrained(self, x_unconstrained):
+    #     if not isinstance(x_unconstrained, torch.Tensor):
+    #         raise TypeError("x_unconstrained should be a torch.Tensor.")
+    #     if x_unconstrained.ndim != 2:
+    #         raise ValueError("x_unconstrained.shape should be (n_samples, n_features).")
+        
+    #     log_pdf_grad_x = self.log_pdf_grad(self.transform.inverse(x_unconstrained))
+    #     dx_dz = self.transform.derivative(x_unconstrained)
+    #     d_log_det_jacobian = self.transform.grad_log_abs_det_jacobian(x_unconstrained)
+    #     return log_pdf_grad_x * dx_dz + d_log_det_jacobian
+
     def _log_prob_unconstrained(self, x_unconstrained):
         if not isinstance(x_unconstrained, torch.Tensor):
             raise TypeError("x_unconstrained should be a torch.Tensor.")
@@ -42,8 +64,8 @@ class Distribution(ABC):
             raise ValueError("x_unconstrained.shape should be (n_samples, n_features).")
 
         x_constrained = self.transform.inverse(x_unconstrained)
-        log_det_abs_jacobian = self.transform.derivative(x_unconstrained).abs().log()
-        log_det_abs_jacobian = log_det_abs_jacobian.sum(dim=1) if x_unconstrained.ndim == 2 else log_det_abs_jacobian.sum()
+        jacobian = self.transform.derivative(x_unconstrained)
+        log_det_abs_jacobian = torch.linalg.slogdet(jacobian).logabsdet
         return self.log_pdf(x_constrained).squeeze() + log_det_abs_jacobian
     
     def _log_prob_grad_unconstrained(self, x_unconstrained):
@@ -53,9 +75,11 @@ class Distribution(ABC):
             raise ValueError("x_unconstrained.shape should be (n_samples, n_features).")
         
         log_pdf_grad_x = self.log_pdf_grad(self.transform.inverse(x_unconstrained))
-        dx_dz = self.transform.derivative(x_unconstrained)
+        dx_dz = self.transform.derivative(x_unconstrained)  # (n, d, d)
+        log_pdf_grad_x = log_pdf_grad_x.unsqueeze(2)        # (n, d, 1)
+        term1 = (dx_dz.transpose(1, 2) @ log_pdf_grad_x).squeeze(2)  # (n, d)
         d_log_det_jacobian = self.transform.grad_log_abs_det_jacobian(x_unconstrained)
-        return log_pdf_grad_x * dx_dz + d_log_det_jacobian
+        return term1 + d_log_det_jacobian
     
     def resolve_name(self, name, parameter):
         if isinstance(parameter, RandomParameter | DeterministicParameter):
@@ -452,38 +476,62 @@ class HalfCauchy(Distribution):
         grad_scale = torch.where(mask, grad_scale, torch.full_like(grad_scale, torch.nan))
         return {self.resolve_name("scale", self.scale): grad_scale}
 
-class Dirichlet(Distribution):  # TODO: fix and test
+class Dirichlet(Distribution):  # TODO: make new class for the dirichlet state space before transformation
     def __init__(self, alpha):
         super().__init__(transform=SoftMaxTransform(dim=-1), state_space=ContinuousRange(0, 1), transformed_state_space=ContinuousReal())
         self.alpha = alpha
         self.add_dependency(alpha)
 
     def pdf(self, x):
-        x = torch.as_tensor(x).clamp(min=1e-8, max=1 - 1e-8)
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
         alpha = resolve(self.alpha)
         alpha_sum = alpha.sum(-1, keepdim=True)
         norm_const = torch.exp(torch.lgamma(alpha).sum(-1) - torch.lgamma(alpha_sum).squeeze(-1))
-        prod = torch.prod(x ** (alpha - 1), dim=-1)
-        return prod / norm_const
+        prod = torch.prod(x ** (alpha - 1), dim=-1, keepdim=True)
+        prob = prod / norm_const
+        mask = torch.stack([torch.all(point >= 0) & torch.all(point <= 1) & torch.allclose(point.sum(), torch.ones_like(point.sum())) for point in x]).unsqueeze(1)
+        return torch.where(mask, prob, torch.zeros_like(prob))
 
     def log_pdf(self, x):
-        x = torch.as_tensor(x).clamp(min=1e-8, max=1 - 1e-8)
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
         alpha = resolve(self.alpha)
         alpha_sum = alpha.sum(-1, keepdim=True)
         log_norm_const = torch.lgamma(alpha).sum(-1) - torch.lgamma(alpha_sum).squeeze(-1)
-        return ((alpha - 1) * x.log()).sum(-1) - log_norm_const
+        log_prob = ((alpha - 1) * x.log()).sum(-1, keepdim=True) - log_norm_const
+        mask = torch.stack([torch.all(point >= 0) & torch.all(point <= 1) & torch.allclose(point.sum(), torch.ones_like(point.sum())) for point in x]).unsqueeze(1)
+        return torch.where(mask, log_prob, torch.full_like(log_prob, -torch.inf))
 
     def log_pdf_grad(self, x):
-        x = torch.as_tensor(x).clamp(min=1e-8, max=1 - 1e-8)
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
         alpha = resolve(self.alpha)
-        return (alpha - 1) / x
+        grad = (alpha - 1) / x
+        mask = torch.stack([torch.all(point >= 0) & torch.all(point <= 1) & torch.allclose(point.sum(), torch.ones_like(point.sum())) for point in x]).unsqueeze(1)
+        return torch.where(mask, grad, torch.full_like(grad, torch.nan))
 
     def log_pdf_param_grads(self, x):
-        x = torch.as_tensor(x).clamp(min=1e-8, max=1 - 1e-8)
+        if not isinstance(x, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
         alpha = resolve(self.alpha)
         digamma_alpha = torch.digamma(alpha)
         digamma_alpha_sum = torch.digamma(alpha.sum(-1, keepdim=True))
         grad_alpha = x.log() - digamma_alpha + digamma_alpha_sum
+        mask = torch.stack([torch.all(point >= 0) & torch.all(point <= 1) & torch.allclose(point.sum(), torch.ones_like(point.sum())) for point in x]).unsqueeze(1)
+        grad_alpha = torch.where(mask, grad_alpha, torch.full_like(grad_alpha, torch.nan))
         return {self.resolve_name("alpha", self.alpha): grad_alpha}
 
 
@@ -684,7 +732,7 @@ class Mixture(Distribution):
         if not isinstance(x, torch.Tensor):
             raise TypeError("x should be a torch.Tensor.")
         if x.ndim != 2:
-            raise ValueError("x.shape should be (n_samples, 1).")
+            raise ValueError("x.shape should be (n_samples, n_features).")
         
         weights = resolve(self.weights)
         return sum(w * component.pdf(x) for w, component in zip(weights, self.components))
@@ -693,17 +741,17 @@ class Mixture(Distribution):
         if not isinstance(x, torch.Tensor):
             raise TypeError("x should be a torch.Tensor.")
         if x.ndim != 2:
-            raise ValueError("x.shape should be (n_samples, 1).")
+            raise ValueError("x.shape should be (n_samples, n_features).")
         
         weights = resolve(self.weights)
-        log_pdfs = torch.stack([(w + 1e-12).log() + component.log_pdf(x) for w, component in zip(weights, self.components)])
+        log_pdfs = torch.stack([(w + 1e-12).log() + component.log_pdf(x) for w, component in zip(weights.T, self.components)])  # TODO: make sure weights.T is correct
         return _logsumexp(log_pdfs, dim=0)
 
     def log_pdf_grad(self, x):
         if not isinstance(x, torch.Tensor):
             raise TypeError("x should be a torch.Tensor.")
         if x.ndim != 2:
-            raise ValueError("x.shape should be (n_samples, 1).")
+            raise ValueError("x.shape should be (n_samples, n_features).")
         
         weights = resolve(self.weights)
         
@@ -727,7 +775,7 @@ class Mixture(Distribution):
         if not isinstance(x, torch.Tensor):
             raise TypeError("x should be a torch.Tensor.")
         if x.ndim != 2:
-            raise ValueError("x.shape should be (n_samples, 1).")
+            raise ValueError("x.shape should be (n_samples, n_features).")
         
         weights = resolve(self.weights)
         grads = {}
