@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
-from BayesianDLL.Distributions import Normal, Beta, Exponential, Uniform, InvGamma, HalfCauchy
+from BayesianDLL.Distributions import Normal, Beta, Exponential, Uniform, InvGamma, HalfCauchy, Dirichlet
 from BayesianDLL import Model, RandomParameter, sample
 
 
@@ -51,6 +51,7 @@ plt.plot(x.numpy(), distribution._log_prob_grad_unconstrained(x).numpy(), label=
 plt.legend()
 plt.title("Half Cauchy")
 plt.tight_layout()
+plt.savefig("Tests/sampling/pdfs.png")
 
 
 # ================== SAMPLING ==================
@@ -97,7 +98,7 @@ plt.title("Beta")
 distribution = Beta(0.5, 0.5)
 theta_init = torch.tensor(0.5, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts", delta=0.9)  # to make the sampler stable, set the target accept probability a little higher than default
+    RandomParameter("sample", distribution, theta_init, sampler="nuts", delta=0.8)  # to make the sampler stable, set the target accept probability a little higher than default
     samples = sample(n, 1000)["sample"]
 plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0.01, 0.99, 100).unsqueeze(1)
@@ -165,5 +166,50 @@ y = distribution.pdf(x)
 plt.plot(x.numpy(), y.numpy())
 plt.title("Half Cauchy")
 
+plt.subplot(3, 3, 7)
+d = 3
+# alpha = 5 * torch.ones(d, dtype=torch.float64)
+alpha = torch.tensor([2, 4, 8], dtype=torch.float64)
+distribution = Dirichlet(alpha)
+theta_init = torch.ones(d, dtype=torch.float64)
+theta_init[0], theta_init[1] = 2, 3  # make the initial point not uniform to stabilize the sampling
+theta_init = torch.softmax(theta_init, dim=0)
+with Model() as model:
+    RandomParameter("sample", distribution, theta_init, sampler="nuts", gamma=5)
+    samples = sample(max(n // 20, 100), 1000)["sample"]
+def project_to_2d(points):
+    v1 = torch.tensor([0.0, 0.0])
+    v2 = torch.tensor([1.0, 0.0])
+    v3 = torch.tensor([0.5, 3**0.5 / 2])
+    V = torch.stack([v1, v2, v3]).to(points.dtype)
+    return points @ V
+samples_2d = project_to_2d(samples)
+def shade_pdf():
+    resolution = 200
+    v1 = np.array([0.0, 0.0])
+    v2 = np.array([1.0, 0.0])
+    v3 = np.array([0.5, np.sqrt(3) / 2])
+    V = np.stack([v1, v2, v3], axis=0)
+    grid = []
+    for i in range(resolution + 1):
+        for j in range(resolution + 1 - i):
+            k = resolution - i - j
+            x = i / resolution
+            y = j / resolution
+            z = k / resolution
+            grid.append([x, y, z])
+    grid = np.array(grid)
+    projected = grid @ V
+    simplex_points = torch.tensor(grid, dtype=torch.float64)
+    density = distribution.pdf(simplex_points).squeeze().numpy()
+    return projected, density
+projected, density = shade_pdf()
+plt.tripcolor(projected[:, 0], projected[:, 1], density, shading="gouraud", cmap="Blues")
+plt.scatter(samples_2d[:, 0], samples_2d[:, 1], alpha=0.7, s=1)
+plt.title("Dirichlet")
+triangle_vertices = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.5, 3**0.5 / 2], [0.0, 0.0]])
+plt.plot(triangle_vertices[:, 0], triangle_vertices[:, 1], '-', lw=2, c="black")
+
 plt.tight_layout()
+plt.savefig("Tests/sampling/distributions.png")
 plt.show()
