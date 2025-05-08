@@ -1,6 +1,6 @@
 import torch
 from tqdm import tqdm
-
+from collections import deque
 
 
 class Metropolis:
@@ -12,34 +12,21 @@ class Metropolis:
         self.acceptance_low = acceptance_low
         self.acceptance_high = acceptance_high
         self.m = 0
-        self.n_accepted = 0
-
-    def sample(self, M, theta_init, M_adapt=10):
-        D = len(theta_init)
-        samples = torch.empty((M + M_adapt + 1, D), dtype=theta_init.dtype)
-        theta = theta_init
-
-        progress_bar = tqdm(range(1, M + M_adapt + 1))
-        for _ in progress_bar:
-            if self.m < M_adapt: progress_bar.set_description(f"Warmup")
-            else: progress_bar.set_description(f"Sample")
-
-            theta = self.step(theta, self.m < M_adapt)
-            samples[self.m] = theta
-
-        return samples[M_adapt:]
+        self.accept_queue = deque([], maxlen=20)
     
     def step(self, theta, warmup=False):
         theta_proposal = self.get_proposal(theta)
         acceptance_ratio = min(torch.ones(1), torch.exp(self.log_target(theta_proposal) - self.log_target(theta)))
         if torch.rand(1) < acceptance_ratio:
             theta = theta_proposal
-            self.n_accepted += 1
+            self.accept_queue.append(1)
+        else:
+            self.accept_queue.append(0)
         self.m += 1
 
         if warmup:
             if self.state_space.is_continuous(): self.adapt_proposal_variance()
-        return theta, self.proposal_variance, acceptance_ratio.item()
+        return theta, self.proposal_variance, sum(self.accept_queue) / len(self.accept_queue)
     
     def get_proposal(self, theta):
         if self.state_space.is_discrete():
@@ -53,7 +40,7 @@ class Metropolis:
         return theta
     
     def adapt_proposal_variance(self):
-        acceptance_ratio = self.n_accepted / self.m
+        acceptance_ratio = sum(self.accept_queue) / len(self.accept_queue)
         if acceptance_ratio < self.acceptance_low:
             self.proposal_variance *= (1 - self.adapt_rate)
         elif acceptance_ratio > self.acceptance_high:

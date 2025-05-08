@@ -20,8 +20,8 @@ with Model() as model:
     samples = sample(n, 1000)["bernoulli"]
 counts = torch.tensor([torch.sum(samples == s) for s in distribution.state_space])
 frequencies = counts / counts.sum()
-x = torch.tensor([0, 1])
-plt.bar(x, frequencies.numpy(), label="Estimated")
+x = torch.tensor([[0, 1]])
+plt.bar(x.squeeze(), frequencies.numpy(), label="Estimated")
 plt.scatter(x, distribution.pdf(x), label="True")
 plt.xlabel('State')
 plt.ylabel('Estimated Probability')
@@ -37,8 +37,8 @@ with Model() as model:
     samples = sample(n, 1000)["binomial"]
 counts = torch.tensor([torch.sum(samples == s) for s in distribution.state_space])
 frequencies = counts / counts.sum()
-x = torch.arange(0, k + 1)
-plt.bar(x, frequencies.numpy(), label="Estimated")
+x = torch.arange(0, k + 1).unsqueeze(-1)
+plt.bar(x.squeeze(), frequencies.numpy(), label="Estimated")
 plt.scatter(x, distribution.pdf(x), label="True")
 plt.xlabel('State')
 plt.ylabel('Estimated Probability')
@@ -51,10 +51,10 @@ distribution = Geometric(0.2)
 with Model() as model:
     RandomParameter("geometric", distribution, torch.ones(1), sampler="metropolis")
     samples = sample(n, 1000)["geometric"]
-x = torch.arange(samples.min().int().item(), samples.max().int().item())
+x = torch.arange(samples.min().int().item(), samples.max().int().item()).unsqueeze(-1)
 counts = torch.tensor([torch.sum(samples == s) for s in x])
 frequencies = counts / counts.sum()
-plt.bar(x, frequencies.numpy(), label="Estimated")
+plt.bar(x.squeeze(), frequencies.numpy(), label="Estimated")
 plt.scatter(x, distribution.pdf(x), label="True")
 plt.xlabel('State')
 plt.ylabel('Estimated Probability')
@@ -68,7 +68,7 @@ with Model() as model:
     RandomParameter("exponential", distribution, torch.ones(1, dtype=torch.float64), sampler="metropolis")
     samples = sample(n, 1000)["exponential"]
 plt.hist(samples.numpy(), bins=bins, density=True, label="Estimated")
-x = torch.linspace(0, 20, 100)
+x = torch.linspace(0, 20, 100).unsqueeze(-1)
 plt.plot(x, distribution.pdf(x), label="True")
 plt.xlabel('State')
 plt.ylabel('Estimated Probability')
@@ -78,16 +78,15 @@ plt.legend()
 plt.subplot(3, 3, 5)
 distribution = Beta(1, 1)
 with Model() as model:
-    RandomParameter("beta", distribution, 0.5 * torch.ones(1, dtype=torch.float64), sampler="metropolis")
+    RandomParameter("beta", distribution, 0.5 * torch.ones(1, dtype=torch.float64), sampler="metropolis", acceptance_low = 0.4, acceptance_high = 0.7)
     samples = sample(n, 1000)["beta"]
 plt.hist(samples.numpy(), bins=bins, density=True, label="Estimated")
-x = torch.linspace(0, 1, 100)
+x = torch.linspace(0, 1, 100).unsqueeze(-1)
 plt.plot(x, distribution.pdf(x), label="True")
 plt.xlabel('State')
 plt.ylabel('Estimated Probability')
 plt.title("Beta")
 plt.legend()
-
 
 plt.tight_layout()
 plt.show()

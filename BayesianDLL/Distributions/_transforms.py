@@ -109,3 +109,22 @@ class IdentityTransform(Transform):
     
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.zeros_like(x_unconstrained)
+
+class SoftMaxTransform(Transform):
+    def __init__(self, dim=-1):
+        self.dim = dim
+
+    def forward(self, x_constrained):
+        x_constrained = x_constrained.clamp(min=1e-8)
+        return torch.log(x_constrained)
+
+    def inverse(self, x_unconstrained):
+        e = torch.exp(x_unconstrained - torch.max(x_unconstrained, dim=self.dim, keepdim=True).values)
+        return e / torch.sum(e, dim=self.dim, keepdim=True)
+
+    def derivative(self, x_unconstrained):
+        sm = self.inverse(x_unconstrained)
+        return sm * (1 - sm)
+
+    def grad_log_abs_det_jacobian(self, x_unconstrained):
+        return torch.zeros_like(x_unconstrained)

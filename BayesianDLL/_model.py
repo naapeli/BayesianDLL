@@ -49,15 +49,14 @@ class Model:
                 # if the observed depends on deterministic parameters
                 for deterministic_parameter_name in observed_parameter.distribution.deterministic_parameters:
                     for _ in [input.name for input in self.deterministic_params[deterministic_parameter_name].inputs if input.name == name]:
-                        grad += (self.deterministic_params[deterministic_parameter_name].derivative(name).T @ observed_parameter.distribution.log_pdf_param_grads(observed_parameter.observed_values)[deterministic_parameter_name]) * param.distribution.transform.derivative(param.unconstrained_value)
+                        grad += (self.deterministic_params[deterministic_parameter_name].derivative(name).T @ observed_parameter.distribution.log_pdf_param_grads(observed_parameter.observed_values)[deterministic_parameter_name]).T * param.distribution.transform.derivative(param.unconstrained_value)
 
                 # otherwise if the observed depends straight up on the random variable
                 if observed_parameter.distribution._depends_on_random_variable(name):
                     grad += observed_parameter.distribution.log_pdf_param_grads(observed_parameter.observed_values)[name].sum(dim=0) * param.distribution.transform.derivative(param.unconstrained_value)  # TODO: Make sure the dimensions work (.sum(dim=0) or .sum())
 
-            # prior
             grad += param.distribution._log_prob_grad_unconstrained(param.unconstrained_value)
-            
+        
         return grad
     
     def set_parameter_values(self, constrained_parameters: dict[str, torch.Tensor]):
