@@ -17,12 +17,18 @@ class RandomParameter:
         Raises:
             RuntimeError: _description_
         """
+        if initial_value.ndim not in [0, 1]:
+            raise ValueError("initial_value must be either 0 or 1 dimensional.")
+
         self.name = name
         self.distribution = distribution
-        self.constrained_value = initial_value
-        self.unconstrained_value = self.distribution.transform.forward(initial_value)
+        self.constrained_value = initial_value.unsqueeze(0)
+        if self.constrained_value.ndim == 1: self.constrained_value = self.constrained_value.unsqueeze(0)  # if the original point was of shape [], make it 2 dimensional
+        self.unconstrained_value = self.distribution.transform.forward(self.constrained_value)
         self.sampler = sampler
         self.sampler_params = sampler_params
+        self.state_space = self.distribution.state_space
+        self.transformed_state_space = self.distribution.transformed_state_space
 
         if _active_model._active_model is not None:
             _active_model._active_model.params[name] = self
@@ -30,10 +36,20 @@ class RandomParameter:
             raise RuntimeError("One should select an active model before creating random variables.")
 
     def set_unconstrained_value(self, unconstrained_value):
+        if not isinstance(unconstrained_value, torch.Tensor):
+            raise TypeError("unconstrained_value should be a torch.Tensor.")
+        if unconstrained_value.ndim != 2:
+            raise ValueError("unconstrained_value.shape should be (n_samples, n_features).")
+
         self.unconstrained_value = unconstrained_value
         self.constrained_value = self.distribution.transform.inverse(unconstrained_value)
     
     def set_constrained_value(self, constrained_value):
+        if not isinstance(constrained_value, torch.Tensor):
+            raise TypeError("constrained_value should be a torch.Tensor.")
+        if constrained_value.ndim != 2:
+            raise ValueError("constrained_value.shape should be (n_samples, n_features).")
+
         self.constrained_value = constrained_value
         self.unconstrained_value = self.distribution.transform.forward(constrained_value)
 

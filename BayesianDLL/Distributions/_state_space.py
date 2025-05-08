@@ -34,20 +34,34 @@ class ContinuousSpace(StateSpace, ABC):
     def is_discrete(self):
         return False
 
+class Union(StateSpace):
+    def __init__(self, *spaces):
+        self.state_spaces = spaces
+        self._continuous = all(space.is_continuous() for space in spaces)
+
+    def contains(self, x):
+        return any(space.contains(x) for space in self.state_spaces)
+    
+    def is_continuous(self):
+        return self._continuous
+    
+    def is_discrete(self):
+        return not self._continuous
+
 class DiscreteRange(DiscreteSpace):
     def __init__(self, low, high):
         self.low = low
         self.high = high
 
     def contains(self, state):
-        low = resolve(self.low)
-        high = resolve(self.high)
+        low = resolve(self.low).item()
+        high = resolve(self.high).item()
         values = torch.arange(low, high + 1)
         return state in values
     
     def __iter__(self):
-        low = resolve(self.low)
-        high = resolve(self.high)
+        low = resolve(self.low).item()
+        high = resolve(self.high).item()
         values = torch.arange(low, high + 1)
         for i in range(len(values)):
             yield values[i].item()
@@ -58,20 +72,20 @@ class DiscreteRange(DiscreteSpace):
         return high - low + 1
 
     def __getitem__(self, index):
-        low = resolve(self.low)
-        high = resolve(self.high)
+        low = resolve(self.low).item()
+        high = resolve(self.high).item()
         values = torch.arange(low, high + 1)
         return values[index].item()
     
     @property
     def values(self):
-        low = resolve(self.low)
-        high = resolve(self.high)
+        low = resolve(self.low).item()
+        high = resolve(self.high).item()
         return torch.arange(low, high + 1)
 
 class DiscretePositive(DiscreteSpace):
     def contains(self, state):
-        return state > 0 and state.item().is_integer()
+        return state > 0 and (isinstance(state.item(), int) or state.item().is_integer())
 
     def __iter__(self):
         i = 1

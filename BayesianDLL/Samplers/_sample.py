@@ -34,7 +34,7 @@ def sample(n_samples, warmup_length, model=None, progress_bar=True):
             model.params[name].set_unconstrained_value(new_theta)
             trace[name].append(model.params[name].constrained_value)
 
-    trace = {name: torch.stack(samples[warmup_length:]) for name, samples in trace.items()}
+    trace = {name: torch.cat(samples[warmup_length:]).squeeze() for name, samples in trace.items()}
     return trace
 
 def _decide_step(model, parameter):
@@ -89,25 +89,25 @@ def sample_predicative(trace, n_samples=None, model=None, progress_bar=True, war
     for i in _progress_bar:
         prior_values = {}
         for name, values in trace.items():
-            prior_values[name] = values[i]
+            value = values[i]
+            if value.ndim == 0: value = value.unsqueeze(0).unsqueeze(0)
+            elif value.ndim == 1: value = value.unsqueeze(0)
+            prior_values[name] = value
         
         for name, parameter in model.params.items():
             parameter.set_constrained_value(prior_values[name])
 
         for name, sampler in samplers.items():
-            init_value = model.observed_params[name].observed_values[0]
+            init_value = model.observed_params[name].observed_values[0].unsqueeze(0)
             theta = _init_theta(state_spaces[name], init_value.shape, init_value.dtype)
-            no_squeeze = theta.ndim == 1
-            theta = theta if no_squeeze else theta.unsqueeze(0)
             for m in range(warmup_per_sample + 1):
                 theta, _, _ = sampler.step(theta, m < warmup_per_sample)
-            theta = theta if no_squeeze else theta.squeeze(0)
             predicative_samples[name].append(theta)
 
     for name, parameter in model.params.items():
         parameter.set_constrained_value(prior_values[name])
     
-    predicative_samples = {name: model.observed_params[name].distribution.transform.inverse(torch.stack(samples)) for name, samples in predicative_samples.items()}
+    predicative_samples = {name: model.observed_params[name].distribution.transform.inverse(torch.cat(samples)).squeeze() for name, samples in predicative_samples.items()}
     return predicative_samples
 
 def _init_theta(state_space, shape, dtype):

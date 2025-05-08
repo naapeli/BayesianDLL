@@ -12,7 +12,7 @@ tau = 10
 a = 2
 b = 2
 true_mean, true_variance = 5, 3
-data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N,))
+data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N, 1))
 print(data.mean(), data.var())
 
 with Model() as model:

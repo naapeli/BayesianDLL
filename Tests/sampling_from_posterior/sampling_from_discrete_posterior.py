@@ -9,19 +9,19 @@ from BayesianDLL import Model, RandomParameter, ObservedParameter, sample
 torch.manual_seed(2)
 N = 5  # change this larger to make the posterior more concentrated on max_val
 max_val = 3
-data = torch.randint(0, max_val + 1, size=(N,))
+data = torch.randint(0, max_val + 1, size=(N,)).unsqueeze(1)
 p = 0.5
 with Model() as model:
-    prior = RandomParameter("prior", DiscreteUniform(0, 10), torch.tensor([1], dtype=torch.float64))
+    prior = RandomParameter("prior", DiscreteUniform(0, 10), torch.tensor(1, dtype=torch.float64))
     likelihood = ObservedParameter("likelihood", Binomial(prior, p), data)
-    samples = sample(10000, 500)["prior"]
+    samples = sample(1000, 500)["prior"]
 
 samples = samples.squeeze().int()
 counts = Counter(samples.tolist())
 x_vals = sorted(counts.keys())
 frequencies = [counts[x] / len(samples) for x in x_vals]
 plt.bar(x_vals, frequencies, alpha=0.5, label="posterior")
-plt.bar(prior.distribution.state_space.values, prior.distribution.pdf(prior.distribution.state_space.values.float()), alpha=0.5, label="prior")
+plt.bar(prior.distribution.state_space.values, prior.distribution.pdf(prior.distribution.state_space.values.float().unsqueeze(1)).squeeze(), alpha=0.5, label="prior")
 plt.tight_layout()
 plt.legend()
 plt.show()

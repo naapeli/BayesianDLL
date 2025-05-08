@@ -12,24 +12,24 @@ N = 500
 true_intercept = 1.0
 true_slope = 2.5
 true_variance = 0.5
-x = torch.linspace(0, 1, N).double()
-y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size=(N,))
+x = torch.linspace(0, 1, N).double().unsqueeze(1)
+y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size=(N, 1))
 
 with Model() as linear_model:
     # Priors
-    prior_intercept = RandomParameter("intercept", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto", gamma=5)
-    prior_slope = RandomParameter("slope", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto", gamma=5)
-    prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.tensor([1], dtype=torch.float64), sampler="auto", gamma=5)
+    prior_intercept = RandomParameter("intercept", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto")
+    prior_slope = RandomParameter("slope", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto")
+    prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.tensor([1], dtype=torch.float64), sampler="auto")
 
     # make the transform for the predicted line
-    mu = DeterministicParameter("mu", lambda b, m, x: m * x + b, lambda b, m, x: {"slope": x.unsqueeze(1), "intercept": torch.ones_like(x).unsqueeze(1)}, [prior_intercept, prior_slope, x])
+    mu = DeterministicParameter("mu", lambda b, m: m * x + b, lambda b, m: {"slope": x, "intercept": torch.ones_like(x)}, [prior_intercept, prior_slope])
     
     likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
     samples = sample(10000, 1000)
 
-intercept_samples = samples["intercept"].squeeze()
-slope_samples = samples["slope"].squeeze()
-sigma_samples = samples["sigma"].squeeze()
+intercept_samples = samples["intercept"]
+slope_samples = samples["slope"]
+sigma_samples = samples["sigma"]
 
 # Plotting
 plt.figure(figsize=(10, 6))
@@ -55,6 +55,7 @@ plt.tight_layout()
 plt.savefig("Tests/bayesian_regression/linear_trace_plots_and_posteriors.png")
 
 
+x = x.squeeze()
 y_preds = slope_samples[:, None] * x[None, :] + intercept_samples[:, None]
 y_mean = y_preds.mean(dim=0)
 y_lower = y_preds.quantile(0.025, dim=0)

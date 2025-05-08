@@ -12,7 +12,8 @@ true_coeffs, xmin, xmax = [0.0, 3.488378906, 0.0, -0.855187500, 0.0, 0.107675000
 true_variance = 0.1
 x = torch.linspace(xmin, xmax, N, dtype=torch.float64)
 X = torch.stack([x ** i for i in range(len(true_coeffs))], dim=1)
-y = sum(c * x ** i for i, c in enumerate(true_coeffs)) + torch.normal(0, true_variance ** 0.5, size=(N,))
+y = sum(c * x ** i for i, c in enumerate(true_coeffs)).unsqueeze(1) + torch.normal(0, true_variance ** 0.5, size=(N, 1))
+
 
 # Degree of the polynomial to be fitted
 D = 5
@@ -23,10 +24,10 @@ with Model() as polynomial_model:
     # Priors
     prior_mean = torch.zeros(D + 1, dtype=torch.float64)
     prior_cov = torch.eye(D + 1, dtype=torch.float64)
-    prior_coeffs = RandomParameter("coeffs", MultivariateNormal(prior_mean, prior_cov), torch.zeros_like(prior_mean, dtype=torch.float64), sampler="auto", gamma=5)  # critical to pass gamma=5 as the sampler is otherwise extremely slow
-    prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.ones(1, dtype=torch.float64), sampler="auto", gamma=5)  # critical to pass gamma=5 as the sampler is otherwise extremely slow
+    prior_coeffs = RandomParameter("coeffs", MultivariateNormal(prior_mean, prior_cov), torch.randn_like(prior_mean, dtype=torch.float64), sampler="auto", delta=0.2)
+    prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.ones(1, dtype=torch.float64), sampler="auto", delta=0.2)  # change delta or gamma of NUTS to make sampling faster (smaller delta and larger gamma => larger step size)
 
-    mu = DeterministicParameter("mu", lambda coeffs, phi_x: phi_x @ coeffs, lambda coeffs, phi_x: {"coeffs": phi_x}, [prior_coeffs, phi_x])
+    mu = DeterministicParameter("mu", lambda coeffs: phi_x @ coeffs.T, lambda coeffs: {"coeffs": phi_x}, [prior_coeffs])
     
     likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
     samples = sample(10000, 1000)
