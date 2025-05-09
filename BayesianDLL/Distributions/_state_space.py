@@ -105,6 +105,13 @@ class ContinuousPositive(ContinuousSpace):
     def contains(self, state):
         return torch.all(state > 0)
 
-class ContinuousReal (ContinuousSpace):
+class ContinuousReal(ContinuousSpace):
     def contains(self, state):
         return torch.all(torch.isfinite(state))
+
+class ContinuousSimplex(ContinuousSpace):
+    def contains(self, state):
+        between_0_and_1 = torch.all((0 <= state) & (state <= 1))
+        sum = torch.sum(state)
+        sum_to_1 = torch.allclose(sum, torch.ones_like(sum))
+        return between_0_and_1 & sum_to_1
