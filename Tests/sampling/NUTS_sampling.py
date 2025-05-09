@@ -172,11 +172,11 @@ d = 3
 alpha = torch.tensor([2, 4, 8], dtype=torch.float64)
 distribution = Dirichlet(alpha)
 theta_init = torch.ones(d, dtype=torch.float64)
-theta_init[0], theta_init[1] = 2, 3  # make the initial point not uniform to stabilize the sampling
+theta_init[0], theta_init[1] = 2, -10  # make the initial point in an area with little probability mass to stabilize the sampling
 theta_init = torch.softmax(theta_init, dim=0)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts", gamma=5)
-    samples = sample(max(n // 20, 100), 1000)["sample"]
+    samples = sample(max(n // 20, 100), 2000)["sample"]
 def project_to_2d(points):
     v1 = torch.tensor([0.0, 0.0])
     v2 = torch.tensor([1.0, 0.0])
