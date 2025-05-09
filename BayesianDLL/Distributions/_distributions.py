@@ -3,7 +3,7 @@ import math
 from abc import ABC, abstractmethod
 
 from ._transforms import IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform
-from ._state_space import ContinuousReal, ContinuousPositive, ContinuousRange, DiscretePositive, DiscreteRange, Union
+from ._state_space import ContinuousReal, ContinuousPositive, ContinuousRange, ContinuousSimplex, DiscretePositive, DiscreteRange, Union
 from .._parameters import RandomParameter, DeterministicParameter
 from ._resolve import resolve
 
@@ -35,28 +35,6 @@ class Distribution(ABC):
     def _depends_on_random_variable(self, name):
         return name in self.random_parameters
 
-    # def _log_prob_unconstrained(self, x_unconstrained):
-    #     if not isinstance(x_unconstrained, torch.Tensor):
-    #         raise TypeError("x_unconstrained should be a torch.Tensor.")
-    #     if x_unconstrained.ndim != 2:
-    #         raise ValueError("x_unconstrained.shape should be (n_samples, n_features).")
-
-    #     x_constrained = self.transform.inverse(x_unconstrained)
-    #     log_det_abs_jacobian = self.transform.derivative(x_unconstrained).abs().log()
-    #     log_det_abs_jacobian = log_det_abs_jacobian.sum(dim=1) if x_unconstrained.ndim == 2 else log_det_abs_jacobian.sum()
-    #     return self.log_pdf(x_constrained).squeeze() + log_det_abs_jacobian
-    
-    # def _log_prob_grad_unconstrained(self, x_unconstrained):
-    #     if not isinstance(x_unconstrained, torch.Tensor):
-    #         raise TypeError("x_unconstrained should be a torch.Tensor.")
-    #     if x_unconstrained.ndim != 2:
-    #         raise ValueError("x_unconstrained.shape should be (n_samples, n_features).")
-        
-    #     log_pdf_grad_x = self.log_pdf_grad(self.transform.inverse(x_unconstrained))
-    #     dx_dz = self.transform.derivative(x_unconstrained)
-    #     d_log_det_jacobian = self.transform.grad_log_abs_det_jacobian(x_unconstrained)
-    #     return log_pdf_grad_x * dx_dz + d_log_det_jacobian
-
     def _log_prob_unconstrained(self, x_unconstrained):
         if not isinstance(x_unconstrained, torch.Tensor):
             raise TypeError("x_unconstrained should be a torch.Tensor.")
@@ -75,9 +53,9 @@ class Distribution(ABC):
             raise ValueError("x_unconstrained.shape should be (n_samples, n_features).")
         
         log_pdf_grad_x = self.log_pdf_grad(self.transform.inverse(x_unconstrained))
-        dx_dz = self.transform.derivative(x_unconstrained)  # (n, d, d)
-        log_pdf_grad_x = log_pdf_grad_x.unsqueeze(2)        # (n, d, 1)
-        term1 = (dx_dz.transpose(1, 2) @ log_pdf_grad_x).squeeze(2)  # (n, d)
+        dx_dz = self.transform.derivative(x_unconstrained)
+        log_pdf_grad_x = log_pdf_grad_x.unsqueeze(2)
+        term1 = (dx_dz.transpose(1, 2) @ log_pdf_grad_x).squeeze(2)
         d_log_det_jacobian = self.transform.grad_log_abs_det_jacobian(x_unconstrained)
         return term1 + d_log_det_jacobian
     
@@ -159,11 +137,15 @@ class MultivariateNormal(Distribution):
         
         mu = resolve(self.mu)
         covariance = resolve(self.covariance)
+        n_features = x.size(1)
         diff = x - mu
-        exponent = -0.5 * (diff @ torch.cholesky_solve(diff.T, torch.linalg.cholesky(covariance)))
-        denominator = (2 * math.pi) ** (-len(diff) / 2) * torch.linalg.det(self.covariance) ** -0.5
-        prob = torch.exp(exponent) / denominator
-        return prob
+        L = torch.linalg.cholesky(covariance)
+        sol = torch.cholesky_solve(diff.unsqueeze(-1), L)
+        quad_form = (diff.unsqueeze(-1) * sol).sum(dim=1)
+        log_det = 2 * torch.log(torch.diag(L)).sum()
+        log_norm_const = 0.5 * (n_features * math.log(2 * math.pi) + log_det)
+        log_probs = -0.5 * quad_form - log_norm_const
+        return torch.exp(log_probs)
 
     def log_pdf(self, x):
         if not isinstance(x, torch.Tensor):
@@ -173,11 +155,15 @@ class MultivariateNormal(Distribution):
         
         mu = resolve(self.mu)
         covariance = resolve(self.covariance)
+        n_features = x.size(1)
         diff = x - mu
-        exponent = -0.5 * (diff @ torch.cholesky_solve(diff.T, torch.linalg.cholesky(covariance)))
-        denominator = 0.5 * torch.log(torch.det(self.covariance)) + 0.5 * len(diff) * math.log(2 * math.pi)
-        log_prob = exponent + denominator
-        return log_prob
+        L = torch.linalg.cholesky(covariance)
+        sol = torch.cholesky_solve(diff.unsqueeze(-1), L)
+        quad_form = (diff.unsqueeze(-1) * sol).sum(dim=1)
+        log_det = 2 * torch.log(torch.diag(L)).sum()
+        log_norm_const = 0.5 * (n_features * math.log(2 * math.pi) + log_det)
+        log_probs = -0.5 * quad_form - log_norm_const
+        return log_probs
 
     def log_pdf_grad(self, x):
         if not isinstance(x, torch.Tensor):
@@ -188,7 +174,7 @@ class MultivariateNormal(Distribution):
         mu = resolve(self.mu)
         covariance = resolve(self.covariance)
         diff = x - mu
-        grad = -torch.cholesky_solve(diff.T, torch.linalg.cholesky(covariance)).T
+        grad = -torch.cholesky_solve(diff.unsqueeze(-1), torch.linalg.cholesky(covariance)).squeeze(-1)
         return grad
 
     def log_pdf_param_grads(self, x):
@@ -476,9 +462,9 @@ class HalfCauchy(Distribution):
         grad_scale = torch.where(mask, grad_scale, torch.full_like(grad_scale, torch.nan))
         return {self.resolve_name("scale", self.scale): grad_scale}
 
-class Dirichlet(Distribution):  # TODO: make new class for the dirichlet state space before transformation
+class Dirichlet(Distribution):
     def __init__(self, alpha):
-        super().__init__(transform=SoftMaxTransform(dim=-1), state_space=ContinuousRange(0, 1), transformed_state_space=ContinuousReal())
+        super().__init__(transform=SoftMaxTransform(dim=-1), state_space=ContinuousSimplex(), transformed_state_space=ContinuousReal())
         self.alpha = alpha
         self.add_dependency(alpha)
 
@@ -493,7 +479,7 @@ class Dirichlet(Distribution):  # TODO: make new class for the dirichlet state s
         norm_const = torch.exp(torch.lgamma(alpha).sum(-1) - torch.lgamma(alpha_sum).squeeze(-1))
         prod = torch.prod(x ** (alpha - 1), dim=-1, keepdim=True)
         prob = prod / norm_const
-        mask = torch.stack([torch.all(point >= 0) & torch.all(point <= 1) & torch.allclose(point.sum(), torch.ones_like(point.sum())) for point in x]).unsqueeze(1)
+        mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         return torch.where(mask, prob, torch.zeros_like(prob))
 
     def log_pdf(self, x):
@@ -506,7 +492,7 @@ class Dirichlet(Distribution):  # TODO: make new class for the dirichlet state s
         alpha_sum = alpha.sum(-1, keepdim=True)
         log_norm_const = torch.lgamma(alpha).sum(-1) - torch.lgamma(alpha_sum).squeeze(-1)
         log_prob = ((alpha - 1) * x.log()).sum(-1, keepdim=True) - log_norm_const
-        mask = torch.stack([torch.all(point >= 0) & torch.all(point <= 1) & torch.allclose(point.sum(), torch.ones_like(point.sum())) for point in x]).unsqueeze(1)
+        mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         return torch.where(mask, log_prob, torch.full_like(log_prob, -torch.inf))
 
     def log_pdf_grad(self, x):
@@ -517,7 +503,7 @@ class Dirichlet(Distribution):  # TODO: make new class for the dirichlet state s
         
         alpha = resolve(self.alpha)
         grad = (alpha - 1) / x
-        mask = torch.stack([torch.all(point >= 0) & torch.all(point <= 1) & torch.allclose(point.sum(), torch.ones_like(point.sum())) for point in x]).unsqueeze(1)
+        mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         return torch.where(mask, grad, torch.full_like(grad, torch.nan))
 
     def log_pdf_param_grads(self, x):
@@ -530,7 +516,7 @@ class Dirichlet(Distribution):  # TODO: make new class for the dirichlet state s
         digamma_alpha = torch.digamma(alpha)
         digamma_alpha_sum = torch.digamma(alpha.sum(-1, keepdim=True))
         grad_alpha = x.log() - digamma_alpha + digamma_alpha_sum
-        mask = torch.stack([torch.all(point >= 0) & torch.all(point <= 1) & torch.allclose(point.sum(), torch.ones_like(point.sum())) for point in x]).unsqueeze(1)
+        mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         grad_alpha = torch.where(mask, grad_alpha, torch.full_like(grad_alpha, torch.nan))
         return {self.resolve_name("alpha", self.alpha): grad_alpha}
 
@@ -735,7 +721,7 @@ class Mixture(Distribution):
             raise ValueError("x.shape should be (n_samples, n_features).")
         
         weights = resolve(self.weights)
-        return sum(w * component.pdf(x) for w, component in zip(weights, self.components))
+        return sum(w * component.pdf(x) for w, component in zip(weights.T, self.components))
 
     def log_pdf(self, x):
         if not isinstance(x, torch.Tensor):
@@ -744,7 +730,7 @@ class Mixture(Distribution):
             raise ValueError("x.shape should be (n_samples, n_features).")
         
         weights = resolve(self.weights)
-        log_pdfs = torch.stack([(w + 1e-12).log() + component.log_pdf(x) for w, component in zip(weights.T, self.components)])  # TODO: make sure weights.T is correct
+        log_pdfs = torch.stack([(w + 1e-12).log() + component.log_pdf(x) for w, component in zip(weights.T, self.components)])
         return _logsumexp(log_pdfs, dim=0)
 
     def log_pdf_grad(self, x):
@@ -755,15 +741,12 @@ class Mixture(Distribution):
         
         weights = resolve(self.weights)
         
-        # TODO: Change the distributions to always return consistant shapes
         log_weights = torch.log(weights + 1e-12)
         log_pdfs = torch.stack([component.log_pdf(x) for component in self.components], dim=0).squeeze()
-        if log_pdfs.ndim == 0: log_pdfs = log_pdfs.unsqueeze(0)  # fix the inconsistent shapes in the log_pdf functions of distributions
-        # log_pdfs.shape should be (n_components,)
+        if log_pdfs.ndim == 0: log_pdfs = log_pdfs.unsqueeze(0)
         grads = torch.stack([component.log_pdf_grad(x) for component in self.components], dim=0).squeeze()
-        if grads.ndim == 0: grads = grads.unsqueeze(0)  # fix the inconsistent shapes in the log_pdf functions of distributions
+        if grads.ndim == 0: grads = grads.unsqueeze(0)
         if grads.ndim == 1: grads = grads.unsqueeze(1)
-        # grads.shape should be (n_components, 1)
 
         log_weighted = log_weights + log_pdfs
         log_mixture_pdf = _logsumexp(log_weighted, dim=0)
@@ -781,13 +764,12 @@ class Mixture(Distribution):
         grads = {}
         
         # gradient of weights
-        pdfs = torch.stack([component.pdf(x) for component in self.components]).squeeze()
-        if pdfs.ndim == 0: pdfs = pdfs.unsqueeze(0)
+        pdfs = torch.cat([component.pdf(x) for component in self.components], dim=1)
         grad_weights = pdfs / self.pdf(x)
         grads[self.resolve_name("weights", self.weights)] = grad_weights
     
         # TODO: implement and test gradients of the components' parameters
-        # for w, comp in zip(self.weights, self.components):
+        # for w, comp in zip(weights.T, self.components):
         #     param_grads = comp.log_pdf_param_grads(x)
         #     for k, v in param_grads.items():
         #         if k in grads:
