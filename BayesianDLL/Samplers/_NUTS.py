@@ -1,13 +1,12 @@
 import torch
 import math
-from tqdm import tqdm
 from collections import namedtuple
 
 
 Tree = namedtuple("Tree", ["theta_minus", "r_minus", "grad_minus", "theta_plus", "r_plus", "grad_plus", "theta_prime", "grad_prime", "log_prob_prime", "n_prime", "s_prime", "alpha_prime", "n_prime_alpha"])
 
 class NUTS:
-    def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0):
+    def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=10):
         self.log_target = log_target
         self.gradient = gradient
         self.inverse_transformation = inverse_transformation
@@ -18,6 +17,8 @@ class NUTS:
         self.H_bar = H_bar
         self.delta = delta
         self.max_depth = max_depth
+        self.min_step_size = min_step_size
+        self.max_step_size = max_step_size
 
     def leapfrog(self, theta, r, grad, step_size):
         r_prime = r +  0.5 * step_size * grad
@@ -39,15 +40,14 @@ class NUTS:
             step_size *= 2 ** a
             _, r_prime, grad_prime, log_prob_prime = self.leapfrog(theta_init, r0, grad_init, step_size)
             log_accept_prob = log_prob_prime - log_prob_init - 0.5 * (r_prime @ r_prime.T - r0 @ r0.T)
+        
+        step_size = min(max(step_size, self.min_step_size), self.max_step_size)
         return step_size
-
 
     def build_tree(self, theta, r, grad, log_u, v, j, step_size, joint0):
         if j == 0:
             theta_prime, r_prime, grad_prime, log_prob_prime = self.leapfrog(theta, r, grad, v * step_size)
             log_joint_prime = log_prob_prime - 0.5 * r_prime @ r_prime.T
-            # n_prime = int(log_u < log_joint_prime)
-            # s_prime = int((log_u - 1000) < log_joint_prime)
             n_prime = 1 if log_u < log_joint_prime else 0
             s_prime = 1 if log_u < (log_joint_prime + 1000) else 0
             return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, min(1, torch.exp(log_joint_prime - joint0)), 1)
@@ -106,6 +106,9 @@ class NUTS:
         new_log_prob = self.log_prob_cache
         new_gradient = self.gradient_cache
 
+        alpha_sum_total = 0.0
+        n_alpha_sum_total = 0.0
+
         while s == 1 and j <= self.max_depth:
             v = 1 if torch.rand(1) < 0.5 else -1
             if v == -1:
@@ -114,6 +117,9 @@ class NUTS:
             else:
                 tree = self.build_tree(theta_plus, r_plus, grad_plus, log_u, v, j, self.step_size, joint)
                 theta_plus, r_plus, grad_plus = tree.theta_plus, tree.r_plus, tree.grad_plus
+            
+            alpha_sum_total += float(tree.alpha_prime)
+            n_alpha_sum_total += float(tree.n_prime_alpha)
             
             _tmp = min(1, tree.n_prime / n)
             if tree.s_prime == 1 and torch.rand(1) < _tmp:
@@ -126,8 +132,9 @@ class NUTS:
         
         if warmup:
             eta = 1 / (self.m + self.t0)
-            self.H_bar = (1 - eta) * self.H_bar + eta * (self.delta - tree.alpha_prime / tree.n_prime_alpha)
+            self.H_bar = (1 - eta) * self.H_bar + eta * (self.delta - alpha_sum_total / n_alpha_sum_total)
             self.step_size = math.exp(self.mu - math.sqrt(self.m) / self.gamma * self.H_bar)
+            self.step_size = min(max(self.step_size, self.min_step_size), self.max_step_size)
             eta = self.m ** -self.kappa
             self.step_size_bar = math.exp((1 - eta) * math.log(self.step_size_bar) + eta * math.log(self.step_size))
         else:
@@ -137,7 +144,7 @@ class NUTS:
         self.log_prob_cache = new_log_prob
         self.m += 1
 
-        return new_theta, self.step_size, torch.as_tensor(tree.alpha_prime / tree.n_prime_alpha).item()
+        return new_theta, self.step_size, alpha_sum_total / n_alpha_sum_total
 
     def init_sampler(self):
         pass

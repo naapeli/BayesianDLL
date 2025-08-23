@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
-from BayesianDLL.Distributions import Normal, Beta, Exponential, Uniform, InvGamma, HalfCauchy, Dirichlet
+from BayesianDLL.Distributions import Normal, Beta, Exponential, Uniform, InvGamma, HalfCauchy, Dirichlet, Mixture
 from BayesianDLL import Model, RandomParameter, sample
 
 
@@ -50,11 +50,23 @@ plt.plot(x.numpy(), distribution._log_prob_unconstrained(x).numpy(), label='log_
 plt.plot(x.numpy(), distribution._log_prob_grad_unconstrained(x).numpy(), label='log_pdf_grad')
 plt.legend()
 plt.title("Half Cauchy")
+
+plt.subplot(3, 3, 7)
+means = [-1, 2]
+variances = [0.5 ** 2, 1 ** 2]
+components = [Normal(mu, var) for mu, var in zip(means, variances)]
+weights = [0.3, 0.7]
+distribution = Mixture(components, weights)
+plt.plot(x.numpy(), distribution._log_prob_unconstrained(x).numpy(), label='log_pdf')
+plt.plot(x.numpy(), distribution._log_prob_grad_unconstrained(x).numpy(), label='log_pdf_grad')
+plt.legend()
+plt.title("Mixture of Gaussians")
+
 plt.tight_layout()
 plt.savefig("Tests/sampling/pdfs.png")
 
 
-# ================== SAMPLING ==================
+# # ================== SAMPLING ==================
 n = 10000
 bins = 30
 
@@ -98,8 +110,8 @@ plt.title("Beta")
 distribution = Beta(0.5, 0.5)
 theta_init = torch.tensor(0.5, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts", delta=0.8)  # to make the sampler stable, set the target accept probability a little higher than default
-    samples = sample(n, 1000)["sample"]
+    RandomParameter("sample", distribution, theta_init, sampler="nuts", gamma=5, delta=0.9)
+    samples = sample(n, 2000)["sample"]
 plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0.01, 0.99, 100).unsqueeze(1)
 y = distribution.pdf(x)
@@ -209,6 +221,23 @@ plt.scatter(samples_2d[:, 0], samples_2d[:, 1], alpha=0.7, s=1)
 plt.title("Dirichlet")
 triangle_vertices = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.5, 3**0.5 / 2], [0.0, 0.0]])
 plt.plot(triangle_vertices[:, 0], triangle_vertices[:, 1], '-', lw=2, c="black")
+
+plt.subplot(3, 3, 8)
+means = [-1, 2]
+variances = [0.5 ** 2, 1 ** 2]
+components = [Normal(mu, var) for mu, var in zip(means, variances)]
+weights = [0.3, 0.7]
+distribution = Mixture(components, weights)
+theta_init = torch.tensor(0, dtype=torch.float64)
+with Model() as model:
+    RandomParameter("sample", distribution, theta_init, sampler="nuts")
+    samples = sample(n, 1000)["sample"]
+plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
+x = torch.linspace(-5, 5, 1000).unsqueeze(1)
+y = distribution.pdf(x)
+plt.plot(x, y)
+plt.xlim(-5, 5)
+plt.title("Mixture of Gaussians")
 
 plt.tight_layout()
 plt.savefig("Tests/sampling/distributions.png")
