@@ -721,6 +721,8 @@ class Mixture(Distribution):
             raise ValueError("x.shape should be (n_samples, n_features).")
         
         weights = resolve(self.weights)
+        if weights.ndim == 1:
+            weights = weights.unsqueeze(0)
         return sum(w * component.pdf(x) for w, component in zip(weights.T, self.components))
 
     def log_pdf(self, x):
@@ -730,6 +732,8 @@ class Mixture(Distribution):
             raise ValueError("x.shape should be (n_samples, n_features).")
         
         weights = resolve(self.weights)
+        if weights.ndim == 1:
+            weights = weights.unsqueeze(0)
         log_pdfs = torch.stack([(w + 1e-12).log() + component.log_pdf(x) for w, component in zip(weights.T, self.components)])
         return _logsumexp(log_pdfs, dim=0)
 
@@ -740,19 +744,16 @@ class Mixture(Distribution):
             raise ValueError("x.shape should be (n_samples, n_features).")
         
         weights = resolve(self.weights)
-        
-        log_weights = torch.log(weights + 1e-12)
-        log_pdfs = torch.stack([component.log_pdf(x) for component in self.components], dim=0).squeeze()
-        if log_pdfs.ndim == 0: log_pdfs = log_pdfs.unsqueeze(0)
-        grads = torch.stack([component.log_pdf_grad(x) for component in self.components], dim=0).squeeze()
-        if grads.ndim == 0: grads = grads.unsqueeze(0)
-        if grads.ndim == 1: grads = grads.unsqueeze(1)
+        if weights.ndim == 1:
+            weights = weights.unsqueeze(0)
+        log_pdfs = torch.stack([component.log_pdf(x) for component in self.components], dim=0).squeeze(2)  # (n_components, n_samples, 1)
+        grads = torch.stack([component.log_pdf_grad(x) for component in self.components], dim=0)  # (n_components, n_samples, n_features)
 
-        log_weighted = log_weights + log_pdfs
+        log_weighted = torch.log(weights.T + 1e-12) + log_pdfs  # (n_components, n_samples)
         log_mixture_pdf = _logsumexp(log_weighted, dim=0)
         log_posterior_weights = log_weighted - log_mixture_pdf
-        posterior_weights = torch.exp(log_posterior_weights)
-        return (posterior_weights.unsqueeze(-1) * grads).sum(dim=0)
+        posterior_weights = torch.exp(log_posterior_weights).unsqueeze(2)  # (n_components, n_samples, 1)
+        return (posterior_weights * grads).sum(dim=0)  # (n_samples, n_features)
 
     def log_pdf_param_grads(self, x):
         if not isinstance(x, torch.Tensor):
@@ -761,6 +762,8 @@ class Mixture(Distribution):
             raise ValueError("x.shape should be (n_samples, n_features).")
         
         weights = resolve(self.weights)
+        if weights.ndim == 1:
+            weights = weights.unsqueeze(0)
         grads = {}
         
         # gradient of weights
@@ -769,17 +772,12 @@ class Mixture(Distribution):
         grads[self.resolve_name("weights", self.weights)] = grad_weights
     
         # TODO: implement and test gradients of the components' parameters
-        # for w, comp in zip(weights.T, self.components):
-        #     param_grads = comp.log_pdf_param_grads(x)
-        #     for k, v in param_grads.items():
-        #         if k in grads:
-        #             grads[k] += w * comp.pdf(x) * v
-        #         else:
-        #             grads[k] = w * comp.pdf(x) * v
-        # # Normalize by mixture PDF for gradient of log
-        # mixture_pdf = self.pdf(x)
-        # for k in grads:
-        #     grads[k] /= mixture_pdf
+        mixture_pdf = self.pdf(x)
+        for w, component in zip(weights.T, self.components):
+            param_grads = component.log_pdf_param_grads(x)
+            coefficient = (w * component.pdf(x)) / mixture_pdf
+            for name, gradient in param_grads.items():
+                grads[name] = grads.get(name, 0) + coefficient * gradient  # if two distributions have the same parameter, accumulate the result
         return grads
 
 def _logsumexp(log_values, dim=0):
