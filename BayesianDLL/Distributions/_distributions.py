@@ -771,7 +771,6 @@ class Mixture(Distribution):
         grad_weights = pdfs / self.pdf(x)
         grads[self.resolve_name("weights", self.weights)] = grad_weights
     
-        # TODO: implement and test gradients of the components' parameters
         mixture_pdf = self.pdf(x)
         for w, component in zip(weights.T, self.components):
             param_grads = component.log_pdf_param_grads(x)

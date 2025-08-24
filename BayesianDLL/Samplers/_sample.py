@@ -52,20 +52,20 @@ def _decide_step(model, parameter):
     sampler.init_sampler()
     return sampler
 
-def sample_posterior_predicative(n_samples, warmup_length, model=None, progress_bar=True, warmup_per_sample=20):
+def sample_posterior_predicative(n_samples, warmup_length, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
     model = _active_model._active_model if model is None else model
     trace = sample(n_samples, warmup_length, model, progress_bar)
-    return sample_predicative(trace, n_samples, model, progress_bar, warmup_per_sample)
+    return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
-def sample_prior_predicative(n_samples, warmup_length, model=None, progress_bar=True, warmup_per_sample=20):
+def sample_prior_predicative(n_samples, warmup_length, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
     model = _active_model._active_model if model is None else model
     old_observed = model.observed_params
     model.observed_params = {}  # with prior distributions, one should sample from the priors without the likelihood terms
     trace = sample(n_samples, warmup_length, model, progress_bar)
     model.observed_params = old_observed
-    return sample_predicative(trace, n_samples, model, progress_bar, warmup_per_sample)
+    return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
-def sample_predicative(trace, n_samples=None, model=None, progress_bar=True, warmup_per_sample=20):
+def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
     model = _active_model._active_model if model is None else model
 
     old_prior_values = {}
@@ -78,7 +78,7 @@ def sample_predicative(trace, n_samples=None, model=None, progress_bar=True, war
         samplers[name] = _decide_predicative_step(parameter)
         state_spaces[name] = parameter.distribution.transformed_state_space
 
-    predicative_samples = {name: [] for name in model.observed_params.keys()}
+    predicative_samples = {name: torch.empty(size=(n_samples, samples_per_step, len(parameter.observed_values[0]))) for name, parameter in model.observed_params.items()}
 
     trace_length = len(next(iter(trace.values())))
     n_samples = trace_length if n_samples is None else n_samples
@@ -95,19 +95,23 @@ def sample_predicative(trace, n_samples=None, model=None, progress_bar=True, war
             prior_values[name] = value
         
         for name, parameter in model.params.items():
-            parameter.set_constrained_value(prior_values[name])
+            unconstrained_value = parameter.distribution.transform.forward(prior_values[name])
+            parameter.set_unconstrained_value(unconstrained_value)
 
         for name, sampler in samplers.items():
-            init_value = model.observed_params[name].observed_values[0].unsqueeze(0)
+            parameter = model.observed_params[name]
+            init_value = parameter.observed_values[0].unsqueeze(0)
             theta = _init_theta(state_spaces[name], init_value.shape, init_value.dtype)
-            for m in range(warmup_per_sample + 1):
+            for m in range(warmup_per_sample + samples_per_step):
                 theta, _, _ = sampler.step(theta, m < warmup_per_sample)
-            predicative_samples[name].append(theta)
+                if m >= warmup_per_sample:
+                    predicative_samples[name][i, m - warmup_per_sample] = theta
 
     for name, parameter in model.params.items():
-        parameter.set_constrained_value(prior_values[name])
+            unconstrained_value = parameter.distribution.transform.forward(prior_values[name])
+            parameter.set_unconstrained_value(unconstrained_value)
     
-    predicative_samples = {name: model.observed_params[name].distribution.transform.inverse(torch.cat(samples)).squeeze() for name, samples in predicative_samples.items()}
+    predicative_samples = {name: model.observed_params[name].distribution.transform.inverse(samples.reshape(n_samples * samples_per_step, -1)).reshape(n_samples, samples_per_step, -1) for name, samples in predicative_samples.items()}
     return predicative_samples
 
 def _init_theta(state_space, shape, dtype):
