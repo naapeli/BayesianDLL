@@ -5,25 +5,12 @@ from ._active_model import _active_model
 
 class RandomParameter:
     def __init__(self, name, distribution, initial_value, sampler="auto", **sampler_params):
-        """
-        A random variable following a spesific distribution.
-
-        Args:
-            name (_type_): _description_
-            distribution (_type_): _description_
-            initial_value (_type_): _description_
-            sampler (str, optional): Decides the sampler used for this random variable. Must be one of "auto", "nuts" or "metropolis". Defaults to "auto".
-
-        Raises:
-            RuntimeError: _description_
-        """
         if initial_value.ndim not in [0, 1]:
             raise ValueError("initial_value must be either 0 or 1 dimensional.")
 
         self.name = name
         self.distribution = distribution
-        self.constrained_value = initial_value.unsqueeze(0)
-        if self.constrained_value.ndim == 1: self.constrained_value = self.constrained_value.unsqueeze(0)  # if the original point was of shape [], make it 2 dimensional
+        self.constrained_value = initial_value.reshape(1, -1)
         self.unconstrained_value = self.distribution.transform.forward(self.constrained_value)
         self.sampler = sampler
         self.sampler_params = sampler_params

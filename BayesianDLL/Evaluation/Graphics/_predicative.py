@@ -19,6 +19,8 @@ def plot_predicative_distribution(predicative_distribution, data=None, kind="pdf
 
         values = []
 
+        plt.figure()
+
         for i in range(len(predicative_samples)):
             samples = predicative_samples[i].reshape(-1).numpy()
             # calculate the pdf
@@ -63,5 +65,4 @@ def plot_predicative_distribution(predicative_distribution, data=None, kind="pdf
             plt.plot(x_grid, obs_values, color="black", label="Observed")
 
         plt.title(f"{kind.upper()} - {name}")
-        plt.legend()
-        plt.show()
+        plt.legend(loc="upper right")
