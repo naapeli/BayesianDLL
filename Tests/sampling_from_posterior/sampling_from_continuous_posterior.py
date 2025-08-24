@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Beta, Bernoulli, Binomial
 from BayesianDLL import Model, RandomParameter, ObservedParameter, sample
+from BayesianDLL.Evaluation.Graphics import plot_posterior
 
 
 torch.manual_seed(0)
@@ -15,11 +16,12 @@ with Model() as model:
 
     likelihood_distribution = Bernoulli(prior) if max_val == 1 else Binomial(max_val, prior)
     likelihood = ObservedParameter("likelihood", likelihood_distribution, data)
-    samples = sample(10000, 500)["prior"]
+    samples = sample(1000, 500, n_chains=4)
 
-plt.hist(samples.numpy(), bins=30, density=True, label="Estimated posterior")
+plot_posterior(samples, method="kde")
 x = torch.linspace(0, 1, 1000).unsqueeze(1)
-plt.plot(x, Beta(a + data.sum(), b + (max_val - data).sum()).pdf(x), label="True posterior")
+plt.subplot(1, 2, 1)
+plt.plot(x, Beta(a + data.sum(), b + (max_val - data).sum()).pdf(x), c="black", label="True posterior")
 plt.xlim(0, 1)
-plt.tight_layout()
+plt.legend()
 plt.show()

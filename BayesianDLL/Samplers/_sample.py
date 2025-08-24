@@ -1,40 +1,49 @@
 import torch
 from tqdm import tqdm
 from functools import partial
+import os
 
 from . import NUTS, Metropolis
 from .._active_model import _active_model
 
 
-def sample(n_samples, warmup_length, model=None, progress_bar=True):
+def sample(n_samples, warmup_length, n_chains=2, model=None, progress_bar=True):
     model = _active_model._active_model if model is None else model
-
-    samplers = {}
-    for name, parameter in model.params.items():
-        samplers[name] = _decide_step(model, parameter)
     
-    trace = {name: [] for name in model.params.keys()}
-    _progress_bar = tqdm(range(1, n_samples + warmup_length + 1), bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}") if progress_bar else range(1, n_samples + warmup_length + 1)
-    acceptance_probabilities = [1.0 for _ in range(len(samplers))]
-    step_sizes = [1.0 for _ in range(len(samplers))]
-    for m in _progress_bar:
-        if progress_bar:
-            if m < warmup_length: _progress_bar.set_description(f"Warmup")
-            else: _progress_bar.set_description(f"Sample")
-            _progress_bar.set_postfix({
-                "avg. acc. probs": [f"{prob / m:.3f}" for prob in acceptance_probabilities],
-                "step sizes": [f"{step_size:.3f}" for step_size in step_sizes]
-            })
+    initial_values = {}
+    for name, parameter in model.params.items():
+        initial_values[name] = parameter.unconstrained_value
+    
+    trace = {name: torch.empty(size=(n_chains, n_samples, parameter.constrained_value.size(1))) for name, parameter in model.params.items()}
+    for chain in range(n_chains):
+        for name, parameter in model.params.items():
+            parameter.set_unconstrained_value(initial_values[name])
+        
+        # TODO: reset the states of the samplers for each chain instead of reinitializing them
+        samplers = {}
+        for name, parameter in model.params.items():
+            samplers[name] = _decide_step(model, parameter)
 
-        for i, (name, sampler) in enumerate(samplers.items()):
-            theta = model.params[name].unconstrained_value
-            new_theta, step_size, acceptance_probability = sampler.step(theta, m < warmup_length)
-            step_sizes[i] = step_size
-            acceptance_probabilities[i] += acceptance_probability
-            model.params[name].set_unconstrained_value(new_theta)
-            trace[name].append(model.params[name].constrained_value)
+        _progress_bar = tqdm(range(1, n_samples + warmup_length + 1), bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}") if progress_bar else range(1, n_samples + warmup_length + 1)
+        acceptance_probabilities = [1.0 for _ in range(len(samplers))]
+        step_sizes = [1.0 for _ in range(len(samplers))]
+        for m in _progress_bar:
+            if progress_bar:
+                if m < warmup_length: _progress_bar.set_description(f"Chain {chain + 1}/{n_chains} warmup")
+                else: _progress_bar.set_description(f"Chain {chain + 1}/{n_chains} sample")
+                _progress_bar.set_postfix({
+                    "avg. acc. probs": [f"{prob / m:.3f}" for prob in acceptance_probabilities],
+                    "step sizes": [f"{step_size:.3f}" for step_size in step_sizes]
+                })
 
-    trace = {name: torch.cat(samples[warmup_length:]).squeeze() for name, samples in trace.items()}
+            for i, (name, sampler) in enumerate(samplers.items()):
+                theta = model.params[name].unconstrained_value
+                new_theta, step_size, acceptance_probability = sampler.step(theta, m < warmup_length)
+                step_sizes[i] = step_size
+                acceptance_probabilities[i] += acceptance_probability
+                model.params[name].set_unconstrained_value(new_theta)
+                if m > warmup_length: trace[name][chain, m - warmup_length - 1] = model.params[name].constrained_value
+
     return trace
 
 def _decide_step(model, parameter):
@@ -54,14 +63,14 @@ def _decide_step(model, parameter):
 
 def sample_posterior_predicative(n_samples, warmup_length, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
     model = _active_model._active_model if model is None else model
-    trace = sample(n_samples, warmup_length, model, progress_bar)
+    trace = sample(n_samples, warmup_length, 1, model, progress_bar)
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
 def sample_prior_predicative(n_samples, warmup_length, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
     model = _active_model._active_model if model is None else model
     old_observed = model.observed_params
     model.observed_params = {}  # with prior distributions, one should sample from the priors without the likelihood terms
-    trace = sample(n_samples, warmup_length, model, progress_bar)
+    trace = sample(n_samples, warmup_length, 1, model, progress_bar)
     model.observed_params = old_observed
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
@@ -80,7 +89,9 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
 
     predicative_samples = {name: torch.empty(size=(n_samples, samples_per_step, len(parameter.observed_values[0]))) for name, parameter in model.observed_params.items()}
 
-    trace_length = len(next(iter(trace.values())))
+    n_chains, trace_length, _ = next(iter(trace.values())).shape
+    if n_chains != 1:
+        raise RuntimeError("n_chains must be 1 in the trace given to sample_predicative.")
     n_samples = trace_length if n_samples is None else n_samples
     if trace_length < n_samples:
         raise RuntimeError("n_samples must be less than the length of the trace or None.")
@@ -89,10 +100,7 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
     for i in _progress_bar:
         prior_values = {}
         for name, values in trace.items():
-            value = values[i]
-            if value.ndim == 0: value = value.unsqueeze(0).unsqueeze(0)
-            elif value.ndim == 1: value = value.unsqueeze(0)
-            prior_values[name] = value
+            prior_values[name] = values[:, i]
         
         for name, parameter in model.params.items():
             unconstrained_value = parameter.distribution.transform.forward(prior_values[name])
