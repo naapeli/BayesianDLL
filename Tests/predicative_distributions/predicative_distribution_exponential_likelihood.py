@@ -1,4 +1,5 @@
 import torch
+import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import HalfCauchy, Exponential
 from BayesianDLL import Model, RandomParameter, ObservedParameter, sample_prior_predicative, sample_posterior_predicative
@@ -22,3 +23,4 @@ with Model() as joint_posterior_model:
 
 plot_predicative_distribution(posterior_predicative, data, kind="pdf")
 plot_predicative_distribution(posterior_predicative, data, kind="cdf")
+plt.show()
