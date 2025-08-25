@@ -25,11 +25,11 @@ with Model() as linear_model:
     mu = DeterministicParameter("mu", lambda b, m: m * x + b, lambda b, m: {"slope": x, "intercept": torch.ones_like(x)}, [prior_intercept, prior_slope])
     
     likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
-    samples = sample(10000, 1000)
+    samples = sample(1000, 1000, n_chains=1)
 
-intercept_samples = samples["intercept"]
-slope_samples = samples["slope"]
-sigma_samples = samples["sigma"]
+intercept_samples = samples["intercept"].squeeze()
+slope_samples = samples["slope"].squeeze()
+sigma_samples = samples["sigma"].squeeze()
 
 # Plotting
 plt.figure(figsize=(10, 6))

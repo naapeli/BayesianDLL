@@ -21,7 +21,7 @@ with Model() as model:
     prior_variance = RandomParameter("variance", InvGamma(a, b), torch.ones(1, dtype=torch.float64), sampler="metropolis")
 
     likelihood = ObservedParameter("likelihood", Normal(prior_mean, prior_variance), data)
-    samples = sample(5000, 1000, n_chains=2)
+    samples = sample(500, 500, n_chains=5)
 
 plot_posterior(samples, method="kde")
 plt.show()

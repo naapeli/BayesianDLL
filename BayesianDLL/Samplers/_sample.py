@@ -1,13 +1,14 @@
 import torch
 from tqdm import tqdm
 from functools import partial
-import os
+from warnings import warn
 
 from . import NUTS, Metropolis
 from .._active_model import _active_model
+from ..Evaluation import gelman_rubin
 
 
-def sample(n_samples, warmup_length, n_chains=2, model=None, progress_bar=True):
+def sample(n_samples, warmup_length, n_chains=2, model=None, progress_bar=True, start_point_variance=1):
     model = _active_model._active_model if model is None else model
     
     initial_values = {}
@@ -17,7 +18,7 @@ def sample(n_samples, warmup_length, n_chains=2, model=None, progress_bar=True):
     trace = {name: torch.empty(size=(n_chains, n_samples, parameter.constrained_value.size(1))) for name, parameter in model.params.items()}
     for chain in range(n_chains):
         for name, parameter in model.params.items():
-            parameter.set_unconstrained_value(initial_values[name])
+            parameter.set_unconstrained_value(initial_values[name] + start_point_variance * torch.randn_like(initial_values[name]))
         
         # TODO: reset the states of the samplers for each chain instead of reinitializing them
         samplers = {}
@@ -43,6 +44,11 @@ def sample(n_samples, warmup_length, n_chains=2, model=None, progress_bar=True):
                 acceptance_probabilities[i] += acceptance_probability
                 model.params[name].set_unconstrained_value(new_theta)
                 if m > warmup_length: trace[name][chain, m - warmup_length - 1] = model.params[name].constrained_value
+
+    r_hats = gelman_rubin(trace)
+    for name, statistics in r_hats.items():
+        if torch.any(statistics > 1.1):
+            warn(f"The gelman-Ruben statistic of {name} is above 1.1 ({statistics.tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
 
     return trace
 
