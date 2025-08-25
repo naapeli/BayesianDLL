@@ -17,11 +17,11 @@ data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N, 1))
 print(data.mean(), data.var())
 
 with Model() as model:
-    prior_mean = RandomParameter("mean", Normal(mu0, tau), torch.zeros(1, dtype=torch.float64) + 1e-2, sampler="nuts")
-    prior_variance = RandomParameter("variance", InvGamma(a, b), torch.ones(1, dtype=torch.float64) + 1e-2, sampler="nuts")
+    prior_mean = RandomParameter("mean", Normal(mu0, tau), torch.zeros(1, dtype=torch.float64), sampler="nuts")
+    prior_variance = RandomParameter("variance", InvGamma(a, b), torch.ones(1, dtype=torch.float64), sampler="nuts")
 
     likelihood = ObservedParameter("likelihood", Normal(prior_mean, prior_variance), data)
-    samples = sample(5000, 1000, n_chains=2)
+    samples = sample(500, 500, n_chains=2)
 
 plot_posterior(samples, method="kde")
 plt.show()
