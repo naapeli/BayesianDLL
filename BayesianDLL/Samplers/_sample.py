@@ -15,7 +15,7 @@ def sample(n_samples, warmup_length, n_chains=2, model=None, progress_bar=True, 
     for name, parameter in model.params.items():
         initial_values[name] = parameter.unconstrained_value
     
-    trace = {name: torch.empty(size=(n_chains, n_samples, parameter.constrained_value.size(1))) for name, parameter in model.params.items()}
+    trace = {name: torch.empty(size=(n_chains, n_samples, parameter.constrained_value.size(1)), dtype=parameter.unconstrained_value.dtype) for name, parameter in model.params.items()}
     for chain in range(n_chains):
         for name, parameter in model.params.items():
             parameter.set_unconstrained_value(initial_values[name] + start_point_variance * torch.randn_like(initial_values[name]))
@@ -48,7 +48,7 @@ def sample(n_samples, warmup_length, n_chains=2, model=None, progress_bar=True, 
     r_hats = gelman_rubin(trace)
     for name, statistics in r_hats.items():
         if torch.any(statistics > 1.1):
-            warn(f"The gelman-Ruben statistic of {name} is above 1.1 ({statistics.tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
+            warn(f"The gelman-Ruben statistic of {name} is above 1.1 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
 
     return trace
 
@@ -72,6 +72,10 @@ def sample_posterior_predicative(n_samples, warmup_length, samples_per_step=20, 
     trace = sample(n_samples, warmup_length, 1, model, progress_bar)
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
+def posterior_predicative(trace, n_samples, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
+    model = _active_model._active_model if model is None else model
+    return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
+
 def sample_prior_predicative(n_samples, warmup_length, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
     model = _active_model._active_model if model is None else model
     old_observed = model.observed_params
@@ -93,11 +97,12 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
         samplers[name] = _decide_predicative_step(parameter)
         state_spaces[name] = parameter.distribution.transformed_state_space
 
-    predicative_samples = {name: torch.empty(size=(n_samples, samples_per_step, len(parameter.observed_values[0]))) for name, parameter in model.observed_params.items()}
+    predicative_samples = {name: torch.empty(size=(n_samples, samples_per_step, len(parameter.observed_values[0])), dtype=parameter.observed_values[0].dtype) for name, parameter in model.observed_params.items()}
 
     n_chains, trace_length, _ = next(iter(trace.values())).shape
     if n_chains != 1:
-        raise RuntimeError("n_chains must be 1 in the trace given to sample_predicative.")
+        # raise RuntimeError("n_chains must be 1 in the trace given to sample_predicative.")
+        warn("n_chains is larger than one in the trace given to sample_predicative. Only the first chain is used.")
     n_samples = trace_length if n_samples is None else n_samples
     if trace_length < n_samples:
         raise RuntimeError("n_samples must be less than the length of the trace or None.")
@@ -106,11 +111,12 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
     for i in _progress_bar:
         prior_values = {}
         for name, values in trace.items():
-            prior_values[name] = values[:, i]
+            prior_values[name] = values[0, i].unsqueeze(0)
         
         for name, parameter in model.params.items():
-            unconstrained_value = parameter.distribution.transform.forward(prior_values[name])
-            parameter.set_unconstrained_value(unconstrained_value)
+            # unconstrained_value = parameter.distribution.transform.forward(prior_values[name])
+            # parameter.set_unconstrained_value(unconstrained_value)
+            parameter.set_constrained_value(prior_values[name])
 
         for name, sampler in samplers.items():
             parameter = model.observed_params[name]
@@ -140,10 +146,14 @@ def _init_theta(state_space, shape, dtype):
 def _decide_predicative_step(parameter):
     state_space = parameter.distribution.transformed_state_space
 
+    def log_target(x):
+        return parameter.distribution._log_prob_unconstrained(x)  # .sum(dim=0, keepdim=True)  # reduce over the amount of data points
     if state_space.is_continuous() and (parameter.sampler == "auto" or parameter.sampler == "nuts"):
-        sampler = NUTS(parameter.distribution._log_prob_unconstrained, parameter.distribution._log_prob_grad_unconstrained, lambda x: x, **parameter.sampler_params)
+        def gradient(x):
+            return parameter.distribution._log_prob_grad_unconstrained(x).sum(dim=0, keepdim=True)  # reduce over the amount of data points
+        sampler = NUTS(log_target, gradient, lambda x: x, **parameter.sampler_params)
     elif (state_space.is_discrete() or state_space.is_continuous()) and (parameter.sampler == "auto" or parameter.sampler == "metropolis"):
-        sampler = Metropolis(parameter.distribution._log_prob_unconstrained, state_space, **parameter.sampler_params)
+        sampler = Metropolis(log_target, state_space, **parameter.sampler_params)
     else:
         raise RuntimeError("A distribution is incompatable with the chosen sampler. NUTS can only be used with continuous distributions.")
     
