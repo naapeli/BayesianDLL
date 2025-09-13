@@ -11,47 +11,55 @@ def plot_posterior(trace, method="kde", bins=30):
     # linestyles = ["-", "--", "-.", ":", (0, (1, 1)), (0, (5, 1)), (0, (3, 5, 1, 5))]
     linestyles = ['-', '--', '-.', ':']
 
-    for j, (name, samples) in enumerate(trace.items()):
-        if samples.ndim != 3 or samples.size(2) != 1:
+    row = 0
+    total_rows = 0
+    for name, samples in trace.items():
+        total_rows += samples.size(2)
+
+    for name, samples in trace.items():
+        if samples.ndim != 3:
             raise NotImplementedError()
-        samples = samples.squeeze(2).numpy()
+        for feature in range(samples.size(2)):
+            # samples = samples.squeeze(2).numpy()
+            feature_samples = samples[:, :, feature]
 
-        n_chains = len(samples)
-        cmap = cm.get_cmap("Blues", n_chains + 2)
-        colors = [cmap(i + 1) for i in range(n_chains)]
-        repeated_linestyles = [linestyles[i % len(linestyles)] for i in range(n_chains)]
-        prop_cycle = cycler("color", colors) + cycler("linestyle", repeated_linestyles)
+            n_chains = len(feature_samples)
+            cmap = cm.get_cmap("Blues", n_chains + 2)
+            colors = [cmap(i + 1) for i in range(n_chains)]
+            repeated_linestyles = [linestyles[i % len(linestyles)] for i in range(n_chains)]
+            prop_cycle = cycler("color", colors) + cycler("linestyle", repeated_linestyles)
 
-        plt.subplot(len(trace), 2, 2 * j + 1)
-        plt.gca().set_prop_cycle(prop_cycle)
+            plt.subplot(total_rows, 2, 2 * row + 1)
+            plt.gca().set_prop_cycle(prop_cycle)
 
-        x_grid = np.linspace(samples.min(), samples.max(), 500)
+            x_grid = np.linspace(feature_samples.min(), feature_samples.max(), 500)
 
-        # mean_pdf = np.zeros_like(x_grid)
+            # mean_pdf = np.zeros_like(x_grid)
 
-        for i, chain in enumerate(samples):
-            chain_bins = bins if not isinstance(bins, dict) else bins[name]
+            for i, chain in enumerate(feature_samples):
+                chain_bins = bins if not isinstance(bins, dict) else bins[name]
 
-            if method == "kde":
-                est = gaussian_kde(chain)
-                pdf = est(x_grid)
-            elif method == "hist":
-                hist, bin_edges = np.histogram(chain, bins=chain_bins, range=(x_grid.min(), x_grid.max()), density=True)
-                bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-                pdf = np.interp(x_grid, bin_centers, hist)
+                if method == "kde":
+                    est = gaussian_kde(chain)
+                    pdf = est(x_grid)
+                elif method == "hist":
+                    hist, bin_edges = np.histogram(chain, bins=chain_bins, range=(x_grid.min(), x_grid.max()), density=True)
+                    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                    pdf = np.interp(x_grid, bin_centers, hist)
 
-            # mean_pdf += pdf
-            plt.plot(x_grid, pdf, alpha=0.3, label=f"Chain {i+1}")
-        
-        # mean_pdf /= n_chains
-        # plt.plot(x_grid, mean_pdf, color="orange", linewidth=2, label="Posterior mean")
-        plt.title(name)
-        plt.legend(loc="upper right")
+                # mean_pdf += pdf
+                plt.plot(x_grid, pdf, alpha=0.3, label=f"Chain {i+1}")
+            
+            # mean_pdf /= n_chains
+            # plt.plot(x_grid, mean_pdf, color="orange", linewidth=2, label="Posterior mean")
+            plt.title(f"{name}[{feature}]")
+            plt.legend(loc="upper right")
 
-        plt.subplot(len(trace), 2, 2 * j + 2)
-        plt.gca().set_prop_cycle(prop_cycle)  # TODO: make sure the traces and histograms have the same colors (currently not the case)
-        for i, chain in enumerate(samples):
-            plt.plot(chain, alpha=0.7, label=f"Chain {i+1}")
-        plt.title(name)
-        plt.legend(loc="upper right")
-        plt.tight_layout()
+            plt.subplot(total_rows, 2, 2 * row + 2)
+            plt.gca().set_prop_cycle(prop_cycle)  # TODO: make sure the traces and histograms have the same colors (currently not the case)
+            for i, chain in enumerate(feature_samples):
+                plt.plot(chain, alpha=0.7, label=f"Chain {i+1}")
+            plt.title(f"{name}[{feature}]")
+            plt.legend(loc="upper right")
+            plt.tight_layout()
+            row += 1
