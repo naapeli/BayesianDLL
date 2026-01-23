@@ -18,7 +18,14 @@ class RandomParameter:
         self.transformed_state_space = self.distribution.transformed_state_space
 
         if _active_model._active_model is not None:
-            _active_model._active_model.params[name] = self
+            _active_model._active_model.params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            graph = _active_model._active_model.graph
+            graph.add_node(self.name, type="random")
+            for parameter in self.distribution.parameters:
+                if parameter in graph:
+                    _active_model._active_model.graph.add_edge(parameter, self.name)
+                else:
+                    raise RuntimeError(f"{self.name} depends on {parameter}, which is not in the computation graph of the model.")
         else:
             raise RuntimeError("One should select an active model before creating random variables.")
 
@@ -41,16 +48,22 @@ class RandomParameter:
         self.unconstrained_value = self.distribution.transform.forward(constrained_value)
 
 class ObservedParameter:
-    def __init__(self, name, distribution, observed_values):
+    def __init__(self, name, distribution, observed_values, sampler="auto", **sampler_params):
         self.name = name
         self.distribution = distribution
         self.observed_values = observed_values
-        self.sampler = "metropolis"  # for predicative sampling
-        # self.sampler = "nuts"  # for predicative sampling
-        self.sampler_params = {}
+        self.sampler = sampler  # for predicative sampling
+        self.sampler_params = sampler_params
 
         if _active_model._active_model is not None:
-            _active_model._active_model.observed_params[name] = self
+            _active_model._active_model.observed_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            graph = _active_model._active_model.graph
+            graph.add_node(self.name, type="observed")
+            for parameter in self.distribution.parameters:
+                if parameter in graph:
+                    _active_model._active_model.graph.add_edge(parameter, self.name)
+                else:
+                    raise RuntimeError(f"{self.name} depends on {parameter}, which is not in the computation graph of the model.")
         else:
             raise RuntimeError("One should select an active model before creating random variables.")
 
@@ -62,7 +75,14 @@ class DeterministicParameter:
         self.inputs = inputs
 
         if _active_model._active_model is not None:
-            _active_model._active_model.deterministic_params[name] = self
+            _active_model._active_model.deterministic_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            graph = _active_model._active_model.graph
+            graph.add_node(self.name, type="deterministic")
+            for parameter in self.inputs:
+                if parameter.name in graph:
+                    _active_model._active_model.graph.add_edge(parameter.name, self.name)
+                else:
+                    raise RuntimeError(f"{self.name} depends on {parameter.name}, which is not in the computation graph of the model.")
         else:
             raise RuntimeError("One should select an active model before creating random variables.")
 
@@ -75,28 +95,6 @@ class DeterministicParameter:
         inputs = [self._get_constrained_value(input) for input in self.inputs]
         local_derivative = self.derivative_func(*inputs)[name]
         return local_derivative
-        # TODO: Currently chaining deterministic parameters is not possible as the derivative is not implemented
-
-        # # Handle simple case: all inputs are leaf parameters
-        # if all(not hasattr(input, "name") or input.name in _active_model._active_model.params for input in self.inputs):
-        #     return local_derivative
-
-        # # Chain rule: propagate through deterministic inputs
-        # full_derivative = torch.zeros_like(local_derivative)
-        # for i, input in enumerate(self.inputs):
-        #     if hasattr(input, "name") and input.name in _active_model._active_model.deterministic_params:
-        #         inner_derivative = _active_model._active_model.deterministic_params[input.name].derivative(name)
-        #     elif hasattr(input, "name") and input.name in _active_model._active_model.params:
-        #         # Identity for direct inputs
-        #         inner_derivative = torch.eye(len(input.constrained_value))  # or appropriate shape
-        #     else:
-        #         # Constant tensor input
-        #         inner_derivative = 0
-
-        #     # Multiply partial derivative w.r.t. input[i] with its derivative
-        #     full_derivative += local_derivative[i] @ inner_derivative
-
-        # return full_derivative
 
     def _get_constrained_value(self, input):
         model = _active_model._active_model

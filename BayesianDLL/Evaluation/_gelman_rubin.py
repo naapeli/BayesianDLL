@@ -1,5 +1,6 @@
 import torch
 from scipy.stats import rankdata, norm
+from ._effective_sample_size import effective_sample_size
 
 
 # def gelman_rubin(trace):
@@ -21,24 +22,24 @@ from scipy.stats import rankdata, norm
 #     return r_hats
 
 
-def _rhat_core(chains):
+def _rhat_core(chains, ess):
     n_chains, n_samples = chains.shape
     chain_means = chains.mean(dim=1)
     grand_mean = chain_means.mean(dim=0)
-    B = n_samples / (n_chains - 1) * ((chain_means - grand_mean) ** 2).sum(dim=0)
+    B = ess / (n_chains - 1) * ((chain_means - grand_mean) ** 2).sum(dim=0)
     chain_vars = chains.var(dim=1, unbiased=True)
     W = chain_vars.mean(dim=0)
-    Var_hat = (n_samples - 1) / n_samples * W + B / n_samples
+    Var_hat = (ess - 1) / ess * W + B / ess
     return torch.clamp(torch.sqrt(Var_hat / W), min=1)
 
 
-def _split_rhat_core(chains):
+def _split_rhat_core(chains, ess):
     n_chains, n_samples = chains.shape
     if n_samples % 2 != 0:
         chains = chains[:, :-1]
         n_samples -= 1
     split_chains = chains.reshape(n_chains * 2, n_samples // 2)
-    return _rhat_core(split_chains)
+    return _rhat_core(split_chains, ess)
 
 
 def _rank_normalize(chains):
@@ -49,13 +50,13 @@ def _rank_normalize(chains):
     return torch.tensor(z, dtype=chains.dtype, device=chains.device).reshape(chains.shape)
 
 
-def _rank_normalized_rhat_core(chains):
+def _rank_normalized_rhat_core(chains, ess):
     norm_chains = _rank_normalize(chains)
-    return _split_rhat_core(norm_chains)
-
+    return _split_rhat_core(norm_chains, ess)
 
 
 def gelman_rubin(samples, method="rank"):
+    ess = effective_sample_size(samples)
     results = {}
     for name, chains in samples.items():
         if chains.ndim != 3:
@@ -66,11 +67,11 @@ def gelman_rubin(samples, method="rank"):
         for f in range(n_features):
             feature_chains = chains[:, :, f]
             if method == "classical":
-                rhat_vals[f] = _rhat_core(feature_chains)
+                rhat_vals[f] = _rhat_core(feature_chains, ess[name][f])
             elif method == "split":
-                rhat_vals[f] = _split_rhat_core(feature_chains)
+                rhat_vals[f] = _split_rhat_core(feature_chains, ess[name][f])
             elif method == "rank":
-                rhat_vals[f] = _rank_normalized_rhat_core(feature_chains)
+                rhat_vals[f] = _rank_normalized_rhat_core(feature_chains, ess[name][f])
             else:
                 raise ValueError("method must be 'classical', 'split', or 'rank'")
         results[name] = rhat_vals

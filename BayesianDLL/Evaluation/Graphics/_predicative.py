@@ -19,7 +19,6 @@ def plot_predicative_distribution(predicative_distribution, data=None, kind="pdf
 
         values = []
 
-        plt.figure()
 
         for i in range(len(predicative_samples)):
             samples = predicative_samples[i].reshape(-1).numpy()

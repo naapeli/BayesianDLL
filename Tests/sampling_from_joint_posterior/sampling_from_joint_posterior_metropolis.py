@@ -3,10 +3,11 @@ import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, InvGamma
 from BayesianDLL import Model, RandomParameter, ObservedParameter, sample
-from BayesianDLL.Evaluation.Graphics import plot_posterior
+from BayesianDLL.Evaluation.Graphics import plot_posterior, plot_model
+from BayesianDLL.Evaluation import effective_sample_size, gelman_rubin
 
 
-torch.manual_seed(7)
+torch.manual_seed(0)
 N = 100
 mu0 = 0
 tau = 10
@@ -17,11 +18,18 @@ data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N, 1))
 print(data.mean(), data.var())
 
 with Model() as model:
-    prior_mean = RandomParameter("mean", Normal(mu0, tau), torch.zeros(1, dtype=torch.float64), sampler="metropolis")
-    prior_variance = RandomParameter("variance", InvGamma(a, b), torch.ones(1, dtype=torch.float64), sampler="metropolis")
+    prior_mean = RandomParameter("mean", Normal(mu0, tau), torch.zeros(1, dtype=torch.float64), sampler="metropolis", delta=0.5)
+    prior_variance = RandomParameter("variance", InvGamma(a, b), torch.ones(1, dtype=torch.float64), sampler="metropolis", delta=0.5)
 
     likelihood = ObservedParameter("likelihood", Normal(prior_mean, prior_variance), data)
-    samples = sample(500, 500, n_chains=5)
+    plt.figure()
+    plot_model(model)
+    samples = sample(2000, 500, n_chains=2)
 
+ess = effective_sample_size(samples)
+print(ess)
+print(gelman_rubin(samples))
+
+plt.figure()
 plot_posterior(samples, method="kde")
 plt.show()
