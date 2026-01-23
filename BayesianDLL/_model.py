@@ -4,12 +4,13 @@ from networkx import DiGraph
 from collections import deque
 
 from ._active_model import _active_model
+from ._parameters import RandomParameter, ObservedParameter, DeterministicParameter
 
 class Model:
     def __init__(self):
-        self.params = {}
-        self.observed_params = {}
-        self.deterministic_params = {}
+        self.params: dict[str, RandomParameter] = {}
+        self.observed_params: dict[str, ObservedParameter] = {}
+        self.deterministic_params: dict[str, DeterministicParameter] = {}
         self.graph = DiGraph()
 
     def __enter__(self):
@@ -31,6 +32,19 @@ class Model:
     #             logp += observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
         
     #     return logp
+
+    def model_log_prob(self):
+        logp = 0.0
+        # priors
+        for parameter in self.params.values():
+            diff = parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
+            logp += diff
+
+        # likelihood
+        for observed_parameter in self.observed_params.values():
+            logp += observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
+
+        return logp
 
     def log_prob(self, name, theta):
         with self.temporarily_set(name, theta):

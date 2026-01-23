@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Dirichlet, Normal, Mixture, Exponential
-from BayesianDLL import Model, RandomParameter, ObservedParameter, sample
+from BayesianDLL import Model, RandomParameter, ObservedParameter, sample, find_MAP
 from BayesianDLL.Evaluation.Graphics import plot_posterior, plot_model
 
 
@@ -17,7 +17,7 @@ data = torch.cat([
 ])
 
 sampler_params = {"min_step_size": 1e-6, "max_step_size": 10, "delta": 0.6, "gamma": 0.5}
-weight_sampler_params = {"min_step_size": 1e-10, "max_step_size": 10, "delta": 0.6, "gamma": 5}
+weight_sampler_params = {"min_step_size": 1e-6, "max_step_size": 10, "delta": 0.6, "gamma": 0.5, "max_depth": 4}
 
 with Model() as model:
     alpha = 1.5 * torch.ones(K, dtype=torch.float64)
@@ -33,36 +33,44 @@ with Model() as model:
 
     likelihood = ObservedParameter("likelihood", Mixture(components, weights), data.unsqueeze(1))
 
+    plt.figure()
     plot_model(model)
+
+    # make sampling start close to the maximum a posteriori
+    plt.figure()
+    plt.plot(find_MAP(model, lr=1e-2, epochs=350, callback_frequency=35))
+    print(weights.constrained_value)
+    print([mean.constrained_value for mean in means])
+    print([variance.constrained_value for variance in variances])
     plt.show()
 
-    samples = sample(2000, 2000, n_chains=1)
-    samples = {name: value.squeeze(0) for name, value in samples.items()}
+    samples = sample(400, 100, n_chains=2)
 
 plt.figure()
 for k in range(K):
-    plt.hist(samples["weights"][:, k].numpy(), bins=30, density=True, alpha=0.6, label=f"Weight {k}")
+    plt.hist(samples["weights"].flatten(0, 1)[:, k].numpy(), bins=30, density=True, alpha=0.6, label=f"Weight {k}")
 plt.xlabel("Weight value")
 plt.ylabel("Density")
 plt.legend()
 plt.tight_layout()
 
 plt.figure()
-plt.hist(samples["mean1"].numpy(), bins=30, density=True, alpha=0.6, label="Mean 1")
-plt.hist(samples["mean2"].numpy(), bins=30, density=True, alpha=0.6, label="Mean 2")
+plt.hist(samples["mean1"].flatten(0, 1).numpy(), bins=30, density=True, alpha=0.6, label="Mean 1")
+plt.hist(samples["mean2"].flatten(0, 1).numpy(), bins=30, density=True, alpha=0.6, label="Mean 2")
 plt.xlabel("Means")
 plt.ylabel("Density")
 plt.legend()
 plt.tight_layout()
 
 plt.figure()
-plt.hist(samples["variance1"].numpy(), bins=30, density=True, alpha=0.6, label="Variance 1")
-plt.hist(samples["variance2"].numpy(), bins=30, density=True, alpha=0.6, label="Variance 2")
+plt.hist(samples["variance1"].flatten(0, 1).numpy(), bins=30, density=True, alpha=0.6, label="Variance 1")
+plt.hist(samples["variance2"].flatten(0, 1).numpy(), bins=30, density=True, alpha=0.6, label="Variance 2")
 plt.xlabel("Variances")
 plt.ylabel("Density")
 plt.legend()
 plt.tight_layout()
 
-# plot_posterior(samples)
+plt.figure(figsize=(12, 8))
+plot_posterior(samples)
 
 plt.show()

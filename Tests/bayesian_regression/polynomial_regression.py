@@ -32,18 +32,19 @@ with Model() as polynomial_model:
     
     likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
     samples = sample(2000, 1000)
-    posterior_predicative_distribution = posterior_predicative(samples, n_samples=10, samples_per_step=1000, warmup_per_sample=500)
+    # posterior predicative not working currently, as it should generate values for each x
+    # posterior_predicative_distribution = posterior_predicative(samples, n_samples=10, samples_per_step=1000, warmup_per_sample=500)
 
 # print(Evaluation.gelman_rubin(samples, method="classical"))
 # print(Evaluation.gelman_rubin(samples, method="split"))
 # print(Evaluation.gelman_rubin(samples, method="rank"))
 plt.figure(figsize=(12, 8))
 Evaluation.Graphics.plot_posterior(samples)
-plt.figure()
-plt.subplot(1, 2, 1)
-Evaluation.Graphics.plot_predicative_distribution(posterior_predicative_distribution, y, kind="pdf", method="hist")
-plt.subplot(1, 2, 2)
-Evaluation.Graphics.plot_predicative_distribution(posterior_predicative_distribution, y, kind="cdf", method="hist")
+# plt.figure()
+# plt.subplot(1, 2, 1)
+# Evaluation.Graphics.plot_predicative_distribution(posterior_predicative_distribution, y, kind="pdf", method="hist")
+# plt.subplot(1, 2, 2)
+# Evaluation.Graphics.plot_predicative_distribution(posterior_predicative_distribution, y, kind="cdf", method="hist")
 
 plt.figure(figsize=(10, 6))
 plt.plot(x, y, 'o', label="Observed data", alpha=0.6)
