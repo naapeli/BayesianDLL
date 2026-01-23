@@ -39,7 +39,8 @@ class Distribution(ABC):
 
         x_constrained = self.transform.inverse(x_unconstrained)
         jacobian = self.transform.derivative(x_unconstrained)
-        log_det_abs_jacobian = torch.linalg.slogdet(jacobian).logabsdet
+        # log_det_abs_jacobian = torch.linalg.slogdet(jacobian).logabsdet
+        log_det_abs_jacobian = torch.log(torch.abs(torch.linalg.det(jacobian)) + 1e-8)  # if the determinant is zero, the logabsdet does not go to negative infinity
         return self.log_pdf(x_constrained).squeeze(1) + log_det_abs_jacobian  # (n_samples,)
     
     def _log_prob_grad_unconstrained(self, x_unconstrained):

@@ -1,7 +1,7 @@
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL.Distributions import Normal, HalfCauchy, Independent
+from BayesianDLL.Distributions import Normal, HalfCauchy
 from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, sample, sample_posterior_predicative
 from BayesianDLL.Evaluation import Graphics
 
@@ -25,10 +25,11 @@ with Model() as linear_model:
     # make the transform for the predicted line
     mu = DeterministicParameter("mu", lambda b, m: m * x + b, lambda b, m: {"slope": x, "intercept": torch.ones_like(x)}, [prior_intercept, prior_slope])
     
-    likelihood = ObservedParameter("likelihood", Independent(Normal(mu, prior_sigma), dims=0), y)  # TODO: cannot use Independent as we do not want to sum over the samples during posterior predicative sampling
+    likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
     
     samples = sample(1000, 1000, n_chains=2)
-    posterior_predicative_samples = sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=500)
+    # sample posterior predicative does not currently work as likelihood should return multidimensional values (one for every x)
+    # posterior_predicative_samples = sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=500)
     # print(posterior_predicative_samples, posterior_predicative_samples["likelihood"].shape)
     # plt.plot(posterior_predicative_samples["likelihood"][:, :, 0].T)
     # plt.show()
@@ -40,8 +41,8 @@ Graphics.plot_model(linear_model)
 plt.figure()
 Graphics.plot_posterior(samples)
 
-plt.figure()
-Graphics.plot_predicative_distribution(posterior_predicative_samples, y, method="kde")
+# plt.figure()
+# Graphics.plot_predicative_distribution(posterior_predicative_samples, y, method="kde")
 
 
 x = x.squeeze()
