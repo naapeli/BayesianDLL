@@ -13,8 +13,7 @@ class Distribution(ABC):
         self.transform = transform
         self.state_space = state_space
         self.transformed_state_space = transformed_state_space
-        self.random_parameters = set()  # used to store the random variables the distribution depends on
-        self.deterministic_parameters = set()
+        self.parameters = set()
 
     @abstractmethod
     def pdf(self, x_constrained):
@@ -31,9 +30,6 @@ class Distribution(ABC):
     @abstractmethod
     def log_pdf_param_grads(self, x_constrained):
         pass
-
-    def _depends_on_random_variable(self, name):
-        return name in self.random_parameters
 
     def _log_prob_unconstrained(self, x_unconstrained):
         if not isinstance(x_unconstrained, torch.Tensor):
@@ -65,8 +61,7 @@ class Distribution(ABC):
         return name
     
     def add_dependency(self, parameter):
-        if isinstance(parameter, RandomParameter): self.random_parameters.add(parameter.name)
-        if isinstance(parameter, DeterministicParameter): self.deterministic_parameters.add(parameter.name)
+        if isinstance(parameter, RandomParameter | DeterministicParameter): self.parameters.add(parameter.name)
 
 
 # ========================= CONTINUOUS =========================
@@ -698,7 +693,7 @@ class DiscreteUniform(Distribution):
         raise RuntimeError("The parameters of the discrete uniform distribution are not differentiable. Consider using the metropolis sampler instead of NUTS if the likelihood is uniform.")
 
 
-# ========================= Mixture of distributions =========================
+# ========================= Miscellaneous distributions =========================
 class Mixture(Distribution):
     def __init__(self, components, weights):
         super().__init__(IdentityTransform(), Union(*[component.state_space for component in components]), Union(*[component.transformed_state_space for component in components]))
@@ -709,10 +704,8 @@ class Mixture(Distribution):
         # Add the dependencies of this class
         self.add_dependency(weights)
         for component in components:
-            for param in component.random_parameters:
-                self.random_parameters.add(param)
-            for param in component.deterministic_parameters:
-                self.deterministic_parameters.add(param)
+            for param in component.parameters:
+                self.parameters.add(param)
 
     def pdf(self, x):
         if not isinstance(x, torch.Tensor):
@@ -778,6 +771,36 @@ class Mixture(Distribution):
             for name, gradient in param_grads.items():
                 grads[name] = grads.get(name, 0) + coefficient * gradient  # if two distributions have the same parameter, accumulate the result
         return grads
+
+# class Independent(Distribution):
+#     def __init__(self, base_distribution, dims=-1):
+#         super().__init__(base_distribution.transform, base_distribution.state_space, base_distribution.transformed_state_space)
+#         self.base_distribution = base_distribution
+#         if isinstance(dims, tuple):
+#             for dim in dims:
+#                 if not isinstance(dim, int):
+#                     raise ValueError("dims must be an integer or a tuple of integers")
+#             self.dims = dims
+#         elif isinstance(dims, int):
+#             self.dims = (dims,)
+#         else:
+#             raise ValueError("dims must be an integer or a tuple of integers")
+#         for param in base_distribution.parameters:
+#             self.parameters.add(param)
+
+#     def log_pdf(self, x):
+#         log_probs = self.base_distribution.log_pdf(x)
+#         return torch.sum(log_probs, dim=self.dims, keepdim=True)
+
+#     def pdf(self, x):
+#         return torch.exp(self.log_pdf(x))
+
+#     def log_pdf_grad(self, x):
+#         return torch.sum(self.base_distribution.log_pdf_grad(x), dim=self.dims, keepdim=True)
+
+#     def log_pdf_param_grads(self, x):
+#         return self.base_distribution.log_pdf_param_grads(x)
+
 
 def _logsumexp(log_values, dim=0):
     max_val, _ = torch.max(log_values, dim=dim, keepdim=True)

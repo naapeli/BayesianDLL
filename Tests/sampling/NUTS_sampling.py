@@ -77,8 +77,8 @@ distribution = Normal(0, 1)
 theta_init = torch.tensor(0.1, dtype=torch.float64)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000)["sample"]
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
+    samples = sample(n, 1000, n_chains=1)["sample"]
+plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(-10, 20, 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
@@ -88,8 +88,8 @@ distribution = Normal(5, 3)
 theta_init = torch.tensor(0.1, dtype=torch.float64)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000)["sample"]
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
+    samples = sample(n, 1000, n_chains=1)["sample"]
+plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(-10, 20, 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
@@ -100,8 +100,8 @@ distribution = Beta(2, 5)
 theta_init = torch.tensor(0.5, dtype=torch.float64)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000)["sample"]
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
+    samples = sample(n, 1000, n_chains=1)["sample"]
+plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0, 1, 100).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
@@ -111,8 +111,8 @@ distribution = Beta(0.5, 0.5)
 theta_init = torch.tensor(0.5, dtype=torch.float64)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts", gamma=5, delta=0.9)
-    samples = sample(n, 2000)["sample"]
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
+    samples = sample(n, 1000, n_chains=1)["sample"]
+plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0.01, 0.99, 100).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
@@ -123,8 +123,8 @@ distribution = Exponential(0.3)
 theta_init = torch.tensor(2, dtype=torch.float64)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000)["sample"]
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
+    samples = sample(n, 1000, n_chains=1)["sample"]
+plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0, 20, 100).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
@@ -136,8 +136,8 @@ distribution = Uniform(2, 5)
 theta_init = torch.tensor(3, dtype=torch.float64)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000)["sample"]
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
+    samples = sample(n, 1000, n_chains=1)["sample"]
+plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0, 7, 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
@@ -149,13 +149,13 @@ distribution = InvGamma(3, 6)
 theta_init = torch.tensor(1, dtype=torch.float64)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000)["sample"]
+    samples = sample(n, 1000, n_chains=1)["sample"]
 plt.xscale("log")
 plt.yscale("log")
 xmin = samples.min().item()
 xmax = samples.max().item()
 bin_edges = np.logspace(np.log10(xmin), np.log10(xmax), bins)
-plt.hist(samples.numpy(), bins=bin_edges, alpha=0.5, density=True)
+plt.hist(samples.squeeze().numpy(), bins=bin_edges, alpha=0.5, density=True)
 x = torch.logspace(torch.log10(torch.tensor(xmin)), torch.log10(torch.tensor(xmax)), 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x.numpy(), y.numpy())
@@ -166,13 +166,13 @@ distribution = HalfCauchy(2)
 theta_init = torch.tensor(1, dtype=torch.float64)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000)["sample"]
+    samples = sample(n, 1000, n_chains=1)["sample"]
 plt.xscale("log")
 plt.yscale("log")
 xmin = samples.min().item()
 xmax = samples.max().item()
 bin_edges = np.logspace(np.log10(xmin), np.log10(xmax), bins)
-plt.hist(samples.numpy(), bins=bin_edges, alpha=0.5, density=True)
+plt.hist(samples.squeeze().numpy(), bins=bin_edges, alpha=0.5, density=True)
 x = torch.logspace(torch.log10(torch.tensor(xmin)), torch.log10(torch.tensor(xmax)), 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x.numpy(), y.numpy())
@@ -188,7 +188,7 @@ theta_init[0], theta_init[1] = 2, -10  # make the initial point in an area with 
 theta_init = torch.softmax(theta_init, dim=0)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts", gamma=5)
-    samples = sample(max(n // 20, 100), 2000)["sample"]
+    samples = sample(max(n // 20, 100), 2000, n_chains=1)["sample"].squeeze()
 def project_to_2d(points):
     v1 = torch.tensor([0.0, 0.0])
     v2 = torch.tensor([1.0, 0.0])
@@ -231,8 +231,8 @@ distribution = Mixture(components, weights)
 theta_init = torch.tensor(0, dtype=torch.float64)
 with Model() as model:
     RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000)["sample"]
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
+    samples = sample(n, 1000, n_chains=1)["sample"]
+plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(-5, 5, 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)

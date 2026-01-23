@@ -3,20 +3,21 @@ import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Dirichlet, Normal, Mixture, Exponential
 from BayesianDLL import Model, RandomParameter, ObservedParameter, sample
+from BayesianDLL.Evaluation.Graphics import plot_posterior, plot_model
 
 
 torch.manual_seed(0)
 
 K = 2
 n = 200
-true_weights = torch.tensor([0.6, 0.4])
+true_weights = [0.6, 0.4]
 data = torch.cat([
     torch.normal(-1, 0.5, size=(int(true_weights[0] * n),), dtype=torch.float64),
     torch.normal(2, 1, size=(int(true_weights[1] * n),), dtype=torch.float64)
 ])
 
-sampler_params = {"min_step_size": 1e-6, "max_step_size": 10, "delta": 0.6, "gamma": 0.5}  # mainly decrease the minimum step size for more accurate, but slower sampling. Also increase gamma for faster step size adaptation during warmup
-weight_sampler_params = {"min_step_size": 1e-10, "max_step_size": 10, "delta": 0.9, "gamma": 5}
+sampler_params = {"min_step_size": 1e-6, "max_step_size": 10, "delta": 0.6, "gamma": 0.5}
+weight_sampler_params = {"min_step_size": 1e-10, "max_step_size": 10, "delta": 0.6, "gamma": 5}
 
 with Model() as model:
     alpha = 1.5 * torch.ones(K, dtype=torch.float64)
@@ -27,13 +28,16 @@ with Model() as model:
 
     means = [RandomParameter("mean" + str(i + 1), Normal(0, 10), torch.randn(size=(1,), dtype=torch.float64), **sampler_params) for i in range(K)]
     variances = [RandomParameter("variance" + str(i + 1), Exponential(0.5), torch.rand(size=(1,), dtype=torch.float64) + 1, **sampler_params) for i in range(K)]
-    # variances = [0.5 ** 2 for _ in range(K)]
 
     components = [Normal(mu, cov) for mu, cov in zip(means, variances)]
 
     likelihood = ObservedParameter("likelihood", Mixture(components, weights), data.unsqueeze(1))
 
-    samples = sample(2000, 2000)
+    plot_model(model)
+    plt.show()
+
+    samples = sample(2000, 2000, n_chains=1)
+    samples = {name: value.squeeze(0) for name, value in samples.items()}
 
 plt.figure()
 for k in range(K):
@@ -58,5 +62,7 @@ plt.xlabel("Variances")
 plt.ylabel("Density")
 plt.legend()
 plt.tight_layout()
+
+# plot_posterior(samples)
 
 plt.show()

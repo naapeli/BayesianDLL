@@ -1,5 +1,7 @@
 import torch
 from contextlib import contextmanager
+from networkx import DiGraph
+from collections import deque
 
 from ._active_model import _active_model
 
@@ -8,6 +10,7 @@ class Model:
         self.params = {}
         self.observed_params = {}
         self.deterministic_params = {}
+        self.graph = DiGraph()
 
     def __enter__(self):
         _active_model._active_model = self
@@ -16,17 +19,44 @@ class Model:
     def __exit__(self, exc_type, exc_val, exc_tb):
         _active_model._active_model = None
 
+    # def log_prob(self, name, theta):
+    #     with self.temporarily_set(name, theta):
+    #         logp = 0.0
+    #         # priors
+    #         for parameter in self.params.values():
+    #             logp += parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
+
+    #         # likelihood
+    #         for observed_parameter in self.observed_params.values():
+    #             logp += observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
+        
+    #     return logp
+
     def log_prob(self, name, theta):
         with self.temporarily_set(name, theta):
-            logp = 0.0
-            # priors
-            for parameter in self.params.values():
-                logp += parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
+            logp = 0
+            node_queue = deque()
+            node_queue.append(name)
+            visited = set(name)
 
-            # likelihood
-            for observed_parameter in self.observed_params.values():
-                logp += observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
-        
+            while node_queue:
+                name = node_queue.popleft()
+                if name in self.params:
+                    parameter = self.params[name]
+                    logp += parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
+                elif name in self.observed_params:
+                    observed_parameter = self.observed_params[name]
+                    logp += observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
+                elif name in self.deterministic_params:
+                    pass
+                else:
+                    raise RuntimeError(f"Node {parameter} not in the compute graph")
+                
+                for param in self.graph.successors(name):
+                    if param not in visited:
+                        visited.add(param)
+                        node_queue.append(param)
+
         return logp
 
     @contextmanager
@@ -40,25 +70,43 @@ class Model:
 
     def grad_log_prob(self, name, theta):
         with self.temporarily_set(name, theta):
-            grad = torch.zeros_like(theta)
+            if name not in self.params:
+                raise RuntimeError("One is only able to compute the derivative with respect to a RandomParameter.")
+            
             param = self.params[name]
+            grad = param.distribution._log_prob_grad_unconstrained(param.unconstrained_value)
 
-            # handle the observed parameters
-            for observed_parameter in self.observed_params.values():
+            stack = [(name, torch.eye(param.unconstrained_value.numel(), dtype=param.unconstrained_value.dtype))]
 
-                # if the observed depends on deterministic parameters
-                for deterministic_parameter_name in observed_parameter.distribution.deterministic_parameters:
-                    for _ in [input.name for input in self.deterministic_params[deterministic_parameter_name].inputs if input.name == name]:
-                        distribution_grad = (self.deterministic_params[deterministic_parameter_name].derivative(name).T @ observed_parameter.distribution.log_pdf_param_grads(observed_parameter.observed_values)[deterministic_parameter_name]).T
-                        transform_jacobian = param.distribution.transform.derivative(param.unconstrained_value)
-                        grad += torch.matmul(distribution_grad.unsqueeze(1), transform_jacobian).squeeze(1)
+            while stack:
+                current_name, chain_derivative = stack.pop()
 
-                # otherwise if the observed depends straight up on the random variable
-                if observed_parameter.distribution._depends_on_random_variable(name):
-                    distribution_grad = observed_parameter.distribution.log_pdf_param_grads(observed_parameter.observed_values)[name].sum(dim=0, keepdim=True)
-                    transform_jacobian = param.distribution.transform.derivative(param.unconstrained_value)
-                    grad += torch.matmul(distribution_grad.unsqueeze(1), transform_jacobian).squeeze(1)
+                for successor_name in self.graph.successors(current_name):
+                    if successor_name in self.params:
+                        successor_param = self.params[successor_name]
+                        local_grad = successor_param.distribution.log_pdf_param_grads(successor_param.constrained_value)[current_name]
+                        grad = grad + local_grad @ chain_derivative
 
-            grad += param.distribution._log_prob_grad_unconstrained(param.unconstrained_value)
-        
+                    elif successor_name in self.observed_params:
+                        successor_param = self.observed_params[successor_name]
+                        if current_name == name:  # does not depend on a DeterministicParameter
+                            distribution_grad = successor_param.distribution.log_pdf_param_grads(successor_param.observed_values)[current_name].sum(dim=0, keepdim=True)
+                            transform_jacobian = param.distribution.transform.derivative(param.unconstrained_value)
+                            grad = grad + distribution_grad @ transform_jacobian.squeeze(0)
+                            break
+                        else:  # depends on a DeterministicParameter
+                            distribution_grad = successor_param.distribution.log_pdf_param_grads(successor_param.observed_values)[current_name]
+                            transformed_grad = distribution_grad.T @ chain_derivative
+                            transform_jacobian = param.distribution.transform.derivative(param.unconstrained_value)
+                            grad = grad + transformed_grad @ transform_jacobian.squeeze(0)
+                            break
+
+                    elif successor_name in self.deterministic_params:
+                        deterministic_param = self.deterministic_params[successor_name]
+                        deterministic_derivative = deterministic_param.derivative(current_name)
+                        stack.append((successor_name, deterministic_derivative @ chain_derivative.T))
+
+                    else:
+                        raise RuntimeError(f"Node {successor_name} not in the compute graph")
+
         return grad

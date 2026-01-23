@@ -3,10 +3,11 @@ import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, InvGamma
 from BayesianDLL import Model, RandomParameter, ObservedParameter, sample
-from BayesianDLL.Evaluation.Graphics import plot_posterior
+from BayesianDLL.Evaluation.Graphics import plot_posterior, plot_model
+from BayesianDLL.Evaluation import effective_sample_size, gelman_rubin
 
 
-torch.manual_seed(7)
+torch.manual_seed(0)
 N = 100
 mu0 = 0
 tau = 10
@@ -21,7 +22,14 @@ with Model() as model:
     prior_variance = RandomParameter("variance", InvGamma(a, b), torch.ones(1, dtype=torch.float64), sampler="nuts")
 
     likelihood = ObservedParameter("likelihood", Normal(prior_mean, prior_variance), data)
+    plt.figure()
+    plot_model(model)
     samples = sample(500, 500, n_chains=2)
 
+ess = effective_sample_size(samples)
+print(ess)
+print(gelman_rubin(samples))
+
+plt.figure()
 plot_posterior(samples, method="kde")
 plt.show()

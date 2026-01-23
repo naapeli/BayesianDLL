@@ -1,8 +1,9 @@
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL.Distributions import Normal, HalfCauchy
-from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, sample
+from BayesianDLL.Distributions import Normal, HalfCauchy, Independent
+from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, sample, sample_posterior_predicative
+from BayesianDLL.Evaluation import Graphics
 
 
 torch.manual_seed(7)
@@ -17,59 +18,48 @@ y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size
 
 with Model() as linear_model:
     # Priors
-    prior_intercept = RandomParameter("intercept", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto")
-    prior_slope = RandomParameter("slope", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto")
+    prior_intercept = RandomParameter("intercept", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto", delta=0.4)
+    prior_slope = RandomParameter("slope", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto", delta=0.4)
     prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.tensor([1], dtype=torch.float64), sampler="auto")
 
     # make the transform for the predicted line
     mu = DeterministicParameter("mu", lambda b, m: m * x + b, lambda b, m: {"slope": x, "intercept": torch.ones_like(x)}, [prior_intercept, prior_slope])
     
-    likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
-    samples = sample(1000, 1000, n_chains=1)
+    likelihood = ObservedParameter("likelihood", Independent(Normal(mu, prior_sigma), dims=0), y)  # TODO: cannot use Independent as we do not want to sum over the samples during posterior predicative sampling
+    
+    samples = sample(1000, 1000, n_chains=2)
+    posterior_predicative_samples = sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=500)
+    # print(posterior_predicative_samples, posterior_predicative_samples["likelihood"].shape)
+    # plt.plot(posterior_predicative_samples["likelihood"][:, :, 0].T)
+    # plt.show()
 
-intercept_samples = samples["intercept"].squeeze()
-slope_samples = samples["slope"].squeeze()
-sigma_samples = samples["sigma"].squeeze()
 
-# Plotting
-plt.figure(figsize=(10, 6))
-plt.subplot(2, 2, 1)
-plt.hist(intercept_samples.numpy(), bins=50, density=True)
-plt.title("Posterior of Intercept")
+plt.figure()
+Graphics.plot_model(linear_model)
 
-plt.subplot(2, 2, 2)
-plt.hist(slope_samples.numpy(), bins=50, density=True)
-plt.title("Posterior of Slope")
+plt.figure()
+Graphics.plot_posterior(samples)
 
-plt.subplot(2, 2, 3)
-plt.hist(sigma_samples.numpy(), bins=50, density=True)
-plt.title("Posterior of Sigma")
-
-plt.subplot(2, 2, 4)
-plt.plot(intercept_samples, label="intercept")
-plt.plot(slope_samples, label="slope")
-plt.plot(sigma_samples, label="sigma")
-plt.legend()
-plt.title("Trace Plots")
-plt.tight_layout()
-plt.savefig("Tests/bayesian_regression/linear_trace_plots_and_posteriors.png")
+plt.figure()
+Graphics.plot_predicative_distribution(posterior_predicative_samples, y, method="kde")
 
 
 x = x.squeeze()
-y_preds = slope_samples[:, None] * x[None, :] + intercept_samples[:, None]
+y_preds = samples["slope"][0, :, None] * x[None, :] + samples["intercept"][0, :, None]
+y_preds = y_preds.squeeze()
 y_mean = y_preds.mean(dim=0)
 y_lower = y_preds.quantile(0.025, dim=0)
 y_upper = y_preds.quantile(0.975, dim=0)
+std = samples["sigma"].mean().sqrt()
 
 plt.figure(figsize=(10, 6))
 plt.plot(x, y, 'o', label="Observed data", alpha=0.6)
 plt.plot(x, y_mean, label="Posterior mean", color="black")
-plt.fill_between(x.numpy(), y_lower.numpy(), y_upper.numpy(), color='gray', alpha=0.4, label="95% CI")
-plt.title("Posterior Predictive with 95% Credible Interval")
+plt.fill_between(x, y_lower, y_upper, color="blue", alpha=0.2, label="95% CI for mean")
+plt.fill_between(x, y_mean - 1.96 * std, y_mean + 1.96 * std, color="blue", alpha=0.2, label="95% CI for data points")
 plt.xlabel("x")
 plt.ylabel("y")
 plt.legend()
 plt.tight_layout()
-plt.savefig("Tests/bayesian_regression/linear_fit.png")
 
 plt.show()

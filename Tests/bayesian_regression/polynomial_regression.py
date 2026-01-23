@@ -23,7 +23,6 @@ x_scaled = (x - xmin) / (xmax - xmin) * 2 - 1  # Scaling to [-1, 1] for Chebyshe
 phi_x = torch.stack([torch.cos(i * torch.acos(x_scaled)) for i in range(D + 1)], dim=1).to(torch.float64)  # Chebysev basis functions
 
 with Model() as polynomial_model:
-    # Priors
     prior_mean = torch.zeros(D + 1, dtype=torch.float64)
     prior_cov = torch.eye(D + 1, dtype=torch.float64)
     prior_coeffs = RandomParameter("coeffs", MultivariateNormal(prior_mean, prior_cov), torch.randn_like(prior_mean, dtype=torch.float64), min_step_size=1e-1)
@@ -33,14 +32,17 @@ with Model() as polynomial_model:
     
     likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
     samples = sample(2000, 1000)
-    posterior_predicative_distribution = posterior_predicative(samples, n_samples=1, samples_per_step=500, warmup_per_sample=100)
+    posterior_predicative_distribution = posterior_predicative(samples, n_samples=10, samples_per_step=1000, warmup_per_sample=500)
 
 # print(Evaluation.gelman_rubin(samples, method="classical"))
 # print(Evaluation.gelman_rubin(samples, method="split"))
 # print(Evaluation.gelman_rubin(samples, method="rank"))
 plt.figure(figsize=(12, 8))
 Evaluation.Graphics.plot_posterior(samples)
+plt.figure()
+plt.subplot(1, 2, 1)
 Evaluation.Graphics.plot_predicative_distribution(posterior_predicative_distribution, y, kind="pdf", method="hist")
+plt.subplot(1, 2, 2)
 Evaluation.Graphics.plot_predicative_distribution(posterior_predicative_distribution, y, kind="cdf", method="hist")
 
 plt.figure(figsize=(10, 6))
@@ -63,6 +65,5 @@ plt.xlabel("x")
 plt.ylabel("y")
 plt.legend()
 plt.tight_layout()
-plt.savefig("Tests/bayesian_regression/polynomial_fit.png")
 
 plt.show()

@@ -14,7 +14,7 @@ p = 0.5
 with Model() as model:
     prior = RandomParameter("prior", DiscreteUniform(0, 10), torch.tensor(1, dtype=torch.float64))
     likelihood = ObservedParameter("likelihood", Binomial(prior, p), data)
-    samples = sample(1000, 500)["prior"]
+    samples = sample(1000, 500, n_chains=1)["prior"]
 
 samples = samples.squeeze().int()
 counts = Counter(samples.tolist())

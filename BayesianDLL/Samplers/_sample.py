@@ -18,7 +18,10 @@ def sample(n_samples, warmup_length, n_chains=2, model=None, progress_bar=True, 
     trace = {name: torch.empty(size=(n_chains, n_samples, parameter.constrained_value.size(1)), dtype=parameter.unconstrained_value.dtype) for name, parameter in model.params.items()}
     for chain in range(n_chains):
         for name, parameter in model.params.items():
-            parameter.set_unconstrained_value(initial_values[name] + start_point_variance * torch.randn_like(initial_values[name]))
+            value = initial_values[name]
+            if parameter.distribution.state_space.is_continuous():
+                value += start_point_variance * torch.randn_like(initial_values[name])
+            parameter.set_unconstrained_value(value)
         
         # TODO: reset the states of the samplers for each chain instead of reinitializing them
         samplers = {}
@@ -45,10 +48,11 @@ def sample(n_samples, warmup_length, n_chains=2, model=None, progress_bar=True, 
                 model.params[name].set_unconstrained_value(new_theta)
                 if m > warmup_length: trace[name][chain, m - warmup_length - 1] = model.params[name].constrained_value
 
-    r_hats = gelman_rubin(trace)
-    for name, statistics in r_hats.items():
-        if torch.any(statistics > 1.1):
-            warn(f"The gelman-Ruben statistic of {name} is above 1.1 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
+    if n_chains > 1:
+        r_hats = gelman_rubin(trace)
+        for name, statistics in r_hats.items():
+            if torch.any(statistics > 1.01):
+                warn(f"The gelman-Ruben statistic of {name} is above 1.01 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
 
     return trace
 
@@ -67,21 +71,21 @@ def _decide_step(model, parameter):
     sampler.init_sampler()
     return sampler
 
-def sample_posterior_predicative(n_samples, warmup_length, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
+def sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
     model = _active_model._active_model if model is None else model
     trace = sample(n_samples, warmup_length, 1, model, progress_bar)
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
-def posterior_predicative(trace, n_samples, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
+def posterior_predicative(trace, n_samples=20, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
     model = _active_model._active_model if model is None else model
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
-def sample_prior_predicative(n_samples, warmup_length, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
+def sample_prior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
     model = _active_model._active_model if model is None else model
     old_observed = model.observed_params
     model.observed_params = {}  # with prior distributions, one should sample from the priors without the likelihood terms
     trace = sample(n_samples, warmup_length, 1, model, progress_bar)
-    model.observed_params = old_observed
+    model.observed_params = old_observed  # TODO: fix this as model currently uses a graph structure
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
 def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
@@ -94,6 +98,7 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
     samplers = {}
     state_spaces = {}
     for name, parameter in model.observed_params.items():
+        # shape = parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value).shape  # TODO: get the shape (if shape is not (1,) need to modify and change the sampling)
         samplers[name] = _decide_predicative_step(parameter)
         state_spaces[name] = parameter.distribution.transformed_state_space
 
@@ -102,13 +107,16 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
     n_chains, trace_length, _ = next(iter(trace.values())).shape
     if n_chains != 1:
         # raise RuntimeError("n_chains must be 1 in the trace given to sample_predicative.")
+        # TODO: use all of the chains if needed (flatten them out)
         warn("n_chains is larger than one in the trace given to sample_predicative. Only the first chain is used.")
     n_samples = trace_length if n_samples is None else n_samples
     if trace_length < n_samples:
         raise RuntimeError("n_samples must be less than the length of the trace or None.")
 
-    _progress_bar = tqdm(range(n_samples), desc="Predicative sample") if progress_bar else range(n_samples)
-    for i in _progress_bar:
+    # _progress_bar = tqdm(range(n_samples), desc="Predicative sample") if progress_bar else range(n_samples)
+    # for i in _progress_bar:
+    for i in range(n_samples):
+        # print(f"Predicative sample {i + 1}")
         prior_values = {}
         for name, values in trace.items():
             prior_values[name] = values[0, i].unsqueeze(0)
@@ -119,11 +127,25 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
             parameter.set_constrained_value(prior_values[name])
 
         for name, sampler in samplers.items():
+            sampler.reset()
             parameter = model.observed_params[name]
             init_value = parameter.observed_values[0].unsqueeze(0)
             theta = _init_theta(state_spaces[name], init_value.shape, init_value.dtype)
-            for m in range(warmup_per_sample + samples_per_step):
-                theta, _, _ = sampler.step(theta, m < warmup_per_sample)
+            _progress_bar = tqdm(range(1, warmup_per_sample + samples_per_step + 1), bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}") if progress_bar else range(1, warmup_per_sample + samples_per_step + 1)
+            acceptance_probabilities = 0
+            step_size = 1
+            # for m in range(warmup_per_sample + samples_per_step):
+            for m in _progress_bar:
+                if progress_bar:
+                    if m < warmup_per_sample: _progress_bar.set_description(f"{name} predicative sample {i + 1} warmup")
+                    else: _progress_bar.set_description(f"{name} predicative sample {i + 1}")
+                    _progress_bar.set_postfix({
+                        "avg. acc. probs": f"{acceptance_probabilities / m:.3f}",
+                        "step sizes": f"{step_size:.3f}"
+                    })
+                m = m - 1  # shift back to range(0, end) for following logic
+                theta, step_size, acceptance_probability = sampler.step(theta, m < warmup_per_sample)
+                acceptance_probabilities += acceptance_probability
                 if m >= warmup_per_sample:
                     predicative_samples[name][i, m - warmup_per_sample] = theta
 
@@ -147,10 +169,10 @@ def _decide_predicative_step(parameter):
     state_space = parameter.distribution.transformed_state_space
 
     def log_target(x):
-        return parameter.distribution._log_prob_unconstrained(x)  # .sum(dim=0, keepdim=True)  # reduce over the amount of data points
+        return parameter.distribution._log_prob_unconstrained(x)
     if state_space.is_continuous() and (parameter.sampler == "auto" or parameter.sampler == "nuts"):
         def gradient(x):
-            return parameter.distribution._log_prob_grad_unconstrained(x).sum(dim=0, keepdim=True)  # reduce over the amount of data points
+            return parameter.distribution._log_prob_grad_unconstrained(x)
         sampler = NUTS(log_target, gradient, lambda x: x, **parameter.sampler_params)
     elif (state_space.is_discrete() or state_space.is_continuous()) and (parameter.sampler == "auto" or parameter.sampler == "metropolis"):
         sampler = Metropolis(log_target, state_space, **parameter.sampler_params)

@@ -20,6 +20,15 @@ class NUTS:
         self.min_step_size = min_step_size
         self.max_step_size = max_step_size
 
+        # save in case of resetting
+        self._H_bar = H_bar
+        self._step_size_bar = step_size_bar
+
+    def reset(self):
+        if hasattr(self, "step_size"): del self.step_size  # force step to reset things
+        self.H_bar = self._H_bar
+        self.step_size_bar = self._step_size_bar
+
     def leapfrog(self, theta, r, grad, step_size):
         r_prime = r +  0.5 * step_size * grad
         theta_prime = theta + step_size * r_prime
