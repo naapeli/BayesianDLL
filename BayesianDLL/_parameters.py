@@ -73,6 +73,7 @@ class DeterministicParameter:
         self.forward_func = forward_func
         self.derivative_func = derivative_func
         self.inputs = inputs
+        self.owner_model = _active_model._active_model
 
         if _active_model._active_model is not None:
             _active_model._active_model.deterministic_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
@@ -97,13 +98,27 @@ class DeterministicParameter:
         return local_derivative
 
     def _get_constrained_value(self, input):
-        model = _active_model._active_model
+        # model = _active_model._active_model
         if isinstance(input, torch.Tensor):
             return input
         if hasattr(input, "name"):
-            if input.name in model.params:
-                return model.params[input.name].constrained_value
-            elif input.name in model.deterministic_params:
-                return model.deterministic_params[input.name].constrained_value
+            if input.name in self.owner_model.params:
+                return self.owner_model.params[input.name].constrained_value
+            elif input.name in self.owner_model.deterministic_params:
+                return self.owner_model.deterministic_params[input.name].constrained_value
             raise KeyError(f"Parameter '{input.name}' not found in the active model.")
         raise TypeError(f"Parameter {input} has an unkown type.")
+
+class VariationalParameter:
+    def __init__(self, name, value, min=-float("inf"), max=float("inf")):
+        self.name = name
+        self.value = torch.as_tensor(value, dtype=value.dtype if torch.is_tensor(value) else torch.float32).reshape(-1, 1)
+        self.min = min
+        self.max = max
+
+    def __repr__(self):
+        return f"VariationalParameter {self.name}, value: {self.value}, limits: {(self.min, self.max)}"
+
+    def set_new_value(self, value):
+        assert self.value.shape == value.shape and self.value.dtype == value.dtype
+        self.value = torch.clamp(value, self.min, self.max)

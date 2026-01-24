@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 
 from ._transforms import IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform
 from ._state_space import ContinuousReal, ContinuousPositive, ContinuousRange, ContinuousSimplex, DiscretePositive, DiscreteRange, Union
-from .._parameters import RandomParameter, DeterministicParameter
+from .._parameters import RandomParameter, DeterministicParameter, VariationalParameter
 from ._resolve import resolve
 
 
@@ -14,6 +14,7 @@ class Distribution(ABC):
         self.state_space = state_space
         self.transformed_state_space = transformed_state_space
         self.parameters = set()
+        self.variational_parameters = dict()
 
     @abstractmethod
     def pdf(self, x_constrained):
@@ -57,12 +58,15 @@ class Distribution(ABC):
         return term1 + d_log_det_jacobian
     
     def resolve_name(self, name, parameter):
-        if isinstance(parameter, RandomParameter | DeterministicParameter):
+        if isinstance(parameter, RandomParameter | DeterministicParameter | VariationalParameter):
             return parameter.name
         return name
     
     def add_dependency(self, parameter):
-        if isinstance(parameter, RandomParameter | DeterministicParameter): self.parameters.add(parameter.name)
+        if isinstance(parameter, RandomParameter | DeterministicParameter):
+            self.parameters.add(parameter.name)
+        if isinstance(parameter, VariationalParameter):
+            self.variational_parameters[parameter.name] = parameter
 
 
 # ========================= CONTINUOUS =========================
@@ -116,6 +120,22 @@ class Normal(Distribution):
         grad_mu = diff / variance
         grad_var = 0.5 * (diff ** 2 / variance ** 2 - 1 / variance)
         return {self.resolve_name("mean", self.mu): grad_mu, self.resolve_name("variance", self.variance): grad_var}
+
+    def sample(self, n_samples=1, _reparametrization_trick_grad=False):
+        mu = resolve(self.mu)
+        variance = resolve(self.variance)
+
+        eps = torch.randn((n_samples, *mu.shape[1:]), dtype=mu.dtype)
+        # rand = torch.rand(size=(n_samples, 12), dtype=mu.dtype)
+        # eps = rand.sum(dim=1) - 6
+
+        samples = mu + eps * torch.sqrt(variance)
+        if _reparametrization_trick_grad:
+            grad_mu = torch.ones_like(eps)
+            grad_var = eps / (2 * torch.sqrt(variance))
+            return samples, {self.resolve_name("mean", self.mu): grad_mu, self.resolve_name("variance", self.variance): grad_var}
+        return samples
+
 
 class MultivariateNormal(Distribution):
     def __init__(self, mu, covariance):
@@ -302,6 +322,18 @@ class Exponential(Distribution):
         mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         grad_rate = torch.where(mask, grad_rate, torch.full_like(grad_rate, torch.nan))
         return {self.resolve_name("rate", self.rate): grad_rate}
+    
+    def sample(self, n_samples=1, _reparametrization_trick_grad=False):
+        rate = resolve(self.rate)
+
+        eps = torch.rand(size=(n_samples, *rate.shape[1:]), dtype=rate.dtype)
+        log_eps = torch.log(eps)
+
+        samples = -1 / rate * log_eps
+        if _reparametrization_trick_grad:
+            grad_rate = log_eps / rate ** 2
+            return samples, {self.resolve_name("rate", self.rate): grad_rate}
+        return samples
 
 class Uniform(Distribution):
     def __init__(self, low, high):

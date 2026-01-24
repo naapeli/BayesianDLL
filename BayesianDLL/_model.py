@@ -20,19 +20,6 @@ class Model:
     def __exit__(self, exc_type, exc_val, exc_tb):
         _active_model._active_model = None
 
-    # def log_prob(self, name, theta):
-    #     with self.temporarily_set(name, theta):
-    #         logp = 0.0
-    #         # priors
-    #         for parameter in self.params.values():
-    #             logp += parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
-
-    #         # likelihood
-    #         for observed_parameter in self.observed_params.values():
-    #             logp += observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
-        
-    #     return logp
-
     def model_log_prob(self):
         logp = 0.0
         # priors
@@ -81,6 +68,18 @@ class Model:
             yield
         finally:
             self.params[name].set_unconstrained_value(old_value)
+    
+    @contextmanager
+    def temporarily_set_many(self, values):
+        try:
+            old_values = {}
+            for name, value in values.items():
+                old_values[name] = self.params[name].unconstrained_value
+                self.params[name].set_unconstrained_value(value)
+            yield
+        finally:
+            for name, old_value in old_values.items():
+                self.params[name].set_unconstrained_value(old_value)
 
     def grad_log_prob(self, name, theta):
         with self.temporarily_set(name, theta):
@@ -124,3 +123,7 @@ class Model:
                         raise RuntimeError(f"Node {successor_name} not in the compute graph")
 
         return grad
+
+
+class MeanFieldGuide(Model):
+    pass
