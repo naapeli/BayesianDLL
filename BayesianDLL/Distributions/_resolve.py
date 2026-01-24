@@ -1,5 +1,5 @@
 import torch
-from .. import RandomParameter, DeterministicParameter
+from .. import RandomParameter, DeterministicParameter, VariationalParameter
 
 
 def resolve(parameter):
@@ -7,6 +7,8 @@ def resolve(parameter):
         return parameter
     elif isinstance(parameter, RandomParameter | DeterministicParameter):
         return parameter.constrained_value
+    elif isinstance(parameter, VariationalParameter):
+         return parameter.value
     elif isinstance(parameter, int | float):
         return torch.as_tensor(parameter)
     elif isinstance(parameter, list | tuple):

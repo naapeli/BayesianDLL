@@ -1,4 +1,4 @@
-from ._model import Model
-from ._parameters import RandomParameter, ObservedParameter, DeterministicParameter
+from ._model import Model, MeanFieldGuide
+from ._parameters import RandomParameter, ObservedParameter, DeterministicParameter, VariationalParameter
 from .Samplers import sample, sample_predicative, sample_prior_predicative, sample_posterior_predicative, posterior_predicative
 from .Variational import find_MAP
