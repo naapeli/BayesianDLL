@@ -3,7 +3,7 @@ from . import elbo
 from .. import Model, MeanFieldGuide
 
 
-def BBVI(model: Model, guide: MeanFieldGuide, n_samples=100, epochs=100, lr=1e-2, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
+def BBVI(model: Model, guide: MeanFieldGuide, n_samples=1, epochs=100, lr=1e-2, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
     """
     Black-box variational inference using Monte Carlo ELBO and score-function gradients.
     
