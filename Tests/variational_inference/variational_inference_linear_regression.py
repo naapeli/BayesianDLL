@@ -29,20 +29,20 @@ with Model() as linear_model:
     likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
 
 with MeanFieldGuide() as guide:
-    RandomParameter("intercept", Normal(VariationalParameter("mean", torch.zeros(1).double()), VariationalParameter("variance", torch.ones(1).double(), min=1e-8)), torch.zeros(1).double())
-    RandomParameter("slope", Normal(VariationalParameter("mean", torch.zeros(1).double()), VariationalParameter("variance", torch.ones(1).double(), min=1e-8)), torch.zeros(1).double())
-    RandomParameter("sigma", Exponential(VariationalParameter("scale", torch.full((1,), 100).double(), min=1e-8)), torch.ones(1).double())
+    RandomParameter("intercept", Normal(VariationalParameter("mean", torch.full((1,), 0).double()), VariationalParameter("variance", torch.full((1,), 1).double(), min=1e-8)), torch.zeros(1).double())
+    RandomParameter("slope", Normal(VariationalParameter("mean", torch.full((1,), 0).double()), VariationalParameter("variance", torch.full((1,), 1).double(), min=1e-8)), torch.zeros(1).double())
+    RandomParameter("sigma", Exponential(VariationalParameter("scale", torch.full((1,), 1).double(), min=1e-8)), torch.ones(1).double())
 
-history = BBVI(linear_model, guide, n_samples=1, epochs=10000, callback_frequency=10, lr=1e-2)
+history = BBVI(linear_model, guide, n_samples=1, epochs=5000, callback_frequency=10, lr=1e-2)
 plt.figure()
-plt.plot(history)
+plt.semilogy([-elbo for elbo in history])
 
 print(guide.params["intercept"].distribution.variational_parameters)
 print(guide.params["slope"].distribution.variational_parameters)
 print(guide.params["sigma"].distribution.variational_parameters)
 
 
-samples = sample(n_samples=500, warmup_length=200, n_chains=2, model=guide)  # sample from the fitted guide
+samples = sample(n_samples=1000, warmup_length=500, n_chains=2, model=guide)  # sample from the fitted guide
 
 x = x.squeeze()
 y_preds = samples["slope"][0, :, None] * x[None, :] + samples["intercept"][0, :, None]

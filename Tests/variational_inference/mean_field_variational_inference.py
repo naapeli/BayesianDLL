@@ -17,11 +17,11 @@ with Model() as model:
     RandomParameter("mixture", distribution, theta_init, sampler="nuts")
 
 with MeanFieldGuide() as guide:
-    mean = VariationalParameter("mean", 0)
-    variance = VariationalParameter("variance", 1)
+    mean = VariationalParameter("mean", 10)
+    variance = VariationalParameter("variance", 10)
     RandomParameter("mixture", Normal(mean, variance), initial_value=torch.zeros(1))
 
-history = BBVI(model, guide, n_samples=1000, epochs=140, callback_frequency=20)
+history = BBVI(model, guide, epochs=3000, callback_frequency=20)
 
 plt.figure()
 plt.plot(history)

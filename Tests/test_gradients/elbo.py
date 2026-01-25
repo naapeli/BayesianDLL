@@ -24,7 +24,7 @@ with MeanFieldGuide() as guide:
     RandomParameter("mixture", Normal(mean, variance), initial_value=torch.zeros(1))
 
 
-loss, grads = elbo(model, guide, n_samples=1000)  # with 100000 samples, almost equal
+loss, grads = elbo(model, guide, n_samples=1)  # with 100000 samples, almost equal
 print(loss)
 loss.backward()
 print(meantensor.grad, variancetensor.grad)
@@ -36,6 +36,7 @@ print(grads)
 
 
 torch.manual_seed(7)
+torch.set_default_dtype(torch.float64)
 
 # Generate synthetic data
 N = 500  # 10
@@ -47,9 +48,9 @@ y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size
 
 with Model() as model:
     # Priors
-    prior_intercept = RandomParameter("intercept", Normal(0, 20), torch.tensor(0, dtype=torch.float32), sampler="auto", delta=0.4)
-    prior_slope = RandomParameter("slope", Normal(0, 20), torch.tensor(0, dtype=torch.float32), sampler="auto", delta=0.4)
-    # prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.tensor([1], dtype=torch.float64), sampler="auto")
+    prior_intercept = RandomParameter("intercept", Normal(0, 20), torch.tensor(0), sampler="auto", delta=0.4)
+    prior_slope = RandomParameter("slope", Normal(0, 20), torch.tensor(0), sampler="auto", delta=0.4)
+    # prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.tensor(1), sampler="auto")
     prior_sigma = 0.5
 
     # make the transform for the predicted line
@@ -58,20 +59,20 @@ with Model() as model:
     likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
 
 with MeanFieldGuide() as guide:
-    interceptmeantensor = torch.full((1,), 0, dtype=torch.float32, requires_grad=True)
-    interceptmean = VariationalParameter("mean", interceptmeantensor)
-    interceptvariancetensor = torch.full((1,), 3, dtype=torch.float32, requires_grad=True)
-    interceptvariance = VariationalParameter("variance", interceptvariancetensor, min=1e-8)
+    interceptmeantensor = torch.full((1,), 0, requires_grad=True, dtype=torch.float64)
+    interceptmean = VariationalParameter("mean1", interceptmeantensor)
+    interceptvariancetensor = torch.full((1,), 3, requires_grad=True, dtype=torch.float64)
+    interceptvariance = VariationalParameter("variance1", interceptvariancetensor, min=1e-8)
     RandomParameter("intercept", Normal(interceptmean, interceptvariance), torch.zeros(1))
-    slopemeantensor = torch.full((1,), 0, dtype=torch.float32, requires_grad=True)
-    slopemean = VariationalParameter("mean", slopemeantensor)
-    slopevariancetensor = torch.full((1,), 3, dtype=torch.float32, requires_grad=True)
-    slopevariance = VariationalParameter("variance", slopevariancetensor, min=1e-8)
-    slope = RandomParameter("slope", Normal(slopemean, slopevariance), torch.zeros(1))
+    slopemeantensor = torch.full((1,), 0, requires_grad=True, dtype=torch.float64)
+    slopemean = VariationalParameter("mean2", slopemeantensor)
+    slopevariancetensor = torch.full((1,), 3, requires_grad=True, dtype=torch.float64)
+    slopevariance = VariationalParameter("variance2", slopevariancetensor, min=1e-8)
+    RandomParameter("slope", Normal(slopemean, slopevariance), torch.zeros(1))
 
 
 print("=====================")
-loss, grads = elbo(model, guide, n_samples=1000)
+loss, grads = elbo(model, guide, n_samples=1)
 print(loss)
 loss.backward()
 print(interceptmeantensor.grad, interceptvariancetensor.grad, slopemeantensor.grad, slopevariancetensor.grad)
