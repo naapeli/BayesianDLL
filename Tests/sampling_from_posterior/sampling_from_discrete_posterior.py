@@ -14,9 +14,9 @@ p = 0.5
 with Model() as model:
     prior = RandomParameter("prior", DiscreteUniform(0, 10), torch.tensor(1, dtype=torch.float64))
     likelihood = ObservedParameter("likelihood", Binomial(prior, p), data)
-    samples = sample(1000, 500, n_chains=1)["prior"]
+    samples = sample(1000, 500)["prior"]
 
-samples = samples.squeeze().int()
+samples = samples.squeeze(2).flatten(0, 1).int()
 counts = Counter(samples.tolist())
 x_vals = sorted(counts.keys())
 frequencies = [counts[x] / len(samples) for x in x_vals]

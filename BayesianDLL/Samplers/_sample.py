@@ -2,59 +2,93 @@ import torch
 from tqdm import tqdm
 from functools import partial
 from warnings import warn
+import os
 
 from . import NUTS, Metropolis
+from ._result import SamplingResult
+from loky import get_reusable_executor
 from .._active_model import _active_model
 from ..Evaluation import gelman_rubin
 
 
-def sample(n_samples, warmup_length, n_chains=2, model=None, progress_bar=True, start_point_variance=1):
+def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1):
     model = _active_model._active_model if model is None else model
     
     initial_values = {}
     for name, parameter in model.params.items():
         initial_values[name] = parameter.unconstrained_value
-    
-    trace = {name: torch.empty(size=(n_chains, n_samples, parameter.constrained_value.size(1)), dtype=parameter.unconstrained_value.dtype) for name, parameter in model.params.items()}
-    for chain in range(n_chains):
-        for name, parameter in model.params.items():
-            value = initial_values[name]
-            if parameter.distribution.state_space.is_continuous():
-                value += start_point_variance * torch.randn_like(initial_values[name])
-            parameter.set_unconstrained_value(value)
         
-        # TODO: reset the states of the samplers for each chain instead of reinitializing them
-        samplers = {}
-        for name, parameter in model.params.items():
-            samplers[name] = _decide_step(model, parameter)
+    max_workers = min(n_chains, os.cpu_count())
+    executor = get_reusable_executor(max_workers=max_workers)
+    results = list(executor.map(
+        _sample_single_chain,
+        range(n_chains),
+        [n_chains]*n_chains,
+        [model]*n_chains,
+        [initial_values]*n_chains,
+        [start_point_variance]*n_chains,
+        [n_samples]*n_chains,
+        [warmup_length]*n_chains,
+        [progress_bar]*n_chains
+    ))
 
-        _progress_bar = tqdm(range(1, n_samples + warmup_length + 1), bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}") if progress_bar else range(1, n_samples + warmup_length + 1)
-        acceptance_probabilities = [1.0 for _ in range(len(samplers))]
-        step_sizes = [1.0 for _ in range(len(samplers))]
-        for m in _progress_bar:
-            if progress_bar:
-                if m < warmup_length: _progress_bar.set_description(f"Chain {chain + 1}/{n_chains} warmup")
-                else: _progress_bar.set_description(f"Chain {chain + 1}/{n_chains} sample")
-                _progress_bar.set_postfix({
-                    "avg. acc. probs": [f"{prob / m:.3f}" for prob in acceptance_probabilities],
-                    "step sizes": [f"{step_size:.3f}" for step_size in step_sizes]
-                })
-
-            for i, (name, sampler) in enumerate(samplers.items()):
-                theta = model.params[name].unconstrained_value
-                new_theta, step_size, acceptance_probability = sampler.step(theta, m < warmup_length)
-                step_sizes[i] = step_size
-                acceptance_probabilities[i] += acceptance_probability
-                model.params[name].set_unconstrained_value(new_theta)
-                if m > warmup_length: trace[name][chain, m - warmup_length - 1] = model.params[name].constrained_value
+    trace = {name: torch.stack([res[0][name] for res in results], dim=0) for name in model.params.keys()}
+    divergences = [res[1] for res in results]
+    acceptance_probabilities = [[prob / (n_samples + warmup_length) for prob in res[2]] for res in results]
+    step_sizes = [res[3] for res in results]
 
     if n_chains > 1:
         r_hats = gelman_rubin(trace)
         for name, statistics in r_hats.items():
-            if torch.any(statistics > 1.01):
-                warn(f"The gelman-Ruben statistic of {name} is above 1.01 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
+            if torch.any(statistics > 1.1):  # 1.01
+                warn(f"The gelman-Ruben statistic of {name} is above 1.1 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
+    else:
+        warn(f"The The convergence of the chain is not checked when n_chains 1. Increase it to atleast 2 to enable convergence diagnostics.")
 
-    return trace
+    if sum(divergences) > 0:
+        warn(f"There were {sum(divergences)} divergences across all chains after tuning. Increase target acceptance probability or reparameterize the model.")
+
+    return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes)
+
+def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar):
+    torch.set_num_threads(1)
+    for name, parameter in model.params.items():
+        value = initial_values[name].clone()
+        if parameter.distribution.state_space.is_continuous():
+            value = value + start_point_variance * torch.randn_like(value)
+        parameter.set_unconstrained_value(value)
+    
+    samplers = {}
+    for name, parameter in model.params.items():
+        samplers[name] = _decide_step(model, parameter)
+
+    _progress_bar = tqdm(range(1, n_samples + warmup_length + 1), position=chain, leave=False, bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}") if progress_bar else range(1, n_samples + warmup_length + 1)
+    acceptance_probabilities = [1.0 for _ in range(len(samplers))]
+    step_sizes = [1.0 for _ in range(len(samplers))]
+    divergences_count = 0
+    chain_trace = {name: torch.empty(size=(n_samples, parameter.constrained_value.size(1)), dtype=parameter.unconstrained_value.dtype) for name, parameter in model.params.items()}
+
+    for m in _progress_bar:
+        if progress_bar:
+            if m < warmup_length: _progress_bar.set_description(f"Chain {chain + 1}/{n_chains} warmup", refresh=False)
+            else: _progress_bar.set_description(f"Chain {chain + 1}/{n_chains} sample", refresh=False)
+            _progress_bar.set_postfix({
+                "avg. acc. probs": [f"{prob / m:.3f}" for prob in acceptance_probabilities],
+                "step sizes": [f"{step_size:.3f}" for step_size in step_sizes],
+                "divs": divergences_count
+            }, refresh=False)
+
+        for i, (name, sampler) in enumerate(samplers.items()):
+            theta = model.params[name].unconstrained_value
+            new_theta, step_size, acceptance_probability, diverging = sampler.step(theta, m < warmup_length)
+            if diverging and m >= warmup_length:
+                divergences_count += 1
+            step_sizes[i] = step_size
+            acceptance_probabilities[i] += acceptance_probability
+            model.params[name].set_unconstrained_value(new_theta)
+            if m > warmup_length: chain_trace[name][m - warmup_length - 1] = model.params[name].constrained_value
+
+    return chain_trace, divergences_count, acceptance_probabilities, step_sizes
 
 def _decide_step(model, parameter):
     _log_prob_func = partial(model.log_prob, parameter.name)
@@ -73,7 +107,7 @@ def _decide_step(model, parameter):
 
 def sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
     model = _active_model._active_model if model is None else model
-    trace = sample(n_samples, warmup_length, 1, model, progress_bar)
+    trace = sample(n_samples, warmup_length, 4, model, progress_bar)
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
 def posterior_predicative(trace, n_samples=20, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
@@ -84,8 +118,8 @@ def sample_prior_predicative(n_samples=20, warmup_length=100, samples_per_step=5
     model = _active_model._active_model if model is None else model
     old_observed = model.observed_params
     model.observed_params = {}  # with prior distributions, one should sample from the priors without the likelihood terms
-    trace = sample(n_samples, warmup_length, 1, model, progress_bar)
-    model.observed_params = old_observed  # TODO: fix this as model currently uses a graph structure
+    trace = sample(n_samples, warmup_length, 4, model, progress_bar)
+    model.observed_params = old_observed
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
 def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
@@ -105,21 +139,24 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
     predicative_samples = {name: torch.empty(size=(n_samples, samples_per_step, len(parameter.observed_values[0])), dtype=parameter.observed_values[0].dtype) for name, parameter in model.observed_params.items()}
 
     n_chains, trace_length, _ = next(iter(trace.values())).shape
-    if n_chains != 1:
-        # raise RuntimeError("n_chains must be 1 in the trace given to sample_predicative.")
-        # TODO: use all of the chains if needed (flatten them out)
-        warn("n_chains is larger than one in the trace given to sample_predicative. Only the first chain is used.")
-    n_samples = trace_length if n_samples is None else n_samples
-    if trace_length < n_samples:
-        raise RuntimeError("n_samples must be less than the length of the trace or None.")
+    flattened_trace = {name: values.flatten(0, 1) for name, values in trace.items()}
+    total_samples = n_chains * trace_length
+
+    if n_samples is None:
+        n_samples = total_samples
+        indices = torch.arange(total_samples)
+    else:
+        if total_samples < n_samples:
+            raise RuntimeError(f"n_samples ({n_samples}) must be less than or equal to the total trace length ({total_samples}).")
+        indices = torch.linspace(0, total_samples - 1, steps=n_samples).long()
 
     # _progress_bar = tqdm(range(n_samples), desc="Predicative sample") if progress_bar else range(n_samples)
     # for i in _progress_bar:
     for i in range(n_samples):
         # print(f"Predicative sample {i + 1}")
         prior_values = {}
-        for name, values in trace.items():
-            prior_values[name] = values[0, i].unsqueeze(0)
+        for name, values in flattened_trace.items():
+            prior_values[name] = values[indices[i]].unsqueeze(0)
         
         for name, parameter in model.params.items():
             # unconstrained_value = parameter.distribution.transform.forward(prior_values[name])
@@ -144,14 +181,14 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
                         "step sizes": f"{step_size:.3f}"
                     })
                 m = m - 1  # shift back to range(0, end) for following logic
-                theta, step_size, acceptance_probability = sampler.step(theta, m < warmup_per_sample)
+                theta, step_size, acceptance_probability, diverging = sampler.step(theta, m < warmup_per_sample)
                 acceptance_probabilities += acceptance_probability
                 if m >= warmup_per_sample:
                     predicative_samples[name][i, m - warmup_per_sample] = theta
 
     for name, parameter in model.params.items():
-            unconstrained_value = parameter.distribution.transform.forward(prior_values[name])
-            parameter.set_unconstrained_value(unconstrained_value)
+        unconstrained_value = parameter.distribution.transform.forward(prior_values[name])
+        parameter.set_unconstrained_value(unconstrained_value)
     
     predicative_samples = {name: model.observed_params[name].distribution.transform.inverse(samples.reshape(n_samples * samples_per_step, -1)).reshape(n_samples, samples_per_step, -1) for name, samples in predicative_samples.items()}
     return predicative_samples
@@ -160,10 +197,8 @@ def _init_theta(state_space, shape, dtype):
     if state_space.is_continuous():
         return torch.randn(shape, dtype=dtype)
     elif state_space.is_discrete():
-        if hasattr(state_space, "values"):
-            return state_space.values[0]
-        else:
-            return torch.ones(shape, dtype=dtype)
+        first_value = next(iter(state_space))
+        return first_value * torch.ones(shape, dtype=dtype)
 
 def _decide_predicative_step(parameter):
     state_space = parameter.distribution.transformed_state_space

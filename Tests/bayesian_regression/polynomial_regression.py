@@ -38,7 +38,7 @@ with Model() as polynomial_model:
 # print(Evaluation.gelman_rubin(samples, method="classical"))
 # print(Evaluation.gelman_rubin(samples, method="split"))
 # print(Evaluation.gelman_rubin(samples, method="rank"))
-plt.figure(figsize=(12, 8))
+plt.figure(figsize=(20, 10))
 Evaluation.Graphics.plot_posterior(samples)
 # plt.figure()
 # plt.subplot(1, 2, 1)

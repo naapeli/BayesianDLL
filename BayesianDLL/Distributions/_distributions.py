@@ -1,8 +1,9 @@
 import torch
+import torch.nn.functional as F
 import math
 from abc import ABC, abstractmethod
 
-from ._transforms import IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform
+from ._transforms import IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform, InverseSoftPlusTransform
 from ._state_space import ContinuousReal, ContinuousPositive, ContinuousRange, ContinuousSimplex, DiscretePositive, DiscreteRange, Union
 from .._parameters import RandomParameter, DeterministicParameter, VariationalParameter
 from ._resolve import resolve
@@ -15,6 +16,10 @@ class Distribution(ABC):
         self.transformed_state_space = transformed_state_space
         self.parameters = set()
         self.variational_parameters = dict()
+
+    @property
+    def shape(self):
+        return (1,)
 
     @abstractmethod
     def pdf(self, x_constrained):
@@ -78,6 +83,10 @@ class Normal(Distribution):
         self.add_dependency(mu)
         self.add_dependency(variance)
 
+    @property
+    def shape(self):
+        return torch.broadcast_shapes(resolve(self.mu).shape, resolve(self.variance).shape)
+
     def pdf(self, x):
         if not isinstance(x, torch.Tensor):
             raise TypeError("x should be a torch.Tensor.")
@@ -126,8 +135,6 @@ class Normal(Distribution):
         variance = resolve(self.variance)
 
         eps = torch.randn((n_samples, *mu.shape[1:]), dtype=mu.dtype)
-        # rand = torch.rand(size=(n_samples, 12), dtype=mu.dtype)
-        # eps = rand.sum(dim=1) - 6
 
         samples = mu + eps * torch.sqrt(variance)
         if _reparametrization_trick_grad:
@@ -144,6 +151,10 @@ class MultivariateNormal(Distribution):
         self.covariance = covariance
         self.add_dependency(mu)
         self.add_dependency(covariance)
+
+    @property
+    def shape(self):
+        return resolve(self.mu).shape
 
     def pdf(self, x):
         if not isinstance(x, torch.Tensor):
@@ -220,6 +231,10 @@ class Beta(Distribution):
         self.add_dependency(a)
         self.add_dependency(b)
 
+    @property
+    def shape(self):
+        return torch.broadcast_shapes(resolve(self.a).shape, resolve(self.b).shape)
+
     def pdf(self, x):
         if not isinstance(x, torch.Tensor):
             raise TypeError("x should be a torch.Tensor.")
@@ -271,12 +286,40 @@ class Beta(Distribution):
         grad_b = torch.log(1 - x) - torch.digamma(b) + torch.digamma(a + b)
         grad_b = torch.where(mask, grad_b, torch.full_like(grad_b, torch.nan))
         return {self.resolve_name("a", self.a): grad_a, self.resolve_name("b", self.b): grad_b}
+    
+    def _log_prob_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x_unconstrained should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x_unconstrained.shape should be (n_samples, n_features).")
+        
+        a = resolve(self.a)
+        b = resolve(self.b)
+        log_x = F.logsigmoid(x_unconstrained)
+        log_1_minus_x = F.logsigmoid(-x_unconstrained)
+        log_prob = a * log_x + b * log_1_minus_x - (torch.lgamma(a) + torch.lgamma(b) - torch.lgamma(a + b))
+        return log_prob.squeeze(1)
+    
+    def _log_prob_grad_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x_unconstrained should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x_unconstrained.shape should be (n_samples, n_features).")
+        
+        a = resolve(self.a)
+        b = resolve(self.b)
+        grad = a * torch.sigmoid(-x_unconstrained) - b * torch.sigmoid(x_unconstrained)
+        return grad
 
 class Exponential(Distribution):
     def __init__(self, rate):
         super().__init__(LogTransform(border=0, side="larger"), ContinuousPositive(), ContinuousReal())
         self.rate = rate
         self.add_dependency(rate)
+
+    @property
+    def shape(self):
+        return resolve(self.rate).shape
 
     def pdf(self, x):
         if not isinstance(x, torch.Tensor):
@@ -295,7 +338,7 @@ class Exponential(Distribution):
         if x.ndim != 2:
             raise ValueError("x.shape should be (n_samples, 1).")
         
-        rate = resolve(self.rate)
+        rate = resolve(self.rate).clamp(min=1e-8)
         log_prob = torch.log(rate) - rate * x
         mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         return torch.where(mask, log_prob, torch.full_like(log_prob, -torch.inf))
@@ -306,7 +349,7 @@ class Exponential(Distribution):
         if x.ndim != 2:
             raise ValueError("x.shape should be (n_samples, 1).")
         
-        rate = resolve(self.rate)
+        rate = resolve(self.rate).clamp(min=1e-8)
         grad = -rate * torch.ones_like(x)
         mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         return torch.where(mask, grad, torch.full_like(grad, torch.nan))
@@ -317,12 +360,35 @@ class Exponential(Distribution):
         if x.ndim != 2:
             raise ValueError("x.shape should be (n_samples, 1).")
         
-        rate = resolve(self.rate)
+        rate = resolve(self.rate).clamp(min=1e-8)
         grad_rate = 1 / rate - x
         mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         grad_rate = torch.where(mask, grad_rate, torch.full_like(grad_rate, torch.nan))
         return {self.resolve_name("rate", self.rate): grad_rate}
     
+    def _log_prob_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
+        rate = resolve(self.rate)
+        z = x_unconstrained
+        x = torch.exp(z)
+        log_prob = torch.log(rate) - rate * x + z
+        return log_prob.squeeze(1)
+
+    def _log_prob_grad_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
+        rate = resolve(self.rate)
+        x = torch.exp(x_unconstrained)
+        grad = 1 - rate * x
+        return grad
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         rate = resolve(self.rate)
 
@@ -342,6 +408,10 @@ class Uniform(Distribution):
         self.high = high
         self.add_dependency(low)
         self.add_dependency(high)
+
+    @property
+    def shape(self):
+        return torch.broadcast_shapes(resolve(self.low).shape, resolve(self.high).shape)
     
     def pdf(self, x):
         if not isinstance(x, torch.Tensor):
@@ -377,6 +447,26 @@ class Uniform(Distribution):
     def log_pdf_param_grads(self, x):
         raise RuntimeError("The parameters of the uniform distribution are not differentiable. Consider using the metropolis sampler instead of NUTS if the likelihood is uniform.")
 
+    def _log_prob_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
+        z = x_unconstrained
+        log_prob = F.logsigmoid(z) + F.logsigmoid(-z)
+        return log_prob.squeeze(1)
+
+    def _log_prob_grad_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
+        z = x_unconstrained
+        grad = torch.sigmoid(-z) - torch.sigmoid(z)
+        return grad
+
 class InvGamma(Distribution):
     def __init__(self, alpha, beta):
         super().__init__(LogTransform(border=0, side="larger"), ContinuousPositive(), ContinuousReal())
@@ -384,6 +474,10 @@ class InvGamma(Distribution):
         self.beta = beta
         self.add_dependency(alpha)
         self.add_dependency(beta)
+
+    @property
+    def shape(self):
+        return torch.broadcast_shapes(resolve(self.alpha).shape, resolve(self.beta).shape)
 
     def pdf(self, x):
         if not isinstance(x, torch.Tensor):
@@ -438,11 +532,39 @@ class InvGamma(Distribution):
         grad_beta = torch.where(mask, grad_beta, torch.full_like(grad_beta, torch.nan))
         return {self.resolve_name("alpha", self.alpha): grad_alpha, self.resolve_name("beta", self.beta): grad_beta}
 
+    def _log_prob_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
+        alpha = resolve(self.alpha)
+        beta = resolve(self.beta)
+        z = x_unconstrained
+        log_prob = alpha * torch.log(beta) - torch.lgamma(alpha) - alpha * z - beta * torch.exp(-z)
+        return log_prob.squeeze(1)
+
+    def _log_prob_grad_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
+        alpha = resolve(self.alpha)
+        beta = resolve(self.beta)
+        x = torch.exp(x_unconstrained)
+        grad = -alpha + beta / x
+        return grad
+
 class HalfCauchy(Distribution):
     def __init__(self, scale):
         super().__init__(LogTransform(border=0, side="larger"), ContinuousPositive(), ContinuousReal())
         self.scale = scale
         self.add_dependency(scale)
+
+    @property
+    def shape(self):
+        return resolve(self.scale).shape
 
     def pdf(self, x):
         if not isinstance(x, torch.Tensor):
@@ -490,11 +612,38 @@ class HalfCauchy(Distribution):
         grad_scale = torch.where(mask, grad_scale, torch.full_like(grad_scale, torch.nan))
         return {self.resolve_name("scale", self.scale): grad_scale}
 
+    def _log_prob_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
+        scale = resolve(self.scale)
+        z = x_unconstrained
+        x = torch.exp(z)
+        log_prob = math.log(2.0) - math.log(math.pi) - torch.log(scale) + z - torch.log(1 + (x / scale) ** 2)
+        return log_prob.squeeze(1)
+
+    def _log_prob_grad_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
+        scale = resolve(self.scale)
+        x = torch.exp(x_unconstrained)
+        grad = (scale ** 2 - x ** 2) / (scale ** 2 + x ** 2)
+        return grad
+
 class Dirichlet(Distribution):
     def __init__(self, alpha):
         super().__init__(transform=SoftMaxTransform(dim=-1), state_space=ContinuousSimplex(), transformed_state_space=ContinuousReal())
         self.alpha = alpha
         self.add_dependency(alpha)
+
+    @property
+    def shape(self):
+        return resolve(self.alpha).shape
 
     def pdf(self, x):
         if not isinstance(x, torch.Tensor):
@@ -548,6 +697,32 @@ class Dirichlet(Distribution):
         grad_alpha = torch.where(mask, grad_alpha, torch.full_like(grad_alpha, torch.nan))
         return {self.resolve_name("alpha", self.alpha): grad_alpha}
 
+    def _log_prob_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
+        alpha = resolve(self.alpha)
+        alpha_sum = alpha.sum(-1, keepdim=True)
+        log_norm_const = torch.lgamma(alpha).sum(-1, keepdim=True) - torch.lgamma(alpha_sum)
+        
+        z = x_unconstrained
+        log_x = z - torch.logsumexp(z, dim=-1, keepdim=True)
+        log_prob = ((alpha - 1) * log_x).sum(-1, keepdim=True) - log_norm_const
+        return log_prob.squeeze(1)
+
+    def _log_prob_grad_unconstrained(self, x_unconstrained):
+        if not isinstance(x_unconstrained, torch.Tensor):
+            raise TypeError("x should be a torch.Tensor.")
+        if x_unconstrained.ndim != 2:
+            raise ValueError("x.shape should be (n_samples, n_features).")
+        
+        alpha = resolve(self.alpha)
+        x = torch.softmax(x_unconstrained, dim=-1)
+        grad = (alpha - 1) - x * (alpha - 1).sum(-1, keepdim=True)
+        return grad
+
 
 
 # ========================= DISCRETE =========================
@@ -574,7 +749,7 @@ class Geometric(Distribution):
         if x.ndim != 2:
             raise ValueError("x.shape should be (n_samples, 1).")
         
-        p = resolve(self.p)
+        p = resolve(self.p).clamp(1e-8, 1 - 1e-8)
         log_prob = (x - 1) * torch.log(1 - p) + torch.log(p)
         mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         return torch.where(mask, log_prob, torch.full_like(log_prob, -torch.inf))
@@ -588,7 +763,7 @@ class Geometric(Distribution):
         if x.ndim != 2:
             raise ValueError("x.shape should be (n_samples, 1).")
         
-        p = resolve(self.p)
+        p = resolve(self.p).clamp(1e-8, 1 - 1e-8)
         grad = (1 / p) - (x - 1) / (1 - p)
         mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         grad = torch.where(mask, grad, torch.full_like(grad, torch.nan))
@@ -618,7 +793,7 @@ class Bernoulli(Distribution):
         if x.ndim != 2:
             raise ValueError("x.shape should be (n_samples, 1).")
         
-        p = resolve(self.p)
+        p = resolve(self.p).clamp(1e-8, 1 - 1e-8)
         log_prob = x * torch.log(p) + (1 - x) * torch.log(1 - p)
         mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         return torch.where(mask, log_prob, torch.full_like(log_prob, -torch.inf))
@@ -632,7 +807,7 @@ class Bernoulli(Distribution):
         if x.ndim != 2:
             raise ValueError("x.shape should be (n_samples, 1).")
         
-        p = resolve(self.p)
+        p = resolve(self.p).clamp(1e-8, 1 - 1e-8)
         grad = (x / p - (1 - x) / (1 - p))
         mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
         grad = torch.where(mask, grad, torch.full_like(grad, torch.nan))
@@ -665,7 +840,7 @@ class Binomial(Distribution):
         if x.ndim != 2:
             raise ValueError("x.shape should be (n_samples, 1).")
         
-        p = resolve(self.p)
+        p = resolve(self.p).clamp(1e-8, 1 - 1e-8)
         n = resolve(self.n)
         log_prob = self._log_binom_coeff(x) + x * torch.log(p) + (n - x) * torch.log(1 - p)
         mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
@@ -680,7 +855,7 @@ class Binomial(Distribution):
         if x.ndim != 2:
             raise ValueError("x.shape should be (n_samples, 1).")
         
-        p = resolve(self.p)
+        p = resolve(self.p).clamp(1e-8, 1 - 1e-8)
         n = resolve(self.n)
         grad = x / p - (n - x) / (1 - p)
         mask = torch.tensor([self.state_space.contains(point) for point in x]).unsqueeze(1)
@@ -739,6 +914,10 @@ class Mixture(Distribution):
         for component in components:
             for param in component.parameters:
                 self.parameters.add(param)
+    
+    @property
+    def shape(self):
+        return torch.broadcast_shapes(*(component.shape for component in self.components))
 
     def pdf(self, x):
         if not isinstance(x, torch.Tensor):

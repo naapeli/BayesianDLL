@@ -12,11 +12,11 @@ max_val = 1  # choose 1 for bernoulli prior and something else for binomial prio
 data = torch.randint(0, max_val + 1, size=(N,)).unsqueeze(1)
 a, b = 1, 1
 with Model() as model:
-    prior = RandomParameter("prior", Beta(a, b), torch.tensor(0.5, dtype=torch.float64))
+    prior = RandomParameter("prior", Beta(a, b))  # , sampler="metropolis"
 
     likelihood_distribution = Bernoulli(prior) if max_val == 1 else Binomial(max_val, prior)
     likelihood = ObservedParameter("likelihood", likelihood_distribution, data)
-    samples = sample(1000, 500, n_chains=4)
+    samples = sample(1000, 500, n_chains=4, start_point_variance=0)
 
 plot_posterior(samples, method="kde")
 x = torch.linspace(0, 1, 1000).unsqueeze(1)

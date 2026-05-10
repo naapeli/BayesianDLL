@@ -17,13 +17,15 @@ data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N, 1), dtype
 print(data.mean(), data.var())
 
 n_samples = 100
-with Model() as joint_posterior_model:
-    mean = RandomParameter("mean", Normal(mu0, tau), torch.tensor([0], dtype=torch.float64), sampler="auto", gamma=5)
-    variance = RandomParameter("variance", InvGamma(a, b), torch.tensor([10], dtype=torch.float64), sampler="auto", gamma=5)
+with Model() as model:
+    mean = RandomParameter("mean", Normal(mu0, tau))
+    variance = RandomParameter("variance", InvGamma(a, b))
     likelihood = ObservedParameter("likelihood", Normal(mean, variance), data)
-    # prior_predicative = sample_prior_predicative(n_samples, 1000, samples_per_step=1000)
-    posterior_predicative = sample_posterior_predicative(n_samples, 1000, samples_per_step=1000)
+    predicative_distribution = model.sample_prior_predicative(n_samples, 5000, samples_per_step=1000)
+    # predicative_distribution = model.sample_posterior_predicative(n_samples, 1000, samples_per_step=1000)
 
-plot_predicative_distribution(posterior_predicative, data, kind="pdf")
-plot_predicative_distribution(posterior_predicative, data, kind="cdf")
+plt.subplot(1, 2, 1)
+plot_predicative_distribution(predicative_distribution, data, kind="pdf")
+plt.subplot(1, 2, 2)
+plot_predicative_distribution(predicative_distribution, data, kind="cdf")
 plt.show()
