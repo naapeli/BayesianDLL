@@ -3,10 +3,10 @@ import math
 from collections import namedtuple
 
 
-Tree = namedtuple("Tree", ["theta_minus", "r_minus", "grad_minus", "theta_plus", "r_plus", "grad_plus", "theta_prime", "grad_prime", "log_prob_prime", "n_prime", "s_prime", "alpha_prime", "n_prime_alpha"])
+Tree = namedtuple("Tree", ["theta_minus", "r_minus", "grad_minus", "theta_plus", "r_plus", "grad_plus", "theta_prime", "grad_prime", "log_prob_prime", "n_prime", "s_prime", "alpha_prime", "n_prime_alpha", "diverging"])
 
 class NUTS:
-    def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=10):
+    def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100):
         self.log_target = log_target
         self.gradient = gradient
         self.inverse_transformation = inverse_transformation
@@ -57,9 +57,10 @@ class NUTS:
         if j == 0:
             theta_prime, r_prime, grad_prime, log_prob_prime = self.leapfrog(theta, r, grad, v * step_size)
             log_joint_prime = log_prob_prime - 0.5 * r_prime @ r_prime.T
+            diverging = bool(log_u > (log_joint_prime + 1000) or torch.isnan(log_joint_prime) or torch.isnan(log_prob_prime))
             n_prime = 1 if log_u < log_joint_prime else 0
-            s_prime = 1 if log_u < (log_joint_prime + 1000) else 0
-            return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, min(1, torch.exp(log_joint_prime - joint0)), 1)
+            s_prime = 1 if not diverging else 0
+            return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, min(1, torch.exp(log_joint_prime - joint0)), 1, diverging)
         else:
             tree = self.build_tree(theta, r, grad, log_u, v, j - 1, step_size, joint0)
             theta_minus, r_minus, grad_minus = tree.theta_minus, tree.r_minus, tree.grad_minus
@@ -80,7 +81,10 @@ class NUTS:
                 s_prime = tree.s_prime * tree_prime.s_prime * self._uturn(theta_minus, theta_plus, r_minus, r_plus)
                 alpha_prime = tree.alpha_prime + tree_prime.alpha_prime
                 n_prime_alpha = tree.n_prime_alpha + tree_prime.n_prime_alpha
-            return Tree(theta_minus, r_minus, grad_minus, theta_plus, r_plus, grad_plus, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, alpha_prime, n_prime_alpha)
+                diverging = tree.diverging or tree_prime.diverging
+            else:
+                diverging = tree.diverging
+            return Tree(theta_minus, r_minus, grad_minus, theta_plus, r_plus, grad_plus, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, alpha_prime, n_prime_alpha, diverging)
 
     def _uturn(self, theta_minus, theta_plus, r_minus, r_plus):
         delta_theta = theta_plus - theta_minus
@@ -117,6 +121,7 @@ class NUTS:
 
         alpha_sum_total = 0.0
         n_alpha_sum_total = 0.0
+        diverging = False
 
         while s == 1 and j <= self.max_depth:
             v = 1 if torch.rand(1) < 0.5 else -1
@@ -138,6 +143,7 @@ class NUTS:
             n += tree.n_prime
             s = tree.s_prime * self._uturn(theta_minus, theta_plus, r_minus, r_plus)
             j += 1
+            diverging = diverging or tree.diverging
         
         if warmup:
             eta = 1 / (self.m + self.t0)
@@ -153,7 +159,7 @@ class NUTS:
         self.log_prob_cache = new_log_prob
         self.m += 1
 
-        return new_theta, self.step_size, alpha_sum_total / n_alpha_sum_total
+        return new_theta, self.step_size, alpha_sum_total / n_alpha_sum_total, diverging
 
     def init_sampler(self):
         pass

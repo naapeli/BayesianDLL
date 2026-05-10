@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Dirichlet, Normal, Mixture, Exponential
-from BayesianDLL import Model, RandomParameter, ObservedParameter, sample, find_MAP
+from BayesianDLL import Model, RandomParameter, ObservedParameter
 from BayesianDLL.Evaluation.Graphics import plot_posterior, plot_model
 
 
@@ -21,13 +21,10 @@ weight_sampler_params = {"min_step_size": 1e-6, "max_step_size": 10, "delta": 0.
 
 with Model() as model:
     alpha = 1.5 * torch.ones(K, dtype=torch.float64)
-    theta_init = torch.ones(K, dtype=torch.float64)
-    theta_init[0], theta_init[1] = 2, 3  # make the initial point not uniform to stabilize the sampling
-    theta_init = torch.softmax(theta_init, dim=0)
-    weights = RandomParameter("weights", Dirichlet(alpha), theta_init, **weight_sampler_params)
+    weights = RandomParameter("weights", Dirichlet(alpha), shape=K, **weight_sampler_params)
 
-    means = [RandomParameter("mean" + str(i + 1), Normal(0, 10), torch.randn(size=(1,), dtype=torch.float64), **sampler_params) for i in range(K)]
-    variances = [RandomParameter("variance" + str(i + 1), Exponential(0.5), torch.rand(size=(1,), dtype=torch.float64) + 1, **sampler_params) for i in range(K)]
+    means = [RandomParameter("mean" + str(i + 1), Normal(0, 10), **sampler_params) for i in range(K)]
+    variances = [RandomParameter("variance" + str(i + 1), Exponential(0.5), **sampler_params) for i in range(K)]
 
     components = [Normal(mu, cov) for mu, cov in zip(means, variances)]
 
@@ -38,13 +35,14 @@ with Model() as model:
 
     # make sampling start close to the maximum a posteriori
     plt.figure()
-    plt.plot(find_MAP(model, lr=1e-2, epochs=350, callback_frequency=35))
+    plt.plot(model.find_MAP(lr=1e-2, epochs=600, callback_frequency=25))
     print(weights.constrained_value)
     print([mean.constrained_value for mean in means])
     print([variance.constrained_value for variance in variances])
     plt.show()
 
-    samples = sample(400, 100, n_chains=2)
+    result = model.sample(400, 100, start_point_variance=1e-3)  # decrease the starting point variance as different chains may swap the order of the two groups otherwise
+    samples = result.trace
 
 plt.figure()
 for k in range(K):

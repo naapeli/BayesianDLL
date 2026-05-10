@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, HalfCauchy
-from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, sample, sample_posterior_predicative
+from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter
 from BayesianDLL.Evaluation import Graphics
 
 
@@ -18,16 +18,16 @@ y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size
 
 with Model() as linear_model:
     # Priors
-    prior_intercept = RandomParameter("intercept", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto", delta=0.4)
-    prior_slope = RandomParameter("slope", Normal(0, 20), torch.tensor([0], dtype=torch.float64), sampler="auto", delta=0.4)
-    prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.tensor([1], dtype=torch.float64), sampler="auto", max_depth=4)
+    prior_intercept = RandomParameter("intercept", Normal(0, 20), sampler="auto", delta=0.4)
+    prior_slope = RandomParameter("slope", Normal(0, 20), sampler="auto", delta=0.4)
+    prior_sigma = RandomParameter("sigma", HalfCauchy(10), sampler="auto", max_depth=4)
 
     # make the transform for the predicted line
     mu = DeterministicParameter("mu", lambda b, m: m * x + b, lambda b, m: {"slope": x, "intercept": torch.ones_like(x)}, [prior_intercept, prior_slope])
     
     likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
     
-    samples = sample(1000, 1000, n_chains=2)
+    samples = linear_model.sample(1000, 100)
     # sample posterior predicative does not currently work as likelihood should return multidimensional values (one for every x)
     # posterior_predicative_samples = sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=500)
     # print(posterior_predicative_samples, posterior_predicative_samples["likelihood"].shape)

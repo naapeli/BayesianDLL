@@ -4,9 +4,25 @@ from ._active_model import _active_model
 
 
 class RandomParameter:
-    def __init__(self, name, distribution, initial_value, sampler="auto", **sampler_params):
+    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", **sampler_params):
+        if initial_value is None:
+            if shape is None:
+                shape = distribution.shape
+            elif isinstance(shape, int):
+                shape = (shape,)
+            
+            if distribution.state_space.is_continuous():
+                unconstrained = torch.zeros((1, *shape), dtype=torch.float64)
+                initial_value = distribution.transform.inverse(unconstrained).squeeze(0)
+            elif distribution.state_space.is_discrete():
+                first_value = next(iter(distribution.state_space))
+                initial_value = first_value * torch.ones(shape, dtype=torch.float64)
+
+        if initial_value.ndim == 2 and initial_value.size(0) == 1:
+            initial_value = initial_value.squeeze(0)
+
         if initial_value.ndim not in [0, 1]:
-            raise ValueError("initial_value must be either 0 or 1 dimensional.")
+            raise ValueError(f"initial_value must be either 0 or 1 dimensional. Currently the shape is {initial_value.shape}.")
 
         self.name = name
         self.distribution = distribution
@@ -112,7 +128,7 @@ class DeterministicParameter:
 class VariationalParameter:
     def __init__(self, name, value, min=-float("inf"), max=float("inf")):
         self.name = name
-        self.value = torch.as_tensor(value, dtype=value.dtype if torch.is_tensor(value) else torch.float32).reshape(-1, 1)
+        self.value = torch.as_tensor(value, dtype=value.dtype if torch.is_tensor(value) else torch.float32).reshape(1, -1)
         self.min = min
         self.max = max
 
@@ -120,5 +136,6 @@ class VariationalParameter:
         return f"VariationalParameter {self.name}, value: {self.value}, limits: {(self.min, self.max)}"
 
     def set_new_value(self, value):
-        assert self.value.shape == value.shape and self.value.dtype == value.dtype
+        value = value.reshape(self.value.shape)
+        assert self.value.dtype == value.dtype
         self.value = torch.clamp(value, self.min, self.max)

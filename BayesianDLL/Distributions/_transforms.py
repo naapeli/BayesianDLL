@@ -1,6 +1,6 @@
 import torch
+import torch.nn.functional as F
 from abc import ABC, abstractmethod
-from warnings import warn
 
 
 class Transform(ABC):
@@ -43,34 +43,33 @@ class LogTransform(Transform):
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.ones_like(x_unconstrained)
-    
-# class InverseSoftPlusTransform(Transform):  # TODO: SAMPLING NOT WORKING YET WITH THIS TRANSFORM, BUT COULD BE NUMERICALLY MORE STABLE THAN LogTransform
-#     def __init__(self, border=0, side="larger"):
-#         self.border = border
-#         self.side = side
 
-#     def forward(self, x_constrained):
-#         if self.side == "larger":
-#             x = (x_constrained - self.border).clamp(min=1e-8)
-#         else:
-#             x = (self.border - x_constrained).clamp(min=1e-8)
-#         return torch.log(torch.exp(x) - 1)
+class InverseSoftPlusTransform(Transform):  
+    def __init__(self, border=0, side="larger"):
+        super().__init__()
+        self.border = border
+        self.side = side
 
-#     def inverse(self, x_unconstrained):
-#         sign = 1 if self.side == "larger" else -1
-#         if self.side == "larger":
-#             return self.border + torch.log(1 + torch.exp(sign * x_unconstrained))
-#         else:
-#             return self.border - torch.log(1 + torch.exp(sign * x_unconstrained))
+    def forward(self, x_constrained):
+        if self.side == "larger":
+            x = (x_constrained - self.border).clamp(min=1e-8)
+        else:
+            x = (self.border - x_constrained).clamp(min=1e-8)
+        return torch.where(x > 20, x, torch.log(torch.expm1(x)))
 
-#     def derivative(self, x_unconstrained):
-#         sign = 1 if self.side == "larger" else -1
-#         return torch.diag_embed(torch.sigmoid(sign * x_unconstrained))
+    def inverse(self, x_unconstrained):
+        y = F.softplus(x_unconstrained) 
+        if self.side == "larger":
+            return self.border + y
+        else:
+            return self.border - y
 
-#     def grad_log_abs_det_jacobian(self, x_unconstrained):
-#         sign = 1 if self.side == "larger" else -1
-#         sigmoid = torch.sigmoid(sign * x_unconstrained)
-#         return -sigmoid.log() / sigmoid.log().abs() * sign * (1 - sigmoid)
+    def derivative(self, x_unconstrained):
+        sign = 1 if self.side == "larger" else -1
+        return torch.diag_embed(sign * torch.sigmoid(x_unconstrained))
+
+    def grad_log_abs_det_jacobian(self, x_unconstrained):
+        return -F.softplus(-x_unconstrained)
 
 class LogitTransform(Transform):
     def __init__(self, low=0, high=1):

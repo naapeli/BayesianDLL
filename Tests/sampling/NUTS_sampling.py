@@ -1,3 +1,4 @@
+from torch.cuda.profiler import start
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
@@ -66,129 +67,136 @@ plt.tight_layout()
 plt.savefig("Tests/sampling/pdfs.png")
 
 
-# # ================== SAMPLING ==================
-n = 10000
+# ================== SAMPLING ==================
+n = 500  # 10_000
+n_warmup = 200
+n_chains = 11  # 12
 bins = 30
 
 plt.figure(figsize=(6, 6))
 
+print("Normal")
 plt.subplot(3, 3, 1)
 distribution = Normal(0, 1)
-theta_init = torch.tensor(0.1, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000, n_chains=1)["sample"]
-plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
+    RandomParameter("sample", distribution, sampler="nuts")
+    model.find_MAP(verbose=False)
+    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
+plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(-10, 20, 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
 plt.title("Normal")
 
 distribution = Normal(5, 3)
-theta_init = torch.tensor(0.1, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000, n_chains=1)["sample"]
-plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
+    RandomParameter("sample", distribution, sampler="nuts")
+    model.find_MAP(verbose=False)
+    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
+plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(-10, 20, 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
 plt.xlim(-5, 15)
 
+print("Beta")
 plt.subplot(3, 3, 2)
 distribution = Beta(2, 5)
-theta_init = torch.tensor(0.5, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000, n_chains=1)["sample"]
-plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
+    RandomParameter("sample", distribution, sampler="nuts")
+    model.find_MAP(verbose=False)
+    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
+plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0, 1, 100).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
 plt.title("Beta")
 
 distribution = Beta(0.5, 0.5)
-theta_init = torch.tensor(0.5, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts", gamma=5, delta=0.9)
-    samples = sample(n, 1000, n_chains=1)["sample"]
-plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
+    RandomParameter("sample", distribution, sampler="nuts")
+    model.find_MAP(verbose=False)
+    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
+plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0.01, 0.99, 100).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
 plt.xlim(0, 1)
 
+print("Exponential")
 plt.subplot(3, 3, 3)
 distribution = Exponential(0.3)
-theta_init = torch.tensor(2, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000, n_chains=1)["sample"]
-plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
+    RandomParameter("sample", distribution, sampler="nuts", delta=0.9)
+    model.find_MAP(verbose=False)
+    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
+plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0, 20, 100).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
 plt.xlim(0, 20)
 plt.title("Exponential")
 
+print("Uniform")
 plt.subplot(3, 3, 4)
 distribution = Uniform(2, 5)
-theta_init = torch.tensor(3, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000, n_chains=1)["sample"]
-plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
+    RandomParameter("sample", distribution, sampler="nuts")
+    model.find_MAP(verbose=False)
+    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
+plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(0, 7, 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
 plt.xlim(0, 7)
 plt.title("Uniform")
 
+print("Inverse gamma")
 plt.subplot(3, 3, 5)
 distribution = InvGamma(3, 6)
-theta_init = torch.tensor(1, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000, n_chains=1)["sample"]
+    RandomParameter("sample", distribution, sampler="nuts", delta=0.9)
+    model.find_MAP(verbose=False)
+    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
 plt.xscale("log")
 plt.yscale("log")
 xmin = samples.min().item()
 xmax = samples.max().item()
 bin_edges = np.logspace(np.log10(xmin), np.log10(xmax), bins)
-plt.hist(samples.squeeze().numpy(), bins=bin_edges, alpha=0.5, density=True)
+plt.hist(samples.numpy(), bins=bin_edges, alpha=0.5, density=True)
 x = torch.logspace(torch.log10(torch.tensor(xmin)), torch.log10(torch.tensor(xmax)), 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x.numpy(), y.numpy())
 plt.title("Inverse gamma")
 
+print("Half Cauchy")
 plt.subplot(3, 3, 6)
 distribution = HalfCauchy(2)
-theta_init = torch.tensor(1, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000, n_chains=1)["sample"]
+    RandomParameter("sample", distribution, sampler="nuts")
+    model.find_MAP(verbose=False)
+    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
 plt.xscale("log")
 plt.yscale("log")
 xmin = samples.min().item()
 xmax = samples.max().item()
 bin_edges = np.logspace(np.log10(xmin), np.log10(xmax), bins)
-plt.hist(samples.squeeze().numpy(), bins=bin_edges, alpha=0.5, density=True)
+plt.hist(samples.numpy(), bins=bin_edges, alpha=0.5, density=True)
 x = torch.logspace(torch.log10(torch.tensor(xmin)), torch.log10(torch.tensor(xmax)), 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x.numpy(), y.numpy())
 plt.title("Half Cauchy")
 
+print("Dirichlet")
 plt.subplot(3, 3, 7)
 d = 3
 # alpha = 5 * torch.ones(d, dtype=torch.float64)
 alpha = torch.tensor([2, 4, 8], dtype=torch.float64)
 distribution = Dirichlet(alpha)
-theta_init = torch.ones(d, dtype=torch.float64)
-theta_init[0], theta_init[1] = 2, -10  # make the initial point in an area with little probability mass to stabilize the sampling
-theta_init = torch.softmax(theta_init, dim=0)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts", gamma=5)
-    samples = sample(max(n // 20, 100), 2000, n_chains=1)["sample"].squeeze()
+    RandomParameter("sample", distribution, sampler="nuts")
+    model.find_MAP(verbose=False)
+    samples = sample(max(n // 20, 100), n_warmup, n_chains=n_chains, progress_bar=False)["sample"].flatten(0, 1)
 def project_to_2d(points):
     v1 = torch.tensor([0.0, 0.0])
     v2 = torch.tensor([1.0, 0.0])
@@ -222,17 +230,18 @@ plt.title("Dirichlet")
 triangle_vertices = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.5, 3**0.5 / 2], [0.0, 0.0]])
 plt.plot(triangle_vertices[:, 0], triangle_vertices[:, 1], '-', lw=2, c="black")
 
+print("Mixture")
 plt.subplot(3, 3, 8)
 means = [-1, 2]
 variances = [0.5 ** 2, 1 ** 2]
 components = [Normal(mu, var) for mu, var in zip(means, variances)]
 weights = [0.3, 0.7]
 distribution = Mixture(components, weights)
-theta_init = torch.tensor(0, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("sample", distribution, theta_init, sampler="nuts")
-    samples = sample(n, 1000, n_chains=1)["sample"]
-plt.hist(samples.squeeze().numpy(), bins=bins, alpha=0.5, density=True)
+    RandomParameter("sample", distribution, sampler="nuts")
+    model.find_MAP(verbose=False)
+    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
+plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
 x = torch.linspace(-5, 5, 1000).unsqueeze(1)
 y = distribution.pdf(x)
 plt.plot(x, y)
@@ -240,5 +249,5 @@ plt.xlim(-5, 5)
 plt.title("Mixture of Gaussians")
 
 plt.tight_layout()
-plt.savefig("Tests/sampling/distributions.png")
+# plt.savefig("Tests/sampling/distributions.png")
 plt.show()

@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, HalfCauchy, Exponential
-from BayesianDLL import Model, MeanFieldGuide, RandomParameter, ObservedParameter, DeterministicParameter, VariationalParameter, sample
+from BayesianDLL import Model, MeanFieldGuide, RandomParameter, ObservedParameter, DeterministicParameter, VariationalParameter
 from BayesianDLL.Variational import BBVI
 
 
@@ -18,9 +18,9 @@ y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size
 
 with Model() as linear_model:
     # Priors
-    prior_intercept = RandomParameter("intercept", Normal(0, 20), torch.tensor(0, dtype=torch.float64), sampler="auto", delta=0.4)
-    prior_slope = RandomParameter("slope", Normal(0, 20), torch.tensor(0, dtype=torch.float64), sampler="auto", delta=0.4)
-    prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.tensor(1, dtype=torch.float64), sampler="auto")
+    prior_intercept = RandomParameter("intercept", Normal(0, 20))
+    prior_slope = RandomParameter("slope", Normal(0, 20))
+    prior_sigma = RandomParameter("sigma", HalfCauchy(10))
     # prior_sigma = 0.5
 
     # make the transform for the predicted line
@@ -29,11 +29,11 @@ with Model() as linear_model:
     likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
 
 with MeanFieldGuide() as guide:
-    RandomParameter("intercept", Normal(VariationalParameter("mean", torch.full((1,), 0).double()), VariationalParameter("variance", torch.full((1,), 1).double(), min=1e-8)), torch.zeros(1).double())
-    RandomParameter("slope", Normal(VariationalParameter("mean", torch.full((1,), 0).double()), VariationalParameter("variance", torch.full((1,), 1).double(), min=1e-8)), torch.zeros(1).double())
-    RandomParameter("sigma", Exponential(VariationalParameter("scale", torch.full((1,), 1).double(), min=1e-8)), torch.ones(1).double())
+    RandomParameter("intercept", Normal(VariationalParameter("mean", torch.full((1,), 0).double()), VariationalParameter("variance", torch.full((1,), 1).double(), min=1e-8)))
+    RandomParameter("slope", Normal(VariationalParameter("mean", torch.full((1,), 0).double()), VariationalParameter("variance", torch.full((1,), 1).double(), min=1e-8)))
+    RandomParameter("sigma", Exponential(VariationalParameter("scale", torch.full((1,), 1).double(), min=1e-8)))
 
-history = BBVI(linear_model, guide, n_samples=1, epochs=5000, callback_frequency=10, lr=1e-2)
+history = BBVI(linear_model, guide, n_samples=1, epochs=2000, callback_frequency=10, lr=1e-2)
 plt.figure()
 plt.semilogy([-elbo for elbo in history])
 
@@ -42,10 +42,10 @@ print(guide.params["slope"].distribution.variational_parameters)
 print(guide.params["sigma"].distribution.variational_parameters)
 
 
-samples = sample(n_samples=1000, warmup_length=500, n_chains=2, model=guide)  # sample from the fitted guide
+samples = guide.sample(n_samples=1000, warmup_length=1000, n_chains=4)  # sample from the fitted guide
 
 x = x.squeeze()
-y_preds = samples["slope"][0, :, None] * x[None, :] + samples["intercept"][0, :, None]
+y_preds = samples["slope"].flatten(0, 1)[:, None] * x[None, :] + samples["intercept"].flatten(0, 1)[:, None]
 y_preds = y_preds.squeeze()
 y_mean = y_preds.mean(dim=0)
 y_lower = y_preds.quantile(0.025, dim=0)

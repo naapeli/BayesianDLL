@@ -12,16 +12,15 @@ variances = [0.5 ** 2, 1 ** 2]
 components = [Normal(mu, var) for mu, var in zip(means, variances)]
 weights = [0.3, 0.7]
 distribution = Mixture(components, weights)
-theta_init = torch.tensor(0, dtype=torch.float64)
 with Model() as model:
-    RandomParameter("mixture", distribution, theta_init, sampler="nuts")
+    RandomParameter("mixture", distribution, sampler="nuts")
 
 with MeanFieldGuide() as guide:
     mean = VariationalParameter("mean", 10)
     variance = VariationalParameter("variance", 10)
-    RandomParameter("mixture", Normal(mean, variance), initial_value=torch.zeros(1))
+    RandomParameter("mixture", Normal(mean, variance))
 
-history = BBVI(model, guide, epochs=3000, callback_frequency=20)
+history = BBVI(model, guide, epochs=3000, callback_frequency=20, lr=1e-2)
 
 plt.figure()
 plt.plot(history)

@@ -1,0 +1,38 @@
+[project]
+name = "bayesiandll"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "cloudpickle==3.1.2",
+    "colorama==0.4.6",
+    "contourpy==1.3.2",
+    "cycler==0.12.1",
+    "filelock==3.18.0",
+    "fonttools==4.57.0",
+    "fsspec==2025.3.0",
+    "jinja2==3.1.6",
+    "joblib==1.5.0",
+    "kiwisolver==1.4.8",
+    "loky>=3.5.6",
+    "markupsafe==3.0.2",
+    "matplotlib==3.10.1",
+    "mpmath==1.3.0",
+    "networkx==3.4.2",
+    "numpy==2.1.3",
+    "opt-einsum==3.4.0",
+    "packaging==25.0",
+    "pillow==11.2.1",
+    "pyparsing==3.2.3",
+    "pyro-api==0.1.2",
+    "pyro-ppl==1.9.1",
+    "python-dateutil==2.9.0.post0",
+    "scipy==1.15.2",
+    "six==1.17.0",
+    "sympy==1.13.1",
+    "threadpoolctl==3.6.0",
+    "torch==2.6.0",
+    "tqdm==4.67.1",
+    "typing-extensions==4.13.0",
+]

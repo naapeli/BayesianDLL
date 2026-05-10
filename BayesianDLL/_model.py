@@ -38,7 +38,7 @@ class Model:
             logp = 0
             node_queue = deque()
             node_queue.append(name)
-            visited = set(name)
+            visited = {name}
 
             while node_queue:
                 name = node_queue.popleft()
@@ -50,8 +50,10 @@ class Model:
                     logp += observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
                 elif name in self.deterministic_params:
                     pass
+                elif self.graph.nodes[name].get("type") == "observed":
+                    pass
                 else:
-                    raise RuntimeError(f"Node {parameter} not in the compute graph")
+                    raise RuntimeError(f"Node {name} not in the compute graph")
                 
                 for param in self.graph.successors(name):
                     if param not in visited:
@@ -119,11 +121,31 @@ class Model:
                         deterministic_derivative = deterministic_param.derivative(current_name)
                         stack.append((successor_name, deterministic_derivative @ chain_derivative.T))
 
+                    elif self.graph.nodes[successor_name].get("type") == "observed":
+                        # This happens during prior predicative sampling when observed_params is temporarily cleared
+                        pass
+
                     else:
                         raise RuntimeError(f"Node {successor_name} not in the compute graph")
 
         return grad
 
+
+    def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, start_point_variance=1):
+        from .Samplers import sample as _sample
+        return _sample(n_samples, warmup_length, n_chains=n_chains, model=self, progress_bar=progress_bar, start_point_variance=start_point_variance)
+
+    def find_MAP(self, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
+        from .Variational import find_MAP as _find_MAP
+        return _find_MAP(self, lr=lr, epochs=epochs, betas=betas, callback_frequency=callback_frequency, verbose=verbose)
+    
+    def sample_posterior_predicative(self, n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, progress_bar=True):
+        from .Samplers import sample_posterior_predicative as _spp
+        return _spp(n_samples, warmup_length, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)
+
+    def sample_prior_predicative(self, n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, progress_bar=True):
+        from .Samplers import sample_prior_predicative as _spp
+        return _spp(n_samples, warmup_length, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)
 
 class MeanFieldGuide(Model):
     pass

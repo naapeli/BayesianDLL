@@ -24,7 +24,7 @@ class Metropolis:
 
         if warmup:
             if self.state_space.is_continuous(): self.adapt_proposal_variance()
-        return theta, self.proposal_variance, sum(self.accept_queue) / len(self.accept_queue)
+        return theta, self.proposal_variance, sum(self.accept_queue) / len(self.accept_queue), False
     
     def get_proposal(self, theta):
         if self.state_space.is_discrete():
