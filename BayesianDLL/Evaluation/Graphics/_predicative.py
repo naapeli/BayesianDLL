@@ -10,9 +10,10 @@ def plot_predicative_distribution(predicative_distribution, data=None, kind="pdf
         raise ValueError('method should be in ["kde", "hist"].')
     
     for name, predicative_samples in predicative_distribution.items():
-        if predicative_samples.ndim != 3 or predicative_samples.size(2) != 1:
-            raise NotImplementedError()
-
+        # predicative_samples shape: (n_parameter_samples, n_predictive_samples, *batch_shape, *event_shape)
+        # We assume for now that we are plotting univariate distributions.
+        # We flatten everything after the first dimension (parameter samples) to get the predictive distribution.
+        
         left_boarder = (min(data.min(), predicative_samples.min()) if data is not None else predicative_samples.min()).item()
         right_boarder = (max(data.max(), predicative_samples.max()) if data is not None else predicative_samples.max()).item()
         x_grid = np.linspace(left_boarder, right_boarder, 500)
@@ -44,10 +45,8 @@ def plot_predicative_distribution(predicative_distribution, data=None, kind="pdf
         plt.plot(x_grid, mean_values, color="orange", linewidth=2, label="Predicative mean")
 
         if data is not None:
-            if data.ndim != 2 or data.size(1) != 1:
-                raise NotImplementedError()
 
-            obs = data.reshape(-1).numpy()
+            obs = data.flatten().cpu().numpy()
 
             # calculate the pdf
             if method == "kde":

@@ -14,14 +14,21 @@ def plot_posterior(trace, method="kde", bins=30):
     row = 0
     total_rows = 0
     for name, samples in trace.items():
-        total_rows += samples.size(2)
+        # samples shape: (n_chains, trace_length, *param_shape)
+        param_shape = samples.shape[2:]
+        n_features = np.prod(param_shape, dtype=int) if param_shape else 1
+        total_rows += n_features
 
     for name, samples in trace.items():
-        if samples.ndim != 3:
-            raise NotImplementedError()
-        for feature in range(samples.size(2)):
-            # samples = samples.squeeze(2).numpy()
-            feature_samples = samples[:, :, feature]
+        # Flatten all dimensions except chains and trace_length for iteration
+        n_chains, trace_length = samples.shape[:2]
+        param_shape = samples.shape[2:]
+        n_features = np.prod(param_shape, dtype=int) if param_shape else 1
+        
+        reshaped_samples = samples.reshape(n_chains, trace_length, n_features)
+        
+        for feature in range(n_features):
+            feature_samples = reshaped_samples[:, :, feature]
 
             n_chains = len(feature_samples)
             cmap = cm.get_cmap("Blues", n_chains + 2)

@@ -24,7 +24,7 @@ with MeanFieldGuide() as guide:
     RandomParameter("mixture", Normal(mean, variance), initial_value=torch.zeros(1))
 
 
-loss, grads = elbo(model, guide, n_samples=1)  # with 100000 samples, almost equal
+loss, grads = elbo(model, guide, n_samples=5)  # with 100000 samples, almost equal
 print(loss)
 loss.backward()
 print(meantensor.grad, variancetensor.grad)

@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, HalfCauchy
-from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter
+from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, plate
 from BayesianDLL.Evaluation import Graphics
 
 
@@ -13,8 +13,8 @@ N = 500
 true_intercept = 1.0
 true_slope = 2.5
 true_variance = 0.5
-x = torch.linspace(0, 1, N).double().unsqueeze(1)
-y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size=(N, 1))
+x = torch.linspace(0, 1, N).double()
+y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size=(N,))
 
 with Model() as linear_model:
     # Priors
@@ -25,14 +25,15 @@ with Model() as linear_model:
     # make the transform for the predicted line
     mu = DeterministicParameter("mu", lambda b, m: m * x + b, lambda b, m: {"slope": x, "intercept": torch.ones_like(x)}, [prior_intercept, prior_slope])
     
-    likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
+    with plate("data", N):
+        likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
     
+    predicative_distribution = linear_model.sample_posterior_predicative(20, 1000, samples_per_step=10, warmup_per_sample=100)
+    plt.figure()
+    Graphics.plot_predicative_distribution(predicative_distribution, y, kind="pdf")
+    plt.show()
+
     samples = linear_model.sample(1000, 100)
-    # sample posterior predicative does not currently work as likelihood should return multidimensional values (one for every x)
-    # posterior_predicative_samples = sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=500)
-    # print(posterior_predicative_samples, posterior_predicative_samples["likelihood"].shape)
-    # plt.plot(posterior_predicative_samples["likelihood"][:, :, 0].T)
-    # plt.show()
 
 
 plt.figure()
@@ -41,11 +42,7 @@ Graphics.plot_model(linear_model)
 plt.figure()
 Graphics.plot_posterior(samples)
 
-# plt.figure()
-# Graphics.plot_predicative_distribution(posterior_predicative_samples, y, method="kde")
 
-
-x = x.squeeze()
 y_preds = samples["slope"][0, :, None] * x[None, :] + samples["intercept"][0, :, None]
 y_preds = y_preds.squeeze()
 y_mean = y_preds.mean(dim=0)

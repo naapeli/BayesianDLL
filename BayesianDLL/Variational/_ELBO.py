@@ -10,7 +10,7 @@ def elbo(model: Model, guide: MeanFieldGuide, n_samples=1):
     total = 0
     for random_variable_name, param in guide.params.items():
         for variational_param_name, variational_parameter in param.distribution.variational_parameters.items():
-            grads[f"{random_variable_name}_{variational_param_name}"] = torch.zeros_like(variational_parameter.value.reshape(1, -1))
+            grads[f"{random_variable_name}_{variational_param_name}"] = torch.zeros_like(variational_parameter.value)
 
     use_reparametrization_trick = {random_variable_name: hasattr(param.distribution, "sample") for random_variable_name, param in guide.params.items()}
 
@@ -31,9 +31,9 @@ def elbo(model: Model, guide: MeanFieldGuide, n_samples=1):
         z = {}
         for random_variable_name in guide.params:
             if use_reparametrization_trick[random_variable_name]:
-                z[random_variable_name] = reparam_samples[random_variable_name][i:i+1, :]
+                z[random_variable_name] = reparam_samples[random_variable_name][i]
             else:
-                z[random_variable_name] = reinforce_samples[random_variable_name][0, i:i+1, :]
+                z[random_variable_name] = reinforce_samples[random_variable_name][0, i]
 
         with model.temporarily_set_many(z):
             log_p = model.model_log_prob()
@@ -52,7 +52,7 @@ def elbo(model: Model, guide: MeanFieldGuide, n_samples=1):
                 grad_dict = param.distribution.log_pdf_param_grads(z[random_variable_name])
                 for variational_param_name, dz in dz_dparams.items():
                     key = f"{random_variable_name}_{variational_param_name}"
-                    grads[key] += (grad_z_wrt_elbo * dz[i:i+1, :]).sum(dim=1, keepdim=True) - grad_dict[variational_param_name]
+                    grads[key] += (grad_z_wrt_elbo * dz[i]).sum() - grad_dict[variational_param_name].sum()
             else:
                 # REINFORCE gradient (higher variance and not exact, but with n_samples high, close to the correct estimate)
                 grad_dict = param.distribution.log_pdf_param_grads(z[random_variable_name])
