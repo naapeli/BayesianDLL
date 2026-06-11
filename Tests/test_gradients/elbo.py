@@ -1,8 +1,8 @@
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL import Model, MeanFieldGuide, RandomParameter, VariationalParameter, DeterministicParameter, ObservedParameter
-from BayesianDLL.Distributions import Normal, Mixture
+from BayesianDLL import Model, MeanFieldGuide, RandomParameter, VariationalParameter, DeterministicParameter, ObservedParameter, plate
+from BayesianDLL.Distributions import Normal, Mixture, HalfCauchy
 from BayesianDLL.Variational import elbo
 
 
@@ -77,3 +77,48 @@ print(loss)
 loss.backward()
 print(interceptmeantensor.grad, interceptvariancetensor.grad, slopemeantensor.grad, slopevariancetensor.grad)
 print(grads.values())
+
+
+
+
+
+torch.manual_seed(7)
+
+with Model() as model3:
+    prior_intercept = RandomParameter("intercept", Normal(0, 20))
+    prior_slope = RandomParameter("slope", Normal(0, 20))
+    prior_sigma = RandomParameter("sigma", HalfCauchy(10))
+    mu = DeterministicParameter("mu", lambda b, m: m * x + b, lambda b, m: {"slope": x, "intercept": torch.ones_like(x)}, [prior_intercept, prior_slope])
+    likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
+
+with MeanFieldGuide() as guide3:
+    intercept_mean_tensor = torch.full((1,), 0.0, requires_grad=True, dtype=torch.float64)
+    intercept_variance_tensor = torch.full((1,), 1.0, requires_grad=True, dtype=torch.float64)
+    RandomParameter("intercept", Normal(VariationalParameter("mean", intercept_mean_tensor), VariationalParameter("variance", intercept_variance_tensor, min=1e-8)))
+
+    slope_mean_tensor = torch.full((1,), 0.0, requires_grad=True, dtype=torch.float64)
+    slope_variance_tensor = torch.full((1,), 1.0, requires_grad=True, dtype=torch.float64)
+    RandomParameter("slope", Normal(VariationalParameter("mean", slope_mean_tensor), VariationalParameter("variance", slope_variance_tensor, min=1e-8)))
+
+    log_scale_tensor = torch.full((1,), 0.0, requires_grad=True, dtype=torch.float64)
+    log_sigma = RandomParameter("log_sigma", Normal(VariationalParameter("log_scale", log_scale_tensor), 1))
+    sigma = DeterministicParameter("sigma", lambda log_sigma: torch.exp(log_sigma), lambda log_sigma: {"log_sigma": torch.exp(log_sigma)}, [log_sigma])
+
+loss3, grads3 = elbo(model3, guide3, n_samples=5)
+loss3.backward()
+
+print("ELBO Loss:", loss3.item())
+print("Analytical Gradients:")
+for key, val in grads3.items():
+    print(f"  {key}: {val}")
+
+print("Autograd Gradients:")
+print("  intercept_mean:", intercept_mean_tensor.grad)
+print("  intercept_variance:", intercept_variance_tensor.grad)
+print("  slope_mean:", slope_mean_tensor.grad)
+print("  slope_variance:", slope_variance_tensor.grad)
+print("  log_sigma_log_scale:", log_scale_tensor.grad)
+
+
+
+
