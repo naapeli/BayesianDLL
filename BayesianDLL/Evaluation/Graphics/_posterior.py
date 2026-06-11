@@ -1,3 +1,4 @@
+import torch
 import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 from cycler import cycler
@@ -5,7 +6,7 @@ import numpy as np
 import matplotlib.cm as cm
 
 
-def plot_posterior(trace, method="kde", bins=30):
+def plot_posterior(trace: dict[str, torch.Tensor], method: str = "kde", bins: int = 30, parameters: None | list[str] = None):
     if method not in ["kde", "hist"]:
         raise ValueError('method should be in ["kde", "hist"].')
     # linestyles = ["-", "--", "-.", ":", (0, (1, 1)), (0, (5, 1)), (0, (3, 5, 1, 5))]
@@ -20,6 +21,8 @@ def plot_posterior(trace, method="kde", bins=30):
         total_rows += n_features
 
     for name, samples in trace.items():
+        if parameters is not None and name not in parameters:
+            continue
         # Flatten all dimensions except chains and trace_length for iteration
         n_chains, trace_length = samples.shape[:2]
         param_shape = samples.shape[2:]

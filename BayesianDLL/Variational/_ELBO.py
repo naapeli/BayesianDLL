@@ -35,30 +35,56 @@ def elbo(model: Model, guide: MeanFieldGuide, n_samples=1):
             else:
                 z[random_variable_name] = reinforce_samples[random_variable_name][0, i]
 
-        with model.temporarily_set_many(z):
-            log_p = model.model_log_prob()
         with guide.temporarily_set_many(z):
             log_q = guide.model_log_prob()
-        elbo_sample = log_p - log_q
-        total += elbo_sample
+            det_values = {name: det_param.constrained_value for name, det_param in guide.deterministic_params.items()}
 
-        for random_variable_name, param in guide.params.items():
-            if use_reparametrization_trick[random_variable_name]:
-                # reparametrization trick (exactly the same as torch.autograd)
-                dz_dparams = reparam_grads[random_variable_name]
+            model_z = {}
+            for name, val in z.items():
+                if name in model.params:
+                    model_z[name] = val
+            for name, val in det_values.items():
+                if name in model.params:
+                    model_z[name] = model.params[name].distribution.transform.forward(val)
 
-                with model.temporarily_set_many(z):
-                    grad_z_wrt_elbo = model.grad_log_prob(random_variable_name, z[random_variable_name]) - guide.grad_log_prob(random_variable_name, z[random_variable_name])
-                grad_dict = param.distribution.log_pdf_param_grads(z[random_variable_name])
-                for variational_param_name, dz in dz_dparams.items():
-                    key = f"{random_variable_name}_{variational_param_name}"
-                    grads[key] += (grad_z_wrt_elbo * dz[i]).sum() - grad_dict[variational_param_name].sum()
-            else:
-                # REINFORCE gradient (higher variance and not exact, but with n_samples high, close to the correct estimate)
-                grad_dict = param.distribution.log_pdf_param_grads(z[random_variable_name])
-                for variational_param_name, grad_val in grad_dict.items():
-                    key = f"{random_variable_name}_{variational_param_name}"
-                    grads[key] += elbo_sample * grad_val
+            with model.temporarily_set_many(model_z):
+                log_p = model.model_log_prob()
+            elbo_sample = log_p - log_q
+            total += elbo_sample
+
+            for random_variable_name, param in guide.params.items():
+                if use_reparametrization_trick[random_variable_name]:
+                    # reparametrization trick (exactly the same as torch.autograd)
+                    dz_dparams = reparam_grads[random_variable_name]
+
+                    with model.temporarily_set_many(model_z):
+                        if random_variable_name in model.params:
+                            model_grad = model.grad_log_prob(random_variable_name, model_z[random_variable_name])
+                        else:
+                            model_grad = torch.zeros_like(z[random_variable_name])
+                            for det_name, det_param in guide.deterministic_params.items():
+                                if det_name in model.params:
+                                    if any(getattr(inp, 'name', None) == random_variable_name for inp in det_param.inputs):
+                                        deriv = det_param.derivative(random_variable_name)
+                                        grad_wrt_det = model.grad_log_prob(det_name, model_z[det_name])
+                                        det_param_model = model.params[det_name]
+                                        transform_deriv = det_param_model.distribution.transform.derivative(det_param_model.unconstrained_value)
+                                        grad_wrt_det_constrained = grad_wrt_det / (transform_deriv + 1e-8)
+                                        model_grad = model_grad + grad_wrt_det_constrained * deriv
+
+                        grad_z_wrt_elbo = model_grad - guide.grad_log_prob(random_variable_name, z[random_variable_name])
+                    grad_dict = param.distribution.log_pdf_param_grads(z[random_variable_name])
+                    for variational_param_name, dz in dz_dparams.items():
+                        key = f"{random_variable_name}_{variational_param_name}"
+                        if key in grads:
+                            grads[key] += (grad_z_wrt_elbo * dz[i]).sum() - grad_dict[variational_param_name].sum()
+                else:
+                    # REINFORCE gradient (higher variance and not exact, but with n_samples high, close to the correct estimate)
+                    grad_dict = param.distribution.log_pdf_param_grads(z[random_variable_name])
+                    for variational_param_name, grad_val in grad_dict.items():
+                        key = f"{random_variable_name}_{variational_param_name}"
+                        if key in grads:
+                            grads[key] += elbo_sample * grad_val
 
     for key in grads:
         grads[key] /= n_samples

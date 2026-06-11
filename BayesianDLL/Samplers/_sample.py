@@ -33,9 +33,10 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     ))
 
     trace = {name: torch.stack([res[0][name] for res in results], dim=0) for name in model.params.keys()}
-    divergences = [res[1] for res in results]
-    acceptance_probabilities = [[prob / (n_samples + warmup_length) for prob in res[2]] for res in results]
-    step_sizes = [res[3] for res in results]
+    det_trace = {name: torch.stack([res[1][name] for res in results], dim=0) for name in model.deterministic_params.keys()}
+    divergences = [res[2] for res in results]
+    acceptance_probabilities = [[prob / (n_samples + warmup_length) for prob in res[3]] for res in results]
+    step_sizes = [res[4] for res in results]
 
     if n_chains > 1:
         r_hats = gelman_rubin(trace)
@@ -48,7 +49,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     if sum(divergences) > 0:
         warn(f"There were {sum(divergences)} divergences across all chains after tuning. Increase target acceptance probability or reparameterize the model.")
 
-    return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes)
+    return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=det_trace)
 
 def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar):
     torch.set_num_threads(1)
@@ -72,6 +73,10 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     for name, parameter in model.params.items():
         chain_trace[name] = torch.empty(size=(n_samples, *parameter.constrained_value.shape), dtype=parameter.unconstrained_value.dtype)
 
+    chain_det_trace = {}
+    for name, parameter in model.deterministic_params.items():
+        chain_det_trace[name] = torch.empty(size=(n_samples, *parameter.constrained_value.shape), dtype=parameter.constrained_value.dtype)
+
     for m in _progress_bar:
         if progress_bar:
             if m < warmup_length: _progress_bar.set_description(f"Chain {chain + 1}/{n_chains} warmup", refresh=False)
@@ -92,7 +97,11 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
             model.params[name].set_unconstrained_value(new_theta)
             if m > warmup_length: chain_trace[name][m - warmup_length - 1] = model.params[name].constrained_value
 
-    return chain_trace, divergences_count, acceptance_probabilities, step_sizes
+        if m > warmup_length:
+            for name, parameter in model.deterministic_params.items():
+                chain_det_trace[name][m - warmup_length - 1] = parameter.constrained_value
+
+    return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes
 
 def _decide_step(model, parameter):
     _log_prob_func = partial(model.log_prob, parameter.name)
