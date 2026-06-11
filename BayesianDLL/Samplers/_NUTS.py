@@ -5,6 +5,10 @@ from collections import namedtuple
 
 Tree = namedtuple("Tree", ["theta_minus", "r_minus", "grad_minus", "theta_plus", "r_plus", "grad_plus", "theta_prime", "grad_prime", "log_prob_prime", "n_prime", "s_prime", "alpha_prime", "n_prime_alpha", "diverging"])
 
+def _dot(a, b):
+    """Dot product that works for any-shape tensors (flattened)."""
+    return (a * b).sum()
+
 class NUTS:
     def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100):
         self.log_target = log_target
@@ -43,12 +47,12 @@ class NUTS:
         while torch.isinf(log_prob_prime) or torch.isnan(log_prob_prime) or torch.isinf(grad_prime).any() or torch.isnan(grad_prime).any():
             step_size *= 0.5
             _, r_prime, grad_prime, log_prob_prime = self.leapfrog(theta_init, r0, grad_init, step_size)
-        log_accept_prob = log_prob_prime - log_prob_init - 0.5 * (r_prime @ r_prime.T - r0 @ r0.T)
+        log_accept_prob = log_prob_prime - log_prob_init - 0.5 * (_dot(r_prime, r_prime) - _dot(r0, r0))
         a = 1 if log_accept_prob > math.log(0.5) else -1
         while a * log_accept_prob > -a * math.log(2):
             step_size *= 2 ** a
             _, r_prime, grad_prime, log_prob_prime = self.leapfrog(theta_init, r0, grad_init, step_size)
-            log_accept_prob = log_prob_prime - log_prob_init - 0.5 * (r_prime @ r_prime.T - r0 @ r0.T)
+            log_accept_prob = log_prob_prime - log_prob_init - 0.5 * (_dot(r_prime, r_prime) - _dot(r0, r0))
         
         step_size = min(max(step_size, self.min_step_size), self.max_step_size)
         return step_size
@@ -56,7 +60,7 @@ class NUTS:
     def build_tree(self, theta, r, grad, log_u, v, j, step_size, joint0):
         if j == 0:
             theta_prime, r_prime, grad_prime, log_prob_prime = self.leapfrog(theta, r, grad, v * step_size)
-            log_joint_prime = log_prob_prime - 0.5 * r_prime @ r_prime.T
+            log_joint_prime = log_prob_prime - 0.5 * _dot(r_prime, r_prime)
             diverging = bool(log_u > (log_joint_prime + 1000) or torch.isnan(log_joint_prime) or torch.isnan(log_prob_prime))
             n_prime = 1 if log_u < log_joint_prime else 0
             s_prime = 1 if not diverging else 0
@@ -88,12 +92,9 @@ class NUTS:
 
     def _uturn(self, theta_minus, theta_plus, r_minus, r_plus):
         delta_theta = theta_plus - theta_minus
-        return delta_theta @ r_minus.T >= 0 and delta_theta @ r_plus.T >= 0
+        return _dot(delta_theta, r_minus) >= 0 and _dot(delta_theta, r_plus) >= 0
 
     def step(self, theta, warmup=False):
-        if theta.ndim != 2 and theta.size(0) == 1:
-            raise ValueError("theta should be a tensor of shape (1, n_features).")
-        
         if not hasattr(self, "step_size"):
             log_prob = self.log_target(theta)
             gradient = self.gradient(theta)
@@ -104,7 +105,7 @@ class NUTS:
             self.m = 1
 
         r0 = torch.randn_like(theta)
-        joint = self.log_prob_cache - 0.5 * r0 @ r0.T
+        joint = self.log_prob_cache - 0.5 * _dot(r0, r0)
         log_u = joint + torch.log(torch.rand(1))
 
         theta_minus = theta

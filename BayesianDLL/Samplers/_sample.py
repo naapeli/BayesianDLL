@@ -66,7 +66,11 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     acceptance_probabilities = [1.0 for _ in range(len(samplers))]
     step_sizes = [1.0 for _ in range(len(samplers))]
     divergences_count = 0
-    chain_trace = {name: torch.empty(size=(n_samples, parameter.constrained_value.size(1)), dtype=parameter.unconstrained_value.dtype) for name, parameter in model.params.items()}
+
+    # Pre-allocate trace storage: shape (n_samples, *constrained_shape)
+    chain_trace = {}
+    for name, parameter in model.params.items():
+        chain_trace[name] = torch.empty(size=(n_samples, *parameter.constrained_value.shape), dtype=parameter.unconstrained_value.dtype)
 
     for m in _progress_bar:
         if progress_bar:
@@ -132,13 +136,12 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
     samplers = {}
     state_spaces = {}
     for name, parameter in model.observed_params.items():
-        # shape = parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value).shape  # TODO: get the shape (if shape is not (1,) need to modify and change the sampling)
         samplers[name] = _decide_predicative_step(parameter)
         state_spaces[name] = parameter.distribution.transformed_state_space
 
-    predicative_samples = {name: torch.empty(size=(n_samples, samples_per_step, len(parameter.observed_values[0])), dtype=parameter.observed_values[0].dtype) for name, parameter in model.observed_params.items()}
+    predicative_samples = {name: torch.empty(size=(n_samples, samples_per_step, *parameter.observed_values.shape), dtype=parameter.observed_values.dtype) for name, parameter in model.observed_params.items()}
 
-    n_chains, trace_length, _ = next(iter(trace.values())).shape
+    n_chains, trace_length = next(iter(trace.values())).shape[:2]
     flattened_trace = {name: values.flatten(0, 1) for name, values in trace.items()}
     total_samples = n_chains * trace_length
 
@@ -150,28 +153,22 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
             raise RuntimeError(f"n_samples ({n_samples}) must be less than or equal to the total trace length ({total_samples}).")
         indices = torch.linspace(0, total_samples - 1, steps=n_samples).long()
 
-    # _progress_bar = tqdm(range(n_samples), desc="Predicative sample") if progress_bar else range(n_samples)
-    # for i in _progress_bar:
     for i in range(n_samples):
-        # print(f"Predicative sample {i + 1}")
         prior_values = {}
         for name, values in flattened_trace.items():
-            prior_values[name] = values[indices[i]].unsqueeze(0)
+            prior_values[name] = values[indices[i]]
         
         for name, parameter in model.params.items():
-            # unconstrained_value = parameter.distribution.transform.forward(prior_values[name])
-            # parameter.set_unconstrained_value(unconstrained_value)
             parameter.set_constrained_value(prior_values[name])
 
         for name, sampler in samplers.items():
             sampler.reset()
             parameter = model.observed_params[name]
-            init_value = parameter.observed_values[0].unsqueeze(0)
+            init_value = parameter.observed_values
             theta = _init_theta(state_spaces[name], init_value.shape, init_value.dtype)
             _progress_bar = tqdm(range(1, warmup_per_sample + samples_per_step + 1), bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}") if progress_bar else range(1, warmup_per_sample + samples_per_step + 1)
             acceptance_probabilities = 0
             step_size = 1
-            # for m in range(warmup_per_sample + samples_per_step):
             for m in _progress_bar:
                 if progress_bar:
                     if m < warmup_per_sample: _progress_bar.set_description(f"{name} predicative sample {i + 1} warmup")
@@ -190,7 +187,7 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
         unconstrained_value = parameter.distribution.transform.forward(prior_values[name])
         parameter.set_unconstrained_value(unconstrained_value)
     
-    predicative_samples = {name: model.observed_params[name].distribution.transform.inverse(samples.reshape(n_samples * samples_per_step, -1)).reshape(n_samples, samples_per_step, -1) for name, samples in predicative_samples.items()}
+    predicative_samples = {name: model.observed_params[name].distribution.transform.inverse(samples.reshape(-1, *samples.shape[2:])).reshape(samples.shape) for name, samples in predicative_samples.items()}
     return predicative_samples
 
 def _init_theta(state_space, shape, dtype):

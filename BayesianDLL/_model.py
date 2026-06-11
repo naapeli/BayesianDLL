@@ -89,37 +89,60 @@ class Model:
                 raise RuntimeError("One is only able to compute the derivative with respect to a RandomParameter.")
             
             param = self.params[name]
+            n_param = param.unconstrained_value.numel()
+            # Prior gradient: shape same as unconstrained_value
             grad = param.distribution._log_prob_grad_unconstrained(param.unconstrained_value)
+            # Flatten to (n_param,) for accumulation
+            grad_flat = grad.reshape(-1)
 
-            stack = [(name, torch.eye(param.unconstrained_value.numel(), dtype=param.unconstrained_value.dtype))]
+            # chain_derivative: Jacobian of current node w.r.t. the original param
+            # shape: (n_current, n_param)
+            stack = [(name, torch.eye(n_param, dtype=param.unconstrained_value.dtype))]
 
             while stack:
                 current_name, chain_derivative = stack.pop()
+                # chain_derivative shape: (n_current, n_param)
 
                 for successor_name in self.graph.successors(current_name):
                     if successor_name in self.params:
                         successor_param = self.params[successor_name]
                         local_grad = successor_param.distribution.log_pdf_param_grads(successor_param.constrained_value)[current_name]
-                        grad = grad + local_grad @ chain_derivative
+                        # local_grad shape: (*successor_shape) w.r.t. current
+                        # We need: d(log_p_successor)/d(param) = d(log_p)/d(current) @ d(current)/d(param)
+                        grad_flat = grad_flat + local_grad.reshape(-1) @ chain_derivative
 
                     elif successor_name in self.observed_params:
                         successor_param = self.observed_params[successor_name]
-                        if current_name == name:  # does not depend on a DeterministicParameter
-                            distribution_grad = successor_param.distribution.log_pdf_param_grads(successor_param.observed_values)[current_name].sum(dim=0, keepdim=True)
-                            transform_jacobian = param.distribution.transform.derivative(param.unconstrained_value)
-                            grad = grad + distribution_grad @ transform_jacobian.squeeze(0)
-                            break
-                        else:  # depends on a DeterministicParameter
-                            distribution_grad = successor_param.distribution.log_pdf_param_grads(successor_param.observed_values)[current_name]
-                            transformed_grad = distribution_grad.T @ chain_derivative
-                            transform_jacobian = param.distribution.transform.derivative(param.unconstrained_value)
-                            grad = grad + transformed_grad @ transform_jacobian.squeeze(0)
-                            break
+                        observed = successor_param.observed_values
+                        distribution_grad = successor_param.distribution.log_pdf_param_grads(observed)[current_name]
+                        # distribution_grad has shape (*obs_batch, *current_event)
+                        # chain_derivative has shape (n_current, n_param)
+                        # We need sum over obs of: d(log_p)/d(current) @ d(current)/d(param)
+                        # = distribution_grad.reshape(n_obs, n_current) @ chain_derivative
+                        n_current = chain_derivative.shape[0]
+                        dg_flat = distribution_grad.reshape(-1, n_current)  # (n_obs, n_current)
+                        # Sum over observations: (n_obs, n_current) @ (n_current, n_param) -> (n_obs, n_param) -> sum -> (n_param,)
+                        likelihood_grad = (dg_flat @ chain_derivative).sum(dim=0)  # (n_param,)
+                        # Apply transform Jacobian: d(constrained)/d(unconstrained)
+                        deriv = param.distribution.transform.derivative(param.unconstrained_value)
+                        if deriv.shape == param.unconstrained_value.shape:
+                            # Element-wise: Jacobian is diagonal
+                            grad_flat = grad_flat + likelihood_grad * deriv.reshape(-1)
+                        else:
+                            # Full Jacobian (e.g. SoftMax)
+                            grad_flat = grad_flat + likelihood_grad @ deriv.squeeze(0)
+                        break
 
                     elif successor_name in self.deterministic_params:
                         deterministic_param = self.deterministic_params[successor_name]
                         deterministic_derivative = deterministic_param.derivative(current_name)
-                        stack.append((successor_name, deterministic_derivative @ chain_derivative.T))
+                        # deterministic_derivative: d(det_output)/d(current_name)
+                        # shape conceptually (n_det_output, n_current) but stored as tensor
+                        n_current = chain_derivative.shape[0]
+                        n_det = deterministic_derivative.numel() // n_current if n_current > 0 else deterministic_derivative.numel()
+                        det_jac = deterministic_derivative.reshape(n_det, n_current)  # (n_det, n_current)
+                        new_chain = det_jac @ chain_derivative  # (n_det, n_param)
+                        stack.append((successor_name, new_chain))
 
                     elif self.graph.nodes[successor_name].get("type") == "observed":
                         # This happens during prior predicative sampling when observed_params is temporarily cleared
@@ -128,7 +151,7 @@ class Model:
                     else:
                         raise RuntimeError(f"Node {successor_name} not in the compute graph")
 
-        return grad
+        return grad_flat.reshape(param.unconstrained_value.shape)
 
 
     def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, start_point_variance=1):

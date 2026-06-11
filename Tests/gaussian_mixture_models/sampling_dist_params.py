@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Dirichlet, Normal, Mixture, Exponential
-from BayesianDLL import Model, RandomParameter, ObservedParameter
+from BayesianDLL import Model, RandomParameter, ObservedParameter, plate
 from BayesianDLL.Evaluation.Graphics import plot_posterior, plot_model
 
 
@@ -28,7 +28,8 @@ with Model() as model:
 
     components = [Normal(mu, cov) for mu, cov in zip(means, variances)]
 
-    likelihood = ObservedParameter("likelihood", Mixture(components, weights), data.unsqueeze(1))
+    with plate("data", n):
+        likelihood = ObservedParameter("likelihood", Mixture(components, weights), data)
 
     plt.figure()
     plot_model(model)

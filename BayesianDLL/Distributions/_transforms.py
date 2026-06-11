@@ -6,19 +6,39 @@ from abc import ABC, abstractmethod
 class Transform(ABC):
     @abstractmethod
     def forward(self, x_constrained):
+        """Map from constrained → unconstrained space. Element-wise."""
         pass
     
     @abstractmethod
     def inverse(self, x_unconstrained):
+        """Map from unconstrained → constrained space. Element-wise."""
         pass
 
     @abstractmethod
     def derivative(self, x_unconstrained):
+        """
+        Diagonal of the Jacobian dx_constrained/dx_unconstrained.
+        Returns a tensor of the same shape as x_unconstrained.
+        For element-wise transforms this is simply the element-wise derivative.
+        """
         pass
 
     @abstractmethod
-    def grad_log_abs_det_jacobian(x_unconstrained):
+    def log_abs_det_jacobian(self, x_unconstrained):
+        """
+        Log absolute determinant of the Jacobian.
+        Returns a scalar (summed over all elements).
+        """
         pass
+
+    @abstractmethod
+    def grad_log_abs_det_jacobian(self, x_unconstrained):
+        """
+        Gradient of log_abs_det_jacobian w.r.t. x_unconstrained.
+        Returns a tensor of the same shape as x_unconstrained.
+        """
+        pass
+
 
 class LogTransform(Transform):
     def __init__(self, border=0, side="larger"):
@@ -39,10 +59,14 @@ class LogTransform(Transform):
 
     def derivative(self, x_unconstrained):
         sign = 1 if self.side == "larger" else -1
-        return torch.diag_embed(sign * torch.exp(x_unconstrained))
+        return sign * torch.exp(x_unconstrained)
+
+    def log_abs_det_jacobian(self, x_unconstrained):
+        return x_unconstrained.sum()
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.ones_like(x_unconstrained)
+
 
 class InverseSoftPlusTransform(Transform):  
     def __init__(self, border=0, side="larger"):
@@ -66,10 +90,14 @@ class InverseSoftPlusTransform(Transform):
 
     def derivative(self, x_unconstrained):
         sign = 1 if self.side == "larger" else -1
-        return torch.diag_embed(sign * torch.sigmoid(x_unconstrained))
+        return sign * torch.sigmoid(x_unconstrained)
+
+    def log_abs_det_jacobian(self, x_unconstrained):
+        return (-F.softplus(-x_unconstrained)).sum()
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return -F.softplus(-x_unconstrained)
+
 
 class LogitTransform(Transform):
     def __init__(self, low=0, high=1):
@@ -89,13 +117,20 @@ class LogitTransform(Transform):
         x = self.inverse(x_unconstrained)
         x = x.clamp(self.low + 1e-8, self.high - 1e-8)
         x_scaled = (x - self.low) / self.scale
-        return torch.diag_embed(self.scale * x_scaled * (1 - x_scaled))
+        return self.scale * x_scaled * (1 - x_scaled)
+
+    def log_abs_det_jacobian(self, x_unconstrained):
+        x = self.inverse(x_unconstrained)
+        x = x.clamp(self.low + 1e-8, self.high - 1e-8)
+        x_scaled = (x - self.low) / self.scale
+        return torch.log(self.scale * x_scaled * (1 - x_scaled)).sum()
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         x = self.inverse(x_unconstrained)
         x = x.clamp(self.low + 1e-8, self.high - 1e-8)
         x_scaled = (x - self.low) / self.scale
         return 1 - 2 * x_scaled
+
 
 class IdentityTransform(Transform):    
     def forward(self, x_constrained):
@@ -105,10 +140,14 @@ class IdentityTransform(Transform):
         return x_unconstrained
     
     def derivative(self, x_unconstrained):
-        return torch.diag_embed(torch.ones_like(x_unconstrained))
-    
+        return torch.ones_like(x_unconstrained)
+
+    def log_abs_det_jacobian(self, x_unconstrained):
+        return torch.zeros((), dtype=x_unconstrained.dtype)
+
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.zeros_like(x_unconstrained)
+
 
 class SoftMaxTransform(Transform):
     def __init__(self, dim=-1):
@@ -125,8 +164,13 @@ class SoftMaxTransform(Transform):
         return e / torch.sum(e, dim=self.dim, keepdim=True)
 
     def derivative(self, x_unconstrained):
+        # For the softmax transform the Jacobian is not diagonal.
+        # Return the full Jacobian matrix for the last dimension.
         sm = self.inverse(x_unconstrained)
         return torch.diag_embed(sm) - sm.unsqueeze(-1) @ sm.unsqueeze(-2)
+
+    def log_abs_det_jacobian(self, x_unconstrained):
+        return torch.zeros((), dtype=x_unconstrained.dtype)
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.zeros_like(x_unconstrained)

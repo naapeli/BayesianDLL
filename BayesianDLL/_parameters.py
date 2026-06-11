@@ -1,32 +1,45 @@
 import torch
 
 from ._active_model import _active_model
+from ._plate import get_active_plates
 
 
 class RandomParameter:
     def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", **sampler_params):
+        # Capture active plates at creation time
+        self.plates = get_active_plates()
+
+        # Determine the event shape from distribution or explicit shape
+        if shape is not None:
+            event_shape = (shape,) if isinstance(shape, int) else tuple(shape)
+        else:
+            event_shape = distribution.event_shape
+            if event_shape == ():
+                event_shape = (1,)  # minimum 1D for scalar distributions
+
+        # Compute the full value shape: plate_shape + event_shape
+        plate_shape = tuple(p.size for p in self.plates)
+        full_shape = plate_shape + event_shape
+
         if initial_value is None:
-            if shape is None:
-                shape = distribution.shape
-            elif isinstance(shape, int):
-                shape = (shape,)
-            
             if distribution.state_space.is_continuous():
-                unconstrained = torch.zeros((1, *shape), dtype=torch.float64)
-                initial_value = distribution.transform.inverse(unconstrained).squeeze(0)
+                unconstrained = torch.zeros(full_shape, dtype=torch.float64)
+                initial_value = distribution.transform.inverse(unconstrained)
             elif distribution.state_space.is_discrete():
                 first_value = next(iter(distribution.state_space))
-                initial_value = first_value * torch.ones(shape, dtype=torch.float64)
-
-        if initial_value.ndim == 2 and initial_value.size(0) == 1:
-            initial_value = initial_value.squeeze(0)
-
-        if initial_value.ndim not in [0, 1]:
-            raise ValueError(f"initial_value must be either 0 or 1 dimensional. Currently the shape is {initial_value.shape}.")
+                initial_value = first_value * torch.ones(full_shape, dtype=torch.float64)
+        else:
+            # Ensure initial_value has the right shape
+            if initial_value.shape != full_shape:
+                try:
+                    initial_value = initial_value.reshape(full_shape)
+                except RuntimeError:
+                    initial_value = initial_value.expand(full_shape).clone()
 
         self.name = name
         self.distribution = distribution
-        self.constrained_value = initial_value.reshape(1, -1)
+        self.event_shape = event_shape
+        self.constrained_value = initial_value
         self.unconstrained_value = self.distribution.transform.forward(self.constrained_value)
         self.sampler = sampler
         self.sampler_params = sampler_params
@@ -48,20 +61,15 @@ class RandomParameter:
     def set_unconstrained_value(self, unconstrained_value):
         if not isinstance(unconstrained_value, torch.Tensor):
             raise TypeError("unconstrained_value should be a torch.Tensor.")
-        if unconstrained_value.ndim != 2:
-            raise ValueError("unconstrained_value.shape should be (n_samples, n_features).")
-
         self.unconstrained_value = unconstrained_value
         self.constrained_value = self.distribution.transform.inverse(unconstrained_value)
     
     def set_constrained_value(self, constrained_value):
         if not isinstance(constrained_value, torch.Tensor):
             raise TypeError("constrained_value should be a torch.Tensor.")
-        if constrained_value.ndim != 2:
-            raise ValueError("constrained_value.shape should be (n_samples, n_features).")
-
         self.constrained_value = constrained_value
         self.unconstrained_value = self.distribution.transform.forward(constrained_value)
+
 
 class ObservedParameter:
     def __init__(self, name, distribution, observed_values, sampler="auto", **sampler_params):
@@ -70,6 +78,7 @@ class ObservedParameter:
         self.observed_values = observed_values
         self.sampler = sampler  # for predicative sampling
         self.sampler_params = sampler_params
+        self.plates = get_active_plates()
 
         if _active_model._active_model is not None:
             _active_model._active_model.observed_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
@@ -83,6 +92,7 @@ class ObservedParameter:
         else:
             raise RuntimeError("One should select an active model before creating random variables.")
 
+
 class DeterministicParameter:
     def __init__(self, name, forward_func, derivative_func, inputs):
         self.name = name
@@ -90,6 +100,7 @@ class DeterministicParameter:
         self.derivative_func = derivative_func
         self.inputs = inputs
         self.owner_model = _active_model._active_model
+        self.plates = get_active_plates()
 
         if _active_model._active_model is not None:
             _active_model._active_model.deterministic_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
@@ -114,7 +125,6 @@ class DeterministicParameter:
         return local_derivative
 
     def _get_constrained_value(self, input):
-        # model = _active_model._active_model
         if isinstance(input, torch.Tensor):
             return input
         if hasattr(input, "name"):
@@ -125,10 +135,13 @@ class DeterministicParameter:
             raise KeyError(f"Parameter '{input.name}' not found in the active model.")
         raise TypeError(f"Parameter {input} has an unkown type.")
 
+
 class VariationalParameter:
     def __init__(self, name, value, min=-float("inf"), max=float("inf")):
         self.name = name
-        self.value = torch.as_tensor(value, dtype=value.dtype if torch.is_tensor(value) else torch.float32).reshape(1, -1)
+        self.value = torch.as_tensor(value, dtype=value.dtype if torch.is_tensor(value) else torch.float32)
+        if self.value.ndim == 0:
+            self.value = self.value.unsqueeze(0)
         self.min = min
         self.max = max
 

@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, InvGamma
-from BayesianDLL import Model, RandomParameter, ObservedParameter
+from BayesianDLL import Model, RandomParameter, ObservedParameter, plate
 from BayesianDLL.Evaluation.Graphics import plot_model
 
 
@@ -10,10 +10,10 @@ torch.manual_seed(0)
 N = 100
 mu0 = 0
 tau = 10
-a = 2
-b = 2
+a_val = 2
+b_val = 2
 true_mean, true_variance = 5, 3
-data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N, 1))
+data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N,))
 
 with Model() as model:
     a = RandomParameter("a", Normal(0, 1), torch.randn(1, dtype=torch.float64), sampler="nuts")
@@ -21,7 +21,8 @@ with Model() as model:
     c = RandomParameter("c", Normal(b, tau), torch.randn(1, dtype=torch.float64), sampler="nuts")
     d = RandomParameter("d", InvGamma(a, b), torch.ones(1, dtype=torch.float64), sampler="nuts")
 
-    likelihood = ObservedParameter("likelihood", Normal(c, d), data)
+    with plate("data", N):
+        likelihood = ObservedParameter("likelihood", Normal(c, d), data)
     plot_model(model)
 
 

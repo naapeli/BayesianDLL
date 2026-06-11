@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, HalfCauchy, MultivariateNormal
-from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, sample, posterior_predicative
+from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, sample, posterior_predicative, plate
 from BayesianDLL import Evaluation
 
 
@@ -13,7 +13,7 @@ true_coeffs, xmin, xmax = [0.0, 3.488378906, 0.0, -0.855187500, 0.0, 0.107675000
 true_variance = 0.1
 x = torch.linspace(xmin, xmax, N, dtype=torch.float64)
 X = torch.stack([x ** i for i in range(len(true_coeffs))], dim=1)
-y = sum(c * x ** i for i, c in enumerate(true_coeffs)).unsqueeze(1) + torch.normal(0, true_variance ** 0.5, size=(N, 1))
+y = sum(c * x ** i for i, c in enumerate(true_coeffs)) + torch.normal(0, true_variance ** 0.5, size=(N,))
 y = y.to(torch.float64)
 
 
@@ -25,26 +25,27 @@ phi_x = torch.stack([torch.cos(i * torch.acos(x_scaled)) for i in range(D + 1)],
 with Model() as polynomial_model:
     prior_mean = torch.zeros(D + 1, dtype=torch.float64)
     prior_cov = torch.eye(D + 1, dtype=torch.float64)
-    prior_coeffs = RandomParameter("coeffs", MultivariateNormal(prior_mean, prior_cov), torch.randn_like(prior_mean, dtype=torch.float64), min_step_size=1e-1)
-    prior_sigma = RandomParameter("sigma", HalfCauchy(10), torch.ones(1, dtype=torch.float64), min_step_size=1e-1)
+    prior_coeffs = RandomParameter("coeffs", MultivariateNormal(prior_mean, prior_cov), min_step_size=1e-2)
+    prior_sigma = RandomParameter("sigma", HalfCauchy(10), min_step_size=1e-2)
 
-    mu = DeterministicParameter("mu", lambda coeffs: phi_x @ coeffs.T, lambda coeffs: {"coeffs": phi_x}, [prior_coeffs])
+    mu = DeterministicParameter("mu", lambda coeffs: phi_x @ coeffs, lambda coeffs: {"coeffs": phi_x}, [prior_coeffs])
     
-    likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
-    samples = sample(2000, 1000)
-    # posterior predicative not working currently, as it should generate values for each x
-    # posterior_predicative_distribution = posterior_predicative(samples, n_samples=10, samples_per_step=1000, warmup_per_sample=500)
+    with plate("data", N):
+        likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
+    
+    predicative_distribution = polynomial_model.sample_prior_predicative(20, 2000, samples_per_step=10)
+    plt.figure()
+    Evaluation.Graphics.plot_predicative_distribution(predicative_distribution, y, kind="pdf")
+    
+    predicative_distribution = polynomial_model.sample_posterior_predicative(20, 2000, samples_per_step=10, warmup_per_sample=200)
+    plt.figure()
+    Evaluation.Graphics.plot_predicative_distribution(predicative_distribution, y, kind="pdf")
+    plt.show()
 
-# print(Evaluation.gelman_rubin(samples, method="classical"))
-# print(Evaluation.gelman_rubin(samples, method="split"))
-# print(Evaluation.gelman_rubin(samples, method="rank"))
+    samples = sample(2000, 1000)
+
 plt.figure(figsize=(20, 10))
 Evaluation.Graphics.plot_posterior(samples)
-# plt.figure()
-# plt.subplot(1, 2, 1)
-# Evaluation.Graphics.plot_predicative_distribution(posterior_predicative_distribution, y, kind="pdf", method="hist")
-# plt.subplot(1, 2, 2)
-# Evaluation.Graphics.plot_predicative_distribution(posterior_predicative_distribution, y, kind="cdf", method="hist")
 
 plt.figure(figsize=(10, 6))
 plt.plot(x, y, 'o', label="Observed data", alpha=0.6)

@@ -28,7 +28,7 @@ class Metropolis:
     
     def get_proposal(self, theta):
         if self.state_space.is_discrete():
-            theta_proposal = theta + 2 * torch.randint(0, 2, size=(1,)) - 1
+            theta_proposal = theta + 2 * torch.randint(0, 2, size=theta.shape) - 1
         elif self.state_space.is_continuous():
             theta_proposal = theta + self.proposal_variance * torch.randn_like(theta)
         else:
@@ -46,3 +46,7 @@ class Metropolis:
         
     def init_sampler(self):
         pass
+
+    def reset(self):
+        self.m = 0
+        self.accept_queue.clear()

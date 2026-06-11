@@ -10,7 +10,7 @@ def resolve(parameter):
     elif isinstance(parameter, VariationalParameter):
          return parameter.value
     elif isinstance(parameter, int | float):
-        return torch.as_tensor(parameter).unsqueeze(0)
+        return torch.as_tensor(parameter)
     elif isinstance(parameter, list | tuple):
             return torch.tensor(parameter)
     else:
