@@ -239,9 +239,9 @@ class Model:
             return grads[name]
 
 
-    def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, start_point_variance=1):
+    def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, start_point_variance=1, blocks=None, **sampler_params):
         from .Samplers import sample as _sample
-        return _sample(n_samples, warmup_length, n_chains=n_chains, model=self, progress_bar=progress_bar, start_point_variance=start_point_variance)
+        return _sample(n_samples, warmup_length, n_chains=n_chains, model=self, progress_bar=progress_bar, start_point_variance=start_point_variance, blocks=blocks, **sampler_params)
 
     def find_MAP(self, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
         from .Variational import find_MAP as _find_MAP

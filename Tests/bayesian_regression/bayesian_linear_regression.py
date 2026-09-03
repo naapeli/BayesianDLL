@@ -33,7 +33,7 @@ with Model() as linear_model:
     Graphics.plot_predicative_distribution(predicative_distribution, y, kind="pdf")
     plt.show()
 
-    samples = linear_model.sample(1000, 100)
+    samples = linear_model.sample(1000, 100, blocks=[["slope", "intercept", "sigma"]])
 
 
 plt.figure()
