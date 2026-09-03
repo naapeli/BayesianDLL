@@ -62,13 +62,13 @@ def _z_scale(chains: torch.Tensor) -> torch.Tensor:
 
 def _rank_normalized_rhat_core(chains: torch.Tensor) -> float:
     """
-    Rank-normalized folded split R-hat (Vehtari et al., 2021; ArviZ default).
+    Rank-normalized folded split R-hat (Vehtari et al., 2021).
     Computes both bulk R-hat and folded tail R-hat and takes the maximum.
     """
     z_bulk = _z_scale(chains)
     rhat_bulk = _split_rhat_core(z_bulk)
 
-    median = chains.median()
+    median = torch.tensor(np.median(chains.detach().cpu().numpy()), dtype=chains.dtype, device=chains.device)
     folded = torch.abs(chains - median)
     z_tail = _z_scale(folded)
     rhat_tail = _split_rhat_core(z_tail)

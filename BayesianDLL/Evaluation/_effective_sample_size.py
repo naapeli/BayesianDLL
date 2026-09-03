@@ -82,7 +82,41 @@ def _ess_core(ary: np.ndarray) -> float:
     return float(ess)
 
 
-def effective_sample_size(samples: dict[str, torch.Tensor], method: str = "bulk") -> dict[str, torch.Tensor]:
+def _ess_mean(chains: np.ndarray) -> float:
+    """Compute split mean ESS for posterior expectation."""
+    split_feat = _split_chains(chains)
+    return _ess_core(split_feat)
+
+
+def _ess_bulk(chains: np.ndarray) -> float:
+    """Compute rank-normalized split bulk ESS."""
+    split_feat = _split_chains(chains)
+    z_feat = _z_scale(split_feat)
+    return _ess_core(z_feat)
+
+
+def _ess_tail(chains: np.ndarray, prob: float = 0.89) -> float:
+    """
+    Compute tail ESS using quantile indicators matching ArviZ / Stan.
+    prob: coverage probability (default 0.89 matching ArviZ's stats.ci_prob).
+    """
+    if prob is None:
+        prob = 0.89
+    if not isinstance(prob, (list, tuple)):
+        prob = sorted((prob, 1.0 - prob))
+
+    prob_low, prob_high = prob
+    flat = chains.flatten()
+    q_low = float(np.quantile(flat, prob_low))
+    q_high = float(np.quantile(flat, prob_high))
+    split_low = _split_chains((chains <= q_low).astype(float))
+    split_high = _split_chains((chains <= q_high).astype(float))
+    ess_low = _ess_core(split_low)
+    ess_high = _ess_core(split_high)
+    return float(min(ess_low, ess_high))
+
+
+def effective_sample_size(samples: dict[str, torch.Tensor], method: str = "bulk", prob: float = 0.89) -> dict[str, torch.Tensor]:
     """
     Compute Effective Sample Size (ESS).
 
@@ -92,7 +126,10 @@ def effective_sample_size(samples: dict[str, torch.Tensor], method: str = "bulk"
         Mapping from parameter name to tensor of shape (n_chains, n_samples, ...)
     method : str, default "bulk"
         - "bulk": Rank-normalized split ESS.
+        - "tail": Tail ESS computed on upper and lower quantile indicators.
         - "mean": Raw split ESS for posterior mean.
+    prob : float or tuple, default 0.89
+        Coverage probability or quantile pair for tail ESS (only used when method="tail").
 
     Returns:
     --------
@@ -112,17 +149,32 @@ def effective_sample_size(samples: dict[str, torch.Tensor], method: str = "bulk"
         ess_vals = torch.zeros(n_features, dtype=torch.float64)
         for f in range(n_features):
             feat = chains_np[:, :, f]
-            split_feat = _split_chains(feat)
             if method == "mean":
-                ess_vals[f] = _ess_core(split_feat)
+                ess_vals[f] = _ess_mean(feat)
             elif method == "bulk":
-                z_feat = _z_scale(split_feat)
-                ess_vals[f] = _ess_core(z_feat)
+                ess_vals[f] = _ess_bulk(feat)
+            elif method == "tail":
+                ess_vals[f] = _ess_tail(feat, prob=prob)
             else:
-                raise ValueError(f"Unknown method '{method}'. Must be 'bulk' or 'mean'.")
+                raise ValueError(f"Unknown method '{method}'. Must be 'bulk', 'tail', or 'mean'.")
 
         if len(feature_shape) > 0:
             results[name] = ess_vals.reshape(feature_shape)
         else:
             results[name] = ess_vals
     return results
+
+
+def ess_bulk(samples: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Compute rank-normalized bulk ESS."""
+    return effective_sample_size(samples, method="bulk")
+
+
+def ess_tail(samples: dict[str, torch.Tensor], prob: float = 0.89) -> dict[str, torch.Tensor]:
+    """Compute tail ESS using quantile indicators at coverage `prob` (default 0.89)."""
+    return effective_sample_size(samples, method="tail", prob=prob)
+
+
+def ess_mean(samples: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Compute split mean ESS for posterior mean."""
+    return effective_sample_size(samples, method="mean")
