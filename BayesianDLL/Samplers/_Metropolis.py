@@ -14,7 +14,11 @@ class Metropolis:
     
     def step(self, theta, warmup=False):
         theta_proposal = self.get_proposal(theta)
-        acceptance_ratio = min(torch.ones(1), torch.exp(self.log_target(theta_proposal) - self.log_target(theta)))
+        log_diff = self.log_target(theta_proposal) - self.log_target(theta)
+        if torch.isnan(log_diff) or torch.isneginf(log_diff):
+            acceptance_ratio = torch.zeros(1)
+        else:
+            acceptance_ratio = min(torch.ones(1), torch.exp(log_diff))
         if torch.rand(1) < acceptance_ratio:
             theta = theta_proposal
             self.accept_queue.append(1)

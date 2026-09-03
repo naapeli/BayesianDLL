@@ -1,5 +1,6 @@
 import torch
 from contextlib import contextmanager
+import networkx as nx
 from networkx import DiGraph
 from collections import deque
 
@@ -12,6 +13,12 @@ class Model:
         self.observed_params: dict[str, ObservedParameter] = {}
         self.deterministic_params: dict[str, DeterministicParameter] = {}
         self.graph = DiGraph()
+        self._compiled = False
+        self._affected_params: dict[str, list[RandomParameter]] = {}
+        self._affected_observed: dict[str, list[ObservedParameter]] = {}
+        self._all_params_list: list[RandomParameter] = []
+        self._topo_deterministic_params: list[DeterministicParameter] = []
+        self._successors: dict[str, list[str]] = {}
 
     def __enter__(self):
         _active_model._active_model = self
@@ -19,11 +26,52 @@ class Model:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         _active_model._active_model = None
+        self.compile()
+
+    def compile(self):
+        self._all_params_list = list(self.params.values())
+        self._successors = {n: list(self.graph.successors(n)) for n in self.graph.nodes}
+
+        try:
+            topo_order = list(nx.topological_sort(self.graph))
+        except (nx.NetworkXError, nx.NetworkXUnfeasible):
+            topo_order = list(self.graph.nodes)
+
+        self._topo_deterministic_params = [
+            self.deterministic_params[n] for n in topo_order if n in self.deterministic_params
+        ]
+
+        self._affected_params = {}
+        self._affected_observed = {}
+
+        for name in self.params:
+            visited = set()
+            queue = deque([name])
+            visited.add(name)
+
+            while queue:
+                curr = queue.popleft()
+                for succ in self.graph.successors(curr):
+                    if succ not in visited:
+                        visited.add(succ)
+                        queue.append(succ)
+
+            self._affected_params[name] = [
+                self.params[n] for n in visited if n in self.params
+            ]
+            self._affected_observed[name] = [
+                self.observed_params[n] for n in visited if n in self.observed_params
+            ]
+
+        self._compiled = True
 
     def model_log_prob(self):
+        if not self._compiled:
+            self.compile()
+
         logp = 0.0
         # priors
-        for parameter in self.params.values():
+        for parameter in self._all_params_list:
             diff = parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
             logp += diff
 
@@ -34,31 +82,16 @@ class Model:
         return logp
 
     def log_prob(self, name, theta):
-        with self.temporarily_set(name, theta):
-            logp = 0
-            node_queue = deque()
-            node_queue.append(name)
-            visited = {name}
+        if not self._compiled:
+            self.compile()
 
-            while node_queue:
-                name = node_queue.popleft()
-                if name in self.params:
-                    parameter = self.params[name]
-                    logp += parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
-                elif name in self.observed_params:
-                    observed_parameter = self.observed_params[name]
-                    logp += observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
-                elif name in self.deterministic_params:
-                    pass
-                elif self.graph.nodes[name].get("type") == "observed":
-                    pass
-                else:
-                    raise RuntimeError(f"Node {name} not in the compute graph")
-                
-                for param in self.graph.successors(name):
-                    if param not in visited:
-                        visited.add(param)
-                        node_queue.append(param)
+        with self.temporarily_set(name, theta):
+            logp = 0.0
+            for param in self._affected_params[name]:
+                logp += param.distribution._log_prob_unconstrained(param.unconstrained_value)
+            for obs in self._affected_observed[name]:
+                if obs.name in self.observed_params:
+                    logp += obs.distribution.log_pdf(obs.observed_values).sum()
 
         return logp
 
@@ -84,6 +117,9 @@ class Model:
                 self.params[name].set_unconstrained_value(old_value)
 
     def grad_log_prob(self, name, theta):
+        if not self._compiled:
+            self.compile()
+
         with self.temporarily_set(name, theta):
             if name not in self.params:
                 raise RuntimeError("One is only able to compute the derivative with respect to a RandomParameter.")
