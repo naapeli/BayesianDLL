@@ -24,6 +24,7 @@ dependencies = [
     "numpy==2.1.3",
     "opt-einsum==3.4.0",
     "packaging==25.0",
+    "pandas>=2.3.3",
     "pillow==11.2.1",
     "pyparsing==3.2.3",
     "pyro-api==0.1.2",

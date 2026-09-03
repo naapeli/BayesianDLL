@@ -26,6 +26,10 @@ class SamplingResult:
     def items(self):
         return {**self.trace, **self.deterministic_trace}.items()
 
+    def summary(self, hdi_prob=0.94, ci_kind="eti", round_to=3, include_deterministic=True):
+        from ..Evaluation._summary import summary as _summary
+        return _summary(self, hdi_prob=hdi_prob, ci_kind=ci_kind, round_to=round_to, include_deterministic=include_deterministic)
+
     def __repr__(self):
         params = list(self.trace.keys()) + list(self.deterministic_trace.keys())
         return f"SamplingResult(params={params}, divergences={self.divergences})"
