@@ -21,10 +21,6 @@ with Model() as model:
     c = RandomParameter("c", Normal(b, tau), torch.randn(1, dtype=torch.float64), sampler="nuts")
     d = RandomParameter("d", InvGamma(a, b), torch.ones(1, dtype=torch.float64), sampler="nuts")
 
-    with plate("data", N):
-        likelihood = ObservedParameter("likelihood", Normal(c, d), data)
-    plot_model(model)
-
 
 h = 1e-8
 print((model.log_prob("a", a.unconstrained_value + h) - model.log_prob("a", a.unconstrained_value)) / h)

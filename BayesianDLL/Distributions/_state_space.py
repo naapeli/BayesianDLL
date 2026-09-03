@@ -115,3 +115,23 @@ class ContinuousSimplex(ContinuousSpace):
         sum = torch.sum(state)
         sum_to_1 = torch.allclose(sum, torch.ones_like(sum))
         return between_0_and_1 & sum_to_1
+
+class JointStateSpace(StateSpace):
+    def __init__(self, spaces_dict, slices):
+        self.spaces_dict = spaces_dict
+        self.slices = slices
+        self._is_continuous = all(s.is_continuous() for s in spaces_dict.values())
+
+    def contains(self, theta_flat):
+        for name, (start, end, shape) in self.slices.items():
+            val = theta_flat[start:end].reshape(shape)
+            if not self.spaces_dict[name].contains(val):
+                return False
+        return True
+
+    def is_continuous(self):
+        return self._is_continuous
+
+    def is_discrete(self):
+        return not self._is_continuous
+

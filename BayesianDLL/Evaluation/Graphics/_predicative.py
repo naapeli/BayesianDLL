@@ -2,8 +2,10 @@ import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 import numpy as np
 
+from ...Samplers._result import PredicativeResult
 
-def plot_predicative_distribution(predicative_distribution, data=None, kind="pdf", method="kde", bins=30):
+
+def plot_predicative_distribution(predicative_distribution: PredicativeResult, data=None, kind="pdf", method="kde", bins=30):
     if kind not in ["pdf", "cdf"]:
         raise ValueError('kind should be in ["pdf", "cdf"].')
     if method not in ["kde", "hist"]:

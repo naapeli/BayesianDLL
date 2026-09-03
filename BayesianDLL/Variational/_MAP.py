@@ -17,8 +17,9 @@ def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_fre
     for epoch in range(epochs):
         t += 1
 
+        grads = model.joint_grad_log_prob()
         for name, param in model.params.items():
-            grad = model.grad_log_prob(name, param.unconstrained_value)
+            grad = grads[name]
             m[name] = betas[0] * m[name] + (1 - betas[0]) * grad
             v[name] = betas[1] * v[name] + (1 - betas[1]) * grad.pow(2)
             m_hat = m[name] / (1 - betas[0] ** t)
