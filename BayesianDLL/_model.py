@@ -7,6 +7,33 @@ from collections import deque
 from ._active_model import _active_model
 from ._parameters import RandomParameter, ObservedParameter, DeterministicParameter
 
+
+def _sum_to_shape(grad: torch.Tensor, target_shape: tuple) -> torch.Tensor:
+    if not isinstance(grad, torch.Tensor):
+        grad = torch.as_tensor(grad)
+    if grad.shape == target_shape:
+        return grad
+
+    if len(target_shape) == 0:
+        return grad.sum()
+
+    if target_shape == (1,) and grad.numel() > 1:
+        return grad.sum().reshape(1)
+
+    extra_dims = grad.ndim - len(target_shape)
+    if extra_dims > 0:
+        grad = grad.sum(dim=tuple(range(extra_dims)))
+
+    for dim, (g_dim, t_dim) in enumerate(zip(grad.shape, target_shape)):
+        if g_dim != t_dim and t_dim == 1:
+            grad = grad.sum(dim=dim, keepdim=True)
+
+    if grad.shape != target_shape:
+        grad = grad.reshape(target_shape)
+
+    return grad
+
+
 class Model:
     def __init__(self):
         self.params: dict[str, RandomParameter] = {}
@@ -19,6 +46,7 @@ class Model:
         self._all_params_list: list[RandomParameter] = []
         self._topo_deterministic_params: list[DeterministicParameter] = []
         self._successors: dict[str, list[str]] = {}
+        self._topo_order: list[str] = []
 
     def __enter__(self):
         _active_model._active_model = self
@@ -37,6 +65,7 @@ class Model:
         except (nx.NetworkXError, nx.NetworkXUnfeasible):
             topo_order = list(self.graph.nodes)
 
+        self._topo_order = topo_order
         self._topo_deterministic_params = [
             self.deterministic_params[n] for n in topo_order if n in self.deterministic_params
         ]
@@ -116,6 +145,89 @@ class Model:
             for name, old_value in old_values.items():
                 self.params[name].set_unconstrained_value(old_value)
 
+    def joint_grad_log_prob(self, param_names=None):
+        if not self._compiled:
+            self.compile()
+
+        if param_names is None:
+            param_names = list(self.params.keys())
+
+        cotangents: dict[str, torch.Tensor] = {}
+
+        for node_name in reversed(self._topo_order):
+            if node_name in self.observed_params:
+                obs_param = self.observed_params[node_name]
+                observed = obs_param.observed_values
+                param_grads = obs_param.distribution.log_pdf_param_grads(observed)
+                for p_name, p_grad in param_grads.items():
+                    if p_name in self.params:
+                        target_shape = self.params[p_name].constrained_value.shape
+                        grad_p = _sum_to_shape(p_grad, target_shape)
+                        cotangents[p_name] = cotangents[p_name] + grad_p if p_name in cotangents else grad_p
+                    elif p_name in self.deterministic_params:
+                        target_shape = self.deterministic_params[p_name].constrained_value.shape
+                        grad_p = _sum_to_shape(p_grad, target_shape)
+                        cotangents[p_name] = cotangents[p_name] + grad_p if p_name in cotangents else grad_p
+
+            elif node_name in self.deterministic_params:
+                if node_name in cotangents:
+                    det_param = self.deterministic_params[node_name]
+                    bar_v = cotangents[node_name]
+                    for inp in det_param.inputs:
+                        inp_name = inp.name if hasattr(inp, "name") else None
+                        if inp_name and (inp_name in self.params or inp_name in self.deterministic_params):
+                            target_param = self.params[inp_name] if inp_name in self.params else self.deterministic_params[inp_name]
+                            target_shape = target_param.constrained_value.shape
+                            det_deriv = det_param.derivative(inp_name)
+                            if not isinstance(det_deriv, torch.Tensor):
+                                det_deriv = torch.as_tensor(det_deriv, dtype=bar_v.dtype)
+
+                            if (
+                                det_deriv.ndim == 2
+                                and det_deriv.shape[0] == bar_v.numel()
+                                and det_deriv.shape[1] == target_param.constrained_value.numel()
+                                and det_deriv.shape != bar_v.shape
+                            ):
+                                vjp = (bar_v.reshape(-1) @ det_deriv).reshape(target_shape)
+                            else:
+                                vjp = _sum_to_shape(bar_v * det_deriv, target_shape)
+
+                            cotangents[inp_name] = cotangents[inp_name] + vjp if inp_name in cotangents else vjp
+
+            elif node_name in self.params:
+                param = self.params[node_name]
+                if getattr(param.distribution, "parameters", None):
+                    param_grads = param.distribution.log_pdf_param_grads(param.constrained_value)
+                    for p_name, p_grad in param_grads.items():
+                        if p_name in self.params:
+                            target_shape = self.params[p_name].constrained_value.shape
+                            grad_p = _sum_to_shape(p_grad, target_shape)
+                            cotangents[p_name] = cotangents[p_name] + grad_p if p_name in cotangents else grad_p
+                        elif p_name in self.deterministic_params:
+                            target_shape = self.deterministic_params[p_name].constrained_value.shape
+                            grad_p = _sum_to_shape(p_grad, target_shape)
+                            cotangents[p_name] = cotangents[p_name] + grad_p if p_name in cotangents else grad_p
+
+        result = {}
+        for name in param_names:
+            param = self.params[name]
+            prior_grad = param.distribution._log_prob_grad_unconstrained(param.unconstrained_value)
+            if name in cotangents:
+                bar_p = cotangents[name]
+                deriv = param.distribution.transform.derivative(param.unconstrained_value)
+                if deriv.shape == param.unconstrained_value.shape:
+                    likelihood_grad = bar_p * deriv
+                else:
+                    if deriv.ndim >= 2:
+                        likelihood_grad = (deriv.transpose(-2, -1) @ bar_p.unsqueeze(-1)).squeeze(-1)
+                    else:
+                        likelihood_grad = bar_p @ deriv
+                result[name] = prior_grad + likelihood_grad
+            else:
+                result[name] = prior_grad
+
+        return result
+
     def grad_log_prob(self, name, theta):
         if not self._compiled:
             self.compile()
@@ -123,71 +235,8 @@ class Model:
         with self.temporarily_set(name, theta):
             if name not in self.params:
                 raise RuntimeError("One is only able to compute the derivative with respect to a RandomParameter.")
-            
-            param = self.params[name]
-            n_param = param.unconstrained_value.numel()
-            # Prior gradient: shape same as unconstrained_value
-            grad = param.distribution._log_prob_grad_unconstrained(param.unconstrained_value)
-            # Flatten to (n_param,) for accumulation
-            grad_flat = grad.reshape(-1)
-
-            # chain_derivative: Jacobian of current node w.r.t. the original param
-            # shape: (n_current, n_param)
-            stack = [(name, torch.eye(n_param, dtype=param.unconstrained_value.dtype))]
-
-            while stack:
-                current_name, chain_derivative = stack.pop()
-                # chain_derivative shape: (n_current, n_param)
-
-                for successor_name in self.graph.successors(current_name):
-                    if successor_name in self.params:
-                        successor_param = self.params[successor_name]
-                        local_grad = successor_param.distribution.log_pdf_param_grads(successor_param.constrained_value)[current_name]
-                        # local_grad shape: (*successor_shape) w.r.t. current
-                        # We need: d(log_p_successor)/d(param) = d(log_p)/d(current) @ d(current)/d(param)
-                        grad_flat = grad_flat + local_grad.reshape(-1) @ chain_derivative
-
-                    elif successor_name in self.observed_params:
-                        successor_param = self.observed_params[successor_name]
-                        observed = successor_param.observed_values
-                        distribution_grad = successor_param.distribution.log_pdf_param_grads(observed)[current_name]
-                        # distribution_grad has shape (*obs_batch, *current_event)
-                        # chain_derivative has shape (n_current, n_param)
-                        # We need sum over obs of: d(log_p)/d(current) @ d(current)/d(param)
-                        # = distribution_grad.reshape(n_obs, n_current) @ chain_derivative
-                        n_current = chain_derivative.shape[0]
-                        dg_flat = distribution_grad.reshape(-1, n_current)  # (n_obs, n_current)
-                        # Sum over observations: (n_obs, n_current) @ (n_current, n_param) -> (n_obs, n_param) -> sum -> (n_param,)
-                        likelihood_grad = (dg_flat @ chain_derivative).sum(dim=0)  # (n_param,)
-                        # Apply transform Jacobian: d(constrained)/d(unconstrained)
-                        deriv = param.distribution.transform.derivative(param.unconstrained_value)
-                        if deriv.shape == param.unconstrained_value.shape:
-                            # Element-wise: Jacobian is diagonal
-                            grad_flat = grad_flat + likelihood_grad * deriv.reshape(-1)
-                        else:
-                            # Full Jacobian (e.g. SoftMax)
-                            grad_flat = grad_flat + likelihood_grad @ deriv.squeeze(0)
-                        break
-
-                    elif successor_name in self.deterministic_params:
-                        deterministic_param = self.deterministic_params[successor_name]
-                        deterministic_derivative = deterministic_param.derivative(current_name)
-                        # deterministic_derivative: d(det_output)/d(current_name)
-                        # shape conceptually (n_det_output, n_current) but stored as tensor
-                        n_current = chain_derivative.shape[0]
-                        n_det = deterministic_derivative.numel() // n_current if n_current > 0 else deterministic_derivative.numel()
-                        det_jac = deterministic_derivative.reshape(n_det, n_current)  # (n_det, n_current)
-                        new_chain = det_jac @ chain_derivative  # (n_det, n_param)
-                        stack.append((successor_name, new_chain))
-
-                    elif self.graph.nodes[successor_name].get("type") == "observed":
-                        # This happens during prior predicative sampling when observed_params is temporarily cleared
-                        pass
-
-                    else:
-                        raise RuntimeError(f"Node {successor_name} not in the compute graph")
-
-        return grad_flat.reshape(param.unconstrained_value.shape)
+            grads = self.joint_grad_log_prob([name])
+            return grads[name]
 
 
     def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, start_point_variance=1):
