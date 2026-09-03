@@ -1,8 +1,12 @@
 import torch
 from tqdm import tqdm
-from functools import partial
 from warnings import warn
 import os
+import sys
+import threading
+import time
+import struct
+from multiprocessing import shared_memory
 
 from . import NUTS, Metropolis
 from ._result import SamplingResult, PredicativeResult
@@ -183,22 +187,99 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     initial_values = {}
     for name, parameter in model.params.items():
         initial_values[name] = parameter.unconstrained_value
-        
+
+    shm = None
+    shm_name = None
+    updater_thread = None
+    stop_event = threading.Event()
+    bars = []
+
+    if progress_bar and n_chains > 1:
+        shm = shared_memory.SharedMemory(create=True, size=n_chains * 128)
+        shm.buf[:n_chains * 128] = b"\x00" * (n_chains * 128)
+        shm_name = shm.name
+
+        for chain in range(n_chains):
+            bar = tqdm(
+                total=n_samples + warmup_length,
+                position=chain,
+                leave=True,
+                bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}"
+            )
+            bar.set_description(f"Chain {chain + 1}/{n_chains} warmup", refresh=False)
+            bars.append(bar)
+
+        def _updater():
+            while not stop_event.is_set():
+                for chain, bar in enumerate(bars):
+                    m, is_warmup, divs, n_b, *floats = struct.unpack_from("=iiii8f8f", shm.buf, chain * 128)
+                    if m > bar.n:
+                        bar.n = m
+                        if is_warmup:
+                            bar.set_description(f"Chain {chain + 1}/{n_chains} warmup", refresh=False)
+                        else:
+                            bar.set_description(f"Chain {chain + 1}/{n_chains} sample", refresh=False)
+                        if n_b > 0:
+                            s_sizes = floats[:n_b]
+                            acc_probs = floats[8:8 + n_b]
+                            bar.set_postfix({
+                                "avg. acc. probs": [f"{prob / m:.3f}" for prob in acc_probs],
+                                "step sizes": [f"{step_size:.3f}" for step_size in s_sizes],
+                                "divs": divs
+                            }, refresh=False)
+                        bar.refresh()
+                time.sleep(0.05)
+
+        updater_thread = threading.Thread(target=_updater, daemon=True)
+        updater_thread.start()
+
     max_workers = min(n_chains, os.cpu_count())
     executor = get_reusable_executor(max_workers=max_workers)
-    results = list(executor.map(
-        _sample_single_chain,
-        range(n_chains),
-        [n_chains]*n_chains,
-        [model]*n_chains,
-        [initial_values]*n_chains,
-        [start_point_variance]*n_chains,
-        [n_samples]*n_chains,
-        [warmup_length]*n_chains,
-        [progress_bar]*n_chains,
-        [blocks]*n_chains,
-        [sampler_params]*n_chains
-    ))
+    try:
+        results = list(executor.map(
+            _sample_single_chain,
+            range(n_chains),
+            [n_chains]*n_chains,
+            [model]*n_chains,
+            [initial_values]*n_chains,
+            [start_point_variance]*n_chains,
+            [n_samples]*n_chains,
+            [warmup_length]*n_chains,
+            [progress_bar]*n_chains,
+            [blocks]*n_chains,
+            [shm_name]*n_chains,
+            [sampler_params]*n_chains
+        ))
+    finally:
+        if updater_thread is not None:
+            stop_event.set()
+            updater_thread.join()
+
+            # Final refresh to 100% on all bars
+            for chain, bar in enumerate(bars):
+                m, is_warmup, divs, n_b, *floats = struct.unpack_from("=iiii8f8f", shm.buf, chain * 128)
+                bar.n = n_samples + warmup_length
+                bar.set_description(f"Chain {chain + 1}/{n_chains} sample", refresh=False)
+                if n_b > 0:
+                    s_sizes = floats[:n_b]
+                    acc_probs = floats[8:8 + n_b]
+                    total_steps = n_samples + warmup_length
+                    bar.set_postfix({
+                        "avg. acc. probs": [f"{prob / total_steps:.3f}" for prob in acc_probs],
+                        "step sizes": [f"{step_size:.3f}" for step_size in s_sizes],
+                        "divs": divs
+                    }, refresh=False)
+                bar.refresh()
+                bar.close = lambda: None
+                if hasattr(tqdm, "_instances") and bar in tqdm._instances:
+                    tqdm._instances.remove(bar)
+
+            # Clean move below all progress bars
+            sys.stderr.write("\n" * n_chains)
+            sys.stderr.flush()
+
+            shm.close()
+            shm.unlink()
 
     trace = {name: torch.stack([res[0][name] for res in results], dim=0) for name in model.params.keys()}
     det_trace = {name: torch.stack([res[1][name] for res in results], dim=0) for name in model.deterministic_params.keys()}
@@ -219,7 +300,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
 
     return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=det_trace)
 
-def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar, blocks_spec=None, sampler_params=None):
+def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar, blocks_spec=None, shm_name=None, sampler_params=None):
     torch.set_num_threads(1)
     for name, parameter in model.params.items():
         value = initial_values[name].clone()
@@ -229,7 +310,19 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     
     blocks = _build_blocks(model, blocks_spec, sampler_params)
 
-    _progress_bar = tqdm(range(1, n_samples + warmup_length + 1), position=chain, leave=False, bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}") if progress_bar else range(1, n_samples + warmup_length + 1)
+    # Attach to shared memory if multi-chain
+    shm = None
+    if shm_name is not None:
+        shm = shared_memory.SharedMemory(name=shm_name)
+
+    # For single chain execution, use local tqdm directly
+    _progress_bar = None
+    if progress_bar and shm_name is None:
+        _progress_bar = tqdm(
+            range(1, n_samples + warmup_length + 1),
+            bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}"
+        )
+
     acceptance_probabilities = [1.0 for _ in range(len(blocks))]
     step_sizes = [1.0 for _ in range(len(blocks))]
     divergences_count = 0
@@ -243,10 +336,11 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     for name, parameter in model.deterministic_params.items():
         chain_det_trace[name] = torch.empty(size=(n_samples, *parameter.constrained_value.shape), dtype=parameter.constrained_value.dtype)
 
-    for m in _progress_bar:
-        if progress_bar:
-            if m < warmup_length: _progress_bar.set_description(f"Chain {chain + 1}/{n_chains} warmup", refresh=False)
-            else: _progress_bar.set_description(f"Chain {chain + 1}/{n_chains} sample", refresh=False)
+    loop_range = _progress_bar if _progress_bar is not None else range(1, n_samples + warmup_length + 1)
+    for m in loop_range:
+        if _progress_bar is not None:
+            if m < warmup_length: _progress_bar.set_description(f"Chain warmup", refresh=False)
+            else: _progress_bar.set_description(f"Chain sample", refresh=False)
             _progress_bar.set_postfix({
                 "avg. acc. probs": [f"{prob / m:.3f}" for prob in acceptance_probabilities],
                 "step sizes": [f"{step_size:.3f}" for step_size in step_sizes],
@@ -265,6 +359,15 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
                 chain_trace[name][m - warmup_length - 1] = parameter.constrained_value
             for name, parameter in model.deterministic_params.items():
                 chain_det_trace[name][m - warmup_length - 1] = parameter.constrained_value
+
+        if shm is not None:
+            n_b = min(len(blocks), 8)
+            s_padded = (step_sizes + [0.0] * 8)[:8]
+            a_padded = (acceptance_probabilities + [0.0] * 8)[:8]
+            struct.pack_into("=iiii8f8f", shm.buf, chain * 128, m, int(m < warmup_length), divergences_count, n_b, *s_padded, *a_padded)
+
+    if shm is not None:
+        shm.close()
 
     return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes
 
@@ -312,7 +415,13 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
             raise RuntimeError(f"n_samples ({n_samples}) must be less than or equal to the total trace length ({total_samples}).")
         indices = torch.linspace(0, total_samples - 1, steps=n_samples).long()
 
-    for i in range(n_samples):
+    _progress_bar = tqdm(
+        range(n_samples),
+        desc="Predicative sampling",
+        bar_format=r"{desc}: {percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}"
+    ) if progress_bar else range(n_samples)
+
+    for i in _progress_bar:
         prior_values = {}
         for name, values in flattened_trace.items():
             prior_values[name] = values[indices[i]]
@@ -325,20 +434,8 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
             parameter = model.observed_params[name]
             init_value = parameter.observed_values
             theta = _init_theta(state_spaces[name], init_value.shape, init_value.dtype)
-            _progress_bar = tqdm(range(1, warmup_per_sample + samples_per_step + 1), bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}") if progress_bar else range(1, warmup_per_sample + samples_per_step + 1)
-            acceptance_probabilities = 0
-            step_size = 1
-            for m in _progress_bar:
-                if progress_bar:
-                    if m < warmup_per_sample: _progress_bar.set_description(f"{name} predicative sample {i + 1} warmup")
-                    else: _progress_bar.set_description(f"{name} predicative sample {i + 1}")
-                    _progress_bar.set_postfix({
-                        "avg. acc. probs": f"{acceptance_probabilities / m:.3f}",
-                        "step sizes": f"{step_size:.3f}"
-                    })
-                m = m - 1  # shift back to range(0, end) for following logic
+            for m in range(warmup_per_sample + samples_per_step):
                 theta, step_size, acceptance_probability, diverging = sampler.step(theta, m < warmup_per_sample)
-                acceptance_probabilities += acceptance_probability
                 if m >= warmup_per_sample:
                     predicative_samples[name][i, m - warmup_per_sample] = theta
 

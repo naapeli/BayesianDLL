@@ -2,7 +2,7 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, HalfCauchy
-from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, plate
+from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, plate, find_MAP
 from BayesianDLL.Evaluation import Graphics
 
 
@@ -33,7 +33,8 @@ with Model() as linear_model:
     Graphics.plot_predicative_distribution(predicative_distribution, y, kind="pdf")
     plt.show()
 
-    samples = linear_model.sample(1000, 100, blocks=[["slope", "intercept", "sigma"]])
+    find_MAP(linear_model, verbose=False)
+    samples = linear_model.sample(1000, 500, blocks=[["slope", "intercept", "sigma"]], delta=0.7)
 
 
 plt.figure()
