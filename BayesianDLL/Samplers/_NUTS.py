@@ -10,7 +10,7 @@ def _dot(a, b):
     return (a * b).sum()
 
 class NUTS:
-    def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100):
+    def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0):
         self.log_target = log_target
         self.gradient = gradient
         self.inverse_transformation = inverse_transformation
@@ -23,6 +23,7 @@ class NUTS:
         self.max_depth = max_depth
         self.min_step_size = min_step_size
         self.max_step_size = max_step_size
+        self.max_delta = max_delta
 
         # save in case of resetting
         self._H_bar = H_bar
@@ -34,9 +35,10 @@ class NUTS:
         self.step_size_bar = self._step_size_bar
 
     def leapfrog(self, theta, r, grad, step_size):
-        r_prime = r +  0.5 * step_size * grad
+        r_prime = r + 0.5 * step_size * grad
         theta_prime = theta + step_size * r_prime
-        log_prob_prime, grad_prime = self.log_target(theta_prime), self.gradient(theta_prime)
+        log_prob_prime = self.log_target(theta_prime)
+        grad_prime = self.gradient(theta_prime)
         r_prime = r_prime + 0.5 * step_size * grad_prime
         return theta_prime, r_prime, grad_prime, log_prob_prime
 
@@ -46,13 +48,24 @@ class NUTS:
         _, r_prime, grad_prime, log_prob_prime = self.leapfrog(theta_init, r0, grad_init, step_size)
         while torch.isinf(log_prob_prime) or torch.isnan(log_prob_prime) or torch.isinf(grad_prime).any() or torch.isnan(grad_prime).any():
             step_size *= 0.5
+            if step_size < self.min_step_size:
+                return self.min_step_size
             _, r_prime, grad_prime, log_prob_prime = self.leapfrog(theta_init, r0, grad_init, step_size)
         log_accept_prob = log_prob_prime - log_prob_init - 0.5 * (_dot(r_prime, r_prime) - _dot(r0, r0))
+        if torch.isnan(log_accept_prob) or torch.isinf(log_accept_prob):
+            return self.min_step_size
         a = 1 if log_accept_prob > math.log(0.5) else -1
-        while a * log_accept_prob > -a * math.log(2):
+        count = 0
+        while a * log_accept_prob > -a * math.log(2) and count < 100:
             step_size *= 2 ** a
+            if step_size < self.min_step_size or step_size > self.max_step_size:
+                break
             _, r_prime, grad_prime, log_prob_prime = self.leapfrog(theta_init, r0, grad_init, step_size)
+            if torch.isnan(log_prob_prime) or torch.isinf(log_prob_prime) or torch.isnan(grad_prime).any() or torch.isinf(grad_prime).any():
+                step_size *= 0.5
+                break
             log_accept_prob = log_prob_prime - log_prob_init - 0.5 * (_dot(r_prime, r_prime) - _dot(r0, r0))
+            count += 1
         
         step_size = min(max(step_size, self.min_step_size), self.max_step_size)
         return step_size
@@ -60,11 +73,35 @@ class NUTS:
     def build_tree(self, theta, r, grad, log_u, v, j, step_size, joint0):
         if j == 0:
             theta_prime, r_prime, grad_prime, log_prob_prime = self.leapfrog(theta, r, grad, v * step_size)
+            
+            non_finite = (
+                torch.isnan(log_prob_prime)
+                or torch.isinf(log_prob_prime)
+                or torch.isnan(grad_prime).any()
+                or torch.isinf(grad_prime).any()
+                or torch.isnan(r_prime).any()
+                or torch.isinf(r_prime).any()
+            )
+            if non_finite:
+                diverging = True
+                return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, 0, 0, 0.0, 1.0, diverging)
+
             log_joint_prime = log_prob_prime - 0.5 * _dot(r_prime, r_prime)
-            diverging = bool(log_u > (log_joint_prime + 1000) or torch.isnan(log_joint_prime) or torch.isnan(log_prob_prime))
+            energy_diff = joint0 - log_joint_prime
+            diverging = bool(
+                energy_diff > self.max_delta
+                or torch.isnan(log_joint_prime)
+                or torch.isinf(log_joint_prime)
+            )
+
+            if diverging:
+                return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, 0, 0, 0.0, 1.0, diverging)
+
             n_prime = 1 if log_u < log_joint_prime else 0
-            s_prime = 1 if not diverging else 0
-            return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, min(1, torch.exp(log_joint_prime - joint0)), 1, diverging)
+            s_prime = 1
+            log_alpha = log_joint_prime - joint0
+            alpha_prime = 1.0 if log_alpha >= 0 else float(torch.exp(log_alpha).clamp(max=1.0))
+            return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, alpha_prime, 1.0, diverging)
         else:
             tree = self.build_tree(theta, r, grad, log_u, v, j - 1, step_size, joint0)
             theta_minus, r_minus, grad_minus = tree.theta_minus, tree.r_minus, tree.grad_minus
@@ -79,8 +116,11 @@ class NUTS:
                 else:
                     tree_prime = self.build_tree(theta_plus, r_plus, grad_plus, log_u, v, j - 1, step_size, joint0)
                     theta_plus, r_plus, grad_plus = tree_prime.theta_plus, tree_prime.r_plus, tree_prime.grad_plus
-                if torch.rand(1) < tree_prime.n_prime / max(tree.n_prime + tree_prime.n_prime, 1):
-                    theta_prime, grad_prime, log_prob_prime = tree_prime.theta_prime, tree_prime.grad_prime, tree_prime.log_prob_prime
+
+                if tree_prime.s_prime == 1 and (tree.n_prime + tree_prime.n_prime) > 0:
+                    if torch.rand(1) < tree_prime.n_prime / (tree.n_prime + tree_prime.n_prime):
+                        theta_prime, grad_prime, log_prob_prime = tree_prime.theta_prime, tree_prime.grad_prime, tree_prime.log_prob_prime
+
                 n_prime = tree.n_prime + tree_prime.n_prime
                 s_prime = tree.s_prime * tree_prime.s_prime * self._uturn(theta_minus, theta_plus, r_minus, r_plus)
                 alpha_prime = tree.alpha_prime + tree_prime.alpha_prime
@@ -136,19 +176,23 @@ class NUTS:
             alpha_sum_total += float(tree.alpha_prime)
             n_alpha_sum_total += float(tree.n_prime_alpha)
             
-            _tmp = min(1, tree.n_prime / n)
-            if tree.s_prime == 1 and torch.rand(1) < _tmp:
-                new_theta = tree.theta_prime
-                new_log_prob = tree.log_prob_prime
-                new_gradient = tree.grad_prime
+            if tree.s_prime == 1 and n > 0:
+                _tmp = min(1.0, tree.n_prime / n)
+                if torch.rand(1) < _tmp:
+                    new_theta = tree.theta_prime
+                    new_log_prob = tree.log_prob_prime
+                    new_gradient = tree.grad_prime
             n += tree.n_prime
             s = tree.s_prime * self._uturn(theta_minus, theta_plus, r_minus, r_plus)
             j += 1
             diverging = diverging or tree.diverging
         
+        mean_alpha = (alpha_sum_total / n_alpha_sum_total) if n_alpha_sum_total > 0 else 0.0
+        mean_alpha = min(max(mean_alpha, 0.0), 1.0)
+
         if warmup:
             eta = 1 / (self.m + self.t0)
-            self.H_bar = (1 - eta) * self.H_bar + eta * (self.delta - alpha_sum_total / n_alpha_sum_total)
+            self.H_bar = (1 - eta) * self.H_bar + eta * (self.delta - mean_alpha)
             self.step_size = math.exp(self.mu - math.sqrt(self.m) / self.gamma * self.H_bar)
             self.step_size = min(max(self.step_size, self.min_step_size), self.max_step_size)
             eta = self.m ** -self.kappa
@@ -156,11 +200,13 @@ class NUTS:
         else:
             self.step_size = self.step_size_bar
 
-        self.gradient_cache = new_gradient
-        self.log_prob_cache = new_log_prob
+        # Only update cache if new state is finite and valid
+        if not torch.isnan(new_log_prob) and not torch.isinf(new_log_prob) and not torch.isnan(new_gradient).any():
+            self.gradient_cache = new_gradient
+            self.log_prob_cache = new_log_prob
         self.m += 1
 
-        return new_theta, self.step_size, alpha_sum_total / n_alpha_sum_total, diverging
+        return new_theta, self.step_size, mean_alpha, diverging
 
     def init_sampler(self):
         pass

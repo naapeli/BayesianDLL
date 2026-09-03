@@ -1,3 +1,6 @@
+import torch
+
+
 class SamplingResult:
     def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None):
         self.trace = trace
@@ -23,6 +26,39 @@ class SamplingResult:
     def items(self):
         return {**self.trace, **self.deterministic_trace}.items()
 
+    def summary(self, hdi_prob=0.94, ci_kind="eti", round_to=3, include_deterministic=True):
+        from ..Evaluation._summary import summary as _summary
+        return _summary(self, hdi_prob=hdi_prob, ci_kind=ci_kind, round_to=round_to, include_deterministic=include_deterministic)
+
     def __repr__(self):
         params = list(self.trace.keys()) + list(self.deterministic_trace.keys())
         return f"SamplingResult(params={params}, divergences={self.divergences})"
+
+
+class PredicativeResult:
+    def __init__(self, samples: dict[str, torch.Tensor]):
+        self.samples = samples
+
+    def __getitem__(self, key):
+        return self.samples[key]
+
+    def __contains__(self, key):
+        return key in self.samples
+
+    def keys(self):
+        return self.samples.keys()
+
+    def values(self):
+        return self.samples.values()
+
+    def items(self):
+        return self.samples.items()
+
+    def __iter__(self):
+        return iter(self.samples)
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __repr__(self):
+        return f"PredicativeResult(samples={list(self.samples.keys())})"

@@ -48,6 +48,7 @@ class RandomParameter:
 
         if _active_model._active_model is not None:
             _active_model._active_model.params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            _active_model._active_model._compiled = False
             graph = _active_model._active_model.graph
             graph.add_node(self.name, type="random")
             for parameter in self.distribution.parameters:
@@ -82,6 +83,7 @@ class ObservedParameter:
 
         if _active_model._active_model is not None:
             _active_model._active_model.observed_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            _active_model._active_model._compiled = False
             graph = _active_model._active_model.graph
             graph.add_node(self.name, type="observed")
             for parameter in self.distribution.parameters:
@@ -104,6 +106,7 @@ class DeterministicParameter:
 
         if _active_model._active_model is not None:
             _active_model._active_model.deterministic_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            _active_model._active_model._compiled = False
             graph = _active_model._active_model.graph
             graph.add_node(self.name, type="deterministic")
             for parameter in self.inputs:
