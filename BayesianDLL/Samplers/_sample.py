@@ -5,13 +5,179 @@ from warnings import warn
 import os
 
 from . import NUTS, Metropolis
-from ._result import SamplingResult
+from ._result import SamplingResult, PredicativeResult
 from loky import get_reusable_executor
 from .._active_model import _active_model
 from ..Evaluation import gelman_rubin
+from ..Distributions._state_space import JointStateSpace
 
 
-def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1):
+def _select_sampler(log_target, state_space, gradient=None, sampler="auto", sampler_params=None):
+    if sampler_params is None:
+        sampler_params = {}
+
+    is_continuous = state_space.is_continuous()
+    is_discrete = state_space.is_discrete()
+
+    if sampler == "auto":
+        if is_continuous and gradient is not None:
+            sampler = "nuts"
+        else:
+            sampler = "metropolis"
+
+    if sampler == "nuts":
+        if not is_continuous:
+            raise RuntimeError("A distribution is incompatable with the chosen sampler. NUTS can only be used with continuous distributions.")
+        if gradient is None:
+            raise RuntimeError("NUTS sampler requires a gradient function.")
+        instance = NUTS(log_target, gradient, lambda x: x, **sampler_params)
+    elif sampler == "metropolis":
+        if not (is_continuous or is_discrete):
+            raise RuntimeError("State space must be either continuous or discrete for Metropolis sampler.")
+        instance = Metropolis(log_target, state_space, **sampler_params)
+    else:
+        raise RuntimeError(f"A distribution is incompatable with the chosen sampler: '{sampler}'.")
+
+    instance.init_sampler()
+    return instance
+
+
+class SamplingBlock:
+    def __init__(self, model, param_names, sampler_type="auto", sampler_params=None):
+        self.model = model
+        self.param_names = [param_names] if isinstance(param_names, str) else list(param_names)
+        self.sampler_params = sampler_params or {}
+
+        # Check parameter existence
+        for name in self.param_names:
+            if name not in model.params:
+                raise KeyError(f"Parameter '{name}' not found in model parameters.")
+
+        # Disallow mixing continuous and discrete variables in the same block
+        is_continuous_list = [
+            model.params[name].distribution.transformed_state_space.is_continuous()
+            for name in self.param_names
+        ]
+        if any(is_continuous_list) and not all(is_continuous_list):
+            raise ValueError(
+                f"Continuous and discrete variables cannot be grouped in the same block: {self.param_names}"
+            )
+
+        self.is_continuous = all(is_continuous_list)
+
+        # Slice mapping for flat 1D tensor packing/unpacking
+        self.slices = {}
+        offset = 0
+        for name in self.param_names:
+            param = model.params[name]
+            shape = param.unconstrained_value.shape
+            numel = param.unconstrained_value.numel()
+            self.slices[name] = (offset, offset + numel, shape)
+            offset += numel
+        self.total_dim = offset
+
+        merged_params = {}
+        for name in self.param_names:
+            merged_params.update(model.params[name].sampler_params)
+        merged_params.update(self.sampler_params)
+
+        if sampler_type == "auto":
+            requested = [model.params[name].sampler for name in self.param_names]
+            if not self.is_continuous or "metropolis" in requested:
+                sampler_type = "metropolis"
+            else:
+                sampler_type = "nuts"
+
+        self.sampler_type = sampler_type
+
+        def log_target(theta_flat):
+            self.unpack_and_set(theta_flat)
+            return self.model.model_log_prob()
+
+        gradient = None
+        if self.is_continuous:
+            def gradient(theta_flat):
+                self.unpack_and_set(theta_flat)
+                grads_dict = self.model.joint_grad_log_prob(self.param_names)
+                grads = [grads_dict[name].reshape(-1) for name in self.param_names]
+                return torch.cat(grads, dim=0)
+
+        if len(self.param_names) == 1:
+            state_space = model.params[self.param_names[0]].distribution.transformed_state_space
+        else:
+            spaces_dict = {
+                name: model.params[name].distribution.transformed_state_space
+                for name in self.param_names
+            }
+            state_space = JointStateSpace(spaces_dict, self.slices)
+
+        self.sampler = _select_sampler(
+            log_target=log_target,
+            state_space=state_space,
+            gradient=gradient,
+            sampler=self.sampler_type,
+            sampler_params=merged_params,
+        )
+
+    def pack(self) -> torch.Tensor:
+        tensors = [self.model.params[name].unconstrained_value.reshape(-1) for name in self.param_names]
+        return torch.cat(tensors, dim=0)
+
+    def unpack_and_set(self, theta_flat: torch.Tensor):
+        for name, (start, end, shape) in self.slices.items():
+            self.model.params[name].set_unconstrained_value(theta_flat[start:end].reshape(shape))
+
+    def step(self, warmup: bool):
+        theta_flat = self.pack()
+        new_theta_flat, step_size, acc_prob, diverging = self.sampler.step(theta_flat, warmup=warmup)
+        self.unpack_and_set(new_theta_flat)
+        return step_size, acc_prob, diverging
+
+
+def _build_blocks(model, blocks_spec=None, sampler_params=None):
+    if blocks_spec is not None:
+        built_blocks = []
+        covered = set()
+        for b in blocks_spec:
+            if isinstance(b, SamplingBlock):
+                block = b
+            elif isinstance(b, (list, tuple)):
+                block = SamplingBlock(model, list(b), sampler_params=sampler_params)
+            elif isinstance(b, str):
+                block = SamplingBlock(model, [b], sampler_params=sampler_params)
+            else:
+                raise TypeError(f"Invalid block specification: {b}")
+
+            built_blocks.append(block)
+            for name in block.param_names:
+                if name in covered:
+                    raise ValueError(f"Parameter '{name}' appears in multiple blocks.")
+                covered.add(name)
+
+        all_params = set(model.params.keys())
+        missing = all_params - covered
+        if missing:
+            raise ValueError(f"The following parameters were not included in any block: {missing}")
+        return built_blocks
+
+    nuts_names = [
+        name for name, p in model.params.items()
+        if p.distribution.transformed_state_space.is_continuous() and p.sampler in ("auto", "nuts")
+    ]
+    metropolis_names = [
+        name for name in model.params if name not in nuts_names
+    ]
+
+    built_blocks = []
+    if nuts_names:
+        built_blocks.append(SamplingBlock(model, nuts_names, sampler_type="nuts", sampler_params=sampler_params))
+    if metropolis_names:
+        built_blocks.append(SamplingBlock(model, metropolis_names, sampler_type="metropolis", sampler_params=sampler_params))
+
+    return built_blocks
+
+
+def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, **sampler_params):
     model = _active_model._active_model if model is None else model
     
     initial_values = {}
@@ -29,7 +195,9 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
         [start_point_variance]*n_chains,
         [n_samples]*n_chains,
         [warmup_length]*n_chains,
-        [progress_bar]*n_chains
+        [progress_bar]*n_chains,
+        [blocks]*n_chains,
+        [sampler_params]*n_chains
     ))
 
     trace = {name: torch.stack([res[0][name] for res in results], dim=0) for name in model.params.keys()}
@@ -51,7 +219,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
 
     return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=det_trace)
 
-def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar):
+def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar, blocks_spec=None, sampler_params=None):
     torch.set_num_threads(1)
     for name, parameter in model.params.items():
         value = initial_values[name].clone()
@@ -59,13 +227,11 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
             value = value + start_point_variance * torch.randn_like(value)
         parameter.set_unconstrained_value(value)
     
-    samplers = {}
-    for name, parameter in model.params.items():
-        samplers[name] = _decide_step(model, parameter)
+    blocks = _build_blocks(model, blocks_spec, sampler_params)
 
     _progress_bar = tqdm(range(1, n_samples + warmup_length + 1), position=chain, leave=False, bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}") if progress_bar else range(1, n_samples + warmup_length + 1)
-    acceptance_probabilities = [1.0 for _ in range(len(samplers))]
-    step_sizes = [1.0 for _ in range(len(samplers))]
+    acceptance_probabilities = [1.0 for _ in range(len(blocks))]
+    step_sizes = [1.0 for _ in range(len(blocks))]
     divergences_count = 0
 
     # Pre-allocate trace storage: shape (n_samples, *constrained_shape)
@@ -87,36 +253,20 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
                 "divs": divergences_count
             }, refresh=False)
 
-        for i, (name, sampler) in enumerate(samplers.items()):
-            theta = model.params[name].unconstrained_value
-            new_theta, step_size, acceptance_probability, diverging = sampler.step(theta, m < warmup_length)
+        for i, block in enumerate(blocks):
+            step_size, acceptance_probability, diverging = block.step(warmup=(m < warmup_length))
             if diverging and m >= warmup_length:
                 divergences_count += 1
             step_sizes[i] = step_size
             acceptance_probabilities[i] += acceptance_probability
-            model.params[name].set_unconstrained_value(new_theta)
-            if m > warmup_length: chain_trace[name][m - warmup_length - 1] = model.params[name].constrained_value
 
         if m > warmup_length:
+            for name, parameter in model.params.items():
+                chain_trace[name][m - warmup_length - 1] = parameter.constrained_value
             for name, parameter in model.deterministic_params.items():
                 chain_det_trace[name][m - warmup_length - 1] = parameter.constrained_value
 
     return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes
-
-def _decide_step(model, parameter):
-    _log_prob_func = partial(model.log_prob, parameter.name)
-
-    state_space = parameter.distribution.transformed_state_space
-
-    if state_space.is_continuous() and (parameter.sampler == "auto" or parameter.sampler == "nuts"):
-        sampler = NUTS(_log_prob_func, partial(model.grad_log_prob, parameter.name), lambda x: x, **parameter.sampler_params)
-    elif (state_space.is_discrete() or state_space.is_continuous()) and (parameter.sampler == "auto" or parameter.sampler == "metropolis"):
-        sampler = Metropolis(_log_prob_func, state_space, **parameter.sampler_params)
-    else:
-        raise RuntimeError("A distribution is incompatable with the chosen sampler. NUTS can only be used with continuous distributions.")
-    
-    sampler.init_sampler()
-    return sampler
 
 def sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
     model = _active_model._active_model if model is None else model
@@ -197,7 +347,7 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
         parameter.set_unconstrained_value(unconstrained_value)
     
     predicative_samples = {name: model.observed_params[name].distribution.transform.inverse(samples.reshape(-1, *samples.shape[2:])).reshape(samples.shape) for name, samples in predicative_samples.items()}
-    return predicative_samples
+    return PredicativeResult(predicative_samples)
 
 def _init_theta(state_space, shape, dtype):
     if state_space.is_continuous():
@@ -211,14 +361,16 @@ def _decide_predicative_step(parameter):
 
     def log_target(x):
         return parameter.distribution._log_prob_unconstrained(x)
-    if state_space.is_continuous() and (parameter.sampler == "auto" or parameter.sampler == "nuts"):
+
+    gradient = None
+    if state_space.is_continuous():
         def gradient(x):
             return parameter.distribution._log_prob_grad_unconstrained(x)
-        sampler = NUTS(log_target, gradient, lambda x: x, **parameter.sampler_params)
-    elif (state_space.is_discrete() or state_space.is_continuous()) and (parameter.sampler == "auto" or parameter.sampler == "metropolis"):
-        sampler = Metropolis(log_target, state_space, **parameter.sampler_params)
-    else:
-        raise RuntimeError("A distribution is incompatable with the chosen sampler. NUTS can only be used with continuous distributions.")
-    
-    sampler.init_sampler()
-    return sampler
+
+    return _select_sampler(
+        log_target=log_target,
+        state_space=state_space,
+        gradient=gradient,
+        sampler=parameter.sampler,
+        sampler_params=parameter.sampler_params,
+    )
