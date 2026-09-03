@@ -616,7 +616,7 @@ class Mixture(Distribution):
         if weights.ndim == 0:
             weights = weights.unsqueeze(0)
         log_pdfs = torch.stack([component.log_pdf(x) for component in self.components], dim=0)  # (K, *batch)
-        grads = torch.stack([component.log_pdf_grad(x) for component in self.components], dim=0)  # (K, *batch)
+        grads = torch.stack([component.log_pdf_grad(x) for component in self.components], dim=0)  # (K, *batch, ...)
         # Reshape weights (K,) to (K, 1, 1, ...) to broadcast with batch dims
         n_batch_dims = log_pdfs.ndim - 1
         w = weights.reshape(-1, *([1] * n_batch_dims)) if n_batch_dims > 0 else weights
@@ -624,6 +624,8 @@ class Mixture(Distribution):
         log_mixture_pdf = _logsumexp(log_weighted, dim=0)
         log_posterior_weights = log_weighted - log_mixture_pdf
         posterior_weights = torch.exp(log_posterior_weights)
+        if grads.ndim > posterior_weights.ndim:
+            posterior_weights = posterior_weights.reshape(*posterior_weights.shape, *([1] * (grads.ndim - posterior_weights.ndim)))
         return (posterior_weights * grads).sum(dim=0)
 
     def log_pdf_param_grads(self, x):
@@ -631,16 +633,26 @@ class Mixture(Distribution):
         if weights.ndim == 0:
             weights = weights.unsqueeze(0)
         grads = {}
-        pdfs = torch.stack([component.pdf(x) for component in self.components], dim=0)
-        mixture_pdf = self.pdf(x)
-        grad_weights = pdfs / mixture_pdf.unsqueeze(0)
+        log_pdfs = torch.stack([component.log_pdf(x) for component in self.components], dim=-1)
+        log_w = torch.log(weights + 1e-12)
+        log_weighted = log_w + log_pdfs
+        log_mixture_pdf = torch.logsumexp(log_weighted, dim=-1, keepdim=True)
+
+        grad_weights = torch.exp(log_pdfs - log_mixture_pdf)
         grads[self.resolve_name("weights", self.weights)] = grad_weights
 
-        for w, component in zip(weights, self.components):
+        posterior_weights = torch.exp(log_weighted - log_mixture_pdf)
+
+        for i, component in enumerate(self.components):
             param_grads = component.log_pdf_param_grads(x)
-            coefficient = (w * component.pdf(x)) / mixture_pdf
+            coefficient = posterior_weights[..., i]
             for name, gradient in param_grads.items():
-                grads[name] = grads.get(name, 0) + coefficient * gradient
+                if not isinstance(gradient, torch.Tensor):
+                    gradient = torch.as_tensor(gradient, dtype=coefficient.dtype)
+                coeff = coefficient
+                if gradient.ndim > coefficient.ndim:
+                    coeff = coeff.reshape(*coeff.shape, *([1] * (gradient.ndim - coefficient.ndim)))
+                grads[name] = grads.get(name, 0) + coeff * gradient
         return grads
 
 
