@@ -251,6 +251,10 @@ class Model:
         from .Samplers import sample_posterior_predicative as _spp
         return _spp(n_samples, warmup_length, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)
 
+    def posterior_predicative(self, trace, n_samples=20, samples_per_step=500, warmup_per_sample=100, progress_bar=True):
+        from .Samplers import posterior_predicative as _pp
+        return _pp(trace, n_samples=n_samples, samples_per_step=samples_per_step, warmup_per_sample=warmup_per_sample, model=self, progress_bar=progress_bar)
+
     def sample_prior_predicative(self, n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, progress_bar=True):
         from .Samplers import sample_prior_predicative as _spp
         return _spp(n_samples, warmup_length, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)

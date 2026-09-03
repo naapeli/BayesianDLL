@@ -7,10 +7,10 @@ import threading
 import time
 import struct
 from multiprocessing import shared_memory
+from loky import get_reusable_executor
 
 from . import NUTS, Metropolis
 from ._result import SamplingResult, PredicativeResult
-from loky import get_reusable_executor
 from .._active_model import _active_model
 from ..Evaluation import gelman_rubin
 from ..Distributions._state_space import JointStateSpace
@@ -181,7 +181,7 @@ def _build_blocks(model, blocks_spec=None, sampler_params=None):
     return built_blocks
 
 
-def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, **sampler_params):
+def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, check_convergence=True, **sampler_params):
     model = _active_model._active_model if model is None else model
     
     initial_values = {}
@@ -234,7 +234,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
         updater_thread.start()
 
     max_workers = min(n_chains, os.cpu_count())
-    executor = get_reusable_executor(max_workers=max_workers)
+    executor = get_reusable_executor(max_workers=max_workers, timeout=300)
     try:
         results = list(executor.map(
             _sample_single_chain,
@@ -287,13 +287,14 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     acceptance_probabilities = [[prob / (n_samples + warmup_length) for prob in res[3]] for res in results]
     step_sizes = [res[4] for res in results]
 
-    if n_chains > 1:
-        r_hats = gelman_rubin(trace)
-        for name, statistics in r_hats.items():
-            if torch.any(statistics > 1.1):  # 1.01
-                warn(f"The gelman-Ruben statistic of {name} is above 1.1 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
-    else:
-        warn(f"The The convergence of the chain is not checked when n_chains 1. Increase it to atleast 2 to enable convergence diagnostics.")
+    if check_convergence and n_chains > 1:
+        if n_samples >= 50:
+            r_hats = gelman_rubin(trace)
+            for name, statistics in r_hats.items():
+                if torch.any(statistics > 1.01):
+                    warn(f"The gelman-Ruben statistic of {name} is above 1.01 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
+    elif check_convergence and n_chains == 1:
+        warn(f"The convergence of the chain is not checked when n_chains == 1. Increase it to at least 2 to enable convergence diagnostics.")
 
     if sum(divergences) > 0:
         warn(f"There were {sum(divergences)} divergences across all chains after tuning. Increase target acceptance probability or reparameterize the model.")
@@ -373,7 +374,7 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
 
 def sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
     model = _active_model._active_model if model is None else model
-    trace = sample(n_samples, warmup_length, 4, model, progress_bar)
+    trace = sample(n_samples, warmup_length, 4, model, progress_bar, check_convergence=False)
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
 def posterior_predicative(trace, n_samples=20, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
