@@ -1,11 +1,12 @@
 import torch
 from .. import RandomParameter, DeterministicParameter, VariationalParameter
+from .._data import Data
 
 
 def resolve(parameter):
     if isinstance(parameter, torch.Tensor):
         return parameter
-    elif isinstance(parameter, RandomParameter | DeterministicParameter):
+    elif isinstance(parameter, RandomParameter | DeterministicParameter | Data):
         return parameter.constrained_value
     elif isinstance(parameter, VariationalParameter):
          return parameter.value

@@ -36,6 +36,7 @@ def _sum_to_shape(grad: torch.Tensor, target_shape: tuple) -> torch.Tensor:
 
 class Model:
     def __init__(self):
+        self.data = {}
         self.params: dict[str, RandomParameter] = {}
         self.observed_params: dict[str, ObservedParameter] = {}
         self.deterministic_params: dict[str, DeterministicParameter] = {}

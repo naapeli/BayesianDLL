@@ -2,6 +2,7 @@ import torch
 
 from ._active_model import _active_model
 from ._plate import get_active_plates
+from ._data import Data
 
 
 class RandomParameter:
@@ -86,6 +87,10 @@ class ObservedParameter:
             _active_model._active_model._compiled = False
             graph = _active_model._active_model.graph
             graph.add_node(self.name, type="observed")
+            if isinstance(self._observed_values, Data):
+                if _active_model._active_model.data.get(self._observed_values.name) is not self._observed_values:
+                    raise RuntimeError("Observed data must belong to the active model.")
+                graph.add_edge(self._observed_values.name, self.name)
             for parameter in self.distribution.parameters:
                 if parameter in graph:
                     _active_model._active_model.graph.add_edge(parameter, self.name)
@@ -93,6 +98,28 @@ class ObservedParameter:
                     raise RuntimeError(f"{self.name} depends on {parameter}, which is not in the computation graph of the model.")
         else:
             raise RuntimeError("One should select an active model before creating random variables.")
+
+
+    @property
+    def observed_values(self):
+        if isinstance(self._observed_values, Data):
+            return self._observed_values.value
+        return self._observed_values
+
+    @observed_values.setter
+    def observed_values(self, values):
+        self._observed_values = values
+
+    @property
+    def predictive_shape(self):
+        """Shape of a generated value, with plate sizes resolved at runtime."""
+        shape = list(self.observed_values.shape)
+        for index, plate_info in enumerate(self.plates):
+            if index < len(shape):
+                shape[index] = plate_info.size
+            else:
+                shape.append(plate_info.size)
+        return torch.Size(shape)
 
 
 class DeterministicParameter:
@@ -135,6 +162,8 @@ class DeterministicParameter:
                 return self.owner_model.params[input.name].constrained_value
             elif input.name in self.owner_model.deterministic_params:
                 return self.owner_model.deterministic_params[input.name].constrained_value
+            elif input.name in self.owner_model.data:
+                return self.owner_model.data[input.name].value
             raise KeyError(f"Parameter '{input.name}' not found in the active model.")
         raise TypeError(f"Parameter {input} has an unkown type.")
 

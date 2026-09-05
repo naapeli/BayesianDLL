@@ -1,3 +1,4 @@
+from ._data import Data
 from ._model import Model, MeanFieldGuide
 from ._parameters import RandomParameter, ObservedParameter, DeterministicParameter, VariationalParameter
 from ._plate import plate

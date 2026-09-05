@@ -412,7 +412,7 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
             raise RuntimeError(f"n_samples ({n_samples}) must be less than or equal to the total trace length ({total_samples}).")
         indices = torch.linspace(0, total_samples - 1, steps=n_samples).long()
 
-    predicative_samples = {name: torch.empty(size=(n_samples, samples_per_step, *parameter.observed_values.shape), dtype=parameter.observed_values.dtype) for name, parameter in model.observed_params.items()}
+    predicative_samples = {name: torch.empty(size=(n_samples, samples_per_step, *parameter.predictive_shape), dtype=parameter.observed_values.dtype) for name, parameter in model.observed_params.items()}
 
     _progress_bar = tqdm(
         range(n_samples),
@@ -430,7 +430,7 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
                 sampler.reset()
                 parameter = model.observed_params[name]
                 init_value = parameter.observed_values
-                theta = _init_theta(state_spaces[name], init_value.shape, init_value.dtype)
+                theta = _init_theta(state_spaces[name], parameter.predictive_shape, init_value.dtype)
                 for m in range(warmup_per_sample + samples_per_step):
                     theta, step_size, acceptance_probability, diverging = sampler.step(theta, m < warmup_per_sample)
                     if m >= warmup_per_sample:

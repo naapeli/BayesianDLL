@@ -3,7 +3,7 @@ import importlib
 import pytest
 import torch
 
-from BayesianDLL import DeterministicParameter, Model, ObservedParameter, RandomParameter
+from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Distributions import Bernoulli, ContinuousReal, DiscreteRange, Exponential, Normal
 from BayesianDLL.Samplers import (
     Metropolis, NUTS, PredicativeResult, SamplingBlock, SamplingResult,
@@ -148,6 +148,36 @@ def test_predictive_default_uses_all_trace_draws(normal_model):
     normal_model.observed_params["data"].sampler = "metropolis"
     result = sample_predicative({"mean": torch.zeros(2, 3, 1)}, samples_per_step=2, warmup_per_sample=1, model=normal_model, progress_bar=False)
     assert result["data"].shape == (6, 2, 3)
+
+
+def test_predictive_sampling_resolves_data_backed_plate_at_runtime():
+    with Model() as model:
+        x = Data("x", torch.arange(4.0))
+        y = Data("y", torch.arange(4.0))
+        mean = RandomParameter("mean", Normal(0.0, 1.0))
+        fitted_mean = DeterministicParameter(
+            "fitted_mean",
+            lambda mean, x: mean + x,
+            lambda mean, x: {"mean": torch.ones_like(x)},
+            [mean, x],
+        )
+        with plate("observations", x):
+            likelihood = ObservedParameter(
+                "likelihood", Normal(fitted_mean, 1.0), y,
+                sampler="metropolis",
+            )
+
+    assert likelihood.predictive_shape == (4,)
+    x.set_value(torch.arange(2.0))
+    assert likelihood.plates[0].size == 2
+    assert likelihood.predictive_shape == (2,)
+
+    trace = {"mean": torch.zeros(1, 2, 1)}
+    result = model.posterior_predicative(
+        trace, n_samples=2, samples_per_step=3, warmup_per_sample=1,
+        progress_bar=False,
+    )
+    assert result["likelihood"].shape == (2, 3, 2)
 
 
 def test_predictive_rejects_more_draws_than_trace(normal_model):

@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from ._transforms import IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform, InverseSoftPlusTransform
 from ._state_space import ContinuousReal, ContinuousPositive, ContinuousRange, ContinuousSimplex, DiscretePositive, DiscreteRange, Union
 from .._parameters import RandomParameter, DeterministicParameter, VariationalParameter
+from .._data import Data
 from ._resolve import resolve
 
 
@@ -75,12 +76,12 @@ class Distribution(ABC):
         return term1 + d_log_det
 
     def resolve_name(self, name, parameter):
-        if isinstance(parameter, RandomParameter | DeterministicParameter | VariationalParameter):
+        if isinstance(parameter, RandomParameter | DeterministicParameter | VariationalParameter | Data):
             return parameter.name
         return name
 
     def add_dependency(self, parameter):
-        if isinstance(parameter, RandomParameter | DeterministicParameter):
+        if isinstance(parameter, RandomParameter | DeterministicParameter | Data):
             self.parameters.add(parameter.name)
         if isinstance(parameter, VariationalParameter):
             self.variational_parameters[parameter.name] = parameter
