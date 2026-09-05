@@ -7,7 +7,7 @@ from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, 
 from BayesianDLL.Distributions import Bernoulli, ContinuousReal, DiscreteRange, Exponential, Normal
 from BayesianDLL.Samplers import (
     Metropolis, NUTS, PredicativeResult, SamplingBlock, SamplingResult,
-    posterior_predicative, sample_predicative,
+    posterior_predicative, sample_predicative, thin,
 )
 from BayesianDLL.Samplers._sample import _build_blocks, _select_sampler
 
@@ -237,3 +237,104 @@ def test_predictive_transforms_constrained_priors_and_observations():
     result = sample_predicative(trace, n_samples=2, samples_per_step=8, warmup_per_sample=5, model=model, progress_bar=False)
     assert (result["data"] > 0).all()
     assert rate.constrained_value.item() == 1
+
+
+def test_sampling_result_thin():
+    trace = {"x": torch.arange(20.0).reshape(2, 10, 1)}
+    det_trace = {"y": torch.arange(20.0).reshape(2, 10, 1) * 2}
+    divergences = [0, 1]
+    acc_probs = [[0.8], [0.9]]
+    step_sizes = [[0.1], [0.15]]
+    res = SamplingResult(trace, divergences, acc_probs, step_sizes, det_trace)
+
+    thinned = res.thin(2)
+    assert isinstance(thinned, SamplingResult)
+    assert thinned["x"].shape == (2, 5, 1)
+    assert thinned["y"].shape == (2, 5, 1)
+    torch.testing.assert_close(thinned["x"], trace["x"][:, ::2])
+    torch.testing.assert_close(thinned["y"], det_trace["y"][:, ::2])
+    assert thinned.divergences == [0, 1]
+    assert thinned.acceptance_probabilities == [[0.8], [0.9]]
+    assert thinned.step_sizes == [[0.1], [0.15]]
+
+    # Ensure original is unchanged
+    assert res["x"].shape == (2, 10, 1)
+    assert res["y"].shape == (2, 10, 1)
+
+
+def test_sampling_result_thin_with_slice():
+    trace = {"x": torch.arange(20.0).reshape(2, 10, 1)}
+    res = SamplingResult(trace, [0, 0], [[0.8]], [[0.1]])
+    thinned = res.thin(slice(2, 8, 2))
+    assert thinned["x"].shape == (2, 3, 1)
+    torch.testing.assert_close(thinned["x"], trace["x"][:, 2:8:2])
+
+
+def test_sampling_result_standalone_thin():
+    trace = {"x": torch.arange(20.0).reshape(2, 10, 1)}
+    res = SamplingResult(trace, [0, 0], [[0.8]], [[0.1]])
+    t1 = res.thin(3)
+    t2 = thin(res, 3)
+    torch.testing.assert_close(t1["x"], t2["x"])
+
+
+def test_sampling_result_thin_validation():
+    trace = {"x": torch.arange(20.0).reshape(2, 10, 1)}
+    res = SamplingResult(trace, [0, 0], [[0.8]], [[0.1]])
+    with pytest.raises(ValueError, match="integer >= 1"):
+        res.thin(0)
+    with pytest.raises(ValueError, match="integer >= 1"):
+        res.thin(-2)
+    with pytest.raises(TypeError, match="bool"):
+        res.thin(True)
+    with pytest.raises(TypeError, match="Expected int or slice"):
+        res.thin("invalid")
+    with pytest.raises(TypeError, match="Expected int or slice"):
+        res.thin(1.5)
+
+
+def test_predicative_result_thin():
+    samples = {"data": torch.arange(40.0).reshape(4, 5, 2)}
+    res = PredicativeResult(samples)
+
+    # Default dim=1 (predictive samples)
+    thinned_pred = res.thin(2)
+    assert isinstance(thinned_pred, PredicativeResult)
+    assert thinned_pred["data"].shape == (4, 3, 2)
+    torch.testing.assert_close(thinned_pred["data"], samples["data"][:, ::2])
+
+    # dim=0 (parameter samples)
+    thinned_param = res.thin(2, dim=0)
+    assert thinned_param["data"].shape == (2, 5, 2)
+    torch.testing.assert_close(thinned_param["data"], samples["data"][::2])
+
+    # dim=(0, 1) (both)
+    thinned_both = res.thin(2, dim=(0, 1))
+    assert thinned_both["data"].shape == (2, 3, 2)
+    torch.testing.assert_close(thinned_both["data"], samples["data"][::2, ::2])
+
+    # Slicing
+    thinned_slice = res.thin(slice(1, 4), dim=1)
+    assert thinned_slice["data"].shape == (4, 3, 2)
+    torch.testing.assert_close(thinned_slice["data"], samples["data"][:, 1:4])
+
+    # Standalone function
+    torch.testing.assert_close(thin(res, 2)["data"], thinned_pred["data"])
+
+    # Invalid dim
+    with pytest.raises(ValueError, match="dim must be 0, 1, or"):
+        res.thin(2, dim=2)
+
+
+def test_thin_unsupported_type():
+    with pytest.raises(TypeError, match="does not support thinning"):
+        thin([1, 2, 3], 2)
+
+
+def test_sampling_result_thin_with_summary():
+    trace = {"x": torch.randn(2, 50, 1)}
+    res = SamplingResult(trace, [0, 0], [[0.8]], [[0.1]])
+    thinned = res.thin(2)
+    assert thinned["x"].shape == (2, 25, 1)
+    df = thinned.summary()
+    assert "x[0]" in df.index

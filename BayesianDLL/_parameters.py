@@ -99,7 +99,6 @@ class ObservedParameter:
         else:
             raise RuntimeError("One should select an active model before creating random variables.")
 
-
     @property
     def observed_values(self):
         if isinstance(self._observed_values, Data):
@@ -120,6 +119,10 @@ class ObservedParameter:
             else:
                 shape.append(plate_info.size)
         return torch.Size(shape)
+
+    @property
+    def constrained_value(self):
+        return self.observed_values
 
 
 class DeterministicParameter:
@@ -160,6 +163,8 @@ class DeterministicParameter:
         if hasattr(input, "name"):
             if input.name in self.owner_model.params:
                 return self.owner_model.params[input.name].constrained_value
+            elif input.name in self.owner_model.observed_params:
+                return self.owner_model.observed_params[input.name].constrained_value
             elif input.name in self.owner_model.deterministic_params:
                 return self.owner_model.deterministic_params[input.name].constrained_value
             elif input.name in self.owner_model.data:

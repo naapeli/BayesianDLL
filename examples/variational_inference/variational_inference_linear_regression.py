@@ -43,7 +43,6 @@ plt.figure()
 plt.semilogy([-elbo for elbo in history])
 
 samples = guide.sample(n_samples=1000, warmup_length=1000, n_chains=4)  # sample from the fitted guide
-plt.figure()
 plot_posterior(samples, parameters=["intercept", "slope", "sigma_squared"])
 
 y_preds = samples["slope"].flatten(0, 1)[:, None] * x[None, :] + samples["intercept"].flatten(0, 1)[:, None]

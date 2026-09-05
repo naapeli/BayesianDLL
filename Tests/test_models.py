@@ -2,8 +2,8 @@ import pytest
 import torch
 
 from BayesianDLL import (
-    DeterministicParameter, Model, ObservedParameter, RandomParameter,
-    VariationalParameter, plate,
+    Data, DeterministicParameter, Model, ObservedParameter, RandomParameter,
+    VariationalParameter, plate, condition,
 )
 from BayesianDLL.Distributions import Bernoulli, Dirichlet, Exponential, Normal
 from BayesianDLL.Distributions._resolve import resolve
@@ -139,3 +139,174 @@ def test_variational_parameter_clamping_and_resolution():
     torch.testing.assert_close(resolve([1.0, 2.0]), torch.tensor([1.0, 2.0]))
     with pytest.raises(RuntimeError, match="not of type"):
         resolve(object())
+
+
+def test_condition_basic_and_immutability():
+    with Model() as model:
+        x = RandomParameter("x", Normal(0.0, 1.0))
+        y = ObservedParameter("y", Normal(x, 1.0), torch.tensor([2.0]))
+
+    assert "x" in model.params
+    assert "x" not in model.observed_params
+
+    # Condition x to 1.5
+    conditioned = condition(model, {"x": 1.5})
+
+    # Original model is untouched
+    assert "x" in model.params
+    assert "x" not in model.observed_params
+    assert _active_model._active_model is None
+    assert conditioned is not model
+
+    # Conditioned model has x as observed
+    assert "x" not in conditioned.params
+    assert "x" in conditioned.observed_params
+    assert conditioned.graph.nodes["x"]["type"] == "observed"
+    torch.testing.assert_close(conditioned.observed_params["x"].observed_values, torch.tensor([1.5]))
+    torch.testing.assert_close(conditioned.observed_params["x"].constrained_value, torch.tensor([1.5]))
+
+    # Joint log prob
+    expected = (
+        torch.distributions.Normal(0.0, 1.0).log_prob(torch.tensor(1.5))
+        + torch.distributions.Normal(1.5, 1.0).log_prob(torch.tensor(2.0))
+    )
+    torch.testing.assert_close(conditioned.model_log_prob(), expected)
+
+
+def test_condition_calling_conventions():
+    with Model() as model:
+        x = RandomParameter("x", Normal(0.0, 1.0))
+        y = RandomParameter("y", Normal(x, 1.0))
+        ObservedParameter("z", Normal(y, 1.0), torch.tensor([0.0]))
+
+    # 1. Via dict
+    m1 = condition(model, {"x": 0.5})
+    assert "x" in m1.observed_params
+
+    # 2. Via kwargs
+    m2 = condition(model, x=0.5)
+    assert "x" in m2.observed_params
+
+    # 3. Via parameter object as key
+    m3 = condition(model, {x: 0.5})
+    assert "x" in m3.observed_params
+
+    # 4. Via model method
+    m4 = model.condition({"x": 0.5})
+    assert "x" in m4.observed_params
+    m5 = model.condition(x=0.5)
+    assert "x" in m5.observed_params
+
+
+def test_condition_deterministic_downstream_and_gradients():
+    with Model() as model:
+        a = RandomParameter("a", Normal(0.0, 1.0), torch.tensor([1.0]))
+        b = RandomParameter("b", Normal(0.0, 1.0), torch.tensor([2.0]))
+        det = DeterministicParameter("det", lambda a, b: a + 2 * b, lambda a, b: {"a": torch.ones_like(a), "b": 2 * torch.ones_like(b)}, [a, b])
+        ObservedParameter("obs", Normal(det, 1.0), torch.tensor([5.0]))
+
+    # Condition on a = 3.0
+    cond = condition(model, a=3.0)
+    assert "a" in cond.observed_params
+    assert "b" in cond.params
+
+    # Check that det can resolve its value in cond
+    # det = 3.0 + 2 * 2.0 = 7.0
+    torch.testing.assert_close(cond.deterministic_params["det"].constrained_value, torch.tensor([7.0]))
+
+    # Gradients should only include remaining latent params ('b')
+    grads = cond.joint_grad_log_prob()
+    assert set(grads.keys()) == {"b"}
+    assert "a" not in grads
+
+
+def test_condition_update_observed_parameter():
+    with Model() as model:
+        x = RandomParameter("x", Normal(0.0, 1.0))
+        ObservedParameter("y", Normal(x, 1.0), torch.tensor([1.0]))
+
+    # Update y's observed values
+    cond = condition(model, y=torch.tensor([3.0]))
+    torch.testing.assert_close(cond.observed_params["y"].observed_values, torch.tensor([3.0]))
+    # Original unchanged
+    torch.testing.assert_close(model.observed_params["y"].observed_values, torch.tensor([1.0]))
+
+
+def test_condition_data_object_updates_copy_without_observing_it():
+    with Model() as model:
+        x = Data("x", torch.tensor([1.0, 2.0]))
+        slope = RandomParameter("slope", Normal(0.0, 1.0), torch.tensor([1.0]))
+        mean = DeterministicParameter(
+            "mean",
+            lambda slope, x: slope * x,
+            lambda slope, x: {"slope": x},
+            [slope, x],
+        )
+        ObservedParameter("y", Normal(mean, 1.0), torch.tensor([1.0, 2.0]))
+
+    conditioned = condition(model, {x: torch.tensor([2.0, 4.0])})
+
+    assert conditioned is not model
+    assert conditioned.data["x"] is not x
+    torch.testing.assert_close(model.data["x"].value, torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(conditioned.data["x"].value, torch.tensor([2.0, 4.0]))
+    assert conditioned.graph.nodes["x"]["type"] == "data"
+    assert "x" not in conditioned.params
+    assert "x" not in conditioned.observed_params
+    torch.testing.assert_close(conditioned.deterministic_params["mean"].constrained_value, torch.tensor([2.0, 4.0]))
+
+
+def test_condition_data_by_name_and_model_method():
+    with Model() as model:
+        x = Data("x", torch.tensor([1.0, 2.0]))
+        ObservedParameter("y", Normal(x, 1.0), torch.tensor([1.0, 2.0]))
+
+    by_name = condition(model, x=torch.tensor([3.0, 4.0]))
+    by_method = model.condition({x: torch.tensor([5.0, 6.0])})
+
+    torch.testing.assert_close(by_name.data["x"].value, torch.tensor([3.0, 4.0]))
+    torch.testing.assert_close(by_method.data["x"].value, torch.tensor([5.0, 6.0]))
+
+
+def test_condition_data_uses_data_event_shape_validation():
+    with Model() as model:
+        features = Data("features", torch.zeros(3, 2), event_ndim=1)
+
+    with pytest.raises(ValueError, match="requires event shape"):
+        condition(model, {features: torch.zeros(3, 3)})
+
+    torch.testing.assert_close(model.data["features"].value, torch.zeros(3, 2))
+
+
+def test_condition_sampling():
+    with Model() as model:
+        x = RandomParameter("x", Normal(0.0, 1.0))
+        y = RandomParameter("y", Normal(x, 1.0))
+        ObservedParameter("obs", Normal(y, 1.0), torch.tensor([0.0]))
+
+    cond = condition(model, x=1.0)
+    trace = cond.sample(n_samples=5, warmup_length=5, n_chains=1, progress_bar=False)
+    assert "y" in trace
+    assert "x" not in trace
+
+
+def test_condition_validation_errors():
+    with Model() as model:
+        x = RandomParameter("x", Exponential(1.0))
+        det = DeterministicParameter("det", lambda x: x * 2, lambda x: {"x": 2 * torch.ones_like(x)}, [x])
+        ObservedParameter("y", Normal(det, 1.0), torch.tensor([1.0]))
+
+    with pytest.raises(TypeError, match="must be an instance of Model"):
+        condition("not_a_model", x=1.0)
+
+    with pytest.raises(TypeError, match="must be a dict"):
+        condition(model, "not_a_dict")
+
+    with pytest.raises(KeyError, match="Variable 'unknown' not found"):
+        condition(model, unknown=1.0)
+
+    with pytest.raises(ValueError, match="Cannot condition deterministic parameter 'det'"):
+        condition(model, det=2.0)
+
+    with pytest.raises(ValueError, match="outside its distribution's state space"):
+        condition(model, x=-1.0)

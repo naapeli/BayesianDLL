@@ -42,7 +42,7 @@ sampling_result = SamplingResult(
 )
 
 print("\n--- BayesianDLL sampling_result.summary(hdi_prob=0.94) ---")
-df_summary = sampling_result.summary(hdi_prob=0.94, round_to=3)
+df_summary = sampling_result.summary(hdi_prob=0.94, round_to=3, include_deterministic=True)
 print(df_summary)
 
 print("\n--- ArviZ az.summary() on the exact same draws ---")
@@ -60,7 +60,7 @@ print(az_df)
 print("\n" + "=" * 80)
 print("EXACT NUMERICAL COMPARISON CHECK (Unrounded raw values):")
 print("=" * 80)
-df_summary_raw = sampling_result.summary(hdi_prob=0.94, round_to=None)
+df_summary_raw = sampling_result.summary(hdi_prob=0.94, round_to=None, include_deterministic=True)
 az_df_raw = az.summary(idata, ci_prob=0.94, ci_kind="eti", round_to="none")
 
 col_pairs = [

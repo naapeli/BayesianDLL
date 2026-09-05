@@ -23,7 +23,6 @@ with Model() as model:
 
     with plate("data", N):
         likelihood = ObservedParameter("likelihood", Normal(prior_mean, prior_variance), data)
-    plt.figure()
     plot_model(model)
     samples = sample(2000, 500, n_chains=2)
 
@@ -31,6 +30,5 @@ ess = effective_sample_size(samples)
 print(ess)
 print(gelman_rubin(samples))
 
-plt.figure()
 plot_posterior(samples, method="kde")
 plt.show()

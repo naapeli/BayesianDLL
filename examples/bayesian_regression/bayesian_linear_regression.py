@@ -34,6 +34,8 @@ with Model() as linear_model:
     
     with plate("data", x_data):
         likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y_data)
+
+    Graphics.plot_model(linear_model)
     
     linear_model.find_MAP(verbose=False)
     samples = linear_model.sample(1000, 500, blocks=[["slope", "intercept", "sigma"]], delta=0.7)
@@ -44,13 +46,8 @@ with Model() as linear_model:
     predicative_distribution = linear_model.posterior_predicative(samples, n_samples=20, samples_per_step=50, warmup_per_sample=50)
 
 
-plt.figure()
-Graphics.plot_model(linear_model)
-
-plt.figure()
 Graphics.plot_posterior(samples)
 
-plt.figure()
 Graphics.plot_predicative_distribution(predicative_distribution, y_test, kind="pdf")
 
 

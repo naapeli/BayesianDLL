@@ -1,6 +1,19 @@
 import torch
 
 
+def _normalize_slice(s):
+    if isinstance(s, bool):
+        raise TypeError("Thinning step must be an integer or slice, got bool.")
+    if isinstance(s, int):
+        if s < 1:
+            raise ValueError(f"Thinning step must be an integer >= 1, got {s}.")
+        return slice(None, None, s)
+    elif isinstance(s, slice):
+        return s
+    else:
+        raise TypeError(f"Expected int or slice for thinning, got {type(s).__name__}.")
+
+
 class SamplingResult:
     def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None):
         self.trace = trace
@@ -25,6 +38,18 @@ class SamplingResult:
 
     def items(self):
         return {**self.trace, **self.deterministic_trace}.items()
+
+    def thin(self, step: int | slice = 1) -> "SamplingResult":
+        s = _normalize_slice(step)
+        thinned_trace = {name: val[:, s] for name, val in self.trace.items()}
+        thinned_det = {name: val[:, s] for name, val in self.deterministic_trace.items()}
+        return SamplingResult(
+            trace=thinned_trace,
+            divergences=list(self.divergences),
+            acceptance_probabilities=[list(ap) for ap in self.acceptance_probabilities],
+            step_sizes=[list(ss) for ss in self.step_sizes],
+            deterministic_trace=thinned_det,
+        )
 
     def summary(self, hdi_prob=0.94, ci_kind="eti", round_to=3, include_deterministic=False):
         from ..Evaluation._summary import summary as _summary
@@ -60,5 +85,23 @@ class PredicativeResult:
     def __len__(self):
         return len(self.samples)
 
+    def thin(self, step: int | slice = 1, dim: int | tuple[int, ...] = 1) -> "PredicativeResult":
+        s = _normalize_slice(step)
+        if dim == 1:
+            thinned = {name: val[:, s] for name, val in self.samples.items()}
+        elif dim == 0:
+            thinned = {name: val[s] for name, val in self.samples.items()}
+        elif dim in ((0, 1), (1, 0)):
+            thinned = {name: val[s, s] for name, val in self.samples.items()}
+        else:
+            raise ValueError(f"dim must be 0, 1, or (0, 1), got {dim}.")
+        return PredicativeResult(thinned)
+
     def __repr__(self):
         return f"PredicativeResult(samples={list(self.samples.keys())})"
+
+
+def thin(result, step: int | slice = 1, **kwargs):
+    if hasattr(result, "thin") and callable(result.thin):
+        return result.thin(step, **kwargs)
+    raise TypeError(f"Object of type '{type(result).__name__}' does not support thinning.")

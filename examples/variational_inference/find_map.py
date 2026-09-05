@@ -37,7 +37,6 @@ sigma = linear_model.params["sigma"].constrained_value.squeeze()
 plt.figure()
 plt.plot(history)
 
-plt.figure()
 Graphics.plot_model(linear_model)
 
 
