@@ -269,12 +269,18 @@ class Exponential(Distribution):
         return {self.resolve_name("rate", self.rate): grad_rate}
 
     def _log_prob_unconstrained(self, x_unconstrained):
+        if not isinstance(self.transform, LogTransform):
+            raise RuntimeError("Exponential._log_prob_unconstrained can only be used if the transform is a log transform")
+        
         rate = resolve(self.rate)
         z = x_unconstrained
         x = torch.exp(z)
         return (torch.log(rate) - rate * x + z).sum()
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
+        if not isinstance(self.transform, LogTransform):
+            raise RuntimeError("Exponential._log_prob_unconstrained can only be used if the transform is a log transform")
+        
         rate = resolve(self.rate)
         x = torch.exp(x_unconstrained)
         return 1 - rate * x
