@@ -41,12 +41,8 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Deterministic import Linear, Sigmoid
 from BayesianDLL.Distributions import Bernoulli, Normal
-from BayesianDLL.Evaluation import (
-    Graphics,
-    effective_sample_size,
-    gelman_rubin,
-    summary,
-)
+from BayesianDLL.Evaluation import Graphics, summary
+
 
 x = torch.linspace(-3.0, 3.0, 80)
 y = torch.bernoulli(torch.sigmoid(-0.4 + 1.6 * x))
@@ -65,8 +61,6 @@ with Model() as model:
 Graphics.plot_model(model)
 trace = model.sample(500, 500)
 print(summary(trace))
-print("R-hat:", gelman_rubin(trace.trace))
-print("ESS:", effective_sample_size(trace.trace))
 Graphics.plot_posterior(trace, parameters=["intercept", "slope"])
 plt.show()
 ```
@@ -81,20 +75,13 @@ hyperparameters:
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import (
-    Data,
-    MeanFieldGuide,
-    Model,
-    ObservedParameter,
-    RandomParameter,
-    VariationalParameter,
-    plate,
-)
+from BayesianDLL import Data, MeanFieldGuide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.Evaluation import Graphics, summary
 from BayesianDLL.GP import ExactGP, RBF, exact_gp_predictive
 from BayesianDLL.Variational import BBVI
+
 
 x = torch.linspace(0.0, 1.0, 18, dtype=torch.float64)
 y = torch.sin(2 * torch.pi * x) + 0.08 * torch.randn_like(x)
