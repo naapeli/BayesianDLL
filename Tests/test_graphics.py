@@ -79,6 +79,35 @@ def test_plot_posterior_aggregates_parameter_components():
     plt.gcf().canvas.draw()
 
 
+@pytest.mark.parametrize(
+    "vars, expected_titles",
+    [
+        ("random", {"x"}),
+        ("deterministic", {"f"}),
+        ("all", {"x", "f"}),
+    ],
+)
+def test_plot_posterior_selects_random_and_deterministic_variables(vars, expected_titles):
+    result = SamplingResult(
+        {"x": torch.randn(2, 40)},
+        [],
+        [],
+        [],
+        deterministic_trace={"f": torch.randn(2, 40)},
+    )
+
+    axes = plot_posterior(result, method="hist", vars=vars, aggregate=True)
+
+    assert axes.shape == (len(expected_titles), 2)
+    assert {axis.get_title() for axis in axes[:, 0]} == expected_titles
+
+
+def test_plot_posterior_rejects_invalid_variable_selection():
+    result = SamplingResult({"x": torch.randn(2, 40, 1)}, [], [], [])
+    with pytest.raises(ValueError, match="vars should be in"):
+        plot_posterior(result, vars="invalid")
+
+
 @pytest.mark.parametrize("method", ["hist", "kde"])
 @pytest.mark.parametrize("kind", ["pdf", "cdf"])
 def test_predictive_plots(method, kind):
