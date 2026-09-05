@@ -96,7 +96,7 @@ class InverseSoftPlusTransform(Transform):
         return (-F.softplus(-x_unconstrained)).sum()
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
-        return -F.softplus(-x_unconstrained)
+        return torch.sigmoid(-x_unconstrained)
 
 
 class LogitTransform(Transform):

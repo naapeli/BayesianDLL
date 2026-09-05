@@ -68,7 +68,7 @@ plt.legend()
 plt.title("Mixture of Gaussians")
 
 plt.tight_layout()
-# plt.savefig("Tests/sampling/pdfs.png")
+# plt.savefig("examples/sampling/pdfs.png")
 
 
 # ================== SAMPLING ==================
@@ -253,5 +253,5 @@ plt.xlim(-5, 5)
 plt.title("Mixture of Gaussians")
 
 plt.tight_layout()
-# plt.savefig("Tests/sampling/distributions.png")
+# plt.savefig("examples/sampling/distributions.png")
 plt.show()

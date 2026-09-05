@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import gaussian_kde
 from cycler import cycler
 import numpy as np
-import matplotlib.cm as cm
+from matplotlib import colormaps
 
 from ...Samplers._result import SamplingResult
 
@@ -35,7 +35,7 @@ def plot_posterior(trace: SamplingResult, method: str = "kde", bins: int = 30, p
             feature_samples = reshaped_samples[:, :, feature]
 
             n_chains = len(feature_samples)
-            cmap = cm.get_cmap("Blues", n_chains + 2)
+            cmap = colormaps["Blues"].resampled(n_chains + 2)
             colors = [cmap(i + 1) for i in range(n_chains)]
             repeated_linestyles = [linestyles[i % len(linestyles)] for i in range(n_chains)]
             prop_cycle = cycler("color", colors) + cycler("linestyle", repeated_linestyles)
@@ -43,7 +43,7 @@ def plot_posterior(trace: SamplingResult, method: str = "kde", bins: int = 30, p
             plt.subplot(total_rows, 2, 2 * row + 1)
             plt.gca().set_prop_cycle(prop_cycle)
 
-            x_grid = np.linspace(feature_samples.min(), feature_samples.max(), 500)
+            x_grid = np.linspace(feature_samples.min().item(), feature_samples.max().item(), 500)
 
             # mean_pdf = np.zeros_like(x_grid)
 
