@@ -1,185 +1,139 @@
-A Bayesian machine learning library capable of performing MCMC and variational inference for fitting complex models.
+# BayesianDLL
 
-Demonstrations live in [examples](examples). Run them as modules from the project root, for example:
+BayesianDLL is a Python library for Bayesian machine learning with probability distributions, graphical models, MCMC, and variational inference. Examples are in [examples](examples), and tests are in
+[Tests](Tests).
 
-```sh
-uv run python -m examples.bayesian_regression.bayesian_linear_regression
-```
+## Environment
 
-The [Tests](Tests) folder contains the pytest suite. Install the development dependencies and run all tests with:
+Requires Python >= 3.13 and `uv`.
+
+From the project root:
 
 ```sh
 uv sync --dev
+```
+
+Run examples as modules:
+
+```sh
+uv run python -m examples.bayesian_regression.logistic_regression
+uv run python -m examples.variational_inference.variational_exact_gp
+```
+
+To run the tests:
+
+```sh
 uv run pytest
 ```
 
-Tests cover distributions and gradients, transforms and state spaces, model construction and plates, MCMC and predictive sampling, MAP and variational inference, diagnostics, result containers, and plotting. Randomized tests use fixed seeds; plots use a noninteractive backend. Longer sampling and optimization checks are marked `integration`:
+## Examples
 
-```sh
-uv run pytest -m "not integration"
-uv run pytest -m integration
-```
+### Logistic regression
 
-The original demonstrations (including exploratory gradient scripts) are preserved in `examples`; pytest only discovers tests in `Tests` by default.
-
-Use `Data` for inputs you want to replace before MAP estimation or posterior
-sampling without rebuilding the model:
-
-```python
-from BayesianDLL import Data, Model, RandomParameter, ObservedParameter
-from BayesianDLL.Distributions import Normal
-
-with Model() as model:
-    observations = Data("observations", [1.0, 2.0, 3.0])
-    mean = RandomParameter("mean", Normal(0.0, 4.0))
-    ObservedParameter("likelihood", Normal(mean, 1.0), observations)
-
-observations.set_value([2.0, 3.0, 4.0])
-samples = model.sample(1000, 500)
-```
-
-`Data` can also be a distribution argument or an entry in
-`DeterministicParameter.inputs`; the forward and derivative functions receive
-its current tensor. See the [linear regression example](examples/bayesian_regression/bayesian_linear_regression.py)
-for mutable predictors and observations. Access registered inputs through
-`model.data[name]`. Data are fixed during inference and are not sampled.
-Updates preserve the event shape, dtype, and device while allowing batch shapes
-to change. By default, `event_ndim=0` treats every element as a scalar event.
-For vector events, use `Data("features", values, event_ndim=1)`: values with shape
-`(100, 3)` can be replaced by `(50, 3)`, but not `(50, 4)`. Use `event_ndim=2`
-for matrix events. Rebuild the model to change the event shape. Use floating-point
-initial values for continuous data.
-
-Model graphs use the standard graphical-model distinction between latent,
-observed, deterministic, and data nodes, and show distributions, data shapes,
-and plate sizes by default:
-
-```python
-from BayesianDLL.Evaluation.Graphics import plot_model
-
-plot_model(model)
-plot_model(model, include_data=False)  # compact stochastic/generative view
-```
-
-The optional `ax`, `show_distributions`, `show_plates`, and `legend` arguments
-can be used to embed or simplify the plot. `plot_model` returns the Matplotlib
-axes it draws into.
-
-All plotting helpers can be embedded in existing Matplotlib figures. Predictive
-plots accept and return one `ax`; posterior plots accept and return an axes grid
-with one row per scalar parameter component and density/trace columns:
+`Linear` creates the linear predictor and `Sigmoid` converts it to a probability for a Bernoulli likelihood:
 
 ```python
 import matplotlib.pyplot as plt
-from BayesianDLL.Evaluation import Graphics
-
-fig, ax = plt.subplots()
-Graphics.plot_predicative_distribution(predictions, data=y, ax=ax)
-
-fig, axes = plt.subplots(2, 2)
-Graphics.plot_posterior(samples, parameters=["intercept", "slope"], axes=axes)
-# For vector-valued parameters, put all components in one density/trace row.
-Graphics.plot_posterior(samples, parameters=["function_white"], aggregate=True)
-```
-
-## Latent Gaussian processes
-
-`BayesianDLL.GP` provides explicit, whitened latent-function Gaussian
-processes for MCMC and variational inference. This keeps the latent function
-in the model instead of integrating it out into a collapsed GP likelihood.
-
-```python
 import torch
 
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, plate
-from BayesianDLL.Distributions import Exponential, Normal
-from BayesianDLL.GP import LatentGP, RBF, gp_predictive
+from BayesianDLL.Deterministic import Linear, Sigmoid
+from BayesianDLL.Distributions import Bernoulli, Normal
+from BayesianDLL.Evaluation import Graphics, summary
 
-x = torch.linspace(0.0, 1.0, 20)
-y = torch.sin(6 * x)
+x = torch.linspace(-3.0, 3.0, 80)
+y = torch.bernoulli(torch.sigmoid(-0.4 + 1.6 * x))
 
 with Model() as model:
     inputs = Data("inputs", x)
-    z = RandomParameter("z", Normal(0.0, 1.0), shape=x.numel())
-    lengthscale = RandomParameter("lengthscale", Exponential(1.0))
-    variance = RandomParameter("variance", Exponential(1.0))
-    function = LatentGP(
-        "function", inputs, RBF(lengthscale=lengthscale, variance=variance), latent=z
-    )
+    intercept = RandomParameter("intercept", Normal(0.0, 2.0))
+    slope = RandomParameter("slope", Normal(0.0, 2.0))
+
+    logits = Linear("logits", inputs, slope=slope, intercept=intercept)
+    probability = Sigmoid("probability", logits)
+
     with plate("observations", x):
-        ObservedParameter("observations", Normal(function, 0.05), y)
+        ObservedParameter("observations", Bernoulli(probability), y)
 
+Graphics.plot_model(model)
 trace = model.sample(500, 500)
+print(summary(trace))
+Graphics.plot_posterior(trace, parameters=["intercept", "slope"])
+plt.show()
 ```
 
-The latent vector can be defined explicitly, as above, or omitted; in the
-latter case the process creates a standard-normal vector named
-`function_white`. It is transformed through the kernel Cholesky factor. Use
-`gp_predictive(function, trace, new_inputs)` to sample latent function values
-at new inputs. The generic `model.posterior_predicative(...)` method samples
-observed likelihood sites at their existing inputs; GP prediction at new
-inputs uses the conditional GP distribution and therefore goes through
-`gp_predictive`. Supported kernels include `RBF`, `Periodic`, `Matern32`, `Matern52`,
-`Linear`, `Constant`, and `WhiteNoise`; kernels can be added or multiplied
-together.
+### Variational exact Gaussian Process
 
-## Ready-made deterministic transformations
-
-Reusable deterministic nodes are available from `BayesianDLL.Deterministic`.
-They register their named inputs in the model graph and provide derivatives for
-MCMC and optimization:
+`ExactGP` analytically implements a Gaussian process connected to a Gaussian likelihood. Variational inference then optimizes a guide over the GP hyperparameters:
 
 ```python
-from BayesianDLL.Deterministic import Exp, Linear, Log
+import matplotlib.pyplot as plt
+import torch
 
-positive_scale = Exp("scale", log_scale)
-log_scale = Log("log_scale", positive_scale)
-mean = Linear("mean", inputs, slope=slope, intercept=intercept)
-```
+from BayesianDLL import Data, MeanFieldGuide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
+from BayesianDLL.Deterministic import Exp
+from BayesianDLL.Distributions import Normal
+from BayesianDLL.Evaluation import Graphics, summary
+from BayesianDLL.GP import ExactGP, RBF, exact_gp_predictive
+from BayesianDLL.Variational import BBVI
 
-`Linear` also accepts a design matrix and a coefficient vector, using
-`inputs @ coefficients + intercept`.
-
-Variational GP examples are available for both formulations:
-[explicit latent GP](examples/variational_inference/variational_latent_gp.py)
-and [collapsed exact GP](examples/variational_inference/variational_exact_gp.py).
-
-For binary outcomes, compose `Linear` with `Sigmoid` and use the result as the
-probability of a `Bernoulli` likelihood. See the
-[logistic regression example](examples/bayesian_regression/logistic_regression.py).
-
-## Exact Gaussian processes
-
-For a Gaussian likelihood, `ExactGP` integrates the latent
-function out analytically and evaluates the multivariate-normal GP marginal
-likelihood. Kernel and noise hyperparameters remain ordinary model parameters,
-so they can be sampled with MCMC without adding one latent variable per input:
-
-```python
-from BayesianDLL.Distributions import Uniform
-from BayesianDLL.GP import ExactGP, Periodic, exact_gp_predictive
+x = torch.linspace(0.0, 1.0, 18, dtype=torch.float64)
+y = torch.sin(2 * torch.pi * x) + 0.08 * torch.randn_like(x)
 
 with Model() as model:
     inputs = Data("inputs", x)
-    lengthscale = RandomParameter("lengthscale", Uniform(0.05, 1.0))
-    variance = RandomParameter("variance", Uniform(0.25, 2.0))
-    period = RandomParameter("period", Uniform(0.5, 1.5))
-    noise_variance = RandomParameter("noise_variance", Uniform(0.001, 0.1))
+    log_lengthscale = RandomParameter("log_lengthscale", Normal(-1.0, 0.5))
+    log_variance = RandomParameter("log_variance", Normal(0.0, 0.5))
+    log_noise = RandomParameter("log_noise", Normal(-5.0, 0.5))
+
+    lengthscale = Exp("lengthscale", log_lengthscale)
+    variance = Exp("variance", log_variance)
+    noise_variance = Exp("noise_variance", log_noise)
+
     function = ExactGP(
-        "function", inputs,
-        Periodic(lengthscale, variance, period),
+        "function",
+        inputs,
+        RBF(lengthscale, variance),
         noise_variance=noise_variance,
     )
     with plate("observations", x):
-        ObservedParameter("y", function, y)
+        ObservedParameter("observations", function, y)
 
-trace = model.sample(500, 500)
-predictions = exact_gp_predictive(function, trace, y, new_inputs)
+Graphics.plot_model(model)
+
+with MeanFieldGuide() as guide:
+    def q_normal(name, mean, variance):
+        return RandomParameter(
+            name,
+            Normal(
+                VariationalParameter(
+                    f"{name}_mean", torch.tensor([mean], dtype=x.dtype)
+                ),
+                VariationalParameter(
+                    f"{name}_variance",
+                    torch.tensor([variance], dtype=x.dtype),
+                    min=1e-6,
+                ),
+            ),
+        )
+
+    q_log_lengthscale = q_normal("log_lengthscale", -1.0, 0.25)
+    q_log_variance = q_normal("log_variance", 0.0, 0.25)
+    q_log_noise = q_normal("log_noise", -5.0, 0.25)
+    Exp("lengthscale", q_log_lengthscale)
+    Exp("variance", q_log_variance)
+    Exp("noise_variance", q_log_noise)
+
+BBVI(model, guide, n_samples=4, epochs=200, lr=5e-3)
+trace = guide.sample(200, 200, n_chains=2)
+print(summary(trace, include_deterministic=True))
+Graphics.plot_posterior(trace, vars="random")
+Graphics.plot_posterior(trace, vars="deterministic")
+predictions = exact_gp_predictive(
+    function,
+    trace,
+    y,
+    torch.linspace(-0.1, 1.1, 100, dtype=x.dtype),
+)
+plt.show()
 ```
-
-`exact_gp_predictive` samples latent or noisy predictions after inference from
-the exact conditional GP distribution. The exact implementation costs
-`O(N^3)` per likelihood evaluation and is intended for Gaussian observations;
-use `LatentGP` when the latent function must remain in the model or the
-likelihood is non-Gaussian. The previous names `GaussianProcess` and
-`ExactGaussianProcess` remain available as compatibility aliases.
