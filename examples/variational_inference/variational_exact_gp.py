@@ -6,6 +6,7 @@ from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.GP import ExactGP, RBF, exact_gp_predictive
 from BayesianDLL.Variational import BBVI
+from BayesianDLL.Evaluation import Graphics
 
 
 def variational_normal(name, dtype):
@@ -49,6 +50,8 @@ posterior = guide.sample(
     warmup_length=300,
     n_chains=4,
 )
+Graphics.plot_posterior(posterior)
+Graphics.plot_posterior(posterior, vars="deterministic")
 
 x_prediction = torch.linspace(-0.1, 1.1, 120, dtype=x.dtype)
 predictions = exact_gp_predictive(

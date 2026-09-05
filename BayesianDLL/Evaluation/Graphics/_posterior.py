@@ -14,23 +14,32 @@ def plot_posterior(
     parameters: None | list[str] = None,
     axes=None,
     aggregate: bool = False,
+    vars: str = "random",
 ):
     """Plot posterior densities and traces.
 
     By default, each scalar parameter component occupies one row: its marginal
     density is drawn in the first column and its MCMC trace in the second. If
     ``aggregate`` is true, all components of each parameter are drawn in the
-    same row instead. If ``axes`` is supplied, it must contain exactly two
+    same row instead. ``vars`` selects random variables, deterministic
+    variables, or both. If ``axes`` is supplied, it must contain exactly two
     axes per plotted row. The returned axes array always has shape
     ``(n_rows, 2)``.
     """
     if method not in ["kde", "hist"]:
         raise ValueError('method should be in ["kde", "hist"].')
+    if vars not in ["random", "deterministic", "all"]:
+        raise ValueError('vars should be in ["random", "deterministic", "all"].')
     linestyles = ['-', '--', '-.', ':']
 
+    traces = {}
+    if vars in ["random", "all"]:
+        traces.update(trace.trace)
+    if vars in ["deterministic", "all"]:
+        traces.update(trace.deterministic_trace)
     selected = [
         (name, samples)
-        for name, samples in trace.trace.items()
+        for name, samples in traces.items()
         if parameters is None or name in parameters
     ]
     total_rows = 0
