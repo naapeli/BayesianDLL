@@ -19,12 +19,25 @@ def get_active_plates():
 
 class PlateInfo:
     """Stores metadata about an active plate context."""
-    __slots__ = ("name", "size", "dim")
+    __slots__ = ("name", "_size", "dim")
 
     def __init__(self, name, size, dim):
         self.name = name
-        self.size = size
+        self._size = size
         self.dim = dim
+
+    @property
+    def size(self):
+        if hasattr(self._size, "batch_shape"):
+            try:
+                return self._size.batch_shape[self.dim]
+            except IndexError as error:
+                raise ValueError(
+                    f"Plate '{self.name}' uses dim {self.dim}, but data "
+                    f"'{self._size.name}' has batch shape "
+                    f"{tuple(self._size.batch_shape)}."
+                ) from error
+        return self._size
 
     def __repr__(self):
         return f"PlateInfo(name={self.name!r}, size={self.size}, dim={self.dim})"
@@ -44,6 +57,14 @@ class plate:
         with plate("data", N):
             y = ObservedParameter("y", Normal(mu, sigma), y_data)
 
+    The size can instead be read from mutable ``Data`` at runtime::
+
+        with plate("data", x_data):
+            y = ObservedParameter("y", Normal(mu, sigma), y_data)
+
+    Calling ``x_data.set_value(...)`` then changes the plate size. Passing an
+    integer keeps the plate size constant.
+
     Plates can be nested::
 
         with plate("batch", B):
@@ -52,7 +73,9 @@ class plate:
 
     Args:
         name: Human-readable identifier for this plate.
-        size: Number of independent repetitions along this dimension.
+        size: Number of independent repetitions along this dimension, or a
+              ``Data`` object whose corresponding batch dimension determines
+              the size at runtime.
         dim:  Which batch dimension this plate controls (negative, counting
               from the right).  When nesting plates without specifying dim,
               each nested plate automatically takes the next leftward

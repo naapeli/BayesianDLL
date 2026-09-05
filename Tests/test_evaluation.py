@@ -131,9 +131,12 @@ def test_summary_statistics_and_intervals(trace, ci_kind):
 
 def test_result_summary_selects_deterministics_and_rounds(trace):
     result = SamplingResult(trace, [], [], [], {"twice": 2 * trace["x"]})
-    assert len(result.summary()) == 4
-    table = result.summary(include_deterministic=False, round_to=2)
+    table = result.summary(round_to=2)
     assert list(table.index) == ["x[0]", "x[1]"]
     assert table.loc["x[0]", "mean"] == round(trace["x"][:, :, 0].mean().item(), 2)
+
+    table_with_deterministics = result.summary(include_deterministic=True)
+    assert list(table_with_deterministics.index) == ["x[0]", "x[1]", "twice[0]", "twice[1]"]
+
     with pytest.raises(TypeError, match="result must be"):
         summary([1, 2, 3])
