@@ -3,7 +3,8 @@ import matplotlib.pyplot as plt
 
 
 from BayesianDLL.Distributions import Normal, HalfCauchy, Exponential
-from BayesianDLL import Model, MeanFieldGuide, RandomParameter, ObservedParameter, DeterministicParameter, VariationalParameter, plate
+from BayesianDLL import Data, Model, MeanFieldGuide, RandomParameter, ObservedParameter, VariationalParameter, plate
+from BayesianDLL.Deterministic import Exp, Linear
 from BayesianDLL.Variational import BBVI
 from BayesianDLL.Evaluation.Graphics import plot_posterior
 
@@ -25,8 +26,8 @@ with Model() as linear_model:
     prior_variance = RandomParameter("sigma_squared", HalfCauchy(10))
     # prior_variance = 0.5
 
-    # make the transform for the predicted line
-    mu = DeterministicParameter("mu", lambda b, m: m * x + b, lambda b, m: {"slope": x, "intercept": torch.ones_like(x)}, [prior_intercept, prior_slope])
+    x_data = Data("x", x)
+    mu = Linear("mu", x_data, slope=prior_slope, intercept=prior_intercept)
     
     with plate("data", N):
         likelihood = ObservedParameter("likelihood", Normal(mu, prior_variance), y)
@@ -36,7 +37,7 @@ with MeanFieldGuide() as guide:
     RandomParameter("slope", Normal(VariationalParameter("mean", torch.full((1,), 0).double()), VariationalParameter("variance", torch.full((1,), 1).double(), min=1e-8)))
     # RandomParameter("sigma_squared", Exponential(VariationalParameter("scale", torch.full((1,), 1).double(), min=1e-8)))  # this is less stable and by reparametrizing, we get a more stable algorithm (cannot use as high of a learning rate if this is used)
     log_sigma_squared = RandomParameter("log_sigma_squared", Normal(VariationalParameter("mean", torch.full((1,), 0).double()), VariationalParameter("variance", torch.full((1,), 1).double(), min=1e-8)))
-    DeterministicParameter("sigma_squared", lambda log_sigma_squared: torch.exp(log_sigma_squared), lambda log_sigma_squared: {"log_sigma_squared": torch.exp(log_sigma_squared)}, [log_sigma_squared])
+    Exp("sigma_squared", log_sigma_squared)
 
 history = BBVI(linear_model, guide, n_samples=10, epochs=500, lr=1e-2)  # n_samples can be lowered for faster optimization or increased for lower variance.
 plt.figure()

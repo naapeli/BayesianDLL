@@ -13,13 +13,16 @@ def plot_posterior(
     bins: int = 30,
     parameters: None | list[str] = None,
     axes=None,
+    aggregate: bool = False,
 ):
     """Plot posterior densities and traces.
 
-    Each scalar parameter component occupies one row: its marginal density is
-    drawn in the first column and its MCMC trace in the second. If ``axes`` is
-    supplied, it must contain exactly two axes per plotted component. The
-    returned axes array always has shape ``(n_components, 2)``.
+    By default, each scalar parameter component occupies one row: its marginal
+    density is drawn in the first column and its MCMC trace in the second. If
+    ``aggregate`` is true, all components of each parameter are drawn in the
+    same row instead. If ``axes`` is supplied, it must contain exactly two
+    axes per plotted row. The returned axes array always has shape
+    ``(n_rows, 2)``.
     """
     if method not in ["kde", "hist"]:
         raise ValueError('method should be in ["kde", "hist"].')
@@ -34,7 +37,7 @@ def plot_posterior(
     for _, samples in selected:
         param_shape = samples.shape[2:]
         n_features = np.prod(param_shape, dtype=int) if param_shape else 1
-        total_rows += n_features
+        total_rows += 1 if aggregate else n_features
 
     if total_rows == 0:
         raise ValueError("No posterior parameter components were selected for plotting.")
@@ -63,42 +66,58 @@ def plot_posterior(
         n_features = np.prod(param_shape, dtype=int) if param_shape else 1
         reshaped_samples = samples.reshape(n_chains, trace_length, n_features)
 
-        for feature in range(n_features):
-            feature_samples = reshaped_samples[:, :, feature]
-            cmap = colormaps["Blues"].resampled(n_chains + 2)
-            colors = [cmap(i + 1) for i in range(n_chains)]
-            repeated_linestyles = [linestyles[i % len(linestyles)] for i in range(n_chains)]
-            prop_cycle = cycler("color", colors) + cycler("linestyle", repeated_linestyles)
-
+        feature_rows = [range(n_features)] if aggregate else [[feature] for feature in range(n_features)]
+        for features in feature_rows:
             density_ax, trace_ax = axes_array[row]
-            density_ax.set_prop_cycle(prop_cycle)
-            x_grid = np.linspace(feature_samples.min().item(), feature_samples.max().item(), 500)
-
-            for i, chain in enumerate(feature_samples):
-                chain_bins = bins if not isinstance(bins, dict) else bins[name]
-                chain_values = chain.detach().cpu().numpy()
-
-                if method == "kde":
-                    est = gaussian_kde(chain_values)
-                    pdf = est(x_grid)
+            for feature in features:
+                feature_samples = reshaped_samples[:, :, feature]
+                if aggregate:
+                    cmap = colormaps["viridis"].resampled(n_features + 2)
+                    colors = [cmap(feature + 1)] * n_chains
+                    repeated_linestyles = [linestyles[i % len(linestyles)] for i in range(n_chains)]
                 else:
-                    hist, bin_edges = np.histogram(
-                        chain_values,
-                        bins=chain_bins,
-                        range=(x_grid.min(), x_grid.max()),
-                        density=True,
-                    )
-                    bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-                    pdf = np.interp(x_grid, bin_centers, hist)
-                density_ax.plot(x_grid, pdf, alpha=0.3, label=f"Chain {i+1}")
+                    cmap = colormaps["Blues"].resampled(n_chains + 2)
+                    colors = [cmap(i + 1) for i in range(n_chains)]
+                    repeated_linestyles = [linestyles[i % len(linestyles)] for i in range(n_chains)]
+                prop_cycle = cycler("color", colors) + cycler("linestyle", repeated_linestyles)
 
-            density_ax.set_title(f"{name}[{feature}]")
+                density_ax.set_prop_cycle(prop_cycle)
+                x_grid = np.linspace(feature_samples.min().item(), feature_samples.max().item(), 500)
+
+                for i, chain in enumerate(feature_samples):
+                    chain_bins = bins if not isinstance(bins, dict) else bins[name]
+                    chain_values = chain.detach().cpu().numpy()
+
+                    if method == "kde":
+                        est = gaussian_kde(chain_values)
+                        pdf = est(x_grid)
+                    else:
+                        hist, bin_edges = np.histogram(
+                            chain_values,
+                            bins=chain_bins,
+                            range=(x_grid.min(), x_grid.max()),
+                            density=True,
+                        )
+                        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
+                        pdf = np.interp(x_grid, bin_centers, hist)
+                    if aggregate:
+                        label = f"{name}[{feature}]" if i == 0 else "_nolegend_"
+                    else:
+                        label = f"Chain {i + 1}"
+                    density_ax.plot(x_grid, pdf, alpha=0.3, label=label)
+
+                trace_ax.set_prop_cycle(prop_cycle)
+                for i, chain in enumerate(feature_samples):
+                    if aggregate:
+                        label = f"{name}[{feature}]" if i == 0 else "_nolegend_"
+                    else:
+                        label = f"Chain {i + 1}"
+                    trace_ax.plot(chain.detach().cpu().numpy(), alpha=0.7, label=label)
+
+            title = name if aggregate else f"{name}[{features[0]}]"
+            density_ax.set_title(title)
             density_ax.legend(loc="upper right")
-
-            trace_ax.set_prop_cycle(prop_cycle)
-            for i, chain in enumerate(feature_samples):
-                trace_ax.plot(chain.detach().cpu().numpy(), alpha=0.7, label=f"Chain {i+1}")
-            trace_ax.set_title(f"{name}[{feature}]")
+            trace_ax.set_title(title)
             trace_ax.legend(loc="upper right")
             row += 1
 

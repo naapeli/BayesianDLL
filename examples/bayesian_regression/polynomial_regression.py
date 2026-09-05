@@ -2,7 +2,8 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, HalfCauchy, MultivariateNormal
-from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, sample, posterior_predicative, plate
+from BayesianDLL import Data, Model, RandomParameter, ObservedParameter, sample, posterior_predicative, plate
+from BayesianDLL.Deterministic import Linear
 from BayesianDLL import Evaluation
 
 
@@ -28,7 +29,8 @@ with Model() as polynomial_model:
     prior_coeffs = RandomParameter("coeffs", MultivariateNormal(prior_mean, prior_cov), min_step_size=1e-2)
     prior_sigma = RandomParameter("sigma", HalfCauchy(10), min_step_size=1e-2)
 
-    mu = DeterministicParameter("mu", lambda coeffs: phi_x @ coeffs, lambda coeffs: {"coeffs": phi_x}, [prior_coeffs])
+    design = Data("design", phi_x)
+    mu = Linear("mu", design, coefficients=prior_coeffs)
     
     with plate("data", N):
         likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)

@@ -2,7 +2,8 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, HalfCauchy
-from BayesianDLL import Data, Model, RandomParameter, ObservedParameter, DeterministicParameter, plate
+from BayesianDLL import Data, Model, RandomParameter, ObservedParameter, plate
+from BayesianDLL.Deterministic import Linear
 from BayesianDLL.Evaluation import Graphics, summary
 
 
@@ -30,7 +31,7 @@ with Model() as linear_model:
     prior_slope = RandomParameter("slope", Normal(0, 20), sampler="auto", delta=0.4)
     prior_sigma = RandomParameter("sigma", HalfCauchy(1), sampler="auto", max_depth=4)
 
-    mu = DeterministicParameter("mu", lambda b, m, inputs: m * inputs + b, lambda b, m, inputs: {"slope": inputs, "intercept": torch.ones_like(inputs)}, [prior_intercept, prior_slope, x_data])
+    mu = Linear("mu", x_data, slope=prior_slope, intercept=prior_intercept)
     
     with plate("data", x_data):
         likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y_data)

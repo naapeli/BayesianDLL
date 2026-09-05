@@ -37,6 +37,18 @@ class PlateInfo:
                     f"'{self._size.name}' has batch shape "
                     f"{tuple(self._size.batch_shape)}."
                 ) from error
+        # ``plate`` is commonly called with the raw tensor used as data,
+        # e.g. ``plate("observations", x)``.  A tensor has no ``batch_shape``
+        # attribute, so returning it directly would make the model plot show
+        # the complete tensor instead of the length of the plate.
+        if hasattr(self._size, "shape"):
+            try:
+                return self._size.shape[self.dim]
+            except IndexError as error:
+                raise ValueError(
+                    f"Plate '{self.name}' uses dim {self.dim}, but the "
+                    f"plate size has shape {tuple(self._size.shape)}."
+                ) from error
         return self._size
 
     def __repr__(self):
