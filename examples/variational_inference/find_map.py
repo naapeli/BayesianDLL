@@ -2,7 +2,8 @@ import torch
 import matplotlib.pyplot as plt
 
 from BayesianDLL.Distributions import Normal, HalfCauchy
-from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, find_MAP, plate
+from BayesianDLL import Data, Model, RandomParameter, ObservedParameter, find_MAP, plate
+from BayesianDLL.Deterministic import Linear
 from BayesianDLL.Evaluation import Graphics
 
 
@@ -22,8 +23,8 @@ with Model() as linear_model:
     prior_slope = RandomParameter("slope", Normal(0, 20))
     prior_sigma = RandomParameter("sigma", HalfCauchy(10))
 
-    # make the transform for the predicted line
-    mu = DeterministicParameter("mu", lambda b, m: m * x + b, lambda b, m: {"slope": x, "intercept": torch.ones_like(x)}, [prior_intercept, prior_slope])
+    x_data = Data("x", x)
+    mu = Linear("mu", x_data, slope=prior_slope, intercept=prior_intercept)
     
     with plate("data", N):
         likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)

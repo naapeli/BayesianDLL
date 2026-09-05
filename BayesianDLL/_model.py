@@ -35,6 +35,17 @@ def _sum_to_shape(grad: torch.Tensor, target_shape: tuple) -> torch.Tensor:
     return grad
 
 
+def _distribution_dependencies(distribution) -> set[str]:
+    """Return named model dependencies, excluding constant arguments.
+
+    Distribution gradient methods use fallback labels such as ``"variance"``
+    for literal arguments so they remain useful outside a model. Inside a
+    model, those labels must not be mistaken for a RandomParameter with the
+    same name.
+    """
+    return set(getattr(distribution, "parameters", ()))
+
+
 class Model:
     def __init__(self):
         self.data = {}
@@ -161,7 +172,10 @@ class Model:
                 obs_param = self.observed_params[node_name]
                 observed = obs_param.observed_values
                 param_grads = obs_param.distribution.log_pdf_param_grads(observed)
+                dependencies = _distribution_dependencies(obs_param.distribution)
                 for p_name, p_grad in param_grads.items():
+                    if p_name not in dependencies:
+                        continue
                     if p_name in self.params:
                         target_shape = self.params[p_name].constrained_value.shape
                         grad_p = _sum_to_shape(p_grad, target_shape)
@@ -175,12 +189,13 @@ class Model:
                 if node_name in cotangents:
                     det_param = self.deterministic_params[node_name]
                     bar_v = cotangents[node_name]
+                    local_derivatives = det_param.derivatives()
                     for inp in det_param.inputs:
                         inp_name = inp.name if hasattr(inp, "name") else None
                         if inp_name and (inp_name in self.params or inp_name in self.deterministic_params):
                             target_param = self.params[inp_name] if inp_name in self.params else self.deterministic_params[inp_name]
                             target_shape = target_param.constrained_value.shape
-                            det_deriv = det_param.derivative(inp_name)
+                            det_deriv = local_derivatives[inp_name]
                             if not isinstance(det_deriv, torch.Tensor):
                                 det_deriv = torch.as_tensor(det_deriv, dtype=bar_v.dtype)
 
@@ -200,7 +215,10 @@ class Model:
                 param = self.params[node_name]
                 if getattr(param.distribution, "parameters", None):
                     param_grads = param.distribution.log_pdf_param_grads(param.constrained_value)
+                    dependencies = _distribution_dependencies(param.distribution)
                     for p_name, p_grad in param_grads.items():
+                        if p_name not in dependencies:
+                            continue
                         if p_name in self.params:
                             target_shape = self.params[p_name].constrained_value.shape
                             grad_p = _sum_to_shape(p_grad, target_shape)

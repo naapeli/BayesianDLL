@@ -38,6 +38,22 @@ def test_plot_model_can_hide_data_and_metadata():
     plt.gcf().canvas.draw()
 
 
+def test_plot_model_uses_length_for_raw_tensor_plate_size():
+    from BayesianDLL import Model, ObservedParameter, plate
+    from BayesianDLL.Distributions import Normal
+
+    values = torch.arange(5.0)
+    with Model() as model:
+        with plate("observations", values):
+            ObservedParameter("likelihood", Normal(0.0, 1.0), values)
+
+    ax = plot_model(model, show_distributions=False)
+    labels = {text.get_text() for text in ax.texts}
+    assert "observations  [5]" in labels
+    assert not any("tensor(" in label for label in labels)
+    plt.gcf().canvas.draw()
+
+
 @pytest.mark.parametrize("method", ["hist", "kde"])
 def test_plot_posterior_draws_density_and_trace(method):
     result = SamplingResult({"x": torch.randn(2, 40, 1)}, [], [], [])
@@ -46,6 +62,20 @@ def test_plot_posterior_draws_density_and_trace(method):
     assert len(axes) == 2
     assert all(len(ax.lines) == 2 for ax in axes)
     np.testing.assert_allclose(axes[1].lines[0].get_ydata(), result["x"][0, :, 0])
+    plt.gcf().canvas.draw()
+
+
+def test_plot_posterior_aggregates_parameter_components():
+    samples = torch.arange(2 * 40 * 3, dtype=torch.float32).reshape(2, 40, 3)
+    result = SamplingResult({"x": samples}, [], [], [])
+
+    axes = plot_posterior(result, method="hist", bins={"x": 8}, parameters=["x"], aggregate=True)
+
+    assert axes.shape == (1, 2)
+    assert all(len(ax.lines) == 6 for ax in axes[0])  # three components across two chains
+    assert axes[0, 0].get_title() == "x"
+    assert axes[0, 1].get_title() == "x"
+    assert {text.get_text() for text in axes[0, 1].get_legend().get_texts()} == {"x[0]", "x[1]", "x[2]"}
     plt.gcf().canvas.draw()
 
 

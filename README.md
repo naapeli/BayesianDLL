@@ -78,4 +78,108 @@ Graphics.plot_predicative_distribution(predictions, data=y, ax=ax)
 
 fig, axes = plt.subplots(2, 2)
 Graphics.plot_posterior(samples, parameters=["intercept", "slope"], axes=axes)
+# For vector-valued parameters, put all components in one density/trace row.
+Graphics.plot_posterior(samples, parameters=["function_white"], aggregate=True)
 ```
+
+## Latent Gaussian processes
+
+`BayesianDLL.GP` provides explicit, whitened latent-function Gaussian
+processes for MCMC and variational inference. This keeps the latent function
+in the model instead of integrating it out into a collapsed GP likelihood.
+
+```python
+import torch
+
+from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, plate
+from BayesianDLL.Distributions import Exponential, Normal
+from BayesianDLL.GP import LatentGP, RBF, gp_predictive
+
+x = torch.linspace(0.0, 1.0, 20)
+y = torch.sin(6 * x)
+
+with Model() as model:
+    inputs = Data("inputs", x)
+    z = RandomParameter("z", Normal(0.0, 1.0), shape=x.numel())
+    lengthscale = RandomParameter("lengthscale", Exponential(1.0))
+    variance = RandomParameter("variance", Exponential(1.0))
+    function = LatentGP(
+        "function", inputs, RBF(lengthscale=lengthscale, variance=variance), latent=z
+    )
+    with plate("observations", x):
+        ObservedParameter("observations", Normal(function, 0.05), y)
+
+trace = model.sample(500, 500)
+```
+
+The latent vector can be defined explicitly, as above, or omitted; in the
+latter case the process creates a standard-normal vector named
+`function_white`. It is transformed through the kernel Cholesky factor. Use
+`gp_predictive(function, trace, new_inputs)` to sample latent function values
+at new inputs. The generic `model.posterior_predicative(...)` method samples
+observed likelihood sites at their existing inputs; GP prediction at new
+inputs uses the conditional GP distribution and therefore goes through
+`gp_predictive`. Supported kernels include `RBF`, `Periodic`, `Matern32`, `Matern52`,
+`Linear`, `Constant`, and `WhiteNoise`; kernels can be added or multiplied
+together.
+
+## Ready-made deterministic transformations
+
+Reusable deterministic nodes are available from `BayesianDLL.Deterministic`.
+They register their named inputs in the model graph and provide derivatives for
+MCMC and optimization:
+
+```python
+from BayesianDLL.Deterministic import Exp, Linear, Log
+
+positive_scale = Exp("scale", log_scale)
+log_scale = Log("log_scale", positive_scale)
+mean = Linear("mean", inputs, slope=slope, intercept=intercept)
+```
+
+`Linear` also accepts a design matrix and a coefficient vector, using
+`inputs @ coefficients + intercept`.
+
+Variational GP examples are available for both formulations:
+[explicit latent GP](examples/variational_inference/variational_latent_gp.py)
+and [collapsed exact GP](examples/variational_inference/variational_exact_gp.py).
+
+For binary outcomes, compose `Linear` with `Sigmoid` and use the result as the
+probability of a `Bernoulli` likelihood. See the
+[logistic regression example](examples/bayesian_regression/logistic_regression.py).
+
+## Exact Gaussian processes
+
+For a Gaussian likelihood, `ExactGP` integrates the latent
+function out analytically and evaluates the multivariate-normal GP marginal
+likelihood. Kernel and noise hyperparameters remain ordinary model parameters,
+so they can be sampled with MCMC without adding one latent variable per input:
+
+```python
+from BayesianDLL.Distributions import Uniform
+from BayesianDLL.GP import ExactGP, Periodic, exact_gp_predictive
+
+with Model() as model:
+    inputs = Data("inputs", x)
+    lengthscale = RandomParameter("lengthscale", Uniform(0.05, 1.0))
+    variance = RandomParameter("variance", Uniform(0.25, 2.0))
+    period = RandomParameter("period", Uniform(0.5, 1.5))
+    noise_variance = RandomParameter("noise_variance", Uniform(0.001, 0.1))
+    function = ExactGP(
+        "function", inputs,
+        Periodic(lengthscale, variance, period),
+        noise_variance=noise_variance,
+    )
+    with plate("observations", x):
+        ObservedParameter("y", function, y)
+
+trace = model.sample(500, 500)
+predictions = exact_gp_predictive(function, trace, y, new_inputs)
+```
+
+`exact_gp_predictive` samples latent or noisy predictions after inference from
+the exact conditional GP distribution. The exact implementation costs
+`O(N^3)` per likelihood evaluation and is intended for Gaussian observations;
+use `LatentGP` when the latent function must remain in the model or the
+likelihood is non-Gaussian. The previous names `GaussianProcess` and
+`ExactGaussianProcess` remain available as compatibility aliases.

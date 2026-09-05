@@ -46,6 +46,33 @@ def test_elbo_reparameterization_gradients_match_autograd(normal_model):
     torch.testing.assert_close(guide.params["mean"].unconstrained_value, guide_before)
 
 
+def test_elbo_preserves_vector_reparameterization_gradients():
+    dimension = 3
+    with Model() as model:
+        RandomParameter(
+            "z",
+            Normal(torch.zeros(dimension), torch.ones(dimension)),
+            shape=dimension,
+        )
+
+    mean = torch.tensor([0.3, -0.4, 0.8], requires_grad=True)
+    variance = torch.tensor([1.2, 0.7, 1.5], requires_grad=True)
+    with MeanFieldGuide() as guide:
+        RandomParameter(
+            "z",
+            Normal(
+                VariationalParameter("loc", mean),
+                VariationalParameter("var", variance, min=0.01),
+            ),
+            shape=dimension,
+        )
+
+    value, grads = elbo(model, guide, n_samples=10)
+    expected = torch.autograd.grad(value, (mean, variance))
+    torch.testing.assert_close(grads["z_loc"], expected[0])
+    torch.testing.assert_close(grads["z_var"], expected[1])
+
+
 def test_elbo_is_zero_for_identical_model_and_guide():
     with Model() as model:
         RandomParameter("mean", Normal(torch.tensor([0.3]), torch.tensor([1.2])))

@@ -153,9 +153,11 @@ class DeterministicParameter:
         return self.forward_func(*inputs)
 
     def derivative(self, name):
+        return self.derivatives()[name]
+
+    def derivatives(self):
         inputs = [self._get_constrained_value(input) for input in self.inputs]
-        local_derivative = self.derivative_func(*inputs)[name]
-        return local_derivative
+        return self.derivative_func(*inputs)
 
     def _get_constrained_value(self, input):
         if isinstance(input, torch.Tensor):

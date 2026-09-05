@@ -1,7 +1,8 @@
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, RandomParameter, condition, plate
+from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, condition, plate
+from BayesianDLL.Deterministic import Linear
 from BayesianDLL.Distributions import HalfCauchy, Normal
 from BayesianDLL.Evaluation import summary
 
@@ -26,12 +27,7 @@ with Model() as model:
     slope = RandomParameter("slope", Normal(0.0, 5.0))
     sigma = RandomParameter("sigma", HalfCauchy(1.0))
 
-    mu = DeterministicParameter(
-        "mu",
-        lambda b, m, x_val: m * x_val + b,
-        lambda b, m, x_val: {"slope": x_val, "intercept": torch.ones_like(x_val)},
-        [intercept, slope, x_data],
-    )
+    mu = Linear("mu", x_data, slope=slope, intercept=intercept)
 
     with plate("data", x_data):
         ObservedParameter("obs", Normal(mu, sigma), y_data)
