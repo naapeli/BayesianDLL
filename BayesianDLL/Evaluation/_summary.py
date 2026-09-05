@@ -29,7 +29,7 @@ def summary(
     hdi_prob: float = 0.94,
     ci_kind: str = "eti",
     round_to: int = 3,
-    include_deterministic: bool = True
+    include_deterministic: bool = False,
 ):
     """
     Create a summary DataFrame of MCMC sampling results.
@@ -44,8 +44,11 @@ def summary(
         Type of credible interval to compute ("eti" = equal-tail interval, "hdi" = highest density interval).
     round_to : int or None, default 3
         Decimal places for display rounding (use None for raw numbers).
-    include_deterministic : bool, default True
+    include_deterministic : bool, default False
         Whether to include deterministic parameter traces in the summary table.
+        Deterministic parameters are omitted by default because they can be
+        numerous and are derived from the sampled parameters. Set this to True
+        to inspect their summaries explicitly.
 
     Returns:
     --------
@@ -133,7 +136,7 @@ def summary(
 
             flat_draws = feat_chains.flatten()
             mean_val = float(np.mean(flat_draws))
-            sd_val = float(np.std(flat_draws), ddof=1)  # Arviz has ddof=0, but we use ddof=1, as it is an unbiased estimate of the population std
+            sd_val = float(np.std(flat_draws, ddof=1))  # Sample standard deviation (Arviz uses ddof=0 by default).
 
             if ci_kind == "hdi":
                 ci_min, ci_max = _hdi(flat_draws, hdi_prob=hdi_prob)

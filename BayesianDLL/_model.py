@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import networkx as nx
 from networkx import DiGraph
 from collections import deque
+import copy
 
 from ._active_model import _active_model
 from ._parameters import RandomParameter, ObservedParameter, DeterministicParameter
@@ -34,8 +35,20 @@ def _sum_to_shape(grad: torch.Tensor, target_shape: tuple) -> torch.Tensor:
     return grad
 
 
+def _distribution_dependencies(distribution) -> set[str]:
+    """Return named model dependencies, excluding constant arguments.
+
+    Distribution gradient methods use fallback labels such as ``"variance"``
+    for literal arguments so they remain useful outside a model. Inside a
+    model, those labels must not be mistaken for a RandomParameter with the
+    same name.
+    """
+    return set(getattr(distribution, "parameters", ()))
+
+
 class Model:
     def __init__(self):
+        self.data = {}
         self.params: dict[str, RandomParameter] = {}
         self.observed_params: dict[str, ObservedParameter] = {}
         self.deterministic_params: dict[str, DeterministicParameter] = {}
@@ -159,7 +172,10 @@ class Model:
                 obs_param = self.observed_params[node_name]
                 observed = obs_param.observed_values
                 param_grads = obs_param.distribution.log_pdf_param_grads(observed)
+                dependencies = _distribution_dependencies(obs_param.distribution)
                 for p_name, p_grad in param_grads.items():
+                    if p_name not in dependencies:
+                        continue
                     if p_name in self.params:
                         target_shape = self.params[p_name].constrained_value.shape
                         grad_p = _sum_to_shape(p_grad, target_shape)
@@ -173,12 +189,13 @@ class Model:
                 if node_name in cotangents:
                     det_param = self.deterministic_params[node_name]
                     bar_v = cotangents[node_name]
+                    local_derivatives = det_param.derivatives()
                     for inp in det_param.inputs:
                         inp_name = inp.name if hasattr(inp, "name") else None
                         if inp_name and (inp_name in self.params or inp_name in self.deterministic_params):
                             target_param = self.params[inp_name] if inp_name in self.params else self.deterministic_params[inp_name]
                             target_shape = target_param.constrained_value.shape
-                            det_deriv = det_param.derivative(inp_name)
+                            det_deriv = local_derivatives[inp_name]
                             if not isinstance(det_deriv, torch.Tensor):
                                 det_deriv = torch.as_tensor(det_deriv, dtype=bar_v.dtype)
 
@@ -198,7 +215,10 @@ class Model:
                 param = self.params[node_name]
                 if getattr(param.distribution, "parameters", None):
                     param_grads = param.distribution.log_pdf_param_grads(param.constrained_value)
+                    dependencies = _distribution_dependencies(param.distribution)
                     for p_name, p_grad in param_grads.items():
+                        if p_name not in dependencies:
+                            continue
                         if p_name in self.params:
                             target_shape = self.params[p_name].constrained_value.shape
                             grad_p = _sum_to_shape(p_grad, target_shape)
@@ -259,5 +279,76 @@ class Model:
         from .Samplers import sample_prior_predicative as _spp
         return _spp(n_samples, warmup_length, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)
 
+    def condition(self, random_variable_names_and_values=None, **kwargs):
+        return condition(self, random_variable_names_and_values, **kwargs)
+
+
 class MeanFieldGuide(Model):
     pass
+
+
+def condition(model: Model, random_variable_names_and_values: dict = None, **kwargs) -> Model:
+    if not isinstance(model, Model):
+        raise TypeError(f"model must be an instance of Model, got {type(model).__name__}.")
+
+    conditions = {}
+    if random_variable_names_and_values is not None:
+        if not isinstance(random_variable_names_and_values, dict):
+            raise TypeError(f"random_variable_names_and_values must be a dict, got {type(random_variable_names_and_values).__name__}.")
+        conditions.update(random_variable_names_and_values)
+    conditions.update(kwargs)
+
+    new_model = copy.deepcopy(model)
+
+    for k, v in conditions.items():
+        name = k.name if hasattr(k, "name") else str(k)
+
+        if name in new_model.deterministic_params:
+            raise ValueError(f"Cannot condition deterministic parameter '{name}'. Condition its input random variables instead.")
+
+        if name in new_model.data:
+            new_model.data[name].set_value(v)
+            continue
+
+        if name not in new_model.params and name not in new_model.observed_params:
+            raise KeyError(f"Variable '{name}' not found in model parameters, observed parameters, or data.")
+
+        if name in new_model.params:
+            param = new_model.params[name]
+            dtype = param.constrained_value.dtype
+            target_shape = param.constrained_value.shape
+        else:
+            param = new_model.observed_params[name]
+            dtype = param.observed_values.dtype
+            target_shape = param.observed_values.shape
+
+        val_tensor = torch.as_tensor(v, dtype=dtype)
+        if val_tensor.shape != target_shape:
+            try:
+                val_tensor = val_tensor.reshape(target_shape)
+            except RuntimeError:
+                try:
+                    val_tensor = val_tensor.expand(target_shape).clone()
+                except RuntimeError:
+                    raise ValueError(f"Cannot shape conditioned value of shape {val_tensor.shape} to match parameter '{name}' shape {target_shape}.")
+
+        if hasattr(param.distribution, "state_space") and hasattr(param.distribution.state_space, "contains"):
+            contains = param.distribution.state_space.contains(val_tensor)
+            if isinstance(contains, torch.Tensor):
+                contains = contains.all().item()
+            if not contains:
+                raise ValueError(f"Conditioned value {val_tensor} for '{name}' is outside its distribution's state space.")
+
+        if name in new_model.params:
+            param = new_model.params.pop(name)
+            param.set_constrained_value(val_tensor)
+            param._observed_values = val_tensor
+            param.__class__ = ObservedParameter
+            new_model.observed_params[name] = param
+            new_model.graph.nodes[name]["type"] = "observed"
+        else:
+            param = new_model.observed_params[name]
+            param.observed_values = val_tensor
+
+    new_model.compile()
+    return new_model

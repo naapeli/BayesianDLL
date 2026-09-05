@@ -5,12 +5,23 @@ import numpy as np
 from ...Samplers._result import PredicativeResult
 
 
-def plot_predicative_distribution(predicative_distribution: PredicativeResult, data=None, kind="pdf", method="kde", bins=30):
+def plot_predicative_distribution(
+    predicative_distribution: PredicativeResult,
+    data=None,
+    kind="pdf",
+    method="kde",
+    bins=30,
+    ax=None,
+):
+    """Plot posterior predictive densities or CDFs on one axes."""
     if kind not in ["pdf", "cdf"]:
         raise ValueError('kind should be in ["pdf", "cdf"].')
     if method not in ["kde", "hist"]:
         raise ValueError('method should be in ["kde", "hist"].')
-    
+
+    if ax is None:
+        _, ax = plt.subplots(layout="constrained")
+
     for name, predicative_samples in predicative_distribution.items():
         # predicative_samples shape: (n_parameter_samples, n_predictive_samples, *batch_shape, *event_shape)
         # We assume for now that we are plotting univariate distributions.
@@ -24,7 +35,7 @@ def plot_predicative_distribution(predicative_distribution: PredicativeResult, d
 
 
         for i in range(len(predicative_samples)):
-            samples = predicative_samples[i].reshape(-1).numpy()
+            samples = predicative_samples[i].detach().cpu().reshape(-1).numpy()
             # calculate the pdf
             if method == "kde":
                 est = gaussian_kde(samples)
@@ -40,11 +51,11 @@ def plot_predicative_distribution(predicative_distribution: PredicativeResult, d
                 result = np.cumsum(result)
                 result /= result[-1]
                 values.append(result)
-            plt.plot(x_grid, result, color="lightblue", alpha=0.2)
+            ax.plot(x_grid, result, color="lightblue", alpha=0.2)
 
         values = np.stack(values, axis=0)
         mean_values = values.mean(axis=0)
-        plt.plot(x_grid, mean_values, color="orange", linewidth=2, label="Predicative mean")
+        ax.plot(x_grid, mean_values, color="orange", linewidth=2, label="Predicative mean")
 
         if data is not None:
 
@@ -62,7 +73,9 @@ def plot_predicative_distribution(predicative_distribution: PredicativeResult, d
             if kind == "cdf":
                 obs_values = np.cumsum(obs_values)
                 obs_values /= obs_values[-1]
-            plt.plot(x_grid, obs_values, color="black", label="Observed")
+            ax.plot(x_grid, obs_values, color="black", label="Observed")
 
-        plt.title(f"{kind.upper()} - {name}")
-        plt.legend(loc="upper right")
+        ax.set_title(f"{kind.upper()} - {name}")
+        ax.legend(loc="upper right")
+
+    return ax

@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from ._transforms import IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform, InverseSoftPlusTransform
 from ._state_space import ContinuousReal, ContinuousPositive, ContinuousRange, ContinuousSimplex, DiscretePositive, DiscreteRange, Union
 from .._parameters import RandomParameter, DeterministicParameter, VariationalParameter
+from .._data import Data
 from ._resolve import resolve
 
 
@@ -75,12 +76,12 @@ class Distribution(ABC):
         return term1 + d_log_det
 
     def resolve_name(self, name, parameter):
-        if isinstance(parameter, RandomParameter | DeterministicParameter | VariationalParameter):
+        if isinstance(parameter, RandomParameter | DeterministicParameter | VariationalParameter | Data):
             return parameter.name
         return name
 
     def add_dependency(self, parameter):
-        if isinstance(parameter, RandomParameter | DeterministicParameter):
+        if isinstance(parameter, RandomParameter | DeterministicParameter | Data):
             self.parameters.add(parameter.name)
         if isinstance(parameter, VariationalParameter):
             self.variational_parameters[parameter.name] = parameter
@@ -269,12 +270,18 @@ class Exponential(Distribution):
         return {self.resolve_name("rate", self.rate): grad_rate}
 
     def _log_prob_unconstrained(self, x_unconstrained):
+        if not isinstance(self.transform, LogTransform):
+            raise RuntimeError("Exponential._log_prob_unconstrained can only be used if the transform is a log transform")
+        
         rate = resolve(self.rate)
         z = x_unconstrained
         x = torch.exp(z)
         return (torch.log(rate) - rate * x + z).sum()
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
+        if not isinstance(self.transform, LogTransform):
+            raise RuntimeError("Exponential._log_prob_unconstrained can only be used if the transform is a log transform")
+        
         rate = resolve(self.rate)
         x = torch.exp(x_unconstrained)
         return 1 - rate * x

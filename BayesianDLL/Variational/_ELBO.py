@@ -77,7 +77,13 @@ def elbo(model: Model, guide: MeanFieldGuide, n_samples=1):
                     for variational_param_name, dz in dz_dparams.items():
                         key = f"{random_variable_name}_{variational_param_name}"
                         if key in grads:
-                            grads[key] += (grad_z_wrt_elbo * dz[i]).sum() - grad_dict[variational_param_name].sum()
+                            # Preserve the shape of vector-valued variational
+                            # parameters. Reducing here broadcasts one scalar
+                            # gradient to every latent coordinate.
+                            grads[key] += (
+                                grad_z_wrt_elbo * dz[i]
+                                - grad_dict[variational_param_name]
+                            )
                 else:
                     # REINFORCE gradient (higher variance and not exact, but with n_samples high, close to the correct estimate)
                     grad_dict = param.distribution.log_pdf_param_grads(z[random_variable_name])
