@@ -36,7 +36,6 @@ with Model() as model:
     with plate("data", n):
         likelihood = ObservedParameter("likelihood", Mixture(components, weights), data)
 
-    plt.figure()
     plot_model(model)
 
     # make sampling start close to the maximum a posteriori
@@ -47,10 +46,8 @@ with Model() as model:
     print([variance.constrained_value for variance in variances])
     plt.show()
 
-    sampler_params = {"min_step_size": 1e-6, "max_step_size": 10, "delta": 0.6, "gamma": 0.5}
-    weight_sampler_params = {"min_step_size": 1e-6, "max_step_size": 10, "delta": 0.6, "gamma": 0.5, "max_depth": 4}
-
     result = model.sample(500, 200, max_depth=4)
+    result = result.thin(2)
 
 plt.figure()
 for k in range(K):
@@ -76,7 +73,6 @@ plt.ylabel("Density")
 plt.legend()
 plt.tight_layout()
 
-plt.figure(figsize=(12, 8))
 plot_posterior(result)
 
 plt.show()

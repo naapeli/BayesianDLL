@@ -8,8 +8,33 @@ from BayesianDLL.Samplers import PredicativeResult, SamplingResult
 
 
 def test_plot_model_draws_dependency_graph(normal_model):
-    plot_model(normal_model)
-    assert {text.get_text() for text in plt.gca().texts} == {"mean", "data"}
+    ax = plot_model(normal_model)
+    assert ax is plt.gca()
+    labels = {text.get_text() for text in plt.gca().texts}
+    assert any(label.startswith("mean\n~\n") for label in labels)
+    assert any(label.startswith("data\n~\n") for label in labels)
+    plt.gcf().canvas.draw()
+
+
+def test_plot_model_can_hide_data_and_metadata():
+    from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, RandomParameter, plate
+    from BayesianDLL.Distributions import Normal
+
+    with Model() as model:
+        x = Data("x", torch.arange(5.0))
+        y = Data("y", torch.arange(5.0))
+        slope = RandomParameter("slope", Normal(0.0, 1.0))
+        mu = DeterministicParameter(
+            "mu", lambda m, values: m * values,
+            lambda m, values: {"slope": values}, [slope, x],
+        )
+        with plate("observations", x):
+            ObservedParameter("likelihood", Normal(mu, 1.0), y)
+
+    ax = plot_model(model, include_data=False, show_distributions=False, legend=False)
+    labels = {text.get_text() for text in ax.texts}
+    assert labels == {"slope", "mu", "likelihood", "observations  [5]"}
+    assert len(ax.patches) == 6  # three nodes, two arrows, and one plate
     plt.gcf().canvas.draw()
 
 
@@ -49,3 +74,32 @@ def test_predictive_plot_rejects_invalid_options(kwargs):
 def test_posterior_plot_rejects_invalid_method():
     with pytest.raises(ValueError, match="method should be"):
         plot_posterior(SamplingResult({}, [], [], []), method="invalid")
+
+
+def test_posterior_plot_uses_supplied_axes():
+    result = SamplingResult({"x": torch.randn(2, 40, 1)}, [], [], [])
+    _, supplied_axes = plt.subplots(1, 2)
+
+    returned_axes = plot_posterior(result, axes=supplied_axes)
+
+    assert returned_axes.shape == (1, 2)
+    assert list(returned_axes[0]) == list(supplied_axes)
+    assert all(ax.lines for ax in supplied_axes)
+
+
+def test_posterior_plot_rejects_wrong_number_of_axes():
+    result = SamplingResult({"x": torch.randn(2, 40, 1)}, [], [], [])
+    _, supplied_ax = plt.subplots()
+
+    with pytest.raises(ValueError, match="exactly 2 axes"):
+        plot_posterior(result, axes=supplied_ax)
+
+
+def test_predictive_plot_uses_supplied_axis():
+    result = PredicativeResult({"data": torch.randn(3, 30, 1)})
+    _, supplied_ax = plt.subplots()
+
+    returned_ax = plot_predicative_distribution(result, ax=supplied_ax)
+
+    assert returned_ax is supplied_ax
+    assert supplied_ax.lines

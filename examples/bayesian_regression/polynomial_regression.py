@@ -34,17 +34,14 @@ with Model() as polynomial_model:
         likelihood = ObservedParameter("likelihood", Normal(mu, prior_sigma), y)
     
     predicative_distribution = polynomial_model.sample_prior_predicative(20, 2000, samples_per_step=10)
-    plt.figure()
     Evaluation.Graphics.plot_predicative_distribution(predicative_distribution, y, kind="pdf")
 
     samples = sample(2000, 1000)
     
     predicative_distribution = polynomial_model.posterior_predicative(samples, 20, samples_per_step=10, warmup_per_sample=200)
-    plt.figure()
     Evaluation.Graphics.plot_predicative_distribution(predicative_distribution, y, kind="pdf")
     plt.show()
 
-plt.figure(figsize=(20, 10))
 Evaluation.Graphics.plot_posterior(samples)
 
 plt.figure(figsize=(10, 6))

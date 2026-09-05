@@ -25,8 +25,7 @@ with Model() as model:
     predicative_distribution = model.sample_prior_predicative(n_samples, 5000, samples_per_step=10)
     # predicative_distribution = model.sample_posterior_predicative(n_samples, 1000, samples_per_step=10)
 
-plt.subplot(1, 2, 1)
-plot_predicative_distribution(predicative_distribution, data, kind="pdf")
-plt.subplot(1, 2, 2)
-plot_predicative_distribution(predicative_distribution, data, kind="cdf")
+_, axes = plt.subplots(1, 2, figsize=(12, 5), layout="constrained")
+plot_predicative_distribution(predicative_distribution, data, kind="pdf", ax=axes[0])
+plot_predicative_distribution(predicative_distribution, data, kind="cdf", ax=axes[1])
 plt.show()

@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import networkx as nx
 from networkx import DiGraph
 from collections import deque
+import copy
 
 from ._active_model import _active_model
 from ._parameters import RandomParameter, ObservedParameter, DeterministicParameter
@@ -260,5 +261,76 @@ class Model:
         from .Samplers import sample_prior_predicative as _spp
         return _spp(n_samples, warmup_length, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)
 
+    def condition(self, random_variable_names_and_values=None, **kwargs):
+        return condition(self, random_variable_names_and_values, **kwargs)
+
+
 class MeanFieldGuide(Model):
     pass
+
+
+def condition(model: Model, random_variable_names_and_values: dict = None, **kwargs) -> Model:
+    if not isinstance(model, Model):
+        raise TypeError(f"model must be an instance of Model, got {type(model).__name__}.")
+
+    conditions = {}
+    if random_variable_names_and_values is not None:
+        if not isinstance(random_variable_names_and_values, dict):
+            raise TypeError(f"random_variable_names_and_values must be a dict, got {type(random_variable_names_and_values).__name__}.")
+        conditions.update(random_variable_names_and_values)
+    conditions.update(kwargs)
+
+    new_model = copy.deepcopy(model)
+
+    for k, v in conditions.items():
+        name = k.name if hasattr(k, "name") else str(k)
+
+        if name in new_model.deterministic_params:
+            raise ValueError(f"Cannot condition deterministic parameter '{name}'. Condition its input random variables instead.")
+
+        if name in new_model.data:
+            new_model.data[name].set_value(v)
+            continue
+
+        if name not in new_model.params and name not in new_model.observed_params:
+            raise KeyError(f"Variable '{name}' not found in model parameters, observed parameters, or data.")
+
+        if name in new_model.params:
+            param = new_model.params[name]
+            dtype = param.constrained_value.dtype
+            target_shape = param.constrained_value.shape
+        else:
+            param = new_model.observed_params[name]
+            dtype = param.observed_values.dtype
+            target_shape = param.observed_values.shape
+
+        val_tensor = torch.as_tensor(v, dtype=dtype)
+        if val_tensor.shape != target_shape:
+            try:
+                val_tensor = val_tensor.reshape(target_shape)
+            except RuntimeError:
+                try:
+                    val_tensor = val_tensor.expand(target_shape).clone()
+                except RuntimeError:
+                    raise ValueError(f"Cannot shape conditioned value of shape {val_tensor.shape} to match parameter '{name}' shape {target_shape}.")
+
+        if hasattr(param.distribution, "state_space") and hasattr(param.distribution.state_space, "contains"):
+            contains = param.distribution.state_space.contains(val_tensor)
+            if isinstance(contains, torch.Tensor):
+                contains = contains.all().item()
+            if not contains:
+                raise ValueError(f"Conditioned value {val_tensor} for '{name}' is outside its distribution's state space.")
+
+        if name in new_model.params:
+            param = new_model.params.pop(name)
+            param.set_constrained_value(val_tensor)
+            param._observed_values = val_tensor
+            param.__class__ = ObservedParameter
+            new_model.observed_params[name] = param
+            new_model.graph.nodes[name]["type"] = "observed"
+        else:
+            param = new_model.observed_params[name]
+            param.observed_values = val_tensor
+
+    new_model.compile()
+    return new_model

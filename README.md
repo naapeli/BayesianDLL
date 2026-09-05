@@ -49,3 +49,33 @@ For vector events, use `Data("features", values, event_ndim=1)`: values with sha
 `(100, 3)` can be replaced by `(50, 3)`, but not `(50, 4)`. Use `event_ndim=2`
 for matrix events. Rebuild the model to change the event shape. Use floating-point
 initial values for continuous data.
+
+Model graphs use the standard graphical-model distinction between latent,
+observed, deterministic, and data nodes, and show distributions, data shapes,
+and plate sizes by default:
+
+```python
+from BayesianDLL.Evaluation.Graphics import plot_model
+
+plot_model(model)
+plot_model(model, include_data=False)  # compact stochastic/generative view
+```
+
+The optional `ax`, `show_distributions`, `show_plates`, and `legend` arguments
+can be used to embed or simplify the plot. `plot_model` returns the Matplotlib
+axes it draws into.
+
+All plotting helpers can be embedded in existing Matplotlib figures. Predictive
+plots accept and return one `ax`; posterior plots accept and return an axes grid
+with one row per scalar parameter component and density/trace columns:
+
+```python
+import matplotlib.pyplot as plt
+from BayesianDLL.Evaluation import Graphics
+
+fig, ax = plt.subplots()
+Graphics.plot_predicative_distribution(predictions, data=y, ax=ax)
+
+fig, axes = plt.subplots(2, 2)
+Graphics.plot_posterior(samples, parameters=["intercept", "slope"], axes=axes)
+```
