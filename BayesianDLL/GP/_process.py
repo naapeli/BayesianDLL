@@ -12,22 +12,35 @@ from ..Distributions import Normal
 from ._kernels import Kernel
 
 
-def stable_cholesky(matrix, jitter=1e-6, max_tries=6):
-    """Compute a Cholesky factor, increasing diagonal jitter when necessary."""
+def stable_cholesky(matrix, jitter=1e-6, max_tries=6, return_jitter=False):
+    """Compute a Cholesky factor, increasing diagonal jitter when necessary.
+
+    The jitter added to the diagonal is ``jitter * max(1, max|diag(matrix)|)``,
+    multiplied by 10 for every failed attempt. With ``return_jitter=True`` the
+    result is ``(factor, jitter_info)``, where ``jitter_info`` describes the
+    added jitter so that derivatives can account for its dependence on the
+    covariance (see :func:`_jitter_derivative`).
+    """
     matrix = (matrix + matrix.transpose(-2, -1)) / 2
     if not torch.isfinite(matrix).all():
         raise ValueError("GP covariance contains non-finite values.")
     eye = torch.eye(matrix.shape[-1], dtype=matrix.dtype, device=matrix.device)
-    diagonal_scale = torch.diagonal(matrix, dim1=-2, dim2=-1).abs().max().clamp_min(1.0)
+    diagonal = torch.diagonal(matrix, dim1=-2, dim2=-1).abs()
+    diagonal_scale = diagonal.max().clamp_min(1.0)
+    # The jitter is proportional to the largest diagonal entry only when that
+    # entry exceeds one; otherwise the scale is the constant 1.
+    scale_index = int(diagonal.argmax()) if bool(diagonal.max() > 1.0) else None
     current_jitter = torch.as_tensor(jitter, dtype=matrix.dtype, device=matrix.device) * diagonal_scale
     current_jitter = current_jitter.clamp_min(torch.finfo(matrix.dtype).eps * diagonal_scale)
     error = None
     for _ in range(max_tries):
-        try:
-            return torch.linalg.cholesky(matrix + current_jitter * eye)
-        except RuntimeError as exc:
-            error = exc
-            current_jitter = current_jitter * 10
+        factor, info = torch.linalg.cholesky_ex(matrix + current_jitter * eye)
+        if int(info) == 0:
+            if return_jitter:
+                return factor, (current_jitter, diagonal_scale, scale_index)
+            return factor
+        error = RuntimeError(f"Cholesky decomposition failed (info={int(info)}).")
+        current_jitter = current_jitter * 10
 
     # A covariance assembled in finite precision can have a small negative
     # eigenvalue even when the kernel is theoretically positive semidefinite.
@@ -36,12 +49,33 @@ def stable_cholesky(matrix, jitter=1e-6, max_tries=6):
     minimum_eigenvalue = torch.linalg.eigvalsh(matrix).amin()
     correction = (-minimum_eigenvalue + torch.finfo(matrix.dtype).eps * diagonal_scale).clamp_min(current_jitter)
     try:
-        return torch.linalg.cholesky(matrix + correction * eye)
+        factor = torch.linalg.cholesky(matrix + correction * eye)
+        if return_jitter:
+            # The eigenvalue correction is treated as a constant.
+            return factor, (correction, diagonal_scale, None)
+        return factor
     except RuntimeError as exc:
         error = exc
     raise RuntimeError(
         f"Could not compute a positive-definite Cholesky factor after {max_tries} jitter attempts."
     ) from error
+
+
+def _jitter_derivative(jitter_info, covariance_derivative):
+    """Add the derivative of the scale-dependent jitter to ``dK``.
+
+    ``stable_cholesky`` factorizes ``K + c * max(1, max|diag K|) * I``. When the
+    largest diagonal entry exceeds one, the jitter changes with the covariance
+    and its derivative ``c * d(K_ii)`` (``i`` being the largest diagonal entry)
+    must be included for the gradient to match the factorized matrix.
+    """
+    jitter, scale, index = jitter_info
+    if index is None:
+        return covariance_derivative
+    n = covariance_derivative.shape[-1]
+    eye = torch.eye(n, dtype=covariance_derivative.dtype, device=covariance_derivative.device)
+    scale_derivative = covariance_derivative[..., index, index]
+    return covariance_derivative + (jitter / scale) * scale_derivative[..., None, None] * eye
 
 
 def _as_tensor(value):
@@ -181,15 +215,18 @@ class LatentGP(DeterministicParameter):
                 x = x.to(dtype=latent_value.dtype)
             kernel_values = _named_model_inputs(zip(model_inputs[2:], values[2:]))
             covariance = kernel(x, x, parameter_values=kernel_values)
-            factor = stable_cholesky(covariance, jitter=jitter)
+            factor, jitter_info = stable_cholesky(covariance, jitter=jitter, return_jitter=True)
             derivatives = {latent.name: factor}
 
             covariance_derivatives = kernel.derivatives(x, x, parameter_values=kernel_values)
             for parameter in kernel_parameters:
                 if parameter.name in covariance_derivatives:
+                    covariance_derivative = covariance_derivatives[parameter.name]
+                    if covariance_derivative.ndim == 2:
+                        covariance_derivative = covariance_derivative.unsqueeze(0)
                     derivatives[parameter.name] = _cholesky_output_derivative(
                         factor,
-                        covariance_derivatives[parameter.name],
+                        _jitter_derivative(jitter_info, covariance_derivative),
                         latent_value,
                     )
 
@@ -309,7 +346,7 @@ class ExactGP(Distribution):
                 )
 
         covariance = covariance + noise[0] * torch.eye(n, dtype=x.dtype, device=x.device)
-        factor = stable_cholesky(covariance, jitter=self.jitter)
+        factor, self._jitter_info = stable_cholesky(covariance, jitter=self.jitter, return_jitter=True)
         residual = observed - mean
         alpha = torch.cholesky_solve(residual.reshape(-1, 1), factor).reshape(-1)
         log_det = 2 * torch.log(torch.diagonal(factor)).sum()
@@ -337,6 +374,7 @@ class ExactGP(Distribution):
 
     def log_pdf_param_grads(self, x):
         x_values, covariance, factor, _, alpha, _ = self._components(x)
+        jitter_info = self._jitter_info
         n = x_values.shape[0]
         inverse = torch.cholesky_solve(
             torch.eye(n, dtype=x_values.dtype, device=x_values.device),
@@ -353,12 +391,16 @@ class ExactGP(Distribution):
         ).items():
             if derivative.ndim == 2:
                 derivative = derivative.unsqueeze(0)
+            derivative = _jitter_derivative(jitter_info, derivative)
             gradients[name] = (sensitivity * derivative).sum(dim=(-2, -1))
 
         if hasattr(self.noise_variance, "name"):
-            gradients[self.noise_variance.name] = 0.5 * (
+            # d(K + noise * I + jitter * I) / d(noise) = (1 + d(jitter)/d(noise)) * I.
+            jitter, scale, index = jitter_info
+            noise_scale = 1.0 + (jitter / scale if index is not None else 0.0)
+            gradients[self.noise_variance.name] = (0.5 * (
                 alpha.square().sum() - torch.diagonal(inverse).sum()
-            ).reshape(resolve(self.noise_variance).shape)
+            ) * noise_scale).reshape(resolve(self.noise_variance).shape)
 
         if hasattr(self.mean, "name"):
             gradients[self.mean.name] = alpha
