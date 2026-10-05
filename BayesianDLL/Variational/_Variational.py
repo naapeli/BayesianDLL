@@ -19,8 +19,8 @@ def BBVI(model: Model, guide: MeanFieldGuide, n_samples=1, epochs=100, lr=1e-2, 
         callback_frequency: print progress every this many epochs
         verbose: whether to print ELBO during training
     """
-    m = {name + "_" + param_name: torch.zeros_like(param.value) for name in guide.params for param_name, param in guide.params[name].distribution.variational_parameters.items()}
-    v = {name + "_" + param_name: torch.zeros_like(param.value) for name in guide.params for param_name, param in guide.params[name].distribution.variational_parameters.items()}
+    m = {name + "_" + param_name: torch.zeros_like(param.unconstrained_value) for name in guide.params for param_name, param in guide.params[name].distribution.variational_parameters.items()}
+    v = {name + "_" + param_name: torch.zeros_like(param.unconstrained_value) for name in guide.params for param_name, param in guide.params[name].distribution.variational_parameters.items()}
     t = 0
     current_lr = lr
 
@@ -45,6 +45,7 @@ def BBVI(model: Model, guide: MeanFieldGuide, n_samples=1, epochs=100, lr=1e-2, 
             if param_tensor is None:
                 raise ValueError(f"Parameter {key} not found in guide.")
 
+            grad = current_variational_parameter.unconstrained_grad(grad)
             grad_norm = torch.linalg.norm(grad)
             clipped_grad = grad * torch.clamp(clip_norm / (grad_norm + 1e-8), max=1.0)
 
@@ -54,8 +55,8 @@ def BBVI(model: Model, guide: MeanFieldGuide, n_samples=1, epochs=100, lr=1e-2, 
             m_hat = m[key] / (1 - betas[0] ** t)
             v_hat = v[key] / (1 - betas[1] ** t)
 
-            new_value = current_variational_parameter.value + current_lr * m_hat / (torch.sqrt(v_hat) + 1e-8)
-            current_variational_parameter.set_new_value(new_value)
+            new_value = current_variational_parameter.unconstrained_value + current_lr * m_hat / (torch.sqrt(v_hat) + 1e-8)
+            current_variational_parameter.set_unconstrained_value(new_value)
 
         if verbose and epoch % callback_frequency == 0:
             history.append(current_elbo.item())
