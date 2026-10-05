@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Deterministic import Exp
-from BayesianDLL.Distributions import Normal, Uniform, Exponential
+from BayesianDLL.Distributions import Normal, Uniform
 from BayesianDLL.Evaluation import Graphics
 from BayesianDLL.GP import LatentGP, RBF, Periodic, gp_predictive
 from BayesianDLL.Samplers import SamplingBlock
@@ -17,16 +17,22 @@ y = torch.sin(2 * torch.pi * x) + 0.05 * torch.randn_like(x)
 with Model() as model:
     inputs = Data("inputs", x)
     z = RandomParameter("z", Normal(0.0, 1.0), shape=x.numel())  # the latent variables of the gaussian process (created automatically in the GP if not defined in the model)
-    log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 1.0))
-    log_variance = RandomParameter("log_variance", Normal(0.0, 1.0))
-    # log_period = RandomParameter("log_period", Normal(0.0, 1.0))
+
+    # Weakly informative priors on the scale of the data. Loose priors such as
+    # Normal(0, 1) on the log-lengthscale and Exponential(1) on the noise
+    # variance let the GP interpolate the noise with a tiny lengthscale and
+    # zero noise, which creates a narrow, curved posterior that NUTS struggles
+    # to explore.
+    log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 0.5))
+    log_variance = RandomParameter("log_variance", Normal(0.0, 0.5))
+    log_noise_variance = RandomParameter("log_noise_variance", Normal(-5.0, 1.0))  # noise sd roughly 0.03 - 0.2
     lengthscale = Exp("lengthscale", log_lengthscale)
     variance = Exp("variance", log_variance)
-    # period = Exp("period", log_period)
-    period = RandomParameter("period", Uniform(0.5, 1.5))
+    noise_variance = Exp("noise_variance", log_noise_variance)
+    # The inputs cover a single period of the signal, so the period is only
+    # weakly identified by the data and needs a reasonably narrow prior.
+    period = RandomParameter("period", Uniform(0.75, 1.25))
 
-    # noise_variance = 0.05
-    noise_variance = RandomParameter("noise_variance", Exponential(1.0))
     f = LatentGP(
         "f",
         inputs,
@@ -46,7 +52,9 @@ with Model() as model:
 #     SamplingBlock(model, ["log_lengthscale", "log_variance", "log_period"], sampler_type="nuts", sampler_params={"max_depth": 4})
 # ]
 blocks = None
-trace = model.sample(200, 200, blocks=blocks)  # , max_depth=6, delta=0.8
+# A higher target acceptance probability (smaller steps) avoids most divergences in the
+# narrow posterior of the whitened latent GP.
+trace = model.sample(200, 200, blocks=blocks, delta=0.8)
 print(trace.summary())
 
 new_inputs = torch.linspace(-0.1, 1.1, 50)
