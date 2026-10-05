@@ -94,15 +94,37 @@ class SamplingBlock:
 
         self.sampler_type = sampler_type
 
+        # Proposals far outside the typical set can make a model fail numerically
+        # (e.g. an overflowing exp(log_lengthscale) gives a non-finite GP
+        # covariance). Such points are treated as having zero density, so the
+        # samplers reject them (NUTS records a divergence) instead of crashing.
+        # Errors are only caught once the model has been evaluated successfully,
+        # so a model that is broken everywhere still raises immediately.
+        numerical_errors = (ValueError, RuntimeError, OverflowError, ZeroDivisionError)
+        self._evaluated = False
+
         def log_target(theta_flat):
             self.unpack_and_set(theta_flat)
-            return self.model.model_log_prob()
+            if not self._evaluated:
+                value = self.model.model_log_prob()
+                self._evaluated = True
+                return value
+            try:
+                return self.model.model_log_prob()
+            except numerical_errors:
+                return torch.tensor(-float("inf"), dtype=theta_flat.dtype)
 
         gradient = None
         if self.is_continuous:
             def gradient(theta_flat):
                 self.unpack_and_set(theta_flat)
-                grads_dict = self.model.joint_grad_log_prob(self.param_names)
+                if not self._evaluated:
+                    grads_dict = self.model.joint_grad_log_prob(self.param_names)
+                else:
+                    try:
+                        grads_dict = self.model.joint_grad_log_prob(self.param_names)
+                    except numerical_errors:
+                        return torch.full_like(theta_flat, float("nan"))
                 grads = [grads_dict[name].reshape(-1) for name in self.param_names]
                 return torch.cat(grads, dim=0)
 
@@ -310,6 +332,10 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
         parameter.set_unconstrained_value(value)
     
     blocks = _build_blocks(model, blocks_spec, sampler_params)
+    for block in blocks:
+        if hasattr(block.sampler, "set_warmup_length"):
+            # Warmup steps are the iterations m < warmup_length (m starts at 1).
+            block.sampler.set_warmup_length(max(warmup_length - 1, 0))
 
     # Attach to shared memory if multi-chain
     shm = None
@@ -428,6 +454,8 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
         with model.temporarily_set_many(prior_values):
             for name, sampler in samplers.items():
                 sampler.reset()
+                if hasattr(sampler, "set_warmup_length"):
+                    sampler.set_warmup_length(warmup_per_sample)
                 parameter = model.observed_params[name]
                 init_value = parameter.observed_values
                 theta = _init_theta(state_spaces[name], parameter.predictive_shape, init_value.dtype)
