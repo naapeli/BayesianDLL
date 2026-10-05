@@ -387,3 +387,62 @@ def test_whitened_gp_is_usable_in_variational_inference():
     assert torch.isfinite(value)
     assert gradients
     assert all(torch.isfinite(gradient).all() for gradient in gradients.values())
+
+
+def _finite_difference_check(model, eps=1e-6):
+    gradients = model.joint_grad_log_prob()
+    for name, parameter in model.params.items():
+        start = parameter.unconstrained_value.clone()
+        numerical = torch.zeros_like(start).reshape(-1)
+        for index in range(start.numel()):
+            shift = torch.zeros_like(start).reshape(-1)
+            shift[index] = eps
+            parameter.set_unconstrained_value(start + shift.reshape(start.shape))
+            upper = model.model_log_prob()
+            parameter.set_unconstrained_value(start - shift.reshape(start.shape))
+            lower = model.model_log_prob()
+            numerical[index] = (upper - lower) / (2 * eps)
+        parameter.set_unconstrained_value(start)
+        torch.testing.assert_close(
+            gradients[name].reshape(-1), numerical, rtol=1e-5, atol=1e-6, msg=f"gradient of {name}"
+        )
+
+
+@pytest.mark.parametrize("kernel_name", ["rbf", "periodic"])
+def test_latent_gp_gradient_includes_scale_dependent_jitter(kernel_name):
+    x = torch.linspace(0.0, 1.0, 8, dtype=torch.float64)
+    y = torch.sin(2 * torch.pi * x)
+    with Model() as model:
+        inputs = Data("inputs", x)
+        log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 1.0), initial_value=torch.tensor([0.2]))
+        # A variance above one makes the jitter depend on the variance.
+        log_variance = RandomParameter("log_variance", Normal(0.0, 1.0), initial_value=torch.tensor([1.5]))
+        lengthscale = Exp("lengthscale", log_lengthscale)
+        variance = Exp("variance", log_variance)
+        if kernel_name == "rbf":
+            kernel = RBF(lengthscale, variance)
+        else:
+            kernel = Periodic(lengthscale, variance, RandomParameter("period", Uniform(0.5, 1.5)))
+        function = LatentGP("function", inputs, kernel, jitter=1e-4)
+        ObservedParameter("observations", Normal(function, 0.05), y)
+    model.params["function_white"].set_unconstrained_value(torch.linspace(-1.0, 1.0, 8, dtype=torch.float64))
+    _finite_difference_check(model)
+
+
+def test_exact_gp_gradient_includes_scale_dependent_jitter():
+    x = torch.linspace(0.0, 1.0, 8, dtype=torch.float64)
+    y = torch.sin(2 * torch.pi * x)
+    with Model() as model:
+        inputs = Data("inputs", x)
+        log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 1.0), initial_value=torch.tensor([0.2]))
+        log_variance = RandomParameter("log_variance", Normal(0.0, 1.0), initial_value=torch.tensor([1.5]))
+        log_noise = RandomParameter("log_noise", Normal(0.0, 1.0), initial_value=torch.tensor([0.3]))
+        function = ExactGP(
+            "function",
+            inputs,
+            RBF(Exp("lengthscale", log_lengthscale), Exp("variance", log_variance)),
+            noise_variance=Exp("noise", log_noise),
+            jitter=1e-4,
+        )
+        ObservedParameter("observations", function, y)
+    _finite_difference_check(model)

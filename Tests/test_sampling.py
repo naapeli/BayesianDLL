@@ -338,3 +338,68 @@ def test_sampling_result_thin_with_summary():
     assert thinned["x"].shape == (2, 25, 1)
     df = thinned.summary()
     assert "x[0]" in df.index
+
+
+def test_adaptation_windows_follow_stan_schedule():
+    from BayesianDLL.Samplers._NUTS import _adaptation_windows
+    assert _adaptation_windows(10) == (None, [])
+    assert _adaptation_windows(1000) == (75, [99, 149, 249, 449, 949])
+    start, ends = _adaptation_windows(100)
+    assert 0 < start <= ends[-1] < 100
+
+
+def test_nuts_mass_matrix_adaptation_learns_scales():
+    scales = torch.tensor([10.0, 0.1])
+    sampler = NUTS(lambda x: -0.5 * (x / scales).square().sum(), lambda x: -x / scales.square(), lambda x: x)
+    sampler.set_warmup_length(400)
+    theta = torch.zeros(2)
+    draws = []
+    for i in range(1400):
+        theta, _, _, _ = sampler.step(theta, warmup=i < 400)
+        if i >= 400:
+            draws.append(theta.clone())
+    torch.testing.assert_close(sampler.inv_metric.sqrt(), scales, rtol=0.5, atol=0.0)
+    torch.testing.assert_close(torch.stack(draws).std(dim=0), scales, rtol=0.2, atol=0.0)
+    sampler.reset()
+    assert sampler.inv_metric is None
+
+
+def test_nuts_without_warmup_length_keeps_identity_metric():
+    sampler = make_nuts()
+    theta = torch.zeros(2)
+    for i in range(50):
+        theta, _, _, _ = sampler.step(theta, warmup=True)
+    assert sampler.inv_metric is None
+
+
+def test_sampling_block_rejects_numerical_failures_after_first_evaluation():
+    with Model() as model:
+        x = RandomParameter("x", Normal(0.0, 1.0))
+
+        def forward(value):
+            if value.abs().max() > 3:
+                raise ValueError("numerical failure")
+            return value
+
+        y = DeterministicParameter("y", forward, lambda value: {"x": torch.ones_like(value)}, [x])
+        ObservedParameter("obs", Normal(y, 1.0), torch.tensor([0.5]))
+    block = SamplingBlock(model, ["x"])
+    log_target = block.sampler.log_target
+    gradient = block.sampler.gradient
+    assert torch.isfinite(log_target(torch.tensor([0.0])))
+    assert log_target(torch.tensor([5.0])) == -float("inf")
+    assert torch.isnan(gradient(torch.tensor([5.0]))).all()
+
+
+def test_sampling_block_raises_if_model_fails_on_first_evaluation():
+    with Model() as model:
+        x = RandomParameter("x", Normal(0.0, 1.0))
+
+        def forward(value):
+            raise ValueError("broken model")
+
+        y = DeterministicParameter("y", forward, lambda value: {"x": torch.ones_like(value)}, [x])
+        ObservedParameter("obs", Normal(y, 1.0), torch.tensor([0.5]))
+    block = SamplingBlock(model, ["x"])
+    with pytest.raises(ValueError, match="broken model"):
+        block.sampler.log_target(torch.tensor([0.0]))
