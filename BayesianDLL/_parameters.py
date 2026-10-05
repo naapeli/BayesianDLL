@@ -176,13 +176,38 @@ class DeterministicParameter:
 
 
 class VariationalParameter:
-    def __init__(self, name, value, min=-float("inf"), max=float("inf")):
+    """A parameter of a variational distribution that is optimized by BBVI.
+
+    With ``log_scale=True`` the optimizer works on ``log(value)`` instead of
+    ``value``. This is recommended for positive parameters such as variances:
+    Adam then takes multiplicative steps, so small variances can be reached
+    without overshooting the lower bound.
+    """
+
+    def __init__(self, name, value, min=-float("inf"), max=float("inf"), log_scale=False):
         self.name = name
-        self.value = torch.as_tensor(value, dtype=value.dtype if torch.is_tensor(value) else torch.float32)
-        if self.value.ndim == 0:
-            self.value = self.value.unsqueeze(0)
+        self.log_scale = log_scale
         self.min = min
         self.max = max
+        value = torch.as_tensor(value, dtype=value.dtype if torch.is_tensor(value) else torch.float32)
+        if value.ndim == 0:
+            value = value.unsqueeze(0)
+        if log_scale and not bool((value > 0).all()):
+            raise ValueError(f"VariationalParameter '{name}' uses log_scale=True and must be positive.")
+        self.value = value
+
+    @property
+    def unconstrained_value(self):
+        """The coordinate in which the optimizer takes its steps."""
+        return torch.log(self.value) if self.log_scale else self.value
+
+    def unconstrained_grad(self, grad):
+        """Convert a gradient w.r.t. ``value`` into one w.r.t. ``unconstrained_value``."""
+        return grad * self.value if self.log_scale else grad
+
+    def set_unconstrained_value(self, unconstrained_value):
+        value = torch.exp(unconstrained_value) if self.log_scale else unconstrained_value
+        self.set_new_value(value)
 
     def __repr__(self):
         return f"VariationalParameter {self.name}, value: {self.value}, limits: {(self.min, self.max)}"
