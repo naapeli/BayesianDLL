@@ -310,3 +310,13 @@ def test_condition_validation_errors():
 
     with pytest.raises(ValueError, match="outside its distribution's state space"):
         condition(model, x=-1.0)
+
+
+def test_variational_parameter_log_scale():
+    p = VariationalParameter("variance", torch.tensor([0.5, 2.0]), min=0.1, log_scale=True)
+    torch.testing.assert_close(p.unconstrained_value, torch.log(torch.tensor([0.5, 2.0])))
+    torch.testing.assert_close(p.unconstrained_grad(torch.tensor([1.0, 1.0])), torch.tensor([0.5, 2.0]))
+    p.set_unconstrained_value(torch.log(torch.tensor([0.01, 3.0])))
+    torch.testing.assert_close(p.value, torch.tensor([0.1, 3.0]))
+    with pytest.raises(ValueError, match="positive"):
+        VariationalParameter("bad", torch.tensor([-1.0]), log_scale=True)

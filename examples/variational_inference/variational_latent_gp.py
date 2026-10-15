@@ -14,8 +14,10 @@ def variational_normal(name, shape, dtype, mean=0.0, variance=1.0):
     mean_parameter = VariationalParameter(
         f"{name}_mean", torch.full(shape, mean, dtype=dtype)
     )
+    # Optimizing the variance on the log scale lets Adam take multiplicative
+    # steps, so small posterior variances are reached without overshooting.
     variance_parameter = VariationalParameter(
-        f"{name}_variance", torch.full(shape, variance, dtype=dtype), min=1e-6
+        f"{name}_variance", torch.full(shape, variance, dtype=dtype), min=1e-6, log_scale=True
     )
     return RandomParameter(name, Normal(mean_parameter, variance_parameter), shape=shape)
 
@@ -72,7 +74,7 @@ with MeanFieldGuide() as guide:
         latent=variational_normal("function_white", n_observations, x.dtype),
     )
 
-history = BBVI(model, guide, n_samples=1, epochs=5000, lr=1e-3, callback_frequency=50)
+history = BBVI(model, guide, n_samples=4, epochs=3000, lr=1e-2, lrd=0.999, callback_frequency=10)
 
 posterior = guide.sample(
     n_samples=300,
