@@ -50,4 +50,5 @@ sphinx_gallery_conf = {
     "doc_module": ("BayesianDLL",),
     "reference_url": {"BayesianDLL": None},
     "within_subsection_order": "FileNameSortKey",
+    "nested_sections": False,  # keeps each section once in the sidebar
 }
