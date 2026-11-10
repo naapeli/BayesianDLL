@@ -1,3 +1,12 @@
+"""
+Polynomial Regression
+=====================
+
+Fits a polynomial to noisy data using Chebyshev basis functions with a
+MultivariateNormal prior on the coefficients. The posterior predictive distribution
+is plotted with credible intervals.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

@@ -1,3 +1,12 @@
+"""
+NUTS Sampling
+=============
+
+Plots the log densities of the continuous distributions in their unconstrained
+spaces, then draws samples from each distribution with the No-U-Turn Sampler and
+compares the samples to the true densities.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 import numpy as np

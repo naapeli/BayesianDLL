@@ -1,3 +1,12 @@
+"""
+Logistic Regression
+===================
+
+Builds a logistic regression model where ``Linear`` creates the linear predictor and
+``Sigmoid`` turns it into a probability for a Bernoulli likelihood. The model graph
+is plotted, the posterior is sampled and the fitted probability curve is shown.
+"""
+
 import matplotlib.pyplot as plt
 import torch
 

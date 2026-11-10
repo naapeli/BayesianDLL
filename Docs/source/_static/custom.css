@@ -1,0 +1,14 @@
+.wy-nav-content {
+    padding: 0.3cm;
+    margin: 0cm;
+}
+
+body .wy-nav-content {
+    max-width: 70%;
+}
+
+@media screen and (max-width: 768px) {
+    body .wy-nav-content {
+        max-width: 100%;
+    }
+}

@@ -1,3 +1,11 @@
+"""
+Variational Exact Gaussian Process
+==================================
+
+Fits the hyperparameters of an exact Gaussian process with black-box variational
+inference and plots the resulting predictive distribution.
+"""
+
 import matplotlib.pyplot as plt
 import torch
 

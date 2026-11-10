@@ -1,3 +1,11 @@
+"""
+Posterior Predictive: Exponential Likelihood
+============================================
+
+Samples the posterior predictive distribution of an exponential model with a
+HalfCauchy prior on the rate and compares its pdf and cdf to the observed data.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

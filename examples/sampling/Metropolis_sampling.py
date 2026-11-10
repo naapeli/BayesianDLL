@@ -1,3 +1,12 @@
+"""
+Metropolis Sampling
+===================
+
+Draws samples from the built-in discrete and continuous distributions with the
+Metropolis sampler and compares the sample histograms to the true probability mass
+and density functions.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

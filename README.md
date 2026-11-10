@@ -4,6 +4,9 @@ BayesianDLL is a Python library for Bayesian machine learning with probability
 distributions, graphical models, MCMC, and variational inference. Examples are
 in [examples](examples), and tests are in [Tests](Tests).
 
+The documentation, including the API reference and a gallery of the examples, is at
+<https://naapeli.github.io/BayesianDLL/>.
+
 ## Environment
 
 Requires Python >= 3.13 and `uv`.
@@ -20,6 +23,19 @@ Run examples as modules:
 uv run python -m examples.bayesian_regression.logistic_regression
 uv run python -m examples.variational_inference.variational_exact_gp
 ```
+
+To build the documentation locally (this runs every example, so it takes a while):
+
+```sh
+uv sync --dev --group docs
+uv run make -C Docs html
+```
+
+The pages are written to `Docs/build/html`. The
+[docs workflow](.github/workflows/docs.yml) rebuilds and deploys them to GitHub
+Pages on every push to `main`. A new example only needs a docstring with a title
+at the top of the file to appear in the gallery; prefix the file name with
+`NO_DOCS_` to leave it out.
 
 To run the tests:
 

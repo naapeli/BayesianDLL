@@ -1,3 +1,12 @@
+"""
+Mean-Field Variational Inference
+================================
+
+Approximates a Gaussian mixture with a single normal distribution using black-box
+variational inference (``BBVI``) and a ``MeanFieldGuide``. The ELBO history and the
+fitted approximation are plotted.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

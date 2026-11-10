@@ -1,3 +1,11 @@
+"""
+Variational Linear Regression
+=============================
+
+Fits a linear regression model with black-box variational inference using a
+mean-field guide and plots the approximate posterior.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

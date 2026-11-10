@@ -1,3 +1,12 @@
+"""
+Gaussian Mixture Model
+======================
+
+Infers the mixture weights, means and variances of a two component Gaussian mixture.
+A ``DeterministicParameter`` keeps the component means ordered to avoid label
+switching.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 
