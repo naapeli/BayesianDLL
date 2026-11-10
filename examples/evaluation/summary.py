@@ -1,3 +1,12 @@
+"""
+Posterior Summary
+=================
+
+Creates simulated posterior traces and prints a summary table of the means, standard
+deviations, credible intervals and diagnostics with ``summary``. The results are
+compared against ``arviz.summary``.
+"""
+
 import torch
 import numpy as np
 import arviz as az

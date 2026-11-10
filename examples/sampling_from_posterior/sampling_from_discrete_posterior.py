@@ -1,3 +1,11 @@
+"""
+Discrete Posterior
+==================
+
+Infers the number of trials of a Binomial likelihood with a DiscreteUniform prior and
+compares the posterior to the prior.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 from collections import Counter

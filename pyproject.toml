@@ -43,6 +43,11 @@ dev = [
     "pyro-ppl==1.9.1",
     "pytest>=9.1.1",
 ]
+docs = [
+    "sphinx>=8.2",
+    "sphinx-rtd-theme>=3.0",
+    "sphinx-gallery>=0.19",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["Tests"]

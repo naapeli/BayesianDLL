@@ -1,3 +1,12 @@
+"""
+Exact Gaussian Process
+======================
+
+Fits an exact (marginal) Gaussian process with a periodic kernel to noisy sine data.
+The kernel hyperparameters and the noise variance are sampled with NUTS and the
+posterior predictive mean and credible intervals are plotted.
+"""
+
 import matplotlib.pyplot as plt
 import torch
 

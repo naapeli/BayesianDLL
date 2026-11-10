@@ -1,3 +1,11 @@
+"""
+Maximum a Posteriori Estimation
+===============================
+
+Finds the maximum a posteriori (MAP) estimate of a linear regression model with
+``find_MAP`` and plots the fitted line.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

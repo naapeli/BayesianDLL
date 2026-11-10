@@ -1,3 +1,12 @@
+"""
+Joint Posterior With NUTS
+=========================
+
+Infers the mean and variance of normally distributed data with the No-U-Turn Sampler.
+The effective sample size and Gelman-Rubin statistic are printed and the posterior is
+plotted.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

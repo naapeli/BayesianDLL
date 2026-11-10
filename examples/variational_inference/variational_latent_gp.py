@@ -1,3 +1,11 @@
+"""
+Variational Latent Gaussian Process
+===================================
+
+Fits a latent Gaussian process with black-box variational inference, optimising the
+variational variances on the log scale, and plots the predictive distribution.
+"""
+
 import matplotlib.pyplot as plt
 import torch
 

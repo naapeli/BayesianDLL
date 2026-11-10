@@ -1,3 +1,11 @@
+"""
+Prior Predictive: Normal Likelihood
+===================================
+
+Samples the prior predictive distribution of a normal model with unknown mean and
+variance and compares its pdf and cdf to the observed data.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

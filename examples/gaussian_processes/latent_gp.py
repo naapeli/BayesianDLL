@@ -1,3 +1,12 @@
+"""
+Latent Gaussian Process
+=======================
+
+Fits a latent Gaussian process to noisy sine data, sampling the latent function values
+together with the kernel hyperparameters with NUTS. The posterior of the
+hyperparameters and the predictive distribution of the function are plotted.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

@@ -1,3 +1,12 @@
+"""
+Bayesian Linear Regression
+==========================
+
+Fits a linear regression model with Normal priors on the intercept and slope and a
+HalfCauchy prior on the noise. The posterior is sampled with NUTS, summarised, and
+the posterior predictive distribution is compared against held-out test data.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

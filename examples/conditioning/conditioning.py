@@ -1,3 +1,12 @@
+"""
+Conditioning a Model
+====================
+
+Uses ``condition`` to reuse one linear regression model in several ways: fitting it
+to a new dataset, fixing the intercept to zero for a what-if analysis, and fixing the
+noise level for a sensitivity analysis. The resulting posteriors are compared.
+"""
+
 import matplotlib.pyplot as plt
 import torch
 

@@ -1,3 +1,11 @@
+"""
+Continuous Posterior
+====================
+
+Samples the posterior of a Beta prior with a Bernoulli (or Binomial) likelihood and
+compares it to the analytic Beta posterior.
+"""
+
 import torch
 import matplotlib.pyplot as plt
 

@@ -1,3 +1,12 @@
+"""
+Convergence Diagnostics
+=======================
+
+Computes the Gelman-Rubin statistic (R-hat) and effective sample size for several
+sets of synthetic chains (converged, autocorrelated, drifting and heavy-tailed) and compares the
+values against ArviZ.
+"""
+
 import torch
 import numpy as np
 import arviz as az
