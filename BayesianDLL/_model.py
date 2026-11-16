@@ -234,8 +234,11 @@ class Model:
             prior_grad = param.distribution._log_prob_grad_unconstrained(param.unconstrained_value)
             if name in cotangents:
                 bar_p = cotangents[name]
-                deriv = param.distribution.transform.derivative(param.unconstrained_value)
-                if deriv.shape == param.unconstrained_value.shape:
+                vjp = getattr(param.distribution.transform, "vjp", None)
+                deriv = None if vjp is not None else param.distribution.transform.derivative(param.unconstrained_value)
+                if vjp is not None:
+                    likelihood_grad = vjp(param.unconstrained_value, bar_p)
+                elif deriv.shape == param.unconstrained_value.shape:
                     likelihood_grad = bar_p * deriv
                 else:
                     if deriv.ndim >= 2:

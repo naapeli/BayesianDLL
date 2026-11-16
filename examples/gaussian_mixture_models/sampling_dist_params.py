@@ -2,7 +2,7 @@
 Gaussian Mixture Model
 ======================
 
-Infers the mixture weights, means and variances of a two component Gaussian mixture.
+Infers the mixture weights, means and standard deviations of a two component Gaussian mixture.
 A ``DeterministicParameter`` keeps the component means ordered to avoid label
 switching.
 """
@@ -29,7 +29,7 @@ with Model() as model:
     alpha = 1.5 * torch.ones(K, dtype=torch.float64)
     weights = RandomParameter("weights", Dirichlet(alpha), shape=K)
 
-    mean1 = RandomParameter("mean1", Normal(0, 10))
+    mean1 = RandomParameter("mean1", Normal(0, 3))
     delta_mean = RandomParameter("delta_mean", HalfCauchy(1))
     mean2 = DeterministicParameter(
         "mean2",
@@ -38,9 +38,9 @@ with Model() as model:
         [mean1, delta_mean],
     )
     means = [mean1, mean2]
-    variances = [RandomParameter("variance" + str(i + 1), Exponential(0.5)) for i in range(K)]
+    stds = [RandomParameter("std" + str(i + 1), Exponential(1.0)) for i in range(K)]
 
-    components = [Normal(mu, cov) for mu, cov in zip(means, variances)]
+    components = [Normal(mu, std) for mu, std in zip(means, stds)]
 
     with plate("data", n):
         likelihood = ObservedParameter("likelihood", Mixture(components, weights), data)
@@ -52,7 +52,7 @@ with Model() as model:
     plt.plot(model.find_MAP(lr=1e-2, epochs=600, callback_frequency=25))
     print(weights.constrained_value)
     print([mean.constrained_value for mean in means])
-    print([variance.constrained_value for variance in variances])
+    print([std.constrained_value for std in stds])
     plt.show()
 
     result = model.sample(500, 200, max_depth=4)
@@ -75,9 +75,9 @@ plt.legend()
 plt.tight_layout()
 
 plt.figure()
-plt.hist(result["variance1"].flatten(0, 1).numpy(), bins=30, density=True, alpha=0.6, label="Variance 1")
-plt.hist(result["variance2"].flatten(0, 1).numpy(), bins=30, density=True, alpha=0.6, label="Variance 2")
-plt.xlabel("Variances")
+plt.hist(result["std1"].flatten(0, 1).numpy(), bins=30, density=True, alpha=0.6, label="Std 1")
+plt.hist(result["std2"].flatten(0, 1).numpy(), bins=30, density=True, alpha=0.6, label="Std 2")
+plt.xlabel("Standard deviations")
 plt.ylabel("Density")
 plt.legend()
 plt.tight_layout()

@@ -19,8 +19,8 @@ from BayesianDLL.Evaluation import Graphics
 
 def variational_normal(name, dtype):
     mean = VariationalParameter(f"{name}_mean", torch.zeros(1, dtype=dtype))
-    variance = VariationalParameter(f"{name}_variance", torch.ones(1, dtype=dtype), min=1e-6)
-    return RandomParameter(name, Normal(mean, variance))
+    std = VariationalParameter(f"{name}_std", torch.ones(1, dtype=dtype), min=1e-3)
+    return RandomParameter(name, Normal(mean, std))
 
 
 torch.manual_seed(0)
@@ -31,9 +31,9 @@ y = torch.sin(2 * torch.pi * x) + 0.08 * torch.randn_like(x)
 
 with Model() as model:
     inputs = Data("inputs", x)
-    log_lengthscale = RandomParameter("log_lengthscale", Normal(-1.0, 0.5))
-    log_variance = RandomParameter("log_variance", Normal(0.0, 0.5))
-    log_noise_variance = RandomParameter("log_noise_variance", Normal(-2.5, 0.5))
+    log_lengthscale = RandomParameter("log_lengthscale", Normal(-1.0, 0.7))
+    log_variance = RandomParameter("log_variance", Normal(0.0, 0.7))
+    log_noise_variance = RandomParameter("log_noise_variance", Normal(-2.5, 0.7))
     lengthscale = Exp("lengthscale", log_lengthscale)
     variance = Exp("variance", log_variance)
     noise_variance = Exp("noise_variance", log_noise_variance)

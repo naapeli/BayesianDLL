@@ -12,7 +12,7 @@ def elbo(model: Model, guide: MeanFieldGuide, n_samples=1):
         for variational_param_name, variational_parameter in param.distribution.variational_parameters.items():
             grads[f"{random_variable_name}_{variational_param_name}"] = torch.zeros_like(variational_parameter.value)
 
-    use_reparametrization_trick = {random_variable_name: hasattr(param.distribution, "sample") for random_variable_name, param in guide.params.items()}
+    use_reparametrization_trick = {random_variable_name: bool(getattr(param.distribution, "has_rsample", False)) for random_variable_name, param in guide.params.items()}
 
     reparam_samples = {}
     reparam_grads = {}

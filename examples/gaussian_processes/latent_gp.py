@@ -32,12 +32,12 @@ with Model() as model:
     # variance let the GP interpolate the noise with a tiny lengthscale and
     # zero noise, which creates a narrow, curved posterior that NUTS struggles
     # to explore.
-    log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 0.5))
-    log_variance = RandomParameter("log_variance", Normal(0.0, 0.5))
-    log_noise_variance = RandomParameter("log_noise_variance", Normal(-5.0, 1.0))  # noise sd roughly 0.03 - 0.2
+    log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 0.7))
+    log_variance = RandomParameter("log_variance", Normal(0.0, 0.7))
+    log_noise_std = RandomParameter("log_noise_std", Normal(-2.5, 0.5))  # noise sd roughly 0.03 - 0.2
     lengthscale = Exp("lengthscale", log_lengthscale)
     variance = Exp("variance", log_variance)
-    noise_variance = Exp("noise_variance", log_noise_variance)
+    noise_std = Exp("noise_std", log_noise_std)
     # The inputs cover a single period of the signal, so the period is only
     # weakly identified by the data and needs a reasonably narrow prior.
     period = RandomParameter("period", Uniform(0.75, 1.25))
@@ -50,7 +50,7 @@ with Model() as model:
         latent=z,
     )
     with plate("observations", x):
-        ObservedParameter("y", Normal(f, noise_variance), y)
+        ObservedParameter("y", Normal(f, noise_std), y)
 
     Graphics.plot_model(model)
     plt.show()

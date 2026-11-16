@@ -25,8 +25,8 @@ y = torch.bernoulli(torch.sigmoid(true_logits))
 
 with Model() as model:
     inputs = Data("inputs", x)
-    intercept = RandomParameter("intercept", Normal(0.0, 2.0))
-    slope = RandomParameter("slope", Normal(0.0, 2.0))
+    intercept = RandomParameter("intercept", Normal(0.0, 1.5))
+    slope = RandomParameter("slope", Normal(0.0, 1.5))
 
     logits = Linear("logits", inputs, slope=slope, intercept=intercept)
     probability = Sigmoid("probability", logits)

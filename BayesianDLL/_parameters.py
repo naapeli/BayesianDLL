@@ -24,7 +24,7 @@ class RandomParameter:
 
         if initial_value is None:
             if distribution.state_space.is_continuous():
-                unconstrained = torch.zeros(full_shape, dtype=torch.float64)
+                unconstrained = torch.zeros(distribution.transform.unconstrained_shape(full_shape), dtype=torch.float64)
                 initial_value = distribution.transform.inverse(unconstrained)
             elif distribution.state_space.is_discrete():
                 first_value = next(iter(distribution.state_space))

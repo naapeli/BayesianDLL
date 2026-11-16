@@ -36,8 +36,8 @@ with Model() as linear_model:
     x_data = Data("x", x_train)
     y_data = Data("y", y_train)
 
-    prior_intercept = RandomParameter("intercept", Normal(0, 20), sampler="auto", delta=0.4)
-    prior_slope = RandomParameter("slope", Normal(0, 20), sampler="auto", delta=0.4)
+    prior_intercept = RandomParameter("intercept", Normal(0, 4.5), sampler="auto", delta=0.4)
+    prior_slope = RandomParameter("slope", Normal(0, 4.5), sampler="auto", delta=0.4)
     prior_sigma = RandomParameter("sigma", HalfCauchy(1), sampler="auto", max_depth=4)
 
     mu = Linear("mu", x_data, slope=prior_slope, intercept=prior_intercept)
@@ -66,7 +66,7 @@ y_mean = y_preds.mean(dim=0)
 y_mean_standard_error = y_preds.std(dim=0)
 
 mean_variance = y_preds.var(dim=0)
-noise_variance = samples["sigma"].reshape(-1).mean()
+noise_variance = (samples["sigma"].reshape(-1) ** 2).mean()
 predictive_standard_deviation = torch.sqrt(mean_variance + noise_variance)
 data_credible_lower = y_mean - 1.96 * predictive_standard_deviation
 data_credible_upper = y_mean + 1.96 * predictive_standard_deviation
