@@ -98,13 +98,13 @@ def test_discrete_metropolis_updates_one_coordinate_at_a_time():
     assert 0 < theta.sum() < 30
 
 
-def test_proposal_variance_is_a_deprecated_alias():
-    with pytest.warns(DeprecationWarning, match="proposal_scale"):
-        sampler = Metropolis(lambda x: -x.square().sum(), ContinuousReal(), proposal_variance=0.3)
+def test_proposal_variance_keyword_is_removed():
+    with pytest.raises(TypeError):
+        Metropolis(lambda x: -x.square().sum(), ContinuousReal(), proposal_variance=0.3)
+    sampler = Metropolis(lambda x: -x.square().sum(), ContinuousReal(), proposal_scale=0.3)
     assert sampler.proposal_scale == 0.3
-    assert sampler.proposal_variance == 0.3
-    sampler.proposal_variance = 0.5
-    assert sampler.proposal_scale == 0.5
+    assert not hasattr(sampler, "proposal_variance")
+    assert not hasattr(sampler, "adapt_proposal_variance")
 
 
 # ------------------------------------------------------------------ FiniteGibbs
