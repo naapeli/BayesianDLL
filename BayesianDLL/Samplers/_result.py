@@ -73,7 +73,7 @@ class SampleStats:
 
 
 class SamplingResult:
-    def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None, sample_stats=None, enumerated_probs=None):
+    def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None, sample_stats=None, enumerated_probs=None, log_likelihood=None, log_likelihood_unavailable=None):
         self.trace = trace
         self.divergences = divergences
         self.acceptance_probabilities = acceptance_probabilities
@@ -84,6 +84,12 @@ class SamplingResult:
         # of each support value per coordinate and draw, with shape
         # (n_chains, n_samples, *value_shape, K).
         self.enumerated_probs = {} if enumerated_probs is None else enumerated_probs
+        # Elementwise log-likelihood log p(y_i | theta) of every observed node
+        # per draw, with shape (n_chains, n_samples, *log_density_shape).
+        self.log_likelihood = {} if log_likelihood is None else log_likelihood
+        # Observed nodes whose pointwise log-likelihood could not be recorded,
+        # mapped to the reason.
+        self.log_likelihood_unavailable = {} if log_likelihood_unavailable is None else dict(log_likelihood_unavailable)
 
     def __getitem__(self, key):
         if key in self.trace:
@@ -114,6 +120,8 @@ class SamplingResult:
             deterministic_trace=thinned_det,
             sample_stats=self.sample_stats.thin(step),
             enumerated_probs={name: val[:, s] for name, val in self.enumerated_probs.items()},
+            log_likelihood={name: val[:, s] for name, val in self.log_likelihood.items()},
+            log_likelihood_unavailable=self.log_likelihood_unavailable,
         )
 
     def summary(self, hdi_prob=0.94, ci_kind="eti", round_to=3, include_deterministic=False):
