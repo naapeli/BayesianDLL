@@ -8,7 +8,19 @@ from ._data import Data
 
 
 class RandomParameter:
-    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", **sampler_params):
+    """A latent random variable of the active model.
+
+    With ``enumerate=True`` the parameter is not sampled but summed out of the
+    joint density exactly. This requires a finite discrete support (a
+    ``DiscreteRange``, e.g. ``Bernoulli`` or ``DiscreteUniform``). The other
+    parameters are then sampled from the marginal posterior and posterior
+    draws of the enumerated parameter are added to the sampling result
+    afterwards (see :func:`BayesianDLL.marginalize`).
+    """
+
+    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", enumerate=False, **sampler_params):
+        if enumerate:
+            _check_enumerable(name, distribution)
         # Capture active plates at creation time
         self.plates = get_active_plates()
 
@@ -49,11 +61,16 @@ class RandomParameter:
         self.state_space = self.distribution.state_space
         self.transformed_state_space = self.distribution.transformed_state_space
 
+        self.enumerated = bool(enumerate)
+
         if get_active_model() is not None:
-            get_active_model().params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            if self.enumerated:
+                get_active_model().enumerated_params[name] = self
+            else:
+                get_active_model().params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
             get_active_model()._compiled = False
             graph = get_active_model().graph
-            graph.add_node(self.name, type="random")
+            graph.add_node(self.name, type="random", enumerated=self.enumerated)
             for parameter in self.distribution.parameters:
                 if parameter in graph:
                     get_active_model().graph.add_edge(parameter, self.name)
@@ -73,6 +90,15 @@ class RandomParameter:
             raise TypeError("constrained_value should be a torch.Tensor.")
         self.constrained_value = constrained_value
         self.unconstrained_value = self.distribution.transform.forward(constrained_value)
+
+
+def _check_enumerable(name, distribution):
+    from .Distributions._state_space import DiscreteRange
+    if not isinstance(distribution.state_space, DiscreteRange):
+        raise ValueError(
+            f"Only parameters with a finite discrete support (DiscreteRange) can be enumerated; "
+            f"'{name}' has the state space {type(distribution.state_space).__name__}."
+        )
 
 
 class ObservedParameter:
@@ -202,6 +228,8 @@ class DeterministicParameter:
         if hasattr(input, "name"):
             if input.name in self.owner_model.params:
                 return self.owner_model.params[input.name].constrained_value
+            elif input.name in getattr(self.owner_model, "enumerated_params", {}):
+                return self.owner_model.enumerated_params[input.name].constrained_value
             elif input.name in self.owner_model.observed_params:
                 return self.owner_model.observed_params[input.name].constrained_value
             elif input.name in self.owner_model.deterministic_params:

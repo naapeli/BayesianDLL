@@ -111,6 +111,8 @@ class SamplingBlock:
 
         # Check parameter existence
         for name in self.param_names:
+            if name in getattr(model, "enumerated_params", {}):
+                raise ValueError(f"Parameter '{name}' is enumerated (summed out of the model) and cannot be part of a sampling block.")
             if name not in model.params:
                 raise KeyError(f"Parameter '{name}' not found in model parameters.")
 
@@ -213,12 +215,7 @@ class SamplingBlock:
 
     def block_log_prob(self):
         """Log density terms that depend on this block (at the model's current values)."""
-        logp = 0.0
-        for parameter in self._random_terms:
-            logp = logp + parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
-        for observed in self._observed_terms:
-            logp = logp + observed.distribution.log_pdf(observed.observed_values).sum()
-        return logp
+        return self.model._log_prob_of_terms(self._random_terms, self._observed_terms)
 
     def pack(self) -> torch.Tensor:
         tensors = [self.model.params[name].unconstrained_value.reshape(-1) for name in self.param_names]
@@ -327,6 +324,9 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     ``metric="dense"`` for NUTS.
     """
     model = get_active_model() if model is None else model
+    # Decide how the enumerated parameters are summed out before starting the
+    # workers, so a model that cannot be enumerated fails here.
+    model.prepare_enumeration()
 
     if seed is None:
         seed = int(torch.randint(0, 2 ** 62, (1,)).item())
@@ -431,6 +431,9 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
             shm.unlink()
 
     trace = {name: torch.stack([res[0][name] for res in results], dim=0) for name in model.params.keys()}
+    for name in model.enumerated_params:
+        trace[name] = torch.stack([res[7][name] for res in results], dim=0)
+    enumerated_probs = {name: torch.stack([res[8][name] for res in results], dim=0) for name in model.enumerated_params}
     det_trace = {name: torch.stack([res[1][name] for res in results], dim=0) for name in model.deterministic_params.keys()}
     divergences = [res[2] for res in results]
     acceptance_probabilities = [[prob / (n_samples + warmup_length) for prob in res[3]] for res in results]
@@ -439,7 +442,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
 
     if check_convergence and n_chains > 1:
         if n_samples >= 50:
-            r_hats = gelman_rubin(trace)
+            r_hats = gelman_rubin({name: trace[name] for name in model.params})
             for name, statistics in r_hats.items():
                 if torch.any(statistics > 1.01):
                     warn(f"The gelman-Ruben statistic of {name} is above 1.01 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
@@ -451,7 +454,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
 
     _check_hamiltonian_diagnostics(sample_stats, results[0][6] if results else [], n_samples)
 
-    return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=det_trace, sample_stats=sample_stats)
+    return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=det_trace, sample_stats=sample_stats, enumerated_probs=enumerated_probs)
 
 
 def _combine_sample_stats(per_chain):
@@ -524,6 +527,15 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     for name, parameter in model.params.items():
         chain_trace[name] = torch.empty(size=(n_samples, *parameter.constrained_value.shape), dtype=parameter.unconstrained_value.dtype)
 
+    # Enumerated parameters: exact draws from p(z | other parameters, data) and
+    # the per-coordinate probabilities of every support value.
+    chain_enum_trace = {}
+    chain_enum_probs = {}
+    for name, parameter in model.enumerated_params.items():
+        n_values = len(parameter.distribution.state_space)
+        chain_enum_trace[name] = torch.empty(size=(n_samples, *parameter.constrained_value.shape), dtype=parameter.constrained_value.dtype)
+        chain_enum_probs[name] = torch.empty(size=(n_samples, *parameter.constrained_value.shape, n_values), dtype=parameter.constrained_value.dtype)
+
     chain_det_trace = {}
     for name, parameter in model.deterministic_params.items():
         chain_det_trace[name] = torch.empty(size=(n_samples, *parameter.constrained_value.shape), dtype=parameter.constrained_value.dtype)
@@ -550,6 +562,12 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
                     block_stats[i].setdefault(stat_name, []).append(value)
 
         if m > warmup_length:
+            if chain_enum_trace:
+                # Sets the drawn values on the parameters, so deterministic
+                # nodes below are recorded with them.
+                for name, (value, probabilities) in model.sample_enumerated().items():
+                    chain_enum_trace[name][m - warmup_length - 1] = value
+                    chain_enum_probs[name][m - warmup_length - 1] = probabilities
             for name, parameter in model.params.items():
                 chain_trace[name][m - warmup_length - 1] = parameter.constrained_value
             for name, parameter in model.deterministic_params.items():
@@ -573,7 +591,7 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
         for i, block in enumerate(blocks)
     ]
     max_depths = [getattr(block.sampler, "max_depth", None) for block in blocks]
-    return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes, stats, max_depths
+    return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes, stats, max_depths, chain_enum_trace, chain_enum_probs
 
 def sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
     model = get_active_model() if model is None else model
@@ -588,10 +606,12 @@ def sample_prior_predicative(n_samples=20, warmup_length=100, samples_per_step=5
     model = get_active_model() if model is None else model
     old_observed = model.observed_params
     model.observed_params = {}  # with prior distributions, one should sample from the priors without the likelihood terms
+    model.compile()  # the factor groups of enumerated parameters must not contain the likelihood terms
     try:
         trace = sample(n_samples, warmup_length, 4, model, progress_bar)
     finally:
         model.observed_params = old_observed
+        model.compile()
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
 def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
@@ -626,7 +646,8 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
     for i in _progress_bar:
         prior_values = {
             name: parameter.distribution.transform.forward(flattened_trace[name][indices[i]])
-            for name, parameter in model.params.items()
+            for name, parameter in {**model.params, **model.enumerated_params}.items()
+            if name in flattened_trace
         }
         with model.temporarily_set_many(prior_values):
             for name, sampler in samplers.items():
