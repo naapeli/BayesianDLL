@@ -1,6 +1,7 @@
 import torch
 import numpy as np
-from scipy.stats import rankdata, norm
+
+from ._numerics import z_scale
 
 
 def _rhat_core(chains: torch.Tensor) -> float:
@@ -51,13 +52,7 @@ def _z_scale(chains: torch.Tensor) -> torch.Tensor:
     Rank-normalize values across all chains and draws using Blom's transform:
     z = Phi^{-1}((rank - 3/8) / (S + 1/4))
     """
-    flat = chains.detach().cpu().numpy().flatten()
-    S = len(flat)
-    ranks = rankdata(flat, method="average")
-    u = (ranks - 0.375) / (S + 0.25)
-    u = np.clip(u, 1e-10, 1.0 - 1e-10)
-    z = norm.ppf(u)
-    return torch.tensor(z, dtype=chains.dtype, device=chains.device).reshape(chains.shape)
+    return z_scale(chains.detach()).to(dtype=chains.dtype, device=chains.device)
 
 
 def _rank_normalized_rhat_core(chains: torch.Tensor) -> float:

@@ -27,7 +27,6 @@ dependencies = [
     "pillow==11.2.1",
     "pyparsing==3.2.3",
     "python-dateutil==2.9.0.post0",
-    "scipy==1.15.2",
     "six==1.17.0",
     "sympy==1.13.1",
     "threadpoolctl==3.6.0",
@@ -42,6 +41,7 @@ dev = [
     "pyro-api==0.1.2",
     "pyro-ppl==1.9.1",
     "pytest>=9.1.1",
+    "scipy==1.15.2",
 ]
 docs = [
     "sphinx>=8.2",
