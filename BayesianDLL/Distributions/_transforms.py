@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from abc import ABC, abstractmethod
 
 from ._resolve import resolve
+from .._batching import bsum as _bsum, n_events as _n_events
 
 
 def _tiny(x):
@@ -102,7 +103,7 @@ class LogTransform(Transform):
         return sign * torch.exp(x_unconstrained)
 
     def log_abs_det_jacobian(self, x_unconstrained):
-        return x_unconstrained.sum()
+        return _bsum(x_unconstrained)
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.ones_like(x_unconstrained)
@@ -135,7 +136,7 @@ class InverseSoftPlusTransform(Transform):
         return sign * torch.sigmoid(x_unconstrained)
 
     def log_abs_det_jacobian(self, x_unconstrained):
-        return (-F.softplus(-x_unconstrained)).sum()
+        return _bsum(-F.softplus(-x_unconstrained))
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return torch.sigmoid(-x_unconstrained)
@@ -175,7 +176,7 @@ class LogitTransform(Transform):
     def log_abs_det_jacobian(self, x_unconstrained):
         z = x_unconstrained
         scale = torch.as_tensor(self.scale, dtype=z.dtype, device=z.device)
-        return (torch.log(scale) + F.logsigmoid(z) + F.logsigmoid(-z)).sum()
+        return _bsum(torch.log(scale) + F.logsigmoid(z) + F.logsigmoid(-z))
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return 1 - 2 * torch.sigmoid(x_unconstrained)
@@ -311,7 +312,7 @@ class StickBreakingTransform(Transform):
         return F.logsigmoid(u) + counts * F.logsigmoid(-u)
 
     def log_abs_det_jacobian(self, x_unconstrained):
-        return self._log_det_terms(x_unconstrained).sum()
+        return _bsum(self._log_det_terms(x_unconstrained))
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         u = x_unconstrained - self._offset(x_unconstrained)
@@ -425,7 +426,7 @@ class CorrCholeskyTransform(Transform):
         return (0.5 * log_s + ell) * strict
 
     def log_abs_det_jacobian(self, x_unconstrained):
-        return self._log_det_terms_matrix(x_unconstrained).sum()
+        return _bsum(self._log_det_terms_matrix(x_unconstrained))
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         z = x_unconstrained
@@ -566,7 +567,7 @@ class PositiveDefiniteTransform(Transform):
     def log_abs_det_jacobian(self, x_unconstrained):
         z = x_unconstrained
         w = self._diag_weights(z.dtype, z.device)
-        return (w * z).sum() + math.log(2.0) * self.dim * (z.numel() // self._n)
+        return _bsum(w * z) + math.log(2.0) * self.dim * _n_events(z, self._n)
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         z = x_unconstrained

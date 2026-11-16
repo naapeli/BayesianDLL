@@ -16,6 +16,7 @@ from ._state_space import (
 from .._parameters import RandomParameter, DeterministicParameter, ObservedParameter, VariationalParameter
 from .._data import Data
 from ._resolve import resolve
+from .._batching import bsum as _bsum
 
 
 _LOG_2PI = math.log(2 * math.pi)
@@ -180,7 +181,7 @@ class Distribution(ABC):
         """
         x_constrained = self.transform.inverse(x_unconstrained)
         log_det = self.transform.log_abs_det_jacobian(x_unconstrained)
-        return self.log_pdf(x_constrained).sum() + log_det
+        return _bsum(self.log_pdf(x_constrained)) + log_det
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         """
@@ -298,7 +299,7 @@ class HalfNormal(Distribution):
     def _log_prob_unconstrained(self, x_unconstrained):
         sigma = _as_float(self.sigma)
         z = x_unconstrained
-        return (0.5 * math.log(2 / math.pi) - torch.log(sigma) - 0.5 * torch.exp(2 * z) / sigma ** 2 + z).sum()
+        return _bsum(0.5 * math.log(2 / math.pi) - torch.log(sigma) - 0.5 * torch.exp(2 * z) / sigma ** 2 + z)
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         sigma = _as_float(self.sigma)
@@ -355,7 +356,7 @@ class LogNormal(Distribution):
     def _log_prob_unconstrained(self, x_unconstrained):
         mu, sigma = _as_float(self.mu, self.sigma)
         z = x_unconstrained
-        return (-torch.log(sigma) - 0.5 * _LOG_2PI - 0.5 * ((z - mu) / sigma) ** 2).sum()
+        return _bsum(-torch.log(sigma) - 0.5 * _LOG_2PI - 0.5 * ((z - mu) / sigma) ** 2)
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         mu, sigma = _as_float(self.mu, self.sigma)
@@ -388,6 +389,8 @@ class MultivariateNormal(Distribution):
     ``0.5 * (S^-1 d d^T S^-1 - S^-1)``; the ``scale_tril`` gradient is lower
     triangular.
     """
+
+    _param_event_ndims = {"mu": 1, "covariance": 2, "scale_tril": 2}
 
     def __init__(self, mu, covariance=None, scale_tril=None):
         super().__init__()
@@ -504,7 +507,7 @@ class Beta(Distribution):
         log_x = F.logsigmoid(x_unconstrained)
         log_1_minus_x = F.logsigmoid(-x_unconstrained)
         log_prob = a * log_x + b * log_1_minus_x - (torch.lgamma(a) + torch.lgamma(b) - torch.lgamma(a + b))
-        return log_prob.sum()
+        return _bsum(log_prob)
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         a, b = _as_float(self.a, self.b)
@@ -551,7 +554,7 @@ class Exponential(Distribution):
             raise RuntimeError("Exponential._log_prob_unconstrained can only be used if the transform is a log transform")
         rate = _as_float(self.rate)
         z = x_unconstrained
-        return (torch.log(rate) - rate * torch.exp(z) + z).sum()
+        return _bsum(torch.log(rate) - rate * torch.exp(z) + z)
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         if not isinstance(self.transform, LogTransform):
@@ -612,7 +615,7 @@ class Gamma(Distribution):
     def _log_prob_unconstrained(self, x_unconstrained):
         alpha, beta = _as_float(self.alpha, self.beta)
         z = x_unconstrained
-        return (alpha * torch.log(beta) - torch.lgamma(alpha) + alpha * z - beta * torch.exp(z)).sum()
+        return _bsum(alpha * torch.log(beta) - torch.lgamma(alpha) + alpha * z - beta * torch.exp(z))
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         alpha, beta = _as_float(self.alpha, self.beta)
@@ -684,7 +687,7 @@ class Uniform(Distribution):
     def _log_prob_unconstrained(self, x_unconstrained):
         # log(1/(high-low)) + log|dx/dz| = log sigmoid(z) + log sigmoid(-z): independent of the bounds.
         z = x_unconstrained
-        return (F.logsigmoid(z) + F.logsigmoid(-z)).sum()
+        return _bsum(F.logsigmoid(z) + F.logsigmoid(-z))
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         z = x_unconstrained
@@ -740,7 +743,7 @@ class InvGamma(Distribution):
     def _log_prob_unconstrained(self, x_unconstrained):
         alpha, beta = _as_float(self.alpha, self.beta)
         z = x_unconstrained
-        return (alpha * torch.log(beta) - torch.lgamma(alpha) - alpha * z - beta * torch.exp(-z)).sum()
+        return _bsum(alpha * torch.log(beta) - torch.lgamma(alpha) - alpha * z - beta * torch.exp(-z))
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         alpha, beta = _as_float(self.alpha, self.beta)
@@ -791,7 +794,7 @@ class HalfCauchy(Distribution):
         scale = _as_float(self.scale)
         z = x_unconstrained
         x = torch.exp(z)
-        return (math.log(2.0) - _LOG_PI - torch.log(scale) + z - torch.log1p((x / scale) ** 2)).sum()
+        return _bsum(math.log(2.0) - _LOG_PI - torch.log(scale) + z - torch.log1p((x / scale) ** 2))
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         scale = _as_float(self.scale)
@@ -993,6 +996,8 @@ class Dirichlet(Distribution):
     ``(..., K-1)`` while the constrained value has shape ``(..., K)``).
     """
 
+    _param_event_ndims = {"alpha": 1}
+
     def __init__(self, alpha):
         super().__init__(transform=StickBreakingTransform(), state_space=ContinuousSimplex(), transformed_state_space=ContinuousReal())
         self.alpha = alpha
@@ -1028,7 +1033,7 @@ class Dirichlet(Distribution):
         alpha = _as_float(self.alpha)
         log_x = self.transform.log_simplex(x_unconstrained)
         log_prob = ((alpha - 1) * log_x).sum(-1) - self._log_norm(alpha)
-        return log_prob.sum() + self.transform.log_abs_det_jacobian(x_unconstrained)
+        return _bsum(log_prob) + self.transform.log_abs_det_jacobian(x_unconstrained)
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         alpha = _as_float(self.alpha)
@@ -1111,7 +1116,7 @@ class LKJCholesky(Distribution):
         ell = T._to_matrix(_log1m_tanh_sq(z))
         log_diag = 0.5 * ell.sum(-1)[..., 1:]  # log L_ii, i >= 1
         log_prob = (self._coefficients(eta) * log_diag).sum(-1) - self._log_norm(eta)
-        return log_prob.sum() + T.log_abs_det_jacobian(z)
+        return _bsum(log_prob) + T.log_abs_det_jacobian(z)
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         eta = _as_float(self.eta)
@@ -1160,6 +1165,8 @@ def _bartlett(df, shape, D, dtype, device):
 
 class _WishartFamily(Distribution):
     """Shared parameter handling of :class:`Wishart` and :class:`InverseWishart`."""
+
+    _param_event_ndims = {"scale": 2, "scale_tril": 2}
 
     def __init__(self, df, scale=None, scale_tril=None):
         _check_exactly_one(["scale", "scale_tril"], [scale, scale_tril])
@@ -1250,7 +1257,7 @@ class Wishart(_WishartFamily):
         A = torch.linalg.solve_triangular(L_S.expand(*batch, D, D), L.expand(*batch, D, D), upper=False)
         log_prob = ((df - D - 1)[..., None] * diag_z).sum(-1) - 0.5 * (A ** 2).sum((-2, -1)) \
             - 0.5 * df * D * math.log(2.0) - 0.5 * df * logdet_S - self._log_mvgamma(df)
-        return log_prob.sum() + T.log_abs_det_jacobian(x_unconstrained)
+        return _bsum(log_prob) + T.log_abs_det_jacobian(x_unconstrained)
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         df, _, S_inv, _ = self._params()
@@ -1605,6 +1612,8 @@ class Categorical(Distribution):
     ``log(probs_k / sum(probs))``.
     """
 
+    _param_event_ndims = {"probs": 1, "logits": 1}
+
     def __init__(self, probs=None, logits=None):
         _check_exactly_one(["probs", "logits"], [probs, logits])
         self.probs = probs
@@ -1669,6 +1678,8 @@ class Multinomial(Distribution):
     used as a latent variable for MCMC (its support, vectors summing to
     ``total_count``, is not represented by the state space).
     """
+
+    _param_event_ndims = {"probs": 1, "logits": 1}
 
     def __init__(self, total_count, probs=None, logits=None):
         _check_exactly_one(["probs", "logits"], [probs, logits])
@@ -1986,6 +1997,8 @@ class TransformedDistribution(Distribution):
 
 # ========================= Miscellaneous distributions =========================
 class Mixture(Distribution):
+    _param_event_ndims = {"weights": 1}
+
     def __init__(self, components, weights):
         super().__init__(IdentityTransform(), Union(*[component.state_space for component in components]), Union(*[component.transformed_state_space for component in components]))
         self.components = components
@@ -2016,20 +2029,23 @@ class Mixture(Distribution):
 
     def pdf(self, x):
         weights = self._weights()
-        return sum(w * component.pdf(x) for w, component in zip(weights, self.components))
+        return sum(weights[..., k] * component.pdf(x) for k, component in enumerate(self.components))
 
     def log_pdf(self, x):
         weights = self._weights()
-        log_pdfs = torch.stack([(w + 1e-12).log() + component.log_pdf(x) for w, component in zip(weights, self.components)])
+        log_pdfs = [(weights[..., k] + 1e-12).log() + component.log_pdf(x) for k, component in enumerate(self.components)]
+        shape = torch.broadcast_shapes(*(t.shape for t in log_pdfs))
+        log_pdfs = torch.stack([t.expand(shape) for t in log_pdfs])
         return _logsumexp(log_pdfs, dim=0)
 
     def log_pdf_grad(self, x):
         weights = self._weights()
-        log_pdfs = torch.stack([component.log_pdf(x) for component in self.components], dim=0)  # (K, *batch)
-        grads = torch.stack([component.log_pdf_grad(x) for component in self.components], dim=0)  # (K, *batch, ...)
-        n_batch_dims = log_pdfs.ndim - 1
-        w = weights.reshape(-1, *([1] * n_batch_dims)) if n_batch_dims > 0 else weights
-        log_weighted = torch.log(w + 1e-12) + log_pdfs
+        log_weighted = [torch.log(weights[..., k] + 1e-12) + component.log_pdf(x) for k, component in enumerate(self.components)]
+        grads = [component.log_pdf_grad(x) for component in self.components]
+        shape = torch.broadcast_shapes(*(t.shape for t in log_weighted))
+        log_weighted = torch.stack([t.expand(shape) for t in log_weighted], dim=0)  # (K, *batch)
+        grad_shape = torch.broadcast_shapes(*(g.shape for g in grads))
+        grads = torch.stack([g.expand(grad_shape) for g in grads], dim=0)  # (K, *batch, ...)
         log_mixture_pdf = _logsumexp(log_weighted, dim=0)
         posterior_weights = torch.exp(log_weighted - log_mixture_pdf)
         if grads.ndim > posterior_weights.ndim:

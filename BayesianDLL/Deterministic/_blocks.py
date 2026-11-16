@@ -32,6 +32,17 @@ def _sum_to_shape(grad, shape):
     return sum_to_shape(grad, tuple(shape))
 
 
+def _negative_dim(dim, rank):
+    """``dim`` counted from the right of an unbatched tensor of rank ``rank``.
+
+    Negative dimensions address the same axis of a batched tensor (with a
+    leading chain dimension) and of the unbatched one.
+    """
+    if isinstance(dim, (tuple, list)):
+        return tuple(_negative_dim(d, rank) for d in dim)
+    return dim - rank if dim >= 0 else dim
+
+
 def _reference(values):
     """Floating dtype and device shared by the tensor-valued arguments."""
     dtype = None
@@ -123,6 +134,48 @@ class _Block(DeterministicParameter):
             local = torch.broadcast_to(local, out.shape)
             result[arg.name] = result[arg.name] + local if arg.name in result else local
         return result
+
+    # ------------------------------------------------------------ batching
+    #: Whether batched arguments are aligned (padded after the chain dimension
+    #: to a common batch rank) before ``_compute_batched``.
+    _align_arguments = True
+
+    def _arg_event_ndims(self, unbatched_ndims):
+        """Trailing event dimensions of every argument (elementwise blocks: none)."""
+        return [0] * len(unbatched_ndims)
+
+    def _batched_setup(self, node_values):
+        values = self._values(node_values)
+        node_flags = self._batched_flags()
+        flags = [node_flags[p] if p is not None else False for p in self._positions]
+        unbatched_ndims = [v.ndim - int(f) for v, f in zip(values, flags)]
+        if self._align_arguments:
+            values, _ = self._align_batched(values, flags, self._arg_event_ndims(unbatched_ndims))
+        return values, flags, unbatched_ndims
+
+    def batched_forward(self, input_values):
+        values, flags, unbatched_ndims = self._batched_setup(input_values)
+        return self._to_batched_output(self._compute_batched(values, flags, unbatched_ndims))
+
+    def batched_vjp(self, cotangent, input_values):
+        from .._batching import pad_to, sum_to_batched
+        values, flags, unbatched_ndims = self._batched_setup(input_values)
+        out = self._compute_batched(values, flags, unbatched_ndims)
+        g = pad_to(cotangent, out.ndim)
+        grads = self._arg_grads_batched(g, values, out, self._needs, flags, unbatched_ndims)
+        result = {}
+        for arg, need, flag, position, grad in zip(self._args, self._needs, flags, self._positions, grads):
+            if not need or not flag or grad is None:
+                continue
+            grad = sum_to_batched(grad, input_values[position].shape)
+            result[arg.name] = result[arg.name] + grad if arg.name in result else grad
+        return result
+
+    def _compute_batched(self, values, flags, unbatched_ndims):
+        return self._compute(values)
+
+    def _arg_grads_batched(self, g, values, out, needs, flags, unbatched_ndims):
+        return self._arg_grads(g, values, out, needs)
 
     # ------------------------------------------------------------ to override
     def _compute(self, values):
@@ -336,6 +389,15 @@ class Softmax(_Block):
             return [None]
         return [out * (g - (g * out).sum(dim=self.dim, keepdim=True))]
 
+    def _compute_batched(self, values, flags, unbatched_ndims):
+        return torch.softmax(values[0], dim=_negative_dim(self.dim, unbatched_ndims[0]))
+
+    def _arg_grads_batched(self, g, values, out, needs, flags, unbatched_ndims):
+        if not needs[0]:
+            return [None]
+        dim = _negative_dim(self.dim, unbatched_ndims[0])
+        return [out * (g - (g * out).sum(dim=dim, keepdim=True))]
+
 
 # ============================================================ reductions and shapes
 class Sum(_Block):
@@ -365,6 +427,26 @@ class Sum(_Block):
                 g = g.unsqueeze(d)
         return [g.expand(x.shape)]
 
+    def _compute_batched(self, values, flags, unbatched_ndims):
+        x = values[0]
+        if self.dim is None:
+            out = x.reshape(x.shape[0], -1).sum(-1)
+            return out.reshape(x.shape[0], *([1] * unbatched_ndims[0])) if self.keepdim else out
+        return x.sum(dim=_negative_dim(self.dim, unbatched_ndims[0]), keepdim=self.keepdim)
+
+    def _arg_grads_batched(self, g, values, out, needs, flags, unbatched_ndims):
+        if not needs[0]:
+            return [None]
+        x = values[0]
+        if self.dim is None:
+            return [g.reshape(x.shape[0], *([1] * (x.ndim - 1))).expand(x.shape)]
+        if not self.keepdim:
+            dims = _negative_dim(self.dim, unbatched_ndims[0])
+            dims = (dims,) if isinstance(dims, int) else tuple(dims)
+            for d in sorted(d % x.ndim for d in dims):
+                g = g.unsqueeze(d)
+        return [g.expand(x.shape)]
+
 
 class Concat(_Block):
     """Concatenate inputs along ``dim`` (``torch.cat``)."""
@@ -384,6 +466,28 @@ class Concat(_Block):
         pieces = torch.split(g, sizes, dim=self.dim)
         return [piece.reshape(v.shape) if need else None for piece, v, need in zip(pieces, values, needs)]
 
+    def _batched_pieces(self, values, flags, unbatched_ndims):
+        n_chains = next(v.shape[0] for v, f in zip(values, flags) if f)
+        rank = max(max(unbatched_ndims), 1)
+        pieces = []
+        for value, flag, ndim in zip(values, flags, unbatched_ndims):
+            if not flag:
+                value = value.reshape(1) if value.ndim == 0 else value
+                value = value.unsqueeze(0).expand(n_chains, *value.shape)
+            elif ndim == 0:
+                value = value.reshape(n_chains, 1)
+            pieces.append(value)
+        return pieces, _negative_dim(self.dim, rank)
+
+    def _compute_batched(self, values, flags, unbatched_ndims):
+        pieces, dim = self._batched_pieces(values, flags, unbatched_ndims)
+        return torch.cat(pieces, dim=dim)
+
+    def _arg_grads_batched(self, g, values, out, needs, flags, unbatched_ndims):
+        pieces, dim = self._batched_pieces(values, flags, unbatched_ndims)
+        split = torch.split(g, [p.shape[dim] for p in pieces], dim=dim)
+        return [part.reshape(v.shape) if need and flag else None for part, v, need, flag in zip(split, values, needs, flags)]
+
 
 class Stack(_Block):
     """Stack equally shaped inputs along a new dimension ``dim`` (``torch.stack``)."""
@@ -400,6 +504,16 @@ class Stack(_Block):
 
     def _arg_grads(self, g, values, out, needs):
         return [piece if need else None for piece, need in zip(torch.unbind(g, dim=self.dim), needs)]
+
+    def _compute_batched(self, values, flags, unbatched_ndims):
+        shape = torch.broadcast_shapes(*(v.shape for v in values))
+        rank = len(shape) - 1
+        return torch.stack([v.expand(shape) for v in values], dim=_negative_dim(self.dim, rank + 1))
+
+    def _arg_grads_batched(self, g, values, out, needs, flags, unbatched_ndims):
+        rank = out.ndim - 2
+        pieces = torch.unbind(g, dim=_negative_dim(self.dim, rank + 1))
+        return [piece if need else None for piece, need in zip(pieces, needs)]
 
 
 # ============================================================ linear algebra and indexing
@@ -432,6 +546,44 @@ class MatMul(_Block):
             grad_a = _sum_to_shape(g2 @ b2.transpose(-2, -1), a2.shape).reshape(a.shape)
         if needs[1]:
             grad_b = _sum_to_shape(a2.transpose(-2, -1) @ g2, b2.shape).reshape(b.shape)
+        return [grad_a, grad_b]
+
+    def _arg_event_ndims(self, unbatched_ndims):
+        return [min(ndim, 2) for ndim in unbatched_ndims]
+
+    def _promoted(self, values, unbatched_ndims):
+        a, b = values
+        if unbatched_ndims[0] == 0 or unbatched_ndims[1] == 0:
+            raise ValueError(f"MatMul '{self.name}' needs inputs with at least one dimension.")
+        a2 = a.unsqueeze(-2) if unbatched_ndims[0] == 1 else a
+        b2 = b.unsqueeze(-1) if unbatched_ndims[1] == 1 else b
+        return a2, b2
+
+    def _compute_batched(self, values, flags, unbatched_ndims):
+        a2, b2 = self._promoted(values, unbatched_ndims)
+        out = a2 @ b2
+        if unbatched_ndims[1] == 1:
+            out = out.squeeze(-1)
+        if unbatched_ndims[0] == 1:
+            out = out.squeeze(-2)
+        return out
+
+    def _arg_grads_batched(self, g, values, out, needs, flags, unbatched_ndims):
+        a2, b2 = self._promoted(values, unbatched_ndims)
+        g2 = g
+        if unbatched_ndims[1] == 1:
+            g2 = g2.unsqueeze(-1)
+        if unbatched_ndims[0] == 1:
+            g2 = g2.unsqueeze(-2)
+        grad_a = grad_b = None
+        if needs[0]:
+            grad_a = g2 @ b2.transpose(-2, -1)
+            if unbatched_ndims[0] == 1:
+                grad_a = grad_a.squeeze(-2)
+        if needs[1]:
+            grad_b = a2.transpose(-2, -1) @ g2
+            if unbatched_ndims[1] == 1:
+                grad_b = grad_b.squeeze(-1)
         return [grad_a, grad_b]
 
 
@@ -484,6 +636,51 @@ class Index(_Block):
         grad.index_add_(dim, index.reshape(-1), g)
         return [grad, None]
 
+    _align_arguments = False
+
+    def _gather_layout(self, values, flags, unbatched_ndims):
+        x, index = values
+        n_chains = index.shape[0]
+        dim = self.dim % unbatched_ndims[0]
+        expanded = x if flags[0] else x.unsqueeze(0).expand(n_chains, *x.shape)
+        moved = expanded.movedim(1 + dim, 1)  # (C, n, *pre, *post)
+        n_index = index.ndim - 1
+        chain = torch.arange(n_chains, device=index.device).reshape(n_chains, *([1] * n_index))
+        n_out = 1 + n_index + moved.ndim - 2
+        # gathered layout (C, *index, *pre, *post) -> output (C, *pre, *index, *post)
+        permutation = [0] + list(range(1 + n_index, 1 + n_index + dim)) + list(range(1, 1 + n_index)) + list(range(1 + n_index + dim, n_out))
+        return moved, chain, permutation, dim
+
+    def _compute_batched(self, values, flags, unbatched_ndims):
+        x, index = values
+        if not flags[1]:
+            rank = unbatched_ndims[0]
+            dim = (self.dim % rank - rank) % x.ndim
+            out = torch.index_select(x, dim, index.reshape(-1))
+            return out.reshape(*x.shape[:dim], *index.shape, *x.shape[dim + 1:])
+        moved, chain, permutation, _ = self._gather_layout(values, flags, unbatched_ndims)
+        return moved[chain, index].permute(permutation)
+
+    def _arg_grads_batched(self, g, values, out, needs, flags, unbatched_ndims):
+        if not needs[0] or not flags[0]:
+            return [None, None]
+        x, index = values
+        if not flags[1]:
+            rank = unbatched_ndims[0]
+            dim = (self.dim % rank - rank) % x.ndim
+            g = g.reshape(*x.shape[:dim], index.numel(), *x.shape[dim + 1:])
+            grad = torch.zeros(x.shape, dtype=g.dtype, device=g.device)
+            grad.index_add_(dim, index.reshape(-1), g)
+            return [grad, None]
+        moved, chain, permutation, dim = self._gather_layout(values, flags, unbatched_ndims)
+        inverse = [0] * len(permutation)
+        for position, source in enumerate(permutation):
+            inverse[source] = position
+        gathered = g.permute(inverse)
+        grad = torch.zeros(moved.shape, dtype=g.dtype, device=g.device)
+        grad.index_put_((chain.expand_as(index), index), gathered, accumulate=True)
+        return [grad.movedim(1, 1 + dim), None]
+
 
 class CholeskyCovariance(_Block):
     """Cholesky factor ``diag(sigma) @ L_corr`` of a covariance matrix.
@@ -496,6 +693,9 @@ class CholeskyCovariance(_Block):
 
     def __init__(self, name, L_corr, sigma):
         super().__init__(name, [L_corr, sigma])
+
+    def _arg_event_ndims(self, unbatched_ndims):
+        return [2, 1]
 
     def _compute(self, values):
         L, sigma = values

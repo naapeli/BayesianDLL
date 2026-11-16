@@ -986,3 +986,9 @@ def sparse_gp_predictive(
         )
 
     return torch.stack(outputs)
+
+
+# Batched (vectorized) chains evaluate GP nodes chain by chain (see Model.batch).
+LatentGP._batchable = False
+ExactGP._batchable = False
+SparseGP._batchable = False

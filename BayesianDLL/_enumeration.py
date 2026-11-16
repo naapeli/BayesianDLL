@@ -45,9 +45,31 @@ _PROBE_SEED = 20261116
 _N_PROBES = 2
 
 
-def _sum_to_shape(tensor, shape):
+def _sum_to_shape(tensor, shape, batched=False):
+    if batched:
+        from ._batching import sum_to_batched
+        return sum_to_batched(tensor, shape)
     from ._model import _sum_to_shape as sum_to_shape
     return sum_to_shape(tensor, shape)
+
+
+def _batched(model):
+    return getattr(model, "n_chains", None) is not None
+
+
+def _total(model, value):
+    """Sum to a scalar, or to one value per chain for a batched model."""
+    if _batched(model) and value.ndim > 0:
+        return value.reshape(value.shape[0], -1).sum(-1)
+    return value.sum()
+
+
+def _align_weight(model, weight, shape):
+    """Broadcast per-coordinate weights onto an elementwise term shape."""
+    if _batched(model):
+        from ._batching import pad_to
+        weight = pad_to(weight, len(shape))
+    return torch.broadcast_to(weight, shape)
 
 
 def _support(parameter):
@@ -73,6 +95,8 @@ def weight_gradient(gradient, weight):
 
 def _elementwise_log_prob(model, name):
     """Elementwise log density of the term ``name`` (without Jacobian terms)."""
+    if hasattr(model, "_elementwise_term"):
+        return model._elementwise_term(name)
     if name in model.observed_params:
         observed = model.observed_params[name]
         return observed.distribution.log_pdf(observed.observed_values)
@@ -107,21 +131,31 @@ class EnumerationGroup:
 
     def _restore(self, model, values):
         for parameter, value in zip(self._parameters(model), values):
+            if _batched(model) and value.ndim < parameter.constrained_value.ndim:
+                value = value.unsqueeze(0).expand(model.n_chains, *value.shape)
             parameter.set_constrained_value(value)
+
+    @staticmethod
+    def _value_shape(model, parameter):
+        """Shape of the parameter's value without the chain dimension."""
+        shape = parameter.constrained_value.shape
+        return shape[1:] if _batched(model) else shape
 
     def _term_values(self, model):
         return [(name, _elementwise_log_prob(model, name)) for name in self.terms]
 
     def _constant(self, model):
         """Jacobian terms of the continuous random children (independent of the enumerated values)."""
+        from ._batching import batched_evaluation
         constant = 0.0
-        for name in self.random_terms:
-            parameter = model.params[name]
-            constant = constant + parameter.distribution.transform.log_abs_det_jacobian(parameter.unconstrained_value)
+        with batched_evaluation(getattr(model, "n_chains", None)):
+            for name in self.random_terms:
+                parameter = model.params[name]
+                constant = constant + parameter.distribution.transform.log_abs_det_jacobian(parameter.unconstrained_value)
         return constant
 
     def _shape_signature(self, model):
-        return tuple(tuple(p.constrained_value.shape) for p in self._parameters(model))
+        return tuple(tuple(self._value_shape(model, p)) for p in self._parameters(model))
 
     # ---------------------------------------------------------- detection
     def prepare(self, model):
@@ -155,7 +189,7 @@ class EnumerationGroup:
     def _n_configurations(self, model):
         total = 1
         for parameter in self._parameters(model):
-            total *= len(parameter.distribution.state_space) ** parameter.constrained_value.numel()
+            total *= len(parameter.distribution.state_space) ** self._value_shape(model, parameter).numel()
             if total > MAX_BRUTE_FORCE_CONFIGURATIONS:
                 return total
         return total
@@ -213,8 +247,8 @@ class EnumerationGroup:
         """All joint assignments (brute force) as lists of tensors, one per enumerated parameter."""
         parameters = self._parameters(model)
         supports = [_support(p) for p in parameters]
-        shapes = [p.constrained_value.shape for p in parameters]
-        sizes = [p.constrained_value.numel() for p in parameters]
+        shapes = [self._value_shape(model, p) for p in parameters]
+        sizes = [shape.numel() for shape in shapes]
         per_element = [range(len(s)) for s, n in zip(supports, sizes) for _ in range(n)]
         configurations = []
         for indices in itertools.product(*per_element):
@@ -243,6 +277,7 @@ class EnumerationGroup:
             term_shapes = None
             if self.mode == "factorised":
                 shape = saved[0].shape
+                batched = _batched(model)
                 configurations = list(_support(self._parameters(model)[0]))
                 for k in configurations:
                     self._parameters(model)[0].set_constrained_value(torch.full_like(saved[0], k))
@@ -250,7 +285,7 @@ class EnumerationGroup:
                     term_shapes = {term: value.shape for term, value in values}
                     total = 0.0
                     for _, value in values:
-                        total = total + _sum_to_shape(value, shape)
+                        total = total + _sum_to_shape(value, shape, batched)
                     log_terms.append(torch.broadcast_to(torch.as_tensor(total, dtype=saved[0].dtype, device=saved[0].device), shape))
             else:
                 configurations = self._configurations(model)
@@ -258,11 +293,11 @@ class EnumerationGroup:
                     self._restore(model, values)
                     terms = self._term_values(model)
                     term_shapes = {term: value.shape for term, value in terms}
-                    log_terms.append(sum(value.sum() for _, value in terms))
+                    log_terms.append(sum(_total(model, value) for _, value in terms))
             log_terms = torch.stack(log_terms, dim=0)
         finally:
             self._restore(model, saved)
-        log_marginal = torch.logsumexp(log_terms, dim=0).sum() + self._constant(model)
+        log_marginal = _total(model, torch.logsumexp(log_terms, dim=0)) + self._constant(model)
         return {
             "log_terms": log_terms,
             "configurations": configurations,
@@ -293,9 +328,9 @@ class EnumerationGroup:
                     if weight.numel() == 1:
                         term_weights = {term: weight.reshape(()) for term in active}
                     else:
-                        term_weights = {term: torch.broadcast_to(weight, term_shapes[term]) for term in active}
+                        term_weights = {term: _align_weight(model, weight, term_shapes[term]) for term in active}
                 else:
-                    if weight.item() == 0.0:
+                    if bool((weight == 0.0).all()):
                         continue
                     self._restore(model, configuration)
                     term_weights = {term: weight for term in active}
@@ -327,6 +362,8 @@ class EnumerationGroup:
             parameter.set_constrained_value(value)
             return {parameter.name: (value, probabilities)}
 
+        if _batched(model):
+            return self._sample_brute_force_batched(model, evaluation, weights, parameters)
         uniform = torch.rand((), dtype=weights.dtype, device=weights.device)
         index = int((torch.cumsum(weights, dim=0) < uniform).sum().clamp(max=len(weights) - 1).item())
         configuration = evaluation["configurations"][index]
@@ -339,6 +376,26 @@ class EnumerationGroup:
             probabilities = (weights.reshape(-1, *([1] * (one_hot.ndim - 1))) * one_hot).sum(dim=0)
             draws[parameter.name] = (configuration[position].to(dtype=parameter.constrained_value.dtype), probabilities)
         return draws
+
+
+def _sample_brute_force_batched(self, model, evaluation, weights, parameters):
+    """Per-chain draws of all joint assignments (``weights`` has shape ``(n_configurations, n_chains)``)."""
+    configurations = evaluation["configurations"]
+    uniform = torch.rand(weights.shape[1:], dtype=weights.dtype, device=weights.device)
+    index = (torch.cumsum(weights, dim=0) < uniform).sum(dim=0).clamp(max=len(configurations) - 1)
+    draws = {}
+    for position, parameter in enumerate(parameters):
+        support = _support(parameter)
+        stacked = torch.stack([c[position] for c in configurations], dim=0)  # (K, *shape)
+        value = stacked[index].to(dtype=parameter.constrained_value.dtype)  # (n_chains, *shape)
+        one_hot = (stacked.unsqueeze(-1) == support).to(dtype=weights.dtype)  # (K, *shape, S)
+        probabilities = torch.einsum("kc,k...->c...", weights, one_hot)
+        parameter.set_constrained_value(value)
+        draws[parameter.name] = (value, probabilities)
+    return draws
+
+
+EnumerationGroup._sample_brute_force_batched = _sample_brute_force_batched
 
 
 def build_groups(model):

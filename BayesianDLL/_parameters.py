@@ -236,8 +236,79 @@ class DeterministicParameter:
 
     @property
     def constrained_value(self):
+        model = self.owner_model
+        if model is not None and model.n_chains is not None and self.name in model._batched_nodes:
+            if model._batch_mode == "loop":
+                return model._loop_over_chains(lambda: self.constrained_value)
+            return self.batched_forward(self.input_values())
         inputs = [self._get_constrained_value(input) for input in self.inputs]
         return self.forward_func(*inputs)
+
+    # ------------------------------------------------------------ batching
+    # In a batched model (see BayesianDLL._batching) the inputs that depend on
+    # a latent parameter have a leading chain dimension. The default batched
+    # evaluation treats every input dimension as a batch dimension: batched
+    # inputs are padded with singleton dimensions after the chain dimension to
+    # a common rank, so that functions built from broadcasting operations
+    # (``a + b * x``) work unchanged. The output is reshaped to
+    # ``(n_chains, *value_shape)``. Subclasses with other semantics (matrix
+    # products, reductions, indexing) override ``batched_forward`` and
+    # ``batched_vjp``.
+    def _batched_flags(self):
+        model = self.owner_model
+        return [(not isinstance(inp, torch.Tensor)) and model._is_batched_object(inp) for inp in self.inputs]
+
+    @staticmethod
+    def _align_batched(values, flags, event_ndims=None):
+        from ._batching import pad_to
+        event_ndims = [0] * len(values) if event_ndims is None else list(event_ndims)
+        batch_rank = 0
+        for value, flag, event_ndim in zip(values, flags, event_ndims):
+            if isinstance(value, torch.Tensor):
+                batch_rank = max(batch_rank, value.ndim - int(flag) - event_ndim)
+        aligned = [
+            pad_to(value, 1 + batch_rank + event_ndim) if flag else value
+            for value, flag, event_ndim in zip(values, flags, event_ndims)
+        ]
+        return aligned, batch_rank
+
+    def _to_batched_output(self, out):
+        """Reshape a raw batched output to ``(n_chains, *value_shape)``."""
+        n_chains = self.owner_model.n_chains
+        out = torch.as_tensor(out)
+        expected = getattr(self, "_ub_ndim", None)
+        if expected is None:
+            return out
+        if out.ndim <= expected:
+            # The output does not depend on the batched inputs.
+            out = out.reshape(*([1] * (expected - out.ndim)), *out.shape)
+            return out.unsqueeze(0).expand(n_chains, *out.shape)
+        while out.ndim > expected + 1 and out.shape[1] == 1:
+            out = out.squeeze(1)
+        return out
+
+    def batched_forward(self, input_values):
+        """Value ``(n_chains, *value_shape)`` from batched/unbatched input values."""
+        aligned, _ = self._align_batched(input_values, self._batched_flags())
+        return self._to_batched_output(self.forward_func(*aligned))
+
+    def batched_vjp(self, cotangent, input_values):
+        """Batched counterpart of :meth:`vjp`: gradients with a leading chain dimension."""
+        from ._batching import pad_to
+        aligned, batch_rank = self._align_batched(input_values, self._batched_flags())
+        expected = getattr(self, "_ub_ndim", None) or 0
+        cotangent = pad_to(cotangent, 1 + max(batch_rank, expected))
+        if self.vjp_func is not None:
+            return self.vjp_func(cotangent, *aligned)
+        locals_ = self.derivative_func(*aligned)
+        grads = {}
+        for inp in self.inputs:
+            name = getattr(inp, "name", None)
+            if name is None or name not in locals_ or name in grads:
+                continue
+            local = torch.as_tensor(locals_[name], dtype=cotangent.dtype, device=cotangent.device)
+            grads[name] = cotangent * local
+        return grads
 
     def derivative(self, name):
         return self.derivatives()[name]
