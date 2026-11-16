@@ -73,13 +73,17 @@ class SampleStats:
 
 
 class SamplingResult:
-    def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None, sample_stats=None):
+    def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None, sample_stats=None, enumerated_probs=None):
         self.trace = trace
         self.divergences = divergences
         self.acceptance_probabilities = acceptance_probabilities
         self.step_sizes = step_sizes
         self.deterministic_trace = {} if deterministic_trace is None else deterministic_trace
         self.sample_stats = SampleStats() if sample_stats is None else sample_stats
+        # For every enumerated (summed out) parameter: the posterior probability
+        # of each support value per coordinate and draw, with shape
+        # (n_chains, n_samples, *value_shape, K).
+        self.enumerated_probs = {} if enumerated_probs is None else enumerated_probs
 
     def __getitem__(self, key):
         if key in self.trace:
@@ -109,6 +113,7 @@ class SamplingResult:
             step_sizes=[list(ss) for ss in self.step_sizes],
             deterministic_trace=thinned_det,
             sample_stats=self.sample_stats.thin(step),
+            enumerated_probs={name: val[:, s] for name, val in self.enumerated_probs.items()},
         )
 
     def summary(self, hdi_prob=0.94, ci_kind="eti", round_to=3, include_deterministic=False):
