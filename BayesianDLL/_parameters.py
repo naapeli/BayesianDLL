@@ -343,6 +343,7 @@ class VariationalParameter:
         return f"VariationalParameter {self.name}, value: {self.value}, limits: {(self.min, self.max)}"
 
     def set_new_value(self, value):
-        value = value.reshape(self.value.shape)
-        assert self.value.dtype == value.dtype
+        # The parameter keeps its own dtype and device: gradient steps may be
+        # computed in the model's precision (e.g. float64 for a float32 guide).
+        value = torch.as_tensor(value).to(dtype=self.value.dtype, device=self.value.device).reshape(self.value.shape)
         self.value = torch.clamp(value, self.min, self.max)
