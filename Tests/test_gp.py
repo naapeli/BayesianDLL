@@ -40,7 +40,7 @@ def build_gp_model(n=4):
         lengthscale = RandomParameter("lengthscale", Exponential(1.0))
         variance = RandomParameter("variance", Exponential(1.0))
         latent = LatentGP("function", inputs, RBF(lengthscale, variance))
-        ObservedParameter("observations", Normal(latent, 0.1), y)
+        ObservedParameter("observations", Normal(latent, 0.1 ** 0.5), y)
     return model, inputs, latent
 
 
@@ -208,9 +208,9 @@ def test_condition_can_fix_latent_gp_hyperparameters():
     y = torch.sin(2 * torch.pi * x)
     with Model() as model:
         inputs = Data("inputs", x)
-        log_lengthscale = RandomParameter("log_lengthscale", Normal(-1.0, 0.5))
-        log_variance = RandomParameter("log_variance", Normal(0.0, 0.5))
-        log_noise = RandomParameter("log_noise", Normal(-2.5, 0.5))
+        log_lengthscale = RandomParameter("log_lengthscale", Normal(-1.0, 0.5 ** 0.5))
+        log_variance = RandomParameter("log_variance", Normal(0.0, 0.5 ** 0.5))
+        log_noise = RandomParameter("log_noise", Normal(-2.5, 0.5 ** 0.5))
         lengthscale = Exp("lengthscale", log_lengthscale)
         variance = Exp("variance", log_variance)
         noise = Exp("noise", log_noise)
@@ -276,7 +276,7 @@ def test_gp_variance_gradient_matches_full_model_finite_difference():
         function = GaussianProcess("function", inputs, RBF(0.5, variance), latent=z)
         # The literal likelihood variance must not be confused with the GP
         # hyperparameter named "variance".
-        ObservedParameter("observations", Normal(function, 0.1), y)
+        ObservedParameter("observations", Normal(function, 0.1 ** 0.5), y)
 
     unconstrained = variance.unconstrained_value.clone()
     step = 1e-5
@@ -307,7 +307,7 @@ def test_gp_mcmc_promotes_float32_inputs_to_inference_dtype():
         lengthscale = RandomParameter("lengthscale", Exponential(1.0))
         variance = RandomParameter("variance", Exponential(1.0))
         function = GaussianProcess("function", inputs, RBF(lengthscale, variance))
-        ObservedParameter("observations", Normal(function, 0.1), y)
+        ObservedParameter("observations", Normal(function, 0.1 ** 0.5), y)
     trace = model.sample(2, 2, n_chains=1, progress_bar=False, check_convergence=False)
     assert trace["function"].dtype == trace["function_white"].dtype
 
@@ -371,7 +371,7 @@ def test_whitened_gp_is_usable_in_variational_inference():
             "function_white",
             Normal(
                 VariationalParameter("loc", torch.zeros(3)),
-                VariationalParameter("var", torch.ones(3), min=1e-3),
+                VariationalParameter("std", torch.ones(3), min=1e-3),
             ),
             shape=3,
         )
@@ -424,7 +424,7 @@ def test_latent_gp_gradient_includes_scale_dependent_jitter(kernel_name):
         else:
             kernel = Periodic(lengthscale, variance, RandomParameter("period", Uniform(0.5, 1.5)))
         function = LatentGP("function", inputs, kernel, jitter=1e-4)
-        ObservedParameter("observations", Normal(function, 0.05), y)
+        ObservedParameter("observations", Normal(function, 0.05 ** 0.5), y)
     model.params["function_white"].set_unconstrained_value(torch.linspace(-1.0, 1.0, 8, dtype=torch.float64))
     _finite_difference_check(model)
 

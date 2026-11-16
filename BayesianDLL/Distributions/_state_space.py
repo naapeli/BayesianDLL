@@ -160,3 +160,31 @@ class JointStateSpace(StateSpace):
     def is_discrete(self):
         return not self._is_continuous
 
+
+
+class DiscreteNonNegative(DiscreteSpace):
+    """The integers 0, 1, 2, ... (support of Poisson, NegativeBinomial, ...)."""
+
+    def contains(self, state):
+        state = torch.as_tensor(state)
+        return bool(torch.all((state >= 0) & (state == torch.round(state))))
+
+    def __iter__(self):
+        i = 0
+        while True:
+            yield i
+            i += 1
+
+
+class ContinuousCorrCholesky(ContinuousSpace):
+    """Lower-triangular Cholesky factors of correlation matrices (unit-norm rows, positive diagonal)."""
+
+    def contains(self, state):
+        state = torch.as_tensor(state)
+        if state.ndim < 2 or state.shape[-1] != state.shape[-2]:
+            return False
+        tol = 1e3 * torch.finfo(state.dtype).eps if state.is_floating_point() else 0.0
+        lower = bool(torch.all(torch.triu(state, diagonal=1).abs() <= tol))
+        positive = bool(torch.all(torch.diagonal(state, dim1=-2, dim2=-1) > 0))
+        unit_rows = bool(torch.allclose((state ** 2).sum(-1), torch.ones((), dtype=state.dtype, device=state.device)))
+        return lower and positive and unit_rows

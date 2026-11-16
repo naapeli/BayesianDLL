@@ -13,7 +13,7 @@ def test_linear_regression_is_a_deterministic_parameter():
         slope = RandomParameter("slope", Normal(0.0, 1.0))
         intercept = RandomParameter("intercept", Normal(0.0, 1.0))
         mean = Linear("mean", inputs, slope=slope, intercept=intercept)
-        ObservedParameter("observations", Normal(mean, 0.1), torch.zeros(4))
+        ObservedParameter("observations", Normal(mean, 0.1 ** 0.5), torch.zeros(4))
 
     assert isinstance(mean, DeterministicParameter)
     assert model.deterministic_params["mean"] is mean

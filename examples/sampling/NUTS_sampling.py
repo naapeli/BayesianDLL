@@ -67,8 +67,8 @@ plt.title("Half Cauchy")
 
 plt.subplot(3, 3, 7)
 means = [-1, 2]
-variances = [0.5 ** 2, 1 ** 2]
-components = [Normal(mu, var) for mu, var in zip(means, variances)]
+stds = [0.5, 1.0]
+components = [Normal(mu, std) for mu, std in zip(means, stds)]
 weights = [0.3, 0.7]
 distribution = Mixture(components, weights)
 plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_unconstrained, x).numpy(), label='log_pdf')
@@ -101,7 +101,7 @@ y = distribution.pdf(x)
 plt.plot(x, y)
 plt.title("Normal")
 
-distribution = Normal(5, 3)
+distribution = Normal(5, 3 ** 0.5)
 with Model() as model:
     RandomParameter("sample", distribution, sampler="nuts")
     model.find_MAP(verbose=False)
@@ -246,8 +246,8 @@ plt.plot(triangle_vertices[:, 0], triangle_vertices[:, 1], '-', lw=2, c="black")
 print("Mixture")
 plt.subplot(3, 3, 8)
 means = [-1, 2]
-variances = [0.5 ** 2, 1 ** 2]
-components = [Normal(mu, var) for mu, var in zip(means, variances)]
+stds = [0.5, 1.0]
+components = [Normal(mu, std) for mu, std in zip(means, stds)]
 weights = [0.3, 0.7]
 distribution = Mixture(components, weights)
 with Model() as model:

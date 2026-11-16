@@ -12,7 +12,7 @@ def test_updated_regression_data_reaches_log_prob_gradients_and_sampler():
     with Model() as model:
         x = Data("x", [0.0, 1.0, 2.0])
         y = Data("y", [1.0, 2.0, 3.0])
-        slope = RandomParameter("slope", Normal(0.0, 4.0))
+        slope = RandomParameter("slope", Normal(0.0, 2.0))
         mu = DeterministicParameter(
             "mu", lambda m, x: m * x,
             lambda m, x: {"slope": x}, [slope, x],

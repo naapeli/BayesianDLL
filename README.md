@@ -43,6 +43,17 @@ To run the tests:
 uv run pytest
 ```
 
+## Distributions
+
+`BayesianDLL.Distributions` provides Normal, HalfNormal, LogNormal,
+MultivariateNormal, StudentT, Cauchy, Laplace, Uniform, Beta, Exponential,
+Gamma, InvGamma, HalfCauchy, Dirichlet, LKJCholesky, Bernoulli, Binomial,
+Geometric, Poisson, NegativeBinomial, Categorical, Multinomial and
+DiscreteUniform, plus the Mixture, ZeroInflated, Truncated and
+TransformedDistribution wrappers. Every distribution has `sample()`.
+`Normal(mu, sigma)` is parameterised by the **standard deviation**, and the
+binary/count distributions accept either probabilities or `logits=`.
+
 ## Examples
 
 ### Logistic regression
@@ -65,8 +76,8 @@ y = torch.bernoulli(torch.sigmoid(-0.4 + 1.6 * x))
 
 with Model() as model:
     inputs = Data("inputs", x)
-    intercept = RandomParameter("intercept", Normal(0.0, 2.0))
-    slope = RandomParameter("slope", Normal(0.0, 2.0))
+    intercept = RandomParameter("intercept", Normal(0.0, 1.5))
+    slope = RandomParameter("slope", Normal(0.0, 1.5))
 
     logits = Linear("logits", inputs, slope=slope, intercept=intercept)
     probability = Sigmoid("probability", logits)
@@ -129,7 +140,7 @@ with MeanFieldGuide() as guide:
             name,
             Normal(
                 VariationalParameter(f"{name}_mean", torch.zeros(1, dtype=x.dtype)),
-                VariationalParameter(f"{name}_variance", torch.ones(1, dtype=x.dtype), min=1e-6)
+                VariationalParameter(f"{name}_std", torch.ones(1, dtype=x.dtype), min=1e-3)
             ),
         )
 

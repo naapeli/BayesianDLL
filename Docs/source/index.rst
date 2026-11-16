@@ -42,16 +42,16 @@ A minimal example
 
    import torch
    from BayesianDLL import Model, RandomParameter, ObservedParameter, sample, plate
-   from BayesianDLL.Distributions import Normal, InvGamma
+   from BayesianDLL.Distributions import Normal, HalfNormal
    from BayesianDLL.Evaluation import summary
 
    data = torch.normal(5.0, 3.0 ** 0.5, size=(100,), dtype=torch.float64)
 
    with Model() as model:
-       mean = RandomParameter("mean", Normal(0, 10))
-       variance = RandomParameter("variance", InvGamma(2, 2))
+       mean = RandomParameter("mean", Normal(0, 3))
+       sigma = RandomParameter("sigma", HalfNormal(3))
        with plate("data", len(data)):
-           ObservedParameter("likelihood", Normal(mean, variance), data)
+           ObservedParameter("likelihood", Normal(mean, sigma), data)
        samples = sample(1000, 500, n_chains=2)
 
    print(summary(samples))
