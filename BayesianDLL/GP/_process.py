@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 
 from .._data import Data
@@ -9,7 +11,7 @@ from .._parameters import DeterministicParameter, RandomParameter
 from ..Distributions._distributions import Distribution
 from ..Distributions._resolve import resolve
 from ..Distributions import Normal
-from ._kernels import Kernel
+from ._kernels import Kernel, _is_named
 
 
 def stable_cholesky(matrix, jitter=1e-6, max_tries=6, return_jitter=False):
@@ -93,7 +95,7 @@ def _input_value(value):
 
 
 def _named_model_inputs(values):
-    return {value.name: tensor for value, tensor in values if hasattr(value, "name")}
+    return {value.name: tensor for value, tensor in values if _is_named(value)}
 
 
 def _feature_count(x):
@@ -102,7 +104,7 @@ def _feature_count(x):
 
 
 def _mean_value(mean, x):
-    if hasattr(mean, "name"):
+    if _is_named(mean):
         mean = _input_value(mean)
     mean = _as_tensor(mean).to(dtype=x.dtype, device=x.device)
     if mean.ndim == 0:
@@ -111,7 +113,7 @@ def _mean_value(mean, x):
 
 
 def _resolved_value(value, dtype, device, parameter_values=None):
-    if parameter_values is not None and hasattr(value, "name") and value.name in parameter_values:
+    if parameter_values is not None and _is_named(value) and value.name in parameter_values:
         value = parameter_values[value.name]
     else:
         value = resolve(value)
@@ -173,13 +175,13 @@ class LatentGP(DeterministicParameter):
     ):
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
-        if not hasattr(inputs, "name"):
+        if not _is_named(inputs):
             raise TypeError("inputs must be a named Data or model parameter node.")
 
         n = _feature_count(inputs)
         if latent is None:
             latent = RandomParameter(latent_name or f"{name}_white", Normal(0.0, 1.0), shape=n)
-        if not hasattr(latent, "name"):
+        if not _is_named(latent):
             raise TypeError("latent must be a named model parameter node.")
         if latent.constrained_value.numel() != n:
             raise ValueError(
@@ -189,7 +191,7 @@ class LatentGP(DeterministicParameter):
 
         kernel_parameters = list(kernel.parameters)
         model_inputs = [inputs, latent, *kernel_parameters]
-        mean_input = mean if hasattr(mean, "name") else None
+        mean_input = mean if _is_named(mean) else None
         if mean_input is not None:
             model_inputs.append(mean_input)
 
@@ -224,11 +226,14 @@ class LatentGP(DeterministicParameter):
                     covariance_derivative = covariance_derivatives[parameter.name]
                     if covariance_derivative.ndim == 2:
                         covariance_derivative = covariance_derivative.unsqueeze(0)
+                    # Flatten the parameter axes into one Jacobian column per
+                    # parameter component, as ``Model.joint_grad_log_prob``
+                    # expects for vector-valued (e.g. ARD) parameters.
                     derivatives[parameter.name] = _cholesky_output_derivative(
                         factor,
                         _jitter_derivative(jitter_info, covariance_derivative),
                         latent_value,
-                    )
+                    ).reshape(latent_value.numel(), -1)
 
             if mean_input is not None:
                 mean_value = values[2 + len(kernel_parameters)]
@@ -281,7 +286,7 @@ class ExactGP(Distribution):
         super().__init__()
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
-        if not hasattr(inputs, "name"):
+        if not _is_named(inputs):
             raise TypeError("inputs must be a named Data or model parameter node.")
         self.name = name
         self.inputs = inputs
@@ -359,7 +364,7 @@ class ExactGP(Distribution):
         values = {}
         parameters = [*self.kernel.parameters, self.noise_variance, self.mean]
         for parameter in parameters:
-            if hasattr(parameter, "name"):
+            if _is_named(parameter):
                 values[parameter.name] = resolve(parameter)
         return values
 
@@ -394,7 +399,7 @@ class ExactGP(Distribution):
             derivative = _jitter_derivative(jitter_info, derivative)
             gradients[name] = (sensitivity * derivative).sum(dim=(-2, -1))
 
-        if hasattr(self.noise_variance, "name"):
+        if _is_named(self.noise_variance):
             # d(K + noise * I + jitter * I) / d(noise) = (1 + d(jitter)/d(noise)) * I.
             jitter, scale, index = jitter_info
             noise_scale = 1.0 + (jitter / scale if index is not None else 0.0)
@@ -402,7 +407,7 @@ class ExactGP(Distribution):
                 alpha.square().sum() - torch.diagonal(inverse).sum()
             ) * noise_scale).reshape(resolve(self.noise_variance).shape)
 
-        if hasattr(self.mean, "name"):
+        if _is_named(self.mean):
             gradients[self.mean.name] = alpha
 
         return gradients
@@ -421,6 +426,268 @@ class ExactGP(Distribution):
 
 # Backwards-compatible name retained for existing exact-GP models.
 ExactGaussianProcess = ExactGP
+
+
+_SPARSE_METHODS = ("vfe", "dtc", "fitc")
+
+
+def _with_parameter_axis(derivative):
+    if derivative is not None and derivative.ndim == 2:
+        return derivative.unsqueeze(0)
+    return derivative
+
+
+class SparseGP(Distribution):
+    r"""Inducing-point approximation of the GP marginal likelihood.
+
+    With ``m`` inducing inputs ``Z`` and ``Q_nn = K_nm K_mm⁻¹ K_mn``, the
+    log density of the observations ``y`` (one value per training input) is
+
+    * ``method="vfe"`` (default): Titsias' collapsed variational bound,
+      ``log N(y | mean, Q_nn + σ² I) - tr(K_nn - Q_nn) / (2σ²)``. It is a lower
+      bound on the exact log marginal likelihood and equals it when ``Z``
+      equals the training inputs.
+    * ``method="dtc"``: ``log N(y | mean, Q_nn + σ² I)`` (deterministic
+      training conditional).
+    * ``method="fitc"``: ``log N(y | mean, Q_nn + diag(K_nn - Q_nn) + σ² I)``
+      (fully independent training conditional).
+
+    Everything is evaluated with Cholesky factors of ``m x m`` matrices, the
+    Woodbury identity and the matrix determinant lemma, i.e. in ``O(n m²)``
+    time and ``O(n m)`` memory; no ``n x n`` matrix is ever formed.
+
+    The inducing inputs are fixed (a tensor or a ``Data`` node). Kernel
+    hyperparameters, ``noise_variance`` and ``mean`` can be model parameters;
+    their gradients are derived by hand in :meth:`log_pdf_param_grads`.
+    Use it as the distribution of an ``ObservedParameter``::
+
+        gp = SparseGP("function", inputs, kernel, inducing_points=Z, noise_variance=noise)
+        ObservedParameter("observations", gp, y)
+    """
+
+    def __init__(self, name, inputs, kernel: Kernel, inducing_points, noise_variance=1e-6, mean=0.0, method="vfe", jitter=1e-6):
+        super().__init__()
+        if not isinstance(kernel, Kernel):
+            raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
+        if not _is_named(inputs):
+            raise TypeError("inputs must be a named Data or model parameter node.")
+        if isinstance(inducing_points, (RandomParameter, DeterministicParameter)):
+            raise TypeError("SparseGP inducing_points must be fixed (a tensor or a Data node).")
+        method = str(method).lower()
+        if method not in _SPARSE_METHODS:
+            raise ValueError(f"SparseGP method must be one of {_SPARSE_METHODS}; got {method!r}.")
+        self.name = name
+        self.inputs = inputs
+        self.kernel = kernel
+        self.inducing_points = inducing_points
+        self.noise_variance = noise_variance
+        self.mean = mean
+        self.method = method
+        self.jitter = jitter
+
+        self.add_dependency(inputs)
+        self.add_dependency(inducing_points)
+        for parameter in kernel.parameters:
+            self.add_dependency(parameter)
+        self.add_dependency(noise_variance)
+        self.add_dependency(mean)
+
+    @property
+    def event_shape(self):
+        return (_feature_count(self.inputs),)
+
+    @property
+    def batch_shape(self):
+        return torch.Size()
+
+    def _named_parameter_values(self):
+        values = {}
+        for parameter in [*self.kernel.parameters, self.noise_variance, self.mean]:
+            if _is_named(parameter):
+                values[parameter.name] = resolve(parameter)
+        return values
+
+    def _training_inputs(self):
+        x = torch.as_tensor(_input_value(self.inputs))
+        if x.ndim == 0:
+            x = x.reshape(1)
+        return x
+
+    def _inducing_inputs(self, dtype, device):
+        z = torch.as_tensor(_input_value(self.inducing_points)).to(dtype=dtype, device=device)
+        if z.ndim == 0:
+            z = z.reshape(1)
+        return z
+
+    def _components(self, observed):
+        x = self._training_inputs()
+        dtype, device = x.dtype, x.device
+        z = self._inducing_inputs(dtype, device)
+        observed = torch.as_tensor(observed, dtype=dtype, device=device).reshape(-1)
+        n = _feature_count(x)
+        if observed.numel() != n:
+            raise ValueError(
+                f"Sparse GP observations must contain one value per input ({n}); got {observed.numel()} values."
+            )
+        parameter_values = self._named_parameter_values()
+        noise = _resolved_value(self.noise_variance, dtype, device).reshape(-1)
+        if noise.numel() != 1:
+            raise ValueError("Sparse GP noise_variance must be scalar.")
+        noise = noise[0]
+        mean = _resolved_value(self.mean, dtype, device)
+        if mean.numel() == 1:
+            mean = mean.reshape(()).expand(n)
+        else:
+            mean = mean.reshape(-1)
+            if mean.numel() != n:
+                raise ValueError(
+                    f"Sparse GP mean must be scalar or contain one value per input ({n}); got {mean.numel()} values."
+                )
+
+        k_mm = self.kernel(z, z, parameter_values=parameter_values)
+        k_mn = self.kernel(z, x, parameter_values=parameter_values)
+        k_diag = self.kernel.diag(x, parameter_values=parameter_values)
+        factor, jitter_info = stable_cholesky(k_mm, jitter=self.jitter, return_jitter=True)
+        # V = L⁻¹ K_mn, so Q_nn = Vᵀ V and diag(Q_nn) = colsum(V ⊙ V).
+        v = torch.linalg.solve_triangular(factor, k_mn, upper=False)
+        q_diag = v.square().sum(dim=0)
+        if self.method == "fitc":
+            lam = (k_diag - q_diag).clamp_min(0.0) + noise
+        else:
+            lam = noise.expand(n)
+        residual = observed - mean
+        eye_m = torch.eye(v.shape[0], dtype=dtype, device=device)
+        v_scaled = v / lam
+        # Σ = Vᵀ V + Λ and B = I + V Λ⁻¹ Vᵀ = L_B L_Bᵀ, so |Σ| = |Λ| |B|.
+        factor_b = torch.linalg.cholesky(eye_m + v_scaled @ v.transpose(-2, -1))
+        # Woodbury: Σ⁻¹ r = Λ⁻¹ r - Λ⁻¹ Vᵀ L_B⁻ᵀ c with c = L_B⁻¹ V Λ⁻¹ r.
+        c = torch.linalg.solve_triangular(factor_b, (v_scaled @ residual).reshape(-1, 1), upper=False)
+        correction = torch.linalg.solve_triangular(factor_b.transpose(-2, -1), c, upper=True).reshape(-1)
+        alpha = (residual - v.transpose(-2, -1) @ correction) / lam
+        log_det = torch.log(lam).sum() + 2 * torch.log(torch.diagonal(factor_b)).sum()
+        quadratic = (residual.square() / lam).sum() - c.square().sum()
+        log_probability = -0.5 * (quadratic + log_det + n * math.log(2 * math.pi))
+        trace_term = (k_diag - q_diag).sum()
+        if self.method == "vfe":
+            log_probability = log_probability - 0.5 * trace_term / noise
+        return {
+            "x": x, "z": z, "noise": noise, "factor": factor, "jitter_info": jitter_info,
+            "v": v, "lam": lam, "factor_b": factor_b, "alpha": alpha, "trace_term": trace_term,
+            "parameter_values": parameter_values, "log_probability": log_probability,
+        }
+
+    def pdf(self, x):
+        return torch.exp(self.log_pdf(x))
+
+    def log_pdf(self, x):
+        return self._components(x)["log_probability"]
+
+    def log_pdf_grad(self, x):
+        return -self._components(x)["alpha"]
+
+    def log_pdf_param_grads(self, x):
+        r"""Hand-derived gradients of the approximate log marginal likelihood.
+
+        With ``Σ = Q_nn + Λ``, ``α = Σ⁻¹ r`` and ``W = K_mm⁻¹ K_mn``,
+        ``dQ = dK_nm W + Wᵀ dK_mn - Wᵀ dK_mm W`` and
+        ``d log N(y | mean, Σ) = ½ αᵀ dΣ α - ½ tr(Σ⁻¹ dΣ)``. The traces need
+        only ``P = W Σ⁻¹`` (``m x n``) and ``diag(Σ⁻¹)``, both from Woodbury
+        in ``O(n m²)``:
+
+        * ``½ αᵀ dQ α = (dK_mn α)·(Wα) - ½ (Wα)ᵀ dK_mm (Wα)``,
+        * ``½ tr(Σ⁻¹ dQ) = Σ(P ⊙ dK_mn) - ½ Σ((P Wᵀ) ⊙ dK_mm)``,
+        * a diagonal ``dΛ`` contributes ``½ Σ_i dΛ_i (α_i² - (Σ⁻¹)_ii)``, with
+          ``dΛ = dσ² I`` and, for FITC, also ``d diag(K_nn) - diag(dQ)``,
+          ``diag(dQ) = 2 colsum(dK_mn ⊙ W) - colsum(W ⊙ dK_mm W)``,
+        * the VFE trace term adds ``-(tr dK_nn - tr dQ) / (2σ²)`` to the
+          kernel gradients and ``tr(K_nn - Q_nn) / (2σ⁴)`` to the noise one.
+
+        ``dK_mm`` includes the derivative of the scale-dependent jitter.
+        """
+        parts = self._components(x)
+        x_values, z = parts["x"], parts["z"]
+        factor, factor_b, v, lam, alpha = parts["factor"], parts["factor_b"], parts["v"], parts["lam"], parts["alpha"]
+        noise, jitter_info, parameter_values = parts["noise"], parts["jitter_info"], parts["parameter_values"]
+
+        w = torch.linalg.solve_triangular(factor.transpose(-2, -1), v, upper=True)  # K_mm⁻¹ K_mn, (m, n)
+        w_alpha = w @ alpha
+        # Σ⁻¹ = Λ⁻¹ - Gᵀ G with G = L_B⁻¹ V Λ⁻¹.
+        g = torch.linalg.solve_triangular(factor_b, v / lam, upper=False)
+        sigma_inverse_diag = 1.0 / lam - g.square().sum(dim=0)
+        p = w / lam - (w @ g.transpose(-2, -1)) @ g  # W Σ⁻¹, (m, n)
+        p_w = p @ w.transpose(-2, -1)  # W Σ⁻¹ Wᵀ, (m, m)
+        w_w = w @ w.transpose(-2, -1)
+        diag_weight = 0.5 * (alpha.square() - sigma_inverse_diag)
+        is_vfe = self.method == "vfe"
+        is_fitc = self.method == "fitc"
+
+        cross = self.kernel.derivatives(z, x_values, parameter_values=parameter_values)
+        inducing = self.kernel.derivatives(z, z, parameter_values=parameter_values)
+        diagonal = self.kernel.diag_derivatives(x_values, parameter_values=parameter_values) if (is_vfe or is_fitc) else {}
+        gradients = {}
+        for name in {**cross, **inducing, **diagonal}:
+            d_mn = _with_parameter_axis(cross.get(name))
+            d_mm = _with_parameter_axis(inducing.get(name))
+            d_nn = diagonal.get(name)
+            if d_mm is not None:
+                d_mm = _jitter_derivative(jitter_info, d_mm)
+            if d_nn is not None and d_nn.ndim == 1:
+                d_nn = d_nn.unsqueeze(0)
+            if d_mn is not None:
+                shape = d_mn.shape[:-2]
+            elif d_mm is not None:
+                shape = d_mm.shape[:-2]
+            else:
+                shape = d_nn.shape[:-1]
+            gradient = alpha.new_zeros(shape)
+            trace_dq = alpha.new_zeros(shape)
+            diag_dq = alpha.new_zeros((*shape, alpha.numel()))
+            if d_mn is not None:
+                gradient = gradient + (d_mn @ alpha) @ w_alpha - (p * d_mn).sum(dim=(-2, -1))
+                trace_dq = trace_dq + 2 * (d_mn * w).sum(dim=(-2, -1))
+                if is_fitc:
+                    diag_dq = diag_dq + 2 * (d_mn * w).sum(dim=-2)
+            if d_mm is not None:
+                gradient = gradient - 0.5 * (d_mm @ w_alpha) @ w_alpha + 0.5 * (p_w * d_mm).sum(dim=(-2, -1))
+                trace_dq = trace_dq - (w_w * d_mm).sum(dim=(-2, -1))
+                if is_fitc:
+                    diag_dq = diag_dq - ((d_mm @ w) * w).sum(dim=-2)
+            if is_fitc:
+                # The clamp in Λ is inactive for a valid kernel; it is treated
+                # as the identity when differentiating.
+                d_lam = -diag_dq if d_nn is None else d_nn - diag_dq
+                gradient = gradient + (d_lam * diag_weight).sum(dim=-1)
+            if is_vfe:
+                trace_d_knn = d_nn.sum(dim=-1) if d_nn is not None else 0.0
+                gradient = gradient - 0.5 * (trace_d_knn - trace_dq) / noise
+            gradients[name] = gradient
+
+        if _is_named(self.noise_variance):
+            noise_gradient = diag_weight.sum()
+            if is_vfe:
+                noise_gradient = noise_gradient + 0.5 * parts["trace_term"] / noise.square()
+            gradients[self.noise_variance.name] = noise_gradient.reshape(resolve(self.noise_variance).shape)
+
+        if _is_named(self.mean):
+            gradients[self.mean.name] = alpha
+
+        return gradients
+
+    def sample(self, n_samples=1):
+        """Draw from the approximate prior ``Normal(mean, Q_nn + Λ)``.
+
+        Uses ``Vᵀ ε₁ + sqrt(Λ) ε₂`` with ``V = L⁻¹ K_mn``, so no ``n x n``
+        covariance is formed.
+        """
+        x = self._training_inputs()
+        parts = self._components(torch.zeros(_feature_count(x), dtype=x.dtype, device=x.device))
+        v, lam = parts["v"], parts["lam"]
+        mean = _resolved_value(self.mean, x.dtype, x.device)
+        if mean.numel() == 1:
+            mean = mean.reshape(()).expand(lam.numel())
+        first = torch.randn((n_samples, v.shape[0]), dtype=x.dtype, device=x.device) @ v
+        second = torch.randn((n_samples, lam.numel()), dtype=x.dtype, device=x.device) * lam.sqrt()
+        return mean + first + second
 
 
 def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
@@ -479,7 +746,7 @@ def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
 
 
 def _trace_draws(trace, parameter, n_draws, dtype, device):
-    if hasattr(parameter, "name"):
+    if _is_named(parameter):
         if parameter.name not in trace:
             raise KeyError(
                 f"Trace does not contain the model parameter '{parameter.name}'."
@@ -544,7 +811,7 @@ def exact_gp_predictive(
     parameter_draws = {
         parameter.name: _trace_draws(trace, parameter, n_draws, dtype, device)
         for parameter in gp.kernel.parameters
-        if hasattr(parameter, "name")
+        if _is_named(parameter)
     }
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
     mean_draws = _trace_draws(trace, gp.mean, n_draws, dtype, device)
@@ -610,6 +877,112 @@ def exact_gp_predictive(
             predictive_mean
             + torch.randn((n_samples, new_values.shape[0]), dtype=dtype, device=device)
             @ prediction_factor.transpose(-2, -1)
+        )
+
+    return torch.stack(outputs)
+
+
+def sparse_gp_predictive(
+    gp,
+    trace,
+    observed_values,
+    inputs,
+    n_samples=1,
+    observation_noise=None,
+):
+    r"""Sample sparse-GP predictions conditional on observed training values.
+
+    For every hyperparameter draw in ``trace`` the inducing-point posterior
+    ``q(u) = N(K_mm Σ_u K_mn Λ⁻¹ r, K_mm Σ_u K_mm)`` with
+    ``Σ_u = (K_mm + K_mn Λ⁻¹ K_nm)⁻¹`` (Titsias' optimal ``q(u)`` for VFE,
+    the DTC posterior, and for FITC the same with its diagonal ``Λ``) is
+    projected to the new inputs:
+
+    ``mean = K_*m Σ_u K_mn Λ⁻¹ r`` and ``cov = K_** - Q_** + K_*m Σ_u K_m*``.
+
+    All solves use ``m x m`` Cholesky factors, so the cost is linear in the
+    number of training points. The result has shape
+    ``(n_parameter_draws, n_samples, n_new)``.
+    """
+    if not isinstance(gp, SparseGP):
+        raise TypeError("gp must be a SparseGP distribution returned by BayesianDLL.GP.SparseGP.")
+    if not hasattr(trace, "__getitem__") or not hasattr(trace, "keys"):
+        raise TypeError("trace must be a mapping-like sampling result.")
+    if n_samples < 1:
+        raise ValueError("n_samples must be at least 1.")
+
+    training_values = gp._training_inputs()
+    dtype = training_values.dtype
+    device = training_values.device
+    inducing_values = gp._inducing_inputs(dtype, device)
+    new_values = torch.as_tensor(_input_value(inputs)).to(dtype=dtype, device=device)
+    if new_values.ndim == 0:
+        new_values = new_values.reshape(1)
+    n_training = _feature_count(training_values)
+    n_new = _feature_count(new_values)
+    observed_values = torch.as_tensor(_input_value(observed_values), dtype=dtype, device=device).reshape(-1)
+    if observed_values.numel() != n_training:
+        raise ValueError(
+            f"observed_values must contain one value per training input ({n_training}); "
+            f"got {observed_values.numel()} values."
+        )
+
+    first_value = next(iter(trace.values()))
+    n_draws = first_value.shape[0] * first_value.shape[1] if first_value.ndim >= 2 else first_value.shape[0]
+    parameter_draws = {
+        parameter.name: _trace_draws(trace, parameter, n_draws, dtype, device)
+        for parameter in gp.kernel.parameters
+        if _is_named(parameter)
+    }
+    noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
+    mean_draws = _trace_draws(trace, gp.mean, n_draws, dtype, device)
+    eye_m = torch.eye(_feature_count(inducing_values), dtype=dtype, device=device)
+
+    outputs = []
+    for draw_index in range(n_draws):
+        kernel_values = {name: values[draw_index] for name, values in parameter_draws.items()}
+        noise = noise_draws[draw_index].reshape(-1)
+        if noise.numel() != 1:
+            raise ValueError("Sparse GP noise_variance must be scalar.")
+        mean_value = mean_draws[draw_index].reshape(-1)
+        if mean_value.numel() != 1:
+            raise ValueError("sparse_gp_predictive supports only a scalar mean.")
+        mean_train = mean_value.reshape(()).expand(n_training)
+        mean_new = mean_value.reshape(()).expand(n_new)
+
+        k_mm = gp.kernel(inducing_values, inducing_values, parameter_values=kernel_values)
+        k_mn = gp.kernel(inducing_values, training_values, parameter_values=kernel_values)
+        k_ms = gp.kernel(inducing_values, new_values, parameter_values=kernel_values)
+        k_ss = gp.kernel(new_values, new_values, parameter_values=kernel_values)
+        factor = stable_cholesky(k_mm, jitter=gp.jitter)
+        v = torch.linalg.solve_triangular(factor, k_mn, upper=False)
+        v_new = torch.linalg.solve_triangular(factor, k_ms, upper=False)
+        if gp.method == "fitc":
+            k_diag = gp.kernel.diag(training_values, parameter_values=kernel_values)
+            lam = (k_diag - v.square().sum(dim=0)).clamp_min(0.0) + noise[0]
+        else:
+            lam = noise[0].expand(n_training)
+        # Σ_u = L⁻ᵀ B⁻¹ L⁻¹ with B = I + V Λ⁻¹ Vᵀ = L_B L_Bᵀ.
+        factor_b = torch.linalg.cholesky(eye_m + (v / lam) @ v.transpose(-2, -1))
+        c = torch.linalg.solve_triangular(
+            factor_b, ((v / lam) @ (observed_values - mean_train)).reshape(-1, 1), upper=False
+        )
+        projected = torch.linalg.solve_triangular(factor_b, v_new, upper=False)  # L_B⁻¹ L⁻¹ K_m*
+        predictive_mean = mean_new + (projected.transpose(-2, -1) @ c).reshape(-1)
+        predictive_covariance = (
+            k_ss
+            - v_new.transpose(-2, -1) @ v_new
+            + projected.transpose(-2, -1) @ projected
+        )
+        if observation_noise is not None:
+            predictive_covariance = predictive_covariance + _resolved_value(
+                observation_noise, dtype=dtype, device=device
+            ).reshape(-1)[0] * torch.eye(n_new, dtype=dtype, device=device)
+        predictive_covariance = (predictive_covariance + predictive_covariance.transpose(-2, -1)) / 2
+        prediction_factor = stable_cholesky(predictive_covariance, jitter=gp.jitter)
+        outputs.append(
+            predictive_mean
+            + torch.randn((n_samples, n_new), dtype=dtype, device=device) @ prediction_factor.transpose(-2, -1)
         )
 
     return torch.stack(outputs)
