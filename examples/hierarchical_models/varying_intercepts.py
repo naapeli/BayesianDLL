@@ -84,6 +84,8 @@ y_data.set_value(torch.zeros(50, dtype=torch.float64))
 predictive = model.posterior_predicative(trace, n_samples=200, samples_per_step=5, warmup_per_sample=20, progress_bar=False)
 draws = predictive["y"].flatten(0, 1)  # (draws, 50)
 lower, median, upper = draws.quantile(torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
+print("90% predictive interval width at x = 0: "
+      f"group 0 {(upper[12] - lower[12]).item():.2f}, new group {(upper[37] - lower[37]).item():.2f}")
 
 fig, ax = plt.subplots(figsize=(9, 5))
 mask = group == 0

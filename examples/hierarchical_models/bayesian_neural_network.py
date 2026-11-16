@@ -45,7 +45,9 @@ with Model() as model:
         f = Add("f", MatMul("h_w2", hidden, w2), b2)  # (N,)
         ObservedParameter("y", Normal(f, sigma), y)
 
-trace = model.sample(n_samples=300, warmup_length=300, n_chains=2, progress_bar=False, seed=0, delta=0.8)
+# Neural network posteriors are multimodal and strongly correlated, so the
+# trajectories are capped at 2 ** 6 leapfrog steps to bound the run time.
+trace = model.sample(n_samples=250, warmup_length=250, n_chains=2, progress_bar=False, seed=0, delta=0.8, max_depth=6)
 print("divergences:", sum(trace.divergences))
 print(trace.summary().loc[["sigma[0]", "b2[0]"]])
 
