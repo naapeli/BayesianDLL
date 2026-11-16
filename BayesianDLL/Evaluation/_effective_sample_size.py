@@ -1,7 +1,7 @@
 import torch
 import numpy as np
-from scipy.stats import rankdata, norm
-from scipy.fftpack import next_fast_len
+
+from ._numerics import autocov, z_scale
 
 
 def _split_chains(ary: np.ndarray) -> np.ndarray:
@@ -11,25 +11,11 @@ def _split_chains(ary: np.ndarray) -> np.ndarray:
 
 
 def _z_scale(ary: np.ndarray) -> np.ndarray:
-    size = ary.size
-    ranks = rankdata(ary.flatten(), method="average")
-    u = (ranks - 0.375) / (size + 0.25)
-    u = np.clip(u, 1e-10, 1.0 - 1e-10)
-    z = norm.ppf(u)
-    return z.reshape(ary.shape)
+    return z_scale(torch.from_numpy(np.ascontiguousarray(ary, dtype=np.float64))).numpy()
 
 
 def _autocov(ary: np.ndarray, axis: int = 1) -> np.ndarray:
-    n = ary.shape[axis]
-    m = next_fast_len(2 * n)
-    ary_centered = ary - ary.mean(axis=axis, keepdims=True)
-
-    ifft_ary = np.fft.rfft(ary_centered, n=m, axis=axis)
-    ifft_ary *= np.conjugate(ifft_ary)
-
-    cov = np.fft.irfft(ifft_ary, n=m, axis=axis)[:, :n]
-    cov /= n
-    return cov
+    return autocov(torch.from_numpy(np.ascontiguousarray(ary, dtype=np.float64)), dim=axis).numpy()
 
 
 def _ess_core(ary: np.ndarray) -> float:

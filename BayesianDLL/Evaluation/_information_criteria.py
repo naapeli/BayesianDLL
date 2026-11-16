@@ -21,9 +21,16 @@ from warnings import warn
 
 import numpy as np
 import torch
-from scipy.special import logsumexp
 
 from ._effective_sample_size import effective_sample_size
+
+
+def _logsumexp(values, axis=None):
+    """``log(sum(exp(values)))`` over ``axis`` (all axes by default) of a numpy array, via ``torch.logsumexp``."""
+    values = torch.from_numpy(np.asarray(values, dtype=np.float64))
+    dims = tuple(range(values.ndim)) if axis is None else axis
+    result = torch.logsumexp(values, dim=dims)
+    return float(result) if result.ndim == 0 else result.numpy()
 
 
 @dataclass
@@ -160,7 +167,7 @@ def waic(result, var_name=None, pointwise=False):
     n_samples = n_chains * n_draws
     flat = log_lik.reshape(n_samples, n_obs)
 
-    lppd_i = logsumexp(flat, axis=0) - math.log(n_samples)
+    lppd_i = _logsumexp(flat, axis=0) - math.log(n_samples)
     p_waic_i = np.var(flat, axis=0, ddof=1)
     elpd_i = lppd_i - p_waic_i
 
@@ -210,7 +217,7 @@ def _gpd_fit(x):
 
     k = np.mean(np.log1p(-b[:, None] * x[None, :]), axis=1)
     log_lik = n * (np.log(-b / k) - k - 1.0)
-    weights = np.exp(log_lik - logsumexp(log_lik))
+    weights = np.exp(log_lik - _logsumexp(log_lik))
     keep = weights >= 10 * np.finfo(np.float64).eps
     b, weights = b[keep], weights[keep]
     weights = weights / weights.sum()
@@ -272,9 +279,9 @@ def psis(log_ratios, r_eff=1.0, truncate=True):
         warn(f"The PSIS tail has only {tail_length} draws (at least 5 are needed); the importance ratios are not smoothed.", stacklevel=3)
 
     if truncate:
-        log_mean = logsumexp(log_weights) - math.log(n_samples)
+        log_mean = _logsumexp(log_weights) - math.log(n_samples)
         log_weights = np.minimum(log_weights, 0.75 * math.log(n_samples) + log_mean)
-    log_weights = log_weights - logsumexp(log_weights)
+    log_weights = log_weights - _logsumexp(log_weights)
     return log_weights, k_hat
 
 
@@ -335,8 +342,8 @@ def loo(result, var_name=None, pointwise=False, reff=None):
     k_hat = np.empty(n_obs)
     for i in range(n_obs):
         log_weights, k_hat[i] = psis(-flat[:, i], r_eff=float(r_eff[i]))
-        elpd_i[i] = logsumexp(log_weights + flat[:, i])
-    lppd_i = logsumexp(flat, axis=0) - math.log(n_samples)
+        elpd_i[i] = _logsumexp(log_weights + flat[:, i])
+    lppd_i = _logsumexp(flat, axis=0) - math.log(n_samples)
     p_loo_i = lppd_i - elpd_i
 
     good_k = _good_k(n_samples)

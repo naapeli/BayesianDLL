@@ -1,8 +1,9 @@
 import matplotlib.pyplot as plt
-from scipy.stats import gaussian_kde
 import numpy as np
+import torch
 
 from ...Samplers._result import PredicativeResult
+from .._numerics import gaussian_kde
 
 
 def plot_predicative_distribution(
@@ -38,8 +39,7 @@ def plot_predicative_distribution(
             samples = predicative_samples[i].detach().cpu().reshape(-1).numpy()
             # calculate the pdf
             if method == "kde":
-                est = gaussian_kde(samples)
-                result = est(x_grid)
+                result = gaussian_kde(torch.from_numpy(samples), torch.from_numpy(x_grid)).numpy()
             elif method == "hist":
                 hist, bin_edges = np.histogram(samples, bins=bins, range=(left_boarder, right_boarder), density=True)
                 bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
@@ -63,8 +63,7 @@ def plot_predicative_distribution(
 
             # calculate the pdf
             if method == "kde":
-                est = gaussian_kde(obs)
-                obs_values = est(x_grid)
+                obs_values = gaussian_kde(torch.from_numpy(obs), torch.from_numpy(x_grid)).numpy()
             elif method == "hist":
                 hist, bin_edges = np.histogram(obs, bins=bins, range=(left_boarder, right_boarder), density=True)
                 bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2

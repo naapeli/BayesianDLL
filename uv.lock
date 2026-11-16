@@ -118,7 +118,6 @@ dependencies = [
     { name = "pillow" },
     { name = "pyparsing" },
     { name = "python-dateutil" },
-    { name = "scipy" },
     { name = "six" },
     { name = "sympy" },
     { name = "threadpoolctl" },
@@ -133,6 +132,7 @@ dev = [
     { name = "pyro-api" },
     { name = "pyro-ppl" },
     { name = "pytest" },
+    { name = "scipy" },
 ]
 docs = [
     { name = "sphinx" },
@@ -164,7 +164,6 @@ requires-dist = [
     { name = "pillow", specifier = "==11.2.1" },
     { name = "pyparsing", specifier = "==3.2.3" },
     { name = "python-dateutil", specifier = "==2.9.0.post0" },
-    { name = "scipy", specifier = "==1.15.2" },
     { name = "six", specifier = "==1.17.0" },
     { name = "sympy", specifier = "==1.13.1" },
     { name = "threadpoolctl", specifier = "==3.6.0" },
@@ -179,6 +178,7 @@ dev = [
     { name = "pyro-api", specifier = "==0.1.2" },
     { name = "pyro-ppl", specifier = "==1.9.1" },
     { name = "pytest", specifier = ">=9.1.1" },
+    { name = "scipy", specifier = "==1.15.2" },
 ]
 docs = [
     { name = "sphinx", specifier = ">=8.2" },
