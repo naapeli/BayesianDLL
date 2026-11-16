@@ -58,15 +58,15 @@ binary/count distributions accept either probabilities or `logits=`.
 
 ### Logistic regression
 
-`Linear` creates the linear predictor and `Sigmoid` converts it to a
-probability for a Bernoulli likelihood:
+`Linear` creates the linear predictor, which is passed to the Bernoulli
+likelihood as `logits=`:
 
 ```python
 import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, plate
-from BayesianDLL.Deterministic import Linear, Sigmoid
+from BayesianDLL.Deterministic import Linear
 from BayesianDLL.Distributions import Bernoulli, Normal
 from BayesianDLL.Evaluation import Graphics, summary
 
@@ -80,10 +80,9 @@ with Model() as model:
     slope = RandomParameter("slope", Normal(0.0, 1.5))
 
     logits = Linear("logits", inputs, slope=slope, intercept=intercept)
-    probability = Sigmoid("probability", logits)
 
     with plate("observations", x):
-        ObservedParameter("observations", Bernoulli(probability), y)
+        ObservedParameter("observations", Bernoulli(logits=logits), y)
 
 Graphics.plot_model(model)
 trace = model.sample(500, 500)

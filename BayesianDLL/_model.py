@@ -382,6 +382,19 @@ class Model:
                 if node_name in cotangents:
                     det_param = self.deterministic_params[node_name]
                     bar_v = cotangents[node_name]
+                    if getattr(det_param, "vjp_func", None) is not None:
+                        # Vector-Jacobian product: no Jacobian is materialised.
+                        input_values = det_param.input_values()
+                        input_grads = det_param.vjp(bar_v, input_values)
+                        seen = set()
+                        for inp, value in zip(det_param.inputs, input_values):
+                            inp_name = getattr(inp, "name", None)
+                            if inp_name in seen or inp_name not in input_grads:
+                                continue
+                            seen.add(inp_name)
+                            if inp_name in self.params or inp_name in self.deterministic_params:
+                                _add_grad(cotangents, inp_name, _sum_to_shape(input_grads[inp_name], value.shape))
+                        continue
                     local_derivatives = det_param.derivatives()
                     for inp in det_param.inputs:
                         inp_name = inp.name if hasattr(inp, "name") else None

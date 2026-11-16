@@ -189,11 +189,35 @@ class ObservedParameter:
 
 
 class DeterministicParameter:
-    def __init__(self, name, forward_func, derivative_func, inputs):
+    """A node whose value is a deterministic function of other model nodes.
+
+    ``forward_func(*input_values)`` computes the value from the constrained
+    values of ``inputs`` (named model nodes). The reverse pass of the model
+    needs the derivatives of the output w.r.t. the inputs, given in one of two
+    ways:
+
+    * ``derivative_func(*input_values) -> {input_name: local_derivative}``,
+      where a local derivative is either elementwise (broadcastable to the
+      output) or a dense Jacobian of shape ``(output.numel(), input.numel())``.
+    * ``vjp_func(cotangent, *input_values) -> {input_name: grad}``, a
+      vector-Jacobian product: given the gradient ``cotangent`` w.r.t. the
+      output (shape of the output), return the gradient w.r.t. each input.
+      Gradients are summed onto the input shape when they broadcast. This
+      avoids materialising Jacobians and is used by the reverse pass whenever
+      it is given. Inputs missing from the returned dict get no gradient.
+
+    When only ``vjp_func`` is given, :meth:`derivatives` builds dense
+    Jacobians from it (one VJP per output element).
+    """
+
+    def __init__(self, name, forward_func, derivative_func=None, inputs=(), vjp_func=None):
+        if derivative_func is None and vjp_func is None:
+            raise TypeError("A DeterministicParameter needs derivative_func or vjp_func.")
         self.name = name
         self.forward_func = forward_func
         self.derivative_func = derivative_func
-        self.inputs = inputs
+        self.vjp_func = vjp_func
+        self.inputs = list(inputs)
         self.owner_model = get_active_model()
         self.plates = get_active_plates()
 
@@ -220,7 +244,48 @@ class DeterministicParameter:
 
     def derivatives(self):
         inputs = [self._get_constrained_value(input) for input in self.inputs]
-        return self.derivative_func(*inputs)
+        if self.derivative_func is not None:
+            return self.derivative_func(*inputs)
+        return self._dense_jacobians(inputs)
+
+    def input_values(self):
+        """Constrained values of ``inputs``, in order."""
+        return [self._get_constrained_value(input) for input in self.inputs]
+
+    def vjp(self, cotangent, input_values=None):
+        """Gradients ``{input_name: cotangent^T J_input}`` (requires ``vjp_func``)."""
+        if self.vjp_func is None:
+            raise NotImplementedError(f"'{self.name}' has no vjp_func.")
+        if input_values is None:
+            input_values = self.input_values()
+        return self.vjp_func(cotangent, *input_values)
+
+    def _dense_jacobians(self, inputs):
+        """Jacobians ``(output.numel(), input.numel())`` built row by row from ``vjp_func``."""
+        output = self.forward_func(*inputs)
+        flat = torch.zeros(output.numel(), dtype=output.dtype, device=output.device)
+        names = [getattr(input, "name", None) for input in self.inputs]
+        shapes = {name: torch.as_tensor(value).shape for name, value in zip(names, inputs) if name is not None}
+        rows = {name: [] for name in shapes}
+        for i in range(output.numel()):
+            flat.zero_()
+            flat[i] = 1
+            grads = self.vjp_func(flat.reshape(output.shape), *inputs)
+            for name, shape in shapes.items():
+                grad = grads.get(name)
+                if grad is None:
+                    grad = torch.zeros(shape, dtype=output.dtype, device=output.device)
+                else:
+                    from ._model import _sum_to_shape
+                    grad = _sum_to_shape(grad, shape)
+                rows[name].append(grad.reshape(-1))
+        result = {}
+        for name, shape in shapes.items():
+            if rows[name]:
+                result[name] = torch.stack(rows[name], dim=0)
+            else:
+                result[name] = torch.zeros((0, shape.numel()), dtype=output.dtype, device=output.device)
+        return result
 
     def _get_constrained_value(self, input):
         if isinstance(input, torch.Tensor):
