@@ -19,6 +19,8 @@ from ._process import (
     GaussianProcess,
     LatentGP,
     exact_gp_predictive,
+    SparseGP,
+    sparse_gp_predictive,
     gp_predictive,
     stable_cholesky,
 )
@@ -41,5 +43,7 @@ __all__ = [
     "ExactGaussianProcess",
     "gp_predictive",
     "exact_gp_predictive",
+    "SparseGP",
+    "sparse_gp_predictive",
     "stable_cholesky",
 ]
