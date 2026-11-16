@@ -6,4 +6,4 @@ from .Samplers import (
     sample, sample_predicative, sample_prior_predicative, sample_posterior_predicative,
     posterior_predicative, SamplingResult, PredicativeResult, thin,
 )
-from .Variational import find_MAP
+from .Variational import find_MAP, AutoNormal, AutoMultivariateNormal, laplace_approximation

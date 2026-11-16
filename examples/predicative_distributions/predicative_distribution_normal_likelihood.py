@@ -4,6 +4,10 @@ Prior Predictive: Normal Likelihood
 
 Samples the prior predictive distribution of a normal model with unknown mean and
 standard deviation and compares its pdf and cdf to the observed data.
+
+The prior predictive is drawn exactly by ancestral sampling: the parameters are
+drawn from their priors and the data from the likelihood, without any MCMC. The
+prior draws of the parameters are returned in ``predicative_distribution.prior``.
 """
 
 import torch
@@ -22,14 +26,16 @@ true_mean, true_variance = 5, 3
 data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N,), dtype=torch.float64)
 print(data.mean(), data.var())
 
-n_samples = 100
+n_samples = 30
 with Model() as model:
     mean = RandomParameter("mean", Normal(mu0, tau))
     sigma = RandomParameter("sigma", HalfNormal(3.0))
     with plate("data", N):
         likelihood = ObservedParameter("likelihood", Normal(mean, sigma), data)
-    predicative_distribution = model.sample_prior_predicative(n_samples, 5000, samples_per_step=10)
+    predicative_distribution = model.sample_prior_predicative(n_samples, samples_per_step=10)
     # predicative_distribution = model.sample_posterior_predicative(n_samples, 1000, samples_per_step=10)
+
+print(predicative_distribution.prior.summary())
 
 _, axes = plt.subplots(1, 2, figsize=(12, 5), layout="constrained")
 plot_predicative_distribution(predicative_distribution, data, kind="pdf", ax=axes[0])

@@ -63,6 +63,8 @@ def draw_shaped(distribution, n, target_shape, reparametrized=False):
             index, rank, m = _broadcast_index(source_shape, target_shape)
 
             def rearrange(values):
+                if n_source == 1:
+                    return values.reshape(n, *target_shape)
                 values = values.reshape(n, m, n_source)
                 return values[:, rank, index].reshape(n, *target_shape)
 
