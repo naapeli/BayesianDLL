@@ -197,36 +197,53 @@ def test_predictive_wrappers_condition_on_correct_model(normal_model, monkeypatc
     normal_model.observed_params["data"].sampler = "metropolis"
     wrapper = normal_model.sample_prior_predicative if prior else normal_model.sample_posterior_predicative
     result = wrapper(n_samples=2, warmup_length=1, samples_per_step=2, warmup_per_sample=1, progress_bar=False)
-    assert calls == [set() if prior else {"data"}]
+    # The prior predictive is drawn by ancestral sampling and runs no MCMC.
+    assert calls == ([] if prior else [{"data"}])
     assert normal_model.observed_params is original
     assert result["data"].shape == (2, 2, 3)
 
 
-def test_prior_predictive_restores_observations_on_failure(normal_model, monkeypatch):
-    module = importlib.import_module("BayesianDLL.Samplers._sample")
-    original = normal_model.observed_params
+def test_prior_predictive_restores_parameters_on_failure(normal_model, monkeypatch):
+    original = normal_model.params["mean"].unconstrained_value.clone()
+    distribution = normal_model.observed_params["data"].distribution
     def fail(*args, **kwargs):
         raise ValueError("sampling failed")
-    monkeypatch.setattr(module, "sample", fail)
+    monkeypatch.setattr(distribution, "sample", fail)
     with pytest.raises(ValueError, match="sampling failed"):
         normal_model.sample_prior_predicative(progress_bar=False)
-    assert normal_model.observed_params is original
+    torch.testing.assert_close(normal_model.params["mean"].unconstrained_value, original)
 
 
 def test_predictive_restores_parameters_on_failure(normal_model, monkeypatch):
-    module = importlib.import_module("BayesianDLL.Samplers._sample")
     original = normal_model.params["mean"].unconstrained_value.clone()
-    class FailingSampler:
-        def reset(self):
-            pass
-
-        def step(self, *args):
-            assert normal_model.params["mean"].constrained_value.item() == 2
-            raise ValueError("step failed")
-    monkeypatch.setattr(module, "_decide_predicative_step", lambda parameter: FailingSampler())
+    distribution = normal_model.observed_params["data"].distribution
+    def fail(*args, **kwargs):
+        assert normal_model.params["mean"].constrained_value.item() == 2
+        raise ValueError("step failed")
+    monkeypatch.setattr(distribution, "sample", fail)
     with pytest.raises(ValueError, match="step failed"):
         sample_predicative({"mean": torch.full((1, 2, 1), 2.0)}, n_samples=1, model=normal_model, progress_bar=False)
     torch.testing.assert_close(normal_model.params["mean"].unconstrained_value, original)
+
+
+def test_predictive_falls_back_to_mcmc_without_sampler(normal_model, monkeypatch):
+    module = importlib.import_module("BayesianDLL.Samplers._sample")
+    distribution = normal_model.observed_params["data"].distribution
+    def not_implemented(*args, **kwargs):
+        raise NotImplementedError
+    monkeypatch.setattr(distribution, "sample", not_implemented)
+    calls = []
+    original = module._decide_predicative_step
+    def spy(parameter):
+        calls.append(parameter.name)
+        return original(parameter)
+    monkeypatch.setattr(module, "_decide_predicative_step", spy)
+    trace = {"mean": torch.full((1, 4, 1), 2.0)}
+    with pytest.warns(UserWarning, match="falling back to MCMC"):
+        result = sample_predicative(trace, n_samples=2, samples_per_step=30, warmup_per_sample=30, model=normal_model, progress_bar=False)
+    assert calls == ["data"]
+    assert result["data"].shape == (2, 30, 3)
+    assert abs(result["data"].mean().item() - 2.0) < 0.6
 
 
 def test_predictive_transforms_constrained_priors_and_observations():

@@ -12,7 +12,7 @@ from ._state_space import (
     ContinuousReal, ContinuousPositive, ContinuousRange, ContinuousSimplex, DiscretePositive, DiscreteRange, Union,
     DiscreteNonNegative, ContinuousCorrCholesky,
 )
-from .._parameters import RandomParameter, DeterministicParameter, VariationalParameter
+from .._parameters import RandomParameter, DeterministicParameter, ObservedParameter, VariationalParameter
 from .._data import Data
 from ._resolve import resolve
 
@@ -192,12 +192,12 @@ class Distribution(ABC):
         return term1 + d_log_det
 
     def resolve_name(self, name, parameter):
-        if isinstance(parameter, RandomParameter | DeterministicParameter | VariationalParameter | Data):
+        if isinstance(parameter, RandomParameter | DeterministicParameter | ObservedParameter | VariationalParameter | Data):
             return parameter.name
         return name
 
     def add_dependency(self, parameter):
-        if isinstance(parameter, RandomParameter | DeterministicParameter | Data):
+        if isinstance(parameter, RandomParameter | DeterministicParameter | ObservedParameter | Data):
             self.parameters.add(parameter.name)
         if isinstance(parameter, VariationalParameter):
             self.variational_parameters[parameter.name] = parameter

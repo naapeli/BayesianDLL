@@ -121,8 +121,16 @@ class SamplingResult:
 
 
 class PredicativeResult:
-    def __init__(self, samples: dict[str, torch.Tensor]):
+    """Predictive draws of shape ``(n_samples, samples_per_step, *predictive_shape)`` per observed node.
+
+    ``prior`` holds the prior draws of the model parameters (a
+    :class:`SamplingResult` with one chain) for results of
+    ``sample_prior_predicative``, and is ``None`` otherwise.
+    """
+
+    def __init__(self, samples: dict[str, torch.Tensor], prior=None):
         self.samples = samples
+        self.prior = prior
 
     def __getitem__(self, key):
         return self.samples[key]
@@ -155,7 +163,10 @@ class PredicativeResult:
             thinned = {name: val[s, s] for name, val in self.samples.items()}
         else:
             raise ValueError(f"dim must be 0, 1, or (0, 1), got {dim}.")
-        return PredicativeResult(thinned)
+        prior = self.prior
+        if prior is not None and dim != 1:
+            prior = prior.thin(step)
+        return PredicativeResult(thinned, prior=prior)
 
     def __repr__(self):
         return f"PredicativeResult(samples={list(self.samples.keys())})"
