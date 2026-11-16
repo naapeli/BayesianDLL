@@ -7,10 +7,11 @@ from abc import ABC, abstractmethod
 from ._transforms import (
     IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform, InverseSoftPlusTransform,
     StickBreakingTransform, CorrCholeskyTransform, ChainTransform, _apply_jacobian_transpose, _log1m_tanh_sq,
+    PositiveDefiniteTransform,
 )
 from ._state_space import (
     ContinuousReal, ContinuousPositive, ContinuousRange, ContinuousSimplex, DiscretePositive, DiscreteRange, Union,
-    DiscreteNonNegative, ContinuousCorrCholesky,
+    DiscreteNonNegative, ContinuousCorrCholesky, ContinuousPositiveDefinite,
 )
 from .._parameters import RandomParameter, DeterministicParameter, VariationalParameter
 from .._data import Data
@@ -1139,6 +1140,184 @@ class LKJCholesky(Distribution):
         w = torch.sqrt(y) * u
         diag = (1 - (w ** 2).sum(-1)).clamp(min=torch.finfo(eta.dtype).tiny).sqrt()
         return w + torch.diag_embed(diag)
+
+
+def _spd_parts(X):
+    """Cholesky factor, inverse and log-determinant of SPD matrices."""
+    L = torch.linalg.cholesky(X)
+    inv = torch.cholesky_inverse(L)
+    logdet = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
+    return L, inv, logdet
+
+
+def _bartlett(df, shape, D, dtype, device):
+    """Lower-triangular Bartlett factor ``A`` with ``A A^T ~ Wishart(df, I)``."""
+    i = torch.arange(D, dtype=dtype, device=device)
+    chi2 = 2 * _standard_gamma((0.5 * (df.unsqueeze(-1) - i)).expand(*shape, D))
+    A = torch.tril(torch.randn(*shape, D, D, dtype=dtype, device=device), diagonal=-1)
+    return A + torch.diag_embed(torch.sqrt(chi2))
+
+
+class _WishartFamily(Distribution):
+    """Shared parameter handling of :class:`Wishart` and :class:`InverseWishart`."""
+
+    def __init__(self, df, scale=None, scale_tril=None):
+        _check_exactly_one(["scale", "scale_tril"], [scale, scale_tril])
+        D = resolve(scale if scale is not None else scale_tril).shape[-1]
+        super().__init__(PositiveDefiniteTransform(D), ContinuousPositiveDefinite(), ContinuousReal())
+        self.dim = D
+        self.df = df
+        self.scale = scale
+        self.scale_tril = scale_tril
+        self.add_dependency(df)
+        self.add_dependency(scale if scale is not None else scale_tril)
+
+    @property
+    def event_shape(self):
+        return (self.dim, self.dim)
+
+    @property
+    def batch_shape(self):
+        matrix = resolve(self.scale if self.scale is not None else self.scale_tril)
+        return torch.broadcast_shapes(resolve(self.df).shape, matrix.shape[:-2])
+
+    def _params(self):
+        """(df, L_S, S^-1, log det S)."""
+        if self.scale is not None:
+            df, S = _as_float(self.df, self.scale)
+            L, S_inv, logdet = _spd_parts(S)
+        else:
+            df, L = _as_float(self.df, self.scale_tril)
+            S_inv = torch.cholesky_inverse(L)
+            logdet = 2 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(-1)
+        return df, L, S_inv, logdet
+
+    def _log_mvgamma(self, df):
+        return _mvlgamma(0.5 * df, self.dim)
+
+    def _matrix_grads(self, grad_scale, L):
+        """Return the param-grad entry for ``scale`` (full symmetric) or ``scale_tril``."""
+        if self.scale is not None:
+            return {self.resolve_name("scale", self.scale): grad_scale}
+        return {self.resolve_name("scale_tril", self.scale_tril): torch.tril(2 * grad_scale @ L)}
+
+    def _no_rsample(self, flag):
+        if flag:
+            raise self._no_reparam()
+
+
+class Wishart(_WishartFamily):
+    """Wishart distribution over ``D x D`` SPD matrices with ``df`` degrees of freedom.
+
+    ``Wishart(df, scale)`` or ``Wishart(df, scale_tril=L)`` with
+    ``scale = L L^T``; ``E[X] = df * scale``. Sampled in the
+    ``D(D+1)/2``-dimensional unconstrained space of a
+    :class:`PositiveDefiniteTransform`. Matrix gradients are full symmetric
+    matrices (entries treated as independent), the ``scale_tril`` gradient is
+    lower triangular.
+    """
+
+    def log_pdf(self, x):
+        df, _, S_inv, logdet_S = self._params()
+        _, _, logdet_X = _spd_parts(x)
+        D = self.dim
+        trace = (S_inv * x).sum((-2, -1))
+        return (0.5 * (df - D - 1) * logdet_X - 0.5 * trace - 0.5 * df * D * math.log(2.0)
+                - 0.5 * df * logdet_S - self._log_mvgamma(df))
+
+    def log_pdf_grad(self, x):
+        df, _, S_inv, _ = self._params()
+        _, X_inv, _ = _spd_parts(x)
+        return 0.5 * (df - self.dim - 1)[..., None, None] * X_inv - 0.5 * S_inv
+
+    def log_pdf_param_grads(self, x):
+        df, L, S_inv, logdet_S = self._params()
+        _, _, logdet_X = _spd_parts(x)
+        D = self.dim
+        grad_df = 0.5 * logdet_X - 0.5 * D * math.log(2.0) - 0.5 * logdet_S - 0.5 * _mvdigamma(0.5 * df, D)
+        grad_scale = 0.5 * S_inv @ x @ S_inv - 0.5 * df[..., None, None] * S_inv
+        grads = {self.resolve_name("df", self.df): grad_df}
+        grads.update(self._matrix_grads(grad_scale, L))
+        return grads
+
+    def _log_prob_unconstrained(self, x_unconstrained):
+        df, L_S, _, logdet_S = self._params()
+        T = self.transform
+        L = T.cholesky(x_unconstrained)
+        D = self.dim
+        diag_z = torch.log(torch.diagonal(L, dim1=-2, dim2=-1))
+        batch = torch.broadcast_shapes(L.shape[:-2], L_S.shape[:-2])
+        A = torch.linalg.solve_triangular(L_S.expand(*batch, D, D), L.expand(*batch, D, D), upper=False)
+        log_prob = ((df - D - 1)[..., None] * diag_z).sum(-1) - 0.5 * (A ** 2).sum((-2, -1)) \
+            - 0.5 * df * D * math.log(2.0) - 0.5 * df * logdet_S - self._log_mvgamma(df)
+        return log_prob.sum() + T.log_abs_det_jacobian(x_unconstrained)
+
+    def _log_prob_grad_unconstrained(self, x_unconstrained):
+        df, _, S_inv, _ = self._params()
+        T = self.transform
+        z = x_unconstrained
+        L = T.cholesky(z)
+        rows, cols = T._indices(z.device)
+        bar_L = -(S_inv @ L)[..., rows, cols]
+        grad = torch.where(rows == cols, bar_L * L[..., rows, cols], bar_L)
+        diag = torch.where(rows == cols, torch.ones((), dtype=z.dtype, device=z.device), torch.zeros((), dtype=z.dtype, device=z.device))
+        return grad + (df - self.dim - 1)[..., None] * diag + T.grad_log_abs_det_jacobian(z)
+
+    def sample(self, n_samples=1, _reparametrization_trick_grad=False):
+        """Bartlett decomposition: ``X = L_S A A^T L_S^T``."""
+        self._no_rsample(_reparametrization_trick_grad)
+        df, L, _, _ = self._params()
+        shape = (n_samples, *self.batch_shape)
+        A = _bartlett(df.expand(shape), shape, self.dim, df.dtype, df.device)
+        B = L @ A
+        return B @ B.transpose(-2, -1)
+
+
+class InverseWishart(_WishartFamily):
+    """Inverse-Wishart distribution: ``X^-1 ~ Wishart(df, scale^-1)``.
+
+    ``InverseWishart(df, scale)`` or ``InverseWishart(df, scale_tril=L)``;
+    ``E[X] = scale / (df - D - 1)``. Same transform and gradient conventions
+    as :class:`Wishart`.
+    """
+
+    def log_pdf(self, x):
+        df, _, S, logdet_S = self._scale_params()
+        _, X_inv, logdet_X = _spd_parts(x)
+        D = self.dim
+        trace = (S * X_inv).sum((-2, -1))
+        return (0.5 * df * logdet_S - 0.5 * df * D * math.log(2.0) - self._log_mvgamma(df)
+                - 0.5 * (df + D + 1) * logdet_X - 0.5 * trace)
+
+    def _scale_params(self):
+        """(df, L_S, S, log det S)."""
+        df, L, _, logdet = self._params()
+        return df, L, L @ L.transpose(-2, -1), logdet
+
+    def log_pdf_grad(self, x):
+        df, _, S, _ = self._scale_params()
+        _, X_inv, _ = _spd_parts(x)
+        return -0.5 * (df + self.dim + 1)[..., None, None] * X_inv + 0.5 * X_inv @ S @ X_inv
+
+    def log_pdf_param_grads(self, x):
+        df, L, S_inv, logdet_S = self._params()
+        _, X_inv, logdet_X = _spd_parts(x)
+        D = self.dim
+        grad_df = 0.5 * logdet_S - 0.5 * D * math.log(2.0) - 0.5 * _mvdigamma(0.5 * df, D) - 0.5 * logdet_X
+        grad_scale = 0.5 * df[..., None, None] * S_inv - 0.5 * X_inv
+        grads = {self.resolve_name("df", self.df): grad_df}
+        grads.update(self._matrix_grads(grad_scale, L))
+        return grads
+
+    def sample(self, n_samples=1, _reparametrization_trick_grad=False):
+        """``X = L_S A^-T A^-1 L_S^T`` with a Bartlett factor ``A``."""
+        self._no_rsample(_reparametrization_trick_grad)
+        df, L, _, _ = self._params()
+        shape = (n_samples, *self.batch_shape)
+        A = _bartlett(df.expand(shape), shape, self.dim, df.dtype, df.device)
+        # B = L A^-T  <=>  B^T = A^-1 L^T
+        Bt = torch.linalg.solve_triangular(A, L.transpose(-2, -1).expand(*shape, self.dim, self.dim), upper=False)
+        return Bt.transpose(-2, -1) @ Bt
 
 
 # ========================= DISCRETE =========================

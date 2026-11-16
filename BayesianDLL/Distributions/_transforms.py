@@ -485,3 +485,89 @@ class ChainTransform(Transform):
         x = self.first.inverse(x_unconstrained)
         return self.first.grad_log_abs_det_jacobian(x_unconstrained) + _apply_jacobian_transpose(
             self.first, x_unconstrained, self.second.grad_log_abs_det_jacobian(x))
+
+
+class PositiveDefiniteTransform(Transform):
+    """Bijection between ``R^{D(D+1)/2}`` and symmetric positive-definite ``D x D`` matrices.
+
+    The unconstrained vector fills the lower triangle (row-wise, diagonal
+    included) of a Cholesky factor ``L`` whose diagonal is exponentiated, and
+    ``X = L L^T``. ``log|det J|`` is taken w.r.t. the ``D(D+1)/2`` unique
+    entries of ``X`` (the measure Wishart densities are defined on):
+    ``D log 2 + sum_i (D + 1 - i) z_ii`` (0-indexed ``i``). Since the Jacobian
+    is not a (vector -> vector) matrix, :meth:`vjp` applies ``J^T`` to a full
+    ``(..., D, D)`` cotangent (entries of ``X`` treated as independent).
+    """
+
+    def __init__(self, dim):
+        self.dim = int(dim)
+        self._n = self.dim * (self.dim + 1) // 2
+
+    def unconstrained_shape(self, constrained_shape):
+        return tuple(constrained_shape)[:-2] + (self._n,)
+
+    def constrained_shape(self, unconstrained_shape):
+        return tuple(unconstrained_shape)[:-1] + (self.dim, self.dim)
+
+    def _indices(self, device):
+        return torch.tril_indices(self.dim, self.dim, offset=0, device=device)
+
+    def _is_diag(self, device):
+        rows, cols = self._indices(device)
+        return rows == cols
+
+    def _diag_weights(self, dtype, device):
+        """(D + 1 - i) on diagonal positions, 0 elsewhere."""
+        rows, cols = self._indices(device)
+        return torch.where(rows == cols, (self.dim + 1 - rows).to(dtype), torch.zeros((), dtype=dtype, device=device))
+
+    def cholesky(self, x_unconstrained):
+        z = x_unconstrained
+        rows, cols = self._indices(z.device)
+        values = torch.where(rows == cols, torch.exp(z), z)
+        L = torch.zeros(*z.shape[:-1], self.dim, self.dim, dtype=z.dtype, device=z.device)
+        L[..., rows, cols] = values
+        return L
+
+    def forward(self, x_constrained):
+        L = torch.linalg.cholesky(x_constrained)
+        rows, cols = self._indices(L.device)
+        values = L[..., rows, cols]
+        tiny = torch.finfo(L.dtype).tiny
+        return torch.where(rows == cols, torch.log(values.clamp(min=tiny)), values)
+
+    def inverse(self, x_unconstrained):
+        L = self.cholesky(x_unconstrained)
+        return L @ L.transpose(-2, -1)
+
+    def vjp(self, x_unconstrained, cotangent):
+        L = self.cholesky(x_unconstrained)
+        bar_L = (cotangent + cotangent.transpose(-2, -1)) @ L
+        rows, cols = self._indices(L.device)
+        bar = bar_L[..., rows, cols]
+        return torch.where(rows == cols, bar * L[..., rows, cols], bar)
+
+    def derivative(self, x_unconstrained):
+        """Full Jacobian of shape ``(..., D, D, D(D+1)/2)``."""
+        z = x_unconstrained
+        L = self.cholesky(z)
+        rows, cols = self._indices(z.device)
+        D = self.dim
+        jac = torch.zeros(*z.shape[:-1], D, D, self._n, dtype=z.dtype, device=z.device)
+        for m in range(self._n):
+            i, j = int(rows[m]), int(cols[m])
+            # dL = E_ij scaled by L_ii on the diagonal; dX = dL L^T + L dL^T
+            scale = L[..., i, j] if i == j else torch.ones_like(L[..., i, j])
+            col = L[..., :, j] * scale.unsqueeze(-1)  # (..., D): row a of (E_ij L^T)[i, a] = L[a, j]
+            jac[..., i, :, m] += col
+            jac[..., :, i, m] += col
+        return jac
+
+    def log_abs_det_jacobian(self, x_unconstrained):
+        z = x_unconstrained
+        w = self._diag_weights(z.dtype, z.device)
+        return (w * z).sum() + math.log(2.0) * self.dim * (z.numel() // self._n)
+
+    def grad_log_abs_det_jacobian(self, x_unconstrained):
+        z = x_unconstrained
+        return self._diag_weights(z.dtype, z.device).expand(z.shape).clone()
