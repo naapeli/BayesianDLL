@@ -17,6 +17,7 @@ from ._result import SamplingResult, PredicativeResult, SampleStats
 from .._active_model._active_model import get_active_model
 from ..Evaluation import gelman_rubin
 from ..Evaluation._bfmi import bfmi
+from ..Evaluation._pointwise import pointwise_log_likelihood_plan, pointwise_log_likelihood
 from ..Distributions._state_space import JointStateSpace
 
 
@@ -311,13 +312,20 @@ def _chain_seeds(seed, n_chains):
     return [int(sequence.generate_state(1, dtype=np.uint64)[0] % (2 ** 63)) for sequence in sequences]
 
 
-def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, check_convergence=True, seed=None, **sampler_params):
+def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, check_convergence=True, seed=None, log_likelihood=True, **sampler_params):
     """Draw posterior samples with one process per chain.
 
     ``seed`` makes runs reproducible: every chain gets its own seed derived
     from it. With ``seed=None`` the base seed is drawn from torch's global
     generator, so the chains still differ from each other and a preceding
     ``torch.manual_seed`` also makes the run reproducible.
+
+    ``log_likelihood=True`` records the elementwise log-likelihood
+    ``log p(y_i | theta)`` of every observed node for every kept draw in
+    ``result.log_likelihood[name]`` (shape ``(n_chains, n_samples,
+    *log_density_shape)``), which :func:`~BayesianDLL.Evaluation.loo` and
+    :func:`~BayesianDLL.Evaluation.waic` use. Pass ``False`` to save the
+    memory and time.
 
     Remaining keyword arguments are sampler settings for every block (each
     sampler takes the ones it understands), e.g. ``delta=0.9`` or
@@ -327,6 +335,10 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     # Decide how the enumerated parameters are summed out before starting the
     # workers, so a model that cannot be enumerated fails here.
     model.prepare_enumeration()
+    if log_likelihood:
+        log_likelihood_plan, log_likelihood_unavailable = pointwise_log_likelihood_plan(model)
+    else:
+        log_likelihood_plan, log_likelihood_unavailable = None, {}
 
     if seed is None:
         seed = int(torch.randint(0, 2 ** 62, (1,)).item())
@@ -398,6 +410,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
             [shm_name]*n_chains,
             [sampler_params]*n_chains,
             chain_seeds,
+            [log_likelihood_plan]*n_chains,
         ))
     finally:
         if updater_thread is not None:
@@ -439,6 +452,9 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     acceptance_probabilities = [[prob / (n_samples + warmup_length) for prob in res[3]] for res in results]
     step_sizes = [res[4] for res in results]
     sample_stats = _combine_sample_stats([res[5] for res in results])
+    log_lik = None
+    if log_likelihood_plan is not None:
+        log_lik = {name: torch.stack([res[9][name] for res in results], dim=0) for name in log_likelihood_plan}
 
     if check_convergence and n_chains > 1:
         if n_samples >= 50:
@@ -454,7 +470,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
 
     _check_hamiltonian_diagnostics(sample_stats, results[0][6] if results else [], n_samples)
 
-    return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=det_trace, sample_stats=sample_stats, enumerated_probs=enumerated_probs)
+    return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=det_trace, sample_stats=sample_stats, enumerated_probs=enumerated_probs, log_likelihood=log_lik, log_likelihood_unavailable=log_likelihood_unavailable)
 
 
 def _combine_sample_stats(per_chain):
@@ -486,7 +502,7 @@ def _check_hamiltonian_diagnostics(sample_stats, max_depths, n_samples, bfmi_thr
                 warn(f"{100 * saturated:.1f}% of the NUTS iterations for the parameters {block['params']} reached the maximum tree depth ({max_depth}). Consider increasing max_depth or reparametrizing the model.")
 
 
-def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar, blocks_spec=None, shm_name=None, sampler_params=None, seed=None):
+def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar, blocks_spec=None, shm_name=None, sampler_params=None, seed=None, log_likelihood_plan=None):
     torch.set_num_threads(1)
     if seed is not None:
         # Worker processes may be fresh or reused; seeding here makes each chain
@@ -540,6 +556,12 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     for name, parameter in model.deterministic_params.items():
         chain_det_trace[name] = torch.empty(size=(n_samples, *parameter.constrained_value.shape), dtype=parameter.constrained_value.dtype)
 
+    # Elementwise log-likelihood of the observed nodes per kept draw.
+    chain_log_lik = {}
+    if log_likelihood_plan is not None:
+        for name, values in pointwise_log_likelihood(model, log_likelihood_plan).items():
+            chain_log_lik[name] = torch.empty(size=(n_samples, *values.shape), dtype=values.dtype, device=values.device)
+
     loop_range = _progress_bar if _progress_bar is not None else range(1, n_samples + warmup_length + 1)
     for m in loop_range:
         if _progress_bar is not None:
@@ -572,6 +594,9 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
                 chain_trace[name][m - warmup_length - 1] = parameter.constrained_value
             for name, parameter in model.deterministic_params.items():
                 chain_det_trace[name][m - warmup_length - 1] = parameter.constrained_value
+            if chain_log_lik:
+                for name, values in pointwise_log_likelihood(model, log_likelihood_plan).items():
+                    chain_log_lik[name][m - warmup_length - 1] = values
 
         if shm is not None:
             n_b = min(len(blocks), 8)
@@ -591,7 +616,7 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
         for i, block in enumerate(blocks)
     ]
     max_depths = [getattr(block.sampler, "max_depth", None) for block in blocks]
-    return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes, stats, max_depths, chain_enum_trace, chain_enum_probs
+    return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes, stats, max_depths, chain_enum_trace, chain_enum_probs, chain_log_lik
 
 def sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
     model = get_active_model() if model is None else model
