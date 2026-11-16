@@ -217,3 +217,22 @@ def test_guide_must_cover_every_model_latent(normal_model):
         RandomParameter("other", Normal(VariationalParameter("loc", torch.zeros(1)), VariationalParameter("scale", torch.ones(1))))
     with pytest.raises(ValueError, match="no distribution"):
         elbo(normal_model, guide)
+
+
+def test_bbvi_float32_variational_parameters_with_float64_model():
+    """Python-number VariationalParameters are float32; the model is float64."""
+    from BayesianDLL import MeanFieldGuide, Model, RandomParameter, VariationalParameter
+    from BayesianDLL.Distributions import Mixture, Normal
+    from BayesianDLL.Variational import BBVI
+
+    torch.manual_seed(0)
+    with Model() as model:
+        RandomParameter("x", Mixture([Normal(-1, 0.5), Normal(2, 1.0)], [0.3, 0.7]))
+    with MeanFieldGuide() as guide:
+        mean = VariationalParameter("mean", 0)
+        std = VariationalParameter("std", 2, min=1e-3)
+        RandomParameter("x", Normal(mean, std))
+
+    BBVI(model, guide, epochs=5, lr=1e-2, verbose=False)
+    assert mean.value.dtype == torch.float32
+    assert std.value.dtype == torch.float32
