@@ -13,14 +13,16 @@ from loky import get_reusable_executor
 
 from ._NUTS import NUTS
 from ._Metropolis import Metropolis, FiniteGibbs, has_finite_support
+from ._Slice import Slice
 from ._result import SamplingResult, PredicativeResult, SampleStats
 from .._active_model._active_model import get_active_model
 from ..Evaluation import gelman_rubin
 from ..Evaluation._bfmi import bfmi
+from ..Evaluation._pointwise import pointwise_log_likelihood_plan, pointwise_log_likelihood
 from ..Distributions._state_space import JointStateSpace
 
 
-_SAMPLER_CLASSES = {"nuts": NUTS, "metropolis": Metropolis, "gibbs": FiniteGibbs}
+_SAMPLER_CLASSES = {"nuts": NUTS, "metropolis": Metropolis, "gibbs": FiniteGibbs, "slice": Slice}
 _SAMPLER_ALIASES = {"finite_gibbs": "gibbs", "finitegibbs": "gibbs"}
 # Constructor arguments supplied by the library itself, not by sampler_params.
 _INTERNAL_ARGUMENTS = {"self", "log_target", "gradient", "inverse_transformation", "state_space", "elementwise_log_target"}
@@ -74,6 +76,10 @@ def _select_sampler(log_target, state_space, gradient=None, sampler="auto", samp
         if not (is_continuous or is_discrete):
             raise RuntimeError("State space must be either continuous or discrete for Metropolis sampler.")
         instance = Metropolis(log_target, state_space, **_filter_sampler_params(Metropolis, sampler_params))
+    elif sampler == "slice":
+        if not is_continuous:
+            raise RuntimeError("A distribution is incompatable with the chosen sampler. The slice sampler can only be used with continuous distributions.")
+        instance = Slice(log_target, state_space, **_filter_sampler_params(Slice, sampler_params))
     elif sampler == "gibbs":
         if not (is_discrete and has_finite_support(state_space)):
             raise RuntimeError("The finite Gibbs sampler can only be used with discrete distributions with a finite support.")
@@ -92,6 +98,8 @@ def _sampler_name(sampler):
         return "gibbs"
     if isinstance(sampler, Metropolis):
         return "metropolis"
+    if isinstance(sampler, Slice):
+        return "slice"
     return type(sampler).__name__
 
 
@@ -156,7 +164,14 @@ class SamplingBlock:
         if sampler_type == "auto":
             requested = [_SAMPLER_ALIASES.get(model.params[name].sampler, model.params[name].sampler) for name in self.param_names]
             if self.is_continuous:
-                sampler_type = "metropolis" if "metropolis" in requested else "nuts"
+                if "metropolis" in requested:
+                    sampler_type = "metropolis"
+                elif "slice" in requested:
+                    sampler_type = "slice"
+                else:
+                    sampler_type = "nuts"
+            elif "slice" in requested:
+                raise ValueError(f"The slice sampler can only be used with continuous parameters: {self.param_names}")
             elif "metropolis" in requested or not has_finite_support(state_space):
                 sampler_type = "metropolis"
             else:
@@ -276,6 +291,7 @@ def _build_blocks(model, blocks_spec=None, sampler_params=None):
         return built_blocks
 
     nuts_names = []
+    slice_names = []
     continuous_metropolis_names = []
     gibbs_names = []
     discrete_metropolis_names = []
@@ -285,8 +301,12 @@ def _build_blocks(model, blocks_spec=None, sampler_params=None):
         if space.is_continuous():
             if requested in ("auto", "nuts"):
                 nuts_names.append(name)
+            elif requested == "slice":
+                slice_names.append(name)
             else:
                 continuous_metropolis_names.append(name)
+        elif requested == "slice":
+            raise ValueError(f"The slice sampler can only be used with continuous parameters, but '{name}' is discrete.")
         elif requested in ("auto", "gibbs") and has_finite_support(space):
             gibbs_names.append(name)
         else:
@@ -295,6 +315,8 @@ def _build_blocks(model, blocks_spec=None, sampler_params=None):
     built_blocks = []
     if nuts_names:
         built_blocks.append(SamplingBlock(model, nuts_names, sampler_type="nuts", sampler_params=sampler_params))
+    if slice_names:
+        built_blocks.append(SamplingBlock(model, slice_names, sampler_type="slice", sampler_params=sampler_params))
     if continuous_metropolis_names:
         built_blocks.append(SamplingBlock(model, continuous_metropolis_names, sampler_type="metropolis", sampler_params=sampler_params))
     if gibbs_names:
@@ -311,13 +333,20 @@ def _chain_seeds(seed, n_chains):
     return [int(sequence.generate_state(1, dtype=np.uint64)[0] % (2 ** 63)) for sequence in sequences]
 
 
-def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, check_convergence=True, seed=None, **sampler_params):
+def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, check_convergence=True, seed=None, log_likelihood=True, **sampler_params):
     """Draw posterior samples with one process per chain.
 
     ``seed`` makes runs reproducible: every chain gets its own seed derived
     from it. With ``seed=None`` the base seed is drawn from torch's global
     generator, so the chains still differ from each other and a preceding
     ``torch.manual_seed`` also makes the run reproducible.
+
+    ``log_likelihood=True`` records the elementwise log-likelihood
+    ``log p(y_i | theta)`` of every observed node for every kept draw in
+    ``result.log_likelihood[name]`` (shape ``(n_chains, n_samples,
+    *log_density_shape)``), which :func:`~BayesianDLL.Evaluation.loo` and
+    :func:`~BayesianDLL.Evaluation.waic` use. Pass ``False`` to save the
+    memory and time.
 
     Remaining keyword arguments are sampler settings for every block (each
     sampler takes the ones it understands), e.g. ``delta=0.9`` or
@@ -327,6 +356,10 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     # Decide how the enumerated parameters are summed out before starting the
     # workers, so a model that cannot be enumerated fails here.
     model.prepare_enumeration()
+    if log_likelihood:
+        log_likelihood_plan, log_likelihood_unavailable = pointwise_log_likelihood_plan(model)
+    else:
+        log_likelihood_plan, log_likelihood_unavailable = None, {}
 
     if seed is None:
         seed = int(torch.randint(0, 2 ** 62, (1,)).item())
@@ -398,6 +431,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
             [shm_name]*n_chains,
             [sampler_params]*n_chains,
             chain_seeds,
+            [log_likelihood_plan]*n_chains,
         ))
     finally:
         if updater_thread is not None:
@@ -439,6 +473,9 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     acceptance_probabilities = [[prob / (n_samples + warmup_length) for prob in res[3]] for res in results]
     step_sizes = [res[4] for res in results]
     sample_stats = _combine_sample_stats([res[5] for res in results])
+    log_lik = None
+    if log_likelihood_plan is not None:
+        log_lik = {name: torch.stack([res[9][name] for res in results], dim=0) for name in log_likelihood_plan}
 
     if check_convergence and n_chains > 1:
         if n_samples >= 50:
@@ -454,7 +491,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
 
     _check_hamiltonian_diagnostics(sample_stats, results[0][6] if results else [], n_samples)
 
-    return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=det_trace, sample_stats=sample_stats, enumerated_probs=enumerated_probs)
+    return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=det_trace, sample_stats=sample_stats, enumerated_probs=enumerated_probs, log_likelihood=log_lik, log_likelihood_unavailable=log_likelihood_unavailable)
 
 
 def _combine_sample_stats(per_chain):
@@ -486,7 +523,7 @@ def _check_hamiltonian_diagnostics(sample_stats, max_depths, n_samples, bfmi_thr
                 warn(f"{100 * saturated:.1f}% of the NUTS iterations for the parameters {block['params']} reached the maximum tree depth ({max_depth}). Consider increasing max_depth or reparametrizing the model.")
 
 
-def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar, blocks_spec=None, shm_name=None, sampler_params=None, seed=None):
+def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar, blocks_spec=None, shm_name=None, sampler_params=None, seed=None, log_likelihood_plan=None):
     torch.set_num_threads(1)
     if seed is not None:
         # Worker processes may be fresh or reused; seeding here makes each chain
@@ -540,6 +577,12 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     for name, parameter in model.deterministic_params.items():
         chain_det_trace[name] = torch.empty(size=(n_samples, *parameter.constrained_value.shape), dtype=parameter.constrained_value.dtype)
 
+    # Elementwise log-likelihood of the observed nodes per kept draw.
+    chain_log_lik = {}
+    if log_likelihood_plan is not None:
+        for name, values in pointwise_log_likelihood(model, log_likelihood_plan).items():
+            chain_log_lik[name] = torch.empty(size=(n_samples, *values.shape), dtype=values.dtype, device=values.device)
+
     loop_range = _progress_bar if _progress_bar is not None else range(1, n_samples + warmup_length + 1)
     for m in loop_range:
         if _progress_bar is not None:
@@ -572,6 +615,9 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
                 chain_trace[name][m - warmup_length - 1] = parameter.constrained_value
             for name, parameter in model.deterministic_params.items():
                 chain_det_trace[name][m - warmup_length - 1] = parameter.constrained_value
+            if chain_log_lik:
+                for name, values in pointwise_log_likelihood(model, log_likelihood_plan).items():
+                    chain_log_lik[name][m - warmup_length - 1] = values
 
         if shm is not None:
             n_b = min(len(blocks), 8)
@@ -591,37 +637,68 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
         for i, block in enumerate(blocks)
     ]
     max_depths = [getattr(block.sampler, "max_depth", None) for block in blocks]
-    return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes, stats, max_depths, chain_enum_trace, chain_enum_probs
+    return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes, stats, max_depths, chain_enum_trace, chain_enum_probs, chain_log_lik
 
 def sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
+    """Sample the posterior with MCMC and draw from its predictive distribution.
+
+    The posterior is sampled with :func:`sample` (``warmup_length`` warmup
+    steps, four chains); the predictive draws are then generated exactly with
+    :func:`sample_predicative`. ``samples_per_step`` is the number of
+    replicated data sets per posterior draw and ``warmup_per_sample`` is only
+    used by the MCMC fallback for likelihoods without a sampler.
+    """
     model = get_active_model() if model is None else model
     trace = sample(n_samples, warmup_length, 4, model, progress_bar, check_convergence=False)
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
 def posterior_predicative(trace, n_samples=20, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
+    """Posterior predictive draws for an existing ``trace``; see :func:`sample_predicative`."""
     model = get_active_model() if model is None else model
     return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
 
 def sample_prior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
+    """Draw from the prior predictive distribution by ancestral sampling.
+
+    For each of the ``n_samples`` prior draws, the random parameters are
+    sampled from their priors in topological order (no MCMC) and
+    ``samples_per_step`` data sets are generated from the likelihoods given
+    those parameters.
+
+    Returns a :class:`PredicativeResult` with samples of shape
+    ``(n_samples, samples_per_step, *predictive_shape)``. Its ``prior``
+    attribute is a :class:`SamplingResult` (one chain of ``n_samples`` draws)
+    with the prior draws of the random and deterministic parameters, so
+    ``summary`` and the posterior plots work on it.
+
+    ``warmup_length`` is ignored and only kept for backward compatibility;
+    ``warmup_per_sample`` is only used by the MCMC fallback for distributions
+    that cannot be sampled directly.
+    """
     model = get_active_model() if model is None else model
-    old_observed = model.observed_params
-    model.observed_params = {}  # with prior distributions, one should sample from the priors without the likelihood terms
-    model.compile()  # the factor groups of enumerated parameters must not contain the likelihood terms
-    try:
-        trace = sample(n_samples, warmup_length, 4, model, progress_bar)
-    finally:
-        model.observed_params = old_observed
-        model.compile()
-    return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
+    return _ancestral_predictive(model, n_samples, samples_per_step, None, progress_bar, warmup_per_sample)
 
 def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
-    model = get_active_model() if model is None else model
+    """Posterior predictive samples by exact ancestral sampling.
 
-    samplers = {}
-    state_spaces = {}
-    for name, parameter in model.observed_params.items():
-        samplers[name] = _decide_predicative_step(parameter)
-        state_spaces[name] = parameter.distribution.transformed_state_space
+    ``n_samples`` evenly spaced draws are taken from ``trace`` (all draws when
+    ``None``). For each draw the model parameters are set to it, the graph is
+    walked in topological order and every observed node is sampled
+    ``samples_per_step`` times with its distribution's ``sample`` method,
+    shaped like the node's ``predictive_shape`` (plate sizes, including
+    plates sized by mutable ``Data``, are resolved at call time). When an
+    observed node is a parent of another observed node, the child conditions
+    on the *replicated* value of the parent.
+
+    A likelihood without a sampler (``sample`` raising ``NotImplementedError``
+    or missing) falls back to MCMC for that node only, with a warning; the
+    fallback uses ``warmup_per_sample`` warmup steps. Otherwise
+    ``warmup_per_sample`` is ignored.
+
+    Returns a :class:`PredicativeResult` of tensors with shape
+    ``(n_samples, samples_per_step, *predictive_shape)``.
+    """
+    model = get_active_model() if model is None else model
 
     n_chains, trace_length = next(iter(trace.values())).shape[:2]
     flattened_trace = {name: values.flatten(0, 1) for name, values in trace.items()}
@@ -635,34 +712,166 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
             raise RuntimeError(f"n_samples ({n_samples}) must be less than or equal to the total trace length ({total_samples}).")
         indices = torch.linspace(0, total_samples - 1, steps=n_samples).long()
 
-    predicative_samples = {name: torch.empty(size=(n_samples, samples_per_step, *parameter.predictive_shape), dtype=parameter.observed_values.dtype) for name, parameter in model.observed_params.items()}
+    missing = [name for name in model.params if name not in flattened_trace]
+    if missing:
+        raise KeyError(f"The trace has no draws of the random parameter(s) {missing}.")
 
-    _progress_bar = tqdm(
-        range(n_samples),
-        desc="Predicative sampling",
-        bar_format=r"{desc}: {percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}"
-    ) if progress_bar else range(n_samples)
-
-    for i in _progress_bar:
-        prior_values = {
+    def parameter_values(i):
+        return {
             name: parameter.distribution.transform.forward(flattened_trace[name][indices[i]])
             for name, parameter in {**model.params, **model.enumerated_params}.items()
             if name in flattened_trace
         }
-        with model.temporarily_set_many(prior_values):
-            for name, sampler in samplers.items():
-                sampler.reset()
-                if hasattr(sampler, "set_warmup_length"):
-                    sampler.set_warmup_length(warmup_per_sample)
-                parameter = model.observed_params[name]
-                init_value = parameter.observed_values
-                theta = _init_theta(state_spaces[name], parameter.predictive_shape, init_value.dtype)
-                for m in range(warmup_per_sample + samples_per_step):
-                    theta, step_size, acceptance_probability, diverging = sampler.step(theta, m < warmup_per_sample)
-                    if m >= warmup_per_sample:
-                        predicative_samples[name][i, m - warmup_per_sample] = parameter.distribution.transform.inverse(theta)
 
-    return PredicativeResult(predicative_samples)
+    return _ancestral_predictive(model, n_samples, samples_per_step, parameter_values, progress_bar, warmup_per_sample)
+
+
+def _observed_parents(model):
+    """For each observed node, the observed nodes whose value it reads (directly or through deterministic nodes)."""
+    parents = {}
+    for name in model.observed_params:
+        found = set()
+        seen = set()
+        stack = list(model.graph.predecessors(name))
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            if node in model.observed_params:
+                found.add(node)
+            elif node in model.deterministic_params:
+                stack.extend(model.graph.predecessors(node))
+        parents[name] = found
+    return parents
+
+
+class _MCMCFallback:
+    """MCMC draws for a node whose distribution cannot be sampled directly."""
+
+    def __init__(self, parameter, warmup):
+        self.parameter = parameter
+        self.warmup = warmup
+        self.sampler = _decide_predicative_step(parameter)
+        self.state_space = parameter.distribution.transformed_state_space
+
+    def draw(self, n, shape, dtype):
+        sampler = self.sampler
+        sampler.reset()
+        if hasattr(sampler, "set_warmup_length"):
+            sampler.set_warmup_length(self.warmup)
+        transform = self.parameter.distribution.transform
+        theta = _init_theta(self.state_space, transform.unconstrained_shape(tuple(shape)), dtype)
+        draws = []
+        for m in range(self.warmup + n):
+            theta, _, _, _ = sampler.step(theta, m < self.warmup)
+            if m >= self.warmup:
+                draws.append(transform.inverse(theta))
+        return torch.stack(draws, dim=0)
+
+
+def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, progress_bar, warmup_per_sample):
+    """Prior (``parameter_values is None``) or posterior predictive draws by ancestral sampling.
+
+    ``parameter_values(i)`` returns the unconstrained parameter values of the
+    ``i``-th posterior draw. In prior mode the random parameters are drawn
+    from their priors in topological order instead.
+    """
+    import networkx as nx
+    from ._ancestral import draw_shaped, can_sample
+
+    if not model._compiled:
+        model.compile()
+    prior = parameter_values is None
+    latents = {**model.params, **getattr(model, "enumerated_params", {})}
+    random_order = [latents[n] for n in model._topo_order if n in latents]
+    observed_order = [model.observed_params[n] for n in model._topo_order if n in model.observed_params]
+    observed_parents = _observed_parents(model)
+    replicated_parents = set().union(set(), *observed_parents.values())
+    chained = bool(replicated_parents)
+
+    if prior:
+        for parameter in random_order:
+            if any(node in model.observed_params for node in nx.ancestors(model.graph, parameter.name)):
+                warn(f"The prior of '{parameter.name}' depends on an observed node; its prior predictive draws condition on the observed data.")
+
+    fallbacks = {}
+
+    def draw(parameter, n, shape, dtype):
+        if parameter.name not in fallbacks and can_sample(parameter.distribution):
+            try:
+                return draw_shaped(parameter.distribution, n, shape).to(dtype)
+            except NotImplementedError:
+                pass
+        if parameter.name not in fallbacks:
+            warn(
+                f"{type(parameter.distribution).__name__} of '{parameter.name}' cannot be sampled directly; "
+                f"falling back to MCMC for this node ({warmup_per_sample} warmup steps per draw)."
+            )
+            fallbacks[parameter.name] = _MCMCFallback(parameter, warmup_per_sample)
+        return fallbacks[parameter.name].draw(n, shape, dtype).to(dtype)
+
+    predicative_samples = {
+        parameter.name: torch.empty(size=(n_draws, samples_per_step, *parameter.predictive_shape), dtype=parameter.observed_values.dtype)
+        for parameter in observed_order
+    }
+    prior_trace = {parameter.name: [] for parameter in random_order}
+    prior_det_trace = {name: [] for name in model.deterministic_params}
+
+    saved_values = {name: parameter.unconstrained_value for name, parameter in latents.items()}
+    saved_observed = {parameter.name: parameter._observed_values for parameter in observed_order}
+
+    _progress_bar = tqdm(
+        range(n_draws),
+        desc="Prior predicative sampling" if prior else "Predicative sampling",
+        bar_format=r"{desc}: {percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}"
+    ) if progress_bar else range(n_draws)
+
+    try:
+        for i in _progress_bar:
+            if prior:
+                for parameter in random_order:
+                    value = draw(parameter, 1, parameter.constrained_value.shape, parameter.constrained_value.dtype)[0]
+                    parameter.set_constrained_value(value)
+                    prior_trace[parameter.name].append(parameter.constrained_value.clone())
+                for name, parameter in model.deterministic_params.items():
+                    prior_det_trace[name].append(torch.as_tensor(parameter.constrained_value).clone())
+            else:
+                for name, value in parameter_values(i).items():
+                    latents[name].set_unconstrained_value(value)
+
+            if not chained:
+                for parameter in observed_order:
+                    samples = predicative_samples[parameter.name]
+                    samples[i] = draw(parameter, samples_per_step, parameter.predictive_shape, samples.dtype)
+                continue
+
+            # An observed node feeds another node: draw the replicated data
+            # sets one at a time, so that each child conditions on the
+            # replicated value of its observed parents.
+            try:
+                for j in range(samples_per_step):
+                    for parameter in observed_order:
+                        samples = predicative_samples[parameter.name]
+                        value = draw(parameter, 1, parameter.predictive_shape, samples.dtype)[0]
+                        samples[i, j] = value
+                        if parameter.name in replicated_parents:
+                            parameter.observed_values = value
+            finally:
+                for parameter in observed_order:
+                    parameter._observed_values = saved_observed[parameter.name]
+    finally:
+        for name, value in saved_values.items():
+            latents[name].set_unconstrained_value(value)
+        for parameter in observed_order:
+            parameter._observed_values = saved_observed[parameter.name]
+
+    result = PredicativeResult(predicative_samples)
+    if prior:
+        trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_trace.items() if values}
+        det_trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_det_trace.items() if values}
+        result.prior = SamplingResult(trace, [0], [[]], [[]], deterministic_trace=det_trace)
+    return result
 
 def _init_theta(state_space, shape, dtype):
     if state_space.is_continuous():

@@ -163,3 +163,34 @@ predictions = exact_gp_predictive(
 )
 plt.show()
 ```
+
+### Automatic guides, Laplace approximation and minibatch VI
+
+`AutoNormal(model)` (mean-field) and `AutoMultivariateNormal(model)` (full rank)
+build Gaussian guides over the unconstrained latents automatically, and
+`laplace_approximation(model)` fits a Gaussian at the MAP using a
+finite-difference Hessian of the hand-written gradient. All of them return
+traces with `.sample(n)` that work with `summary` and the plots. With
+`BBVI(..., batch_size=B)` every epoch uses a random minibatch along a plate
+whose size comes from `Data`.
+
+```python
+from BayesianDLL import AutoMultivariateNormal, laplace_approximation
+from BayesianDLL.Variational import BBVI
+
+guide = AutoMultivariateNormal(model)
+BBVI(model, guide, n_samples=4, epochs=1000, lr=0.02)
+trace = guide.sample(1000)
+
+laplace = laplace_approximation(model)
+print(laplace.mean, laplace.cov, laplace.log_marginal_likelihood)
+```
+
+In a hand-written guide, a guide distribution on the real line (e.g. `Normal`)
+describes a latent's unconstrained value (`log sigma` for a positive `sigma`),
+and a guide with the latent's own support (e.g. `LogNormal` for a positive
+latent) describes its constrained value.
+
+Prior and posterior predictive distributions are drawn exactly by ancestral
+sampling; `sample_prior_predicative` runs no MCMC and returns the prior draws of
+the parameters in `result.prior`.

@@ -3,8 +3,9 @@ Bayesian Deep Learning Library documentation
 
 BayesianDLL is a Python library for Bayesian machine learning built on top of
 PyTorch. It lets you write probabilistic models with probability distributions
-and graphical models, and fit them with Markov chain Monte Carlo (NUTS and
-Metropolis) or variational inference.
+and graphical models, and fit them with Markov chain Monte Carlo (NUTS,
+Metropolis, slice and Gibbs samplers), Sequential Monte Carlo or variational
+inference.
 
 The library is intended as an educational project. It aims for clarity and ease
 of understanding rather than raw performance, so for production work libraries
@@ -20,10 +21,10 @@ The rest of the library is split into the following packages:
 
 - **Distributions:** Probability distributions, their state spaces and the transforms to unconstrained space.
 - **Deterministic:** Deterministic nodes such as ``Linear``, ``Exp``, ``Log``, ``Sigmoid``, ``Affine``, ``Index``, ``MatMul``, ``Softmax`` and ``CholeskyCovariance`` for building model graphs.
-- **Samplers:** MCMC samplers (NUTS and Metropolis), sampling utilities and prior / posterior predictive sampling.
-- **Variational:** Maximum a posteriori estimation and black-box variational inference.
-- **GP:** Gaussian process kernels and latent and exact Gaussian processes.
-- **Evaluation:** Convergence diagnostics (R-hat, effective sample size, MCSE), posterior summaries and plotting.
+- **Samplers:** MCMC samplers (NUTS, Metropolis, slice and finite Gibbs), Sequential Monte Carlo with marginal likelihood estimates, sampling utilities and exact (ancestral) prior / posterior predictive sampling.
+- **Variational:** Maximum a posteriori estimation, the Laplace approximation and black-box variational inference (hand-written or automatic guides, minibatch training).
+- **GP:** Gaussian process kernels (with ARD lengthscales) and latent, exact and sparse Gaussian processes.
+- **Evaluation:** Convergence diagnostics (R-hat, effective sample size, MCSE, E-BFMI), posterior summaries, model comparison (PSIS-LOO, WAIC), posterior predictive checks and plotting.
 
 Installation
 ------------

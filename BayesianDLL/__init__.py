@@ -4,6 +4,6 @@ from ._parameters import RandomParameter, ObservedParameter, DeterministicParame
 from ._plate import plate
 from .Samplers import (
     sample, sample_predicative, sample_prior_predicative, sample_posterior_predicative,
-    posterior_predicative, SamplingResult, PredicativeResult, thin,
+    posterior_predicative, SamplingResult, PredicativeResult, thin, sample_smc,
 )
-from .Variational import find_MAP
+from .Variational import find_MAP, AutoNormal, AutoMultivariateNormal, laplace_approximation

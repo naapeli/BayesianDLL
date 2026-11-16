@@ -10,7 +10,7 @@ from BayesianDLL.Distributions import (
     Bernoulli, Beta, Binomial, Categorical, Cauchy, Dirichlet, DiscreteUniform, Exponential, Gamma, Geometric,
     HalfCauchy, HalfNormal, InvGamma, Laplace, LKJCholesky, LogNormal, LogTransform, Mixture, Multinomial,
     MultivariateNormal, NegativeBinomial, Normal, Poisson, StudentT, TransformedDistribution, Truncated, Uniform,
-    ZeroInflated,
+    ZeroInflated, Wishart, InverseWishart,
 )
 
 
@@ -220,3 +220,30 @@ def test_mvn_with_random_mean_and_deterministic_covariance_samples_with_nuts():
     trace = model.sample(300, 300, n_chains=2, progress_bar=False)
     torch.testing.assert_close(trace["mean"].reshape(-1, 2).mean(0), data.mean(0), atol=0.1, rtol=0)
     assert trace["log_scale"].mean().item() == pytest.approx(math.log(2.0), abs=0.25)
+
+
+def test_wishart_family_samples():
+    S = torch.tensor([[2.0, 0.3, 0.1], [0.3, 1.0, -0.2], [0.1, -0.2, 1.5]])
+    L = torch.linalg.cholesky(S)
+    for dist in (Wishart(5.0, S), Wishart(5.0, scale_tril=L)):
+        X = dist.sample(N)
+        assert X.shape == (N, 3, 3)
+        torch.testing.assert_close(X.mean(0), 5.0 * S, atol=0.06, rtol=0)
+        # Var(X_ij) = df (S_ij^2 + S_ii S_jj)
+        torch.testing.assert_close(X.var(0), 5.0 * (S ** 2 + torch.outer(S.diagonal(), S.diagonal())), atol=0.0, rtol=0.05)
+        assert bool(torch.isfinite(dist.log_pdf(X[:100])).all())
+    X = InverseWishart(8.0, S).sample(N)
+    torch.testing.assert_close(X.mean(0), S / 4.0, atol=0.01, rtol=0)
+    assert Wishart(4.0 * torch.ones(2), S).sample(5).shape == (5, 2, 3, 3)
+    with pytest.raises(NotImplementedError):
+        Wishart(5.0, S).sample(2, _reparametrization_trick_grad=True)
+
+
+def test_wishart_nuts_recovers_mean():
+    S = torch.tensor([[1.0, 0.3], [0.3, 0.5]], dtype=torch.float64)
+    with Model() as model:
+        RandomParameter("X", Wishart(6.0, S))
+    assert model.params["X"].unconstrained_value.shape == (3,)
+    trace = model.sample(1000, 500, n_chains=2, progress_bar=False)
+    X = trace["X"].reshape(-1, 2, 2)
+    torch.testing.assert_close(X.mean(0), 6.0 * S, atol=0.4, rtol=0)

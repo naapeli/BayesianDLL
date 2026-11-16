@@ -15,7 +15,7 @@ from BayesianDLL.Distributions import (
     Bernoulli, Beta, Binomial, Categorical, Cauchy, CorrCholeskyTransform, Dirichlet, DiscreteUniform, Exponential,
     Gamma, Geometric, HalfCauchy, HalfNormal, InvGamma, Laplace, LKJCholesky, LogNormal, LogTransform, Mixture,
     Multinomial, MultivariateNormal, NegativeBinomial, Normal, Poisson, StickBreakingTransform, StudentT,
-    TransformedDistribution, Truncated, Uniform, ZeroInflated,
+    TransformedDistribution, Truncated, Uniform, ZeroInflated, Wishart, InverseWishart, PositiveDefiniteTransform,
 )
 
 
@@ -66,6 +66,113 @@ def continuous_case(name):
         "transformed": lambda: (TransformedDistribution(Normal(0.2, 0.7), LogTransform()), td.LogNormal(0.2, 0.7), t([0.3, 1.0, 2.5])),
     }
     return cases[name]()
+
+
+WISHART_SCALE = [[2.0, 0.3, 0.1], [0.3, 1.0, -0.2], [0.1, -0.2, 1.5]]
+WISHART_X = [[[3.0, 0.5, 0.2], [0.5, 2.0, 0.1], [0.2, 0.1, 4.0]], [[1.0, -0.2, 0.0], [-0.2, 0.5, 0.1], [0.0, 0.1, 0.8]]]
+
+
+class _InverseWishartReference:
+    """p_IW(X; df, S) = p_W(X^-1; df, S^-1) |X|^-(D+1)."""
+
+    def __init__(self, df, scale):
+        self.wishart = td.Wishart(torch.as_tensor(df), torch.linalg.inv(scale))
+
+    def log_prob(self, x):
+        return self.wishart.log_prob(torch.linalg.inv(x)) - 4 * torch.logdet(x)
+
+
+def wishart_case(name):
+    S, X = t(WISHART_SCALE), t(WISHART_X)
+    if name == "wishart":
+        return Wishart(5.0, S), td.Wishart(t(5.0), S), X
+    if name == "wishart_tril":
+        return Wishart(5.0, scale_tril=torch.linalg.cholesky(S)), td.Wishart(t(5.0), S), X
+    if name == "inverse_wishart":
+        return InverseWishart(6.0, S), _InverseWishartReference(6.0, S), X
+    return InverseWishart(6.0, scale_tril=torch.linalg.cholesky(S)), _InverseWishartReference(6.0, S), X
+
+
+WISHART_CASES = ["wishart", "wishart_tril", "inverse_wishart", "inverse_wishart_tril"]
+
+
+@pytest.mark.parametrize("name", WISHART_CASES)
+def test_wishart_family_density_and_value_gradient(name):
+    dist, reference, X = wishart_case(name)
+    torch.testing.assert_close(dist.log_pdf(X), reference.log_prob(X))
+    torch.testing.assert_close(dist.pdf(X), reference.log_prob(X).exp())
+    grad = dist.log_pdf_grad(X)
+    torch.testing.assert_close(grad, grad.transpose(-2, -1))
+    eps = 1e-6
+    for i, j in [(0, 0), (1, 0), (2, 1), (2, 2)]:
+        E = torch.zeros(3, 3)
+        E[i, j] = E[j, i] = eps
+        numeric = (dist.log_pdf(X + E) - dist.log_pdf(X - E)) / (2 * eps)
+        torch.testing.assert_close((grad * E).sum((-2, -1)) / eps, numeric, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.parametrize("name", WISHART_CASES)
+def test_wishart_family_parameter_gradients(name):
+    S = t(WISHART_SCALE)
+    X = t(WISHART_X)
+    family = Wishart if name.startswith("wishart") else InverseWishart
+    df = torch.tensor(5.5, requires_grad=True)
+    if name.endswith("tril"):
+        L = torch.linalg.cholesky(S).requires_grad_()
+        dist = family(df, scale_tril=L)
+        expected_df, expected_L = torch.autograd.grad(dist.log_pdf(X).sum(), (df, L))
+        grads = dist.log_pdf_param_grads(X)
+        torch.testing.assert_close(grads["scale_tril"].sum(0), torch.tril(expected_L))
+    else:
+        dist = family(df, S)
+        expected_df, = torch.autograd.grad(dist.log_pdf(X).sum(), df)
+        grads = dist.log_pdf_param_grads(X)
+        G = grads["scale"]
+        torch.testing.assert_close(G, G.transpose(-2, -1))
+        eps = 1e-6
+        for i, j in [(0, 0), (1, 0), (2, 1)]:
+            E = torch.zeros(3, 3)
+            E[i, j] = E[j, i] = eps
+            numeric = (family(df.detach(), S + E).log_pdf(X) - family(df.detach(), S - E).log_pdf(X)).sum() / (2 * eps)
+            assert ((G * E).sum() / eps).item() == pytest.approx(numeric.item(), rel=1e-6)
+    torch.testing.assert_close(grads["df"].sum(), expected_df)
+
+
+@pytest.mark.parametrize("name", WISHART_CASES)
+def test_wishart_family_unconstrained(name):
+    dist, _, X = wishart_case(name)
+    z = dist.transform.forward(X)
+    assert z.shape == (2, 6)
+    torch.testing.assert_close(dist.transform.inverse(z), X)
+    torch.testing.assert_close(dist._log_prob_unconstrained(z), dist.log_pdf(X).sum() + dist.transform.log_abs_det_jacobian(z))
+    z_grad = z.clone().requires_grad_()
+    expected, = torch.autograd.grad(dist._log_prob_unconstrained(z_grad), z_grad)
+    torch.testing.assert_close(dist._log_prob_grad_unconstrained(z), expected)
+
+
+def test_positive_definite_transform_jacobian():
+    T = PositiveDefiniteTransform(3)
+    z = t([0.3, -0.4, 0.2, 0.7, -0.1, 0.5])
+    jac = torch.autograd.functional.jacobian(T.inverse, z)
+    torch.testing.assert_close(T.derivative(z), jac)
+    rows, cols = torch.tril_indices(3, 3)
+    torch.testing.assert_close(T.log_abs_det_jacobian(z), torch.linalg.slogdet(jac[rows, cols])[1])
+    z_grad = z.clone().requires_grad_()
+    expected, = torch.autograd.grad(T.log_abs_det_jacobian(z_grad), z_grad)
+    torch.testing.assert_close(T.grad_log_abs_det_jacobian(z), expected)
+    cotangent = torch.randn(3, 3)
+    torch.testing.assert_close(T.vjp(z, cotangent), (jac * cotangent.unsqueeze(-1)).sum((0, 1)))
+    assert T.unconstrained_shape((4, 3, 3)) == (4, 6)
+    torch.testing.assert_close(T.inverse(torch.zeros(6)), torch.eye(3))
+
+
+def test_model_gradient_through_wishart_prior():
+    with Model() as model:
+        cov = RandomParameter("cov", Wishart(4.0, t(WISHART_SCALE)))
+        ObservedParameter("data", MultivariateNormal(torch.zeros(3), cov), t([[0.3, -0.2, 1.0], [1.5, 0.4, -0.7]]))
+    assert model.params["cov"].unconstrained_value.shape == (6,)
+    model.params["cov"].set_unconstrained_value(t([0.3, -0.4, 0.2, 0.7, -0.1, 0.5]))
+    _assert_model_gradients_match_autograd(model)
 
 
 CONTINUOUS = ["normal", "half_normal", "log_normal", "multivariate_normal", "mvn_scale_tril", "beta", "exponential",

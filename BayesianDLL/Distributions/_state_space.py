@@ -188,3 +188,16 @@ class ContinuousCorrCholesky(ContinuousSpace):
         positive = bool(torch.all(torch.diagonal(state, dim1=-2, dim2=-1) > 0))
         unit_rows = bool(torch.allclose((state ** 2).sum(-1), torch.ones((), dtype=state.dtype, device=state.device)))
         return lower and positive and unit_rows
+
+
+class ContinuousPositiveDefinite(ContinuousSpace):
+    """Symmetric positive-definite matrices (support of Wishart / InverseWishart)."""
+
+    def contains(self, state):
+        state = torch.as_tensor(state)
+        if state.ndim < 2 or state.shape[-1] != state.shape[-2] or not state.is_floating_point():
+            return False
+        if not torch.allclose(state, state.transpose(-2, -1)):
+            return False
+        _, info = torch.linalg.cholesky_ex(state)
+        return bool(torch.all(info == 0))

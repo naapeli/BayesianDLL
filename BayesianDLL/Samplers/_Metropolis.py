@@ -1,5 +1,4 @@
 import math
-import warnings
 from collections import deque
 
 import torch
@@ -43,18 +42,9 @@ class Metropolis(_CachedTarget):
     ``delta``. Discrete states are updated one coordinate at a time: each step
     sweeps over the coordinates in random order and proposes a move of ±1 for
     each, so the acceptance rate does not collapse with the dimension.
-
-    ``proposal_variance`` is a deprecated alias of ``proposal_scale``.
     """
 
-    def __init__(self, log_target, state_space, proposal_scale=1.0, kappa=0.05, delta=0.234, proposal_variance=None):
-        if proposal_variance is not None:
-            warnings.warn(
-                "'proposal_variance' is deprecated and will be removed; use 'proposal_scale' "
-                "(the standard deviation of the Gaussian proposal) instead.",
-                DeprecationWarning, stacklevel=2,
-            )
-            proposal_scale = proposal_variance
+    def __init__(self, log_target, state_space, proposal_scale=1.0, kappa=0.05, delta=0.234):
         self.log_target = log_target
         self.state_space = state_space
         self.proposal_scale = proposal_scale
@@ -64,15 +54,6 @@ class Metropolis(_CachedTarget):
         self.accept_queue = deque([], maxlen=20)
         self.last_stats = {}
         self._init_cache()
-
-    @property
-    def proposal_variance(self):
-        """Deprecated alias of :attr:`proposal_scale`."""
-        return self.proposal_scale
-
-    @proposal_variance.setter
-    def proposal_variance(self, value):
-        self.proposal_scale = value
 
     def step(self, theta, warmup=False):
         if self.state_space.is_discrete():
@@ -155,9 +136,6 @@ class Metropolis(_CachedTarget):
             self.proposal_scale *= (1 - self.kappa)
         elif acceptance_ratio > self.delta:
             self.proposal_scale *= (1 + self.kappa)
-
-    # Backward compatible name.
-    adapt_proposal_variance = adapt_proposal_scale
 
     def init_sampler(self):
         pass
