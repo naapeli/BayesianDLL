@@ -13,6 +13,7 @@ from loky import get_reusable_executor
 
 from ._NUTS import NUTS
 from ._Metropolis import Metropolis, FiniteGibbs, has_finite_support
+from ._Slice import Slice
 from ._result import SamplingResult, PredicativeResult, SampleStats
 from .._active_model._active_model import get_active_model
 from ..Evaluation import gelman_rubin
@@ -20,7 +21,7 @@ from ..Evaluation._bfmi import bfmi
 from ..Distributions._state_space import JointStateSpace
 
 
-_SAMPLER_CLASSES = {"nuts": NUTS, "metropolis": Metropolis, "gibbs": FiniteGibbs}
+_SAMPLER_CLASSES = {"nuts": NUTS, "metropolis": Metropolis, "gibbs": FiniteGibbs, "slice": Slice}
 _SAMPLER_ALIASES = {"finite_gibbs": "gibbs", "finitegibbs": "gibbs"}
 # Constructor arguments supplied by the library itself, not by sampler_params.
 _INTERNAL_ARGUMENTS = {"self", "log_target", "gradient", "inverse_transformation", "state_space", "elementwise_log_target"}
@@ -74,6 +75,10 @@ def _select_sampler(log_target, state_space, gradient=None, sampler="auto", samp
         if not (is_continuous or is_discrete):
             raise RuntimeError("State space must be either continuous or discrete for Metropolis sampler.")
         instance = Metropolis(log_target, state_space, **_filter_sampler_params(Metropolis, sampler_params))
+    elif sampler == "slice":
+        if not is_continuous:
+            raise RuntimeError("A distribution is incompatable with the chosen sampler. The slice sampler can only be used with continuous distributions.")
+        instance = Slice(log_target, state_space, **_filter_sampler_params(Slice, sampler_params))
     elif sampler == "gibbs":
         if not (is_discrete and has_finite_support(state_space)):
             raise RuntimeError("The finite Gibbs sampler can only be used with discrete distributions with a finite support.")
@@ -92,6 +97,8 @@ def _sampler_name(sampler):
         return "gibbs"
     if isinstance(sampler, Metropolis):
         return "metropolis"
+    if isinstance(sampler, Slice):
+        return "slice"
     return type(sampler).__name__
 
 
@@ -156,7 +163,14 @@ class SamplingBlock:
         if sampler_type == "auto":
             requested = [_SAMPLER_ALIASES.get(model.params[name].sampler, model.params[name].sampler) for name in self.param_names]
             if self.is_continuous:
-                sampler_type = "metropolis" if "metropolis" in requested else "nuts"
+                if "metropolis" in requested:
+                    sampler_type = "metropolis"
+                elif "slice" in requested:
+                    sampler_type = "slice"
+                else:
+                    sampler_type = "nuts"
+            elif "slice" in requested:
+                raise ValueError(f"The slice sampler can only be used with continuous parameters: {self.param_names}")
             elif "metropolis" in requested or not has_finite_support(state_space):
                 sampler_type = "metropolis"
             else:
@@ -276,6 +290,7 @@ def _build_blocks(model, blocks_spec=None, sampler_params=None):
         return built_blocks
 
     nuts_names = []
+    slice_names = []
     continuous_metropolis_names = []
     gibbs_names = []
     discrete_metropolis_names = []
@@ -285,8 +300,12 @@ def _build_blocks(model, blocks_spec=None, sampler_params=None):
         if space.is_continuous():
             if requested in ("auto", "nuts"):
                 nuts_names.append(name)
+            elif requested == "slice":
+                slice_names.append(name)
             else:
                 continuous_metropolis_names.append(name)
+        elif requested == "slice":
+            raise ValueError(f"The slice sampler can only be used with continuous parameters, but '{name}' is discrete.")
         elif requested in ("auto", "gibbs") and has_finite_support(space):
             gibbs_names.append(name)
         else:
@@ -295,6 +314,8 @@ def _build_blocks(model, blocks_spec=None, sampler_params=None):
     built_blocks = []
     if nuts_names:
         built_blocks.append(SamplingBlock(model, nuts_names, sampler_type="nuts", sampler_params=sampler_params))
+    if slice_names:
+        built_blocks.append(SamplingBlock(model, slice_names, sampler_type="slice", sampler_params=sampler_params))
     if continuous_metropolis_names:
         built_blocks.append(SamplingBlock(model, continuous_metropolis_names, sampler_type="metropolis", sampler_params=sampler_params))
     if gibbs_names:

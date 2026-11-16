@@ -18,13 +18,14 @@ class SampleStats:
     """Per-iteration sampler statistics of the post-warmup draws, one entry per sampling block.
 
     Each block entry is a dict with the block's ``"params"`` (parameter
-    names), its ``"sampler"`` (``"nuts"``, ``"metropolis"`` or ``"gibbs"``)
-    and ``"stats"``, a dict mapping a statistic name to a tensor of shape
+    names), its ``"sampler"`` (``"nuts"``, ``"metropolis"``, ``"slice"``
+    or ``"gibbs"``) and ``"stats"``, a dict mapping a statistic name to a tensor of shape
     ``(n_chains, n_samples)``. NUTS records ``step_size``, ``accept_stat``,
     ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` and ``lp``;
     Metropolis records ``accept_stat``, ``accepted``, ``step_size`` (the
-    proposal scale) and ``lp``; the finite Gibbs sampler ``accept_stat``,
-    ``step_size`` and ``lp``.
+    proposal scale) and ``lp``; the slice sampler ``n_evals``,
+    ``accept_stat``, ``step_size`` (the mean width) and ``lp``; the finite
+    Gibbs sampler ``accept_stat``, ``step_size`` and ``lp``.
 
     ``stats[i]`` returns the statistics of block ``i`` and ``stats["energy"]``
     the statistic of the only block that records it.
