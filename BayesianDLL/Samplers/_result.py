@@ -14,13 +14,72 @@ def _normalize_slice(s):
         raise TypeError(f"Expected int or slice for thinning, got {type(s).__name__}.")
 
 
+class SampleStats:
+    """Per-iteration sampler statistics of the post-warmup draws, one entry per sampling block.
+
+    Each block entry is a dict with the block's ``"params"`` (parameter
+    names), its ``"sampler"`` (``"nuts"``, ``"metropolis"`` or ``"gibbs"``)
+    and ``"stats"``, a dict mapping a statistic name to a tensor of shape
+    ``(n_chains, n_samples)``. NUTS records ``step_size``, ``accept_stat``,
+    ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` and ``lp``;
+    Metropolis records ``accept_stat``, ``accepted``, ``step_size`` (the
+    proposal scale) and ``lp``; the finite Gibbs sampler ``accept_stat``,
+    ``step_size`` and ``lp``.
+
+    ``stats[i]`` returns the statistics of block ``i`` and ``stats["energy"]``
+    the statistic of the only block that records it.
+    """
+
+    def __init__(self, blocks=None):
+        self.blocks = [] if blocks is None else list(blocks)
+
+    @property
+    def params(self):
+        return [block["params"] for block in self.blocks]
+
+    @property
+    def samplers(self):
+        return [block["sampler"] for block in self.blocks]
+
+    def __len__(self):
+        return len(self.blocks)
+
+    def __iter__(self):
+        return (block["stats"] for block in self.blocks)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self.blocks[key]["stats"]
+        matches = [block["stats"][key] for block in self.blocks if key in block["stats"]]
+        if len(matches) == 1:
+            return matches[0]
+        if not matches:
+            raise KeyError(f"No sampling block records the statistic '{key}'.")
+        raise KeyError(f"Several sampling blocks record '{key}'; index the block first, e.g. sample_stats[0]['{key}'].")
+
+    def __contains__(self, key):
+        return any(key in block["stats"] for block in self.blocks)
+
+    def thin(self, step=1):
+        s = _normalize_slice(step)
+        return SampleStats([
+            {**block, "stats": {name: value[:, s] for name, value in block["stats"].items()}}
+            for block in self.blocks
+        ])
+
+    def __repr__(self):
+        summary = [(block["sampler"], block["params"], list(block["stats"])) for block in self.blocks]
+        return f"SampleStats({summary})"
+
+
 class SamplingResult:
-    def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None):
+    def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None, sample_stats=None):
         self.trace = trace
         self.divergences = divergences
         self.acceptance_probabilities = acceptance_probabilities
         self.step_sizes = step_sizes
         self.deterministic_trace = {} if deterministic_trace is None else deterministic_trace
+        self.sample_stats = SampleStats() if sample_stats is None else sample_stats
 
     def __getitem__(self, key):
         if key in self.trace:
@@ -49,6 +108,7 @@ class SamplingResult:
             acceptance_probabilities=[list(ap) for ap in self.acceptance_probabilities],
             step_sizes=[list(ss) for ss in self.step_sizes],
             deterministic_trace=thinned_det,
+            sample_stats=self.sample_stats.thin(step),
         )
 
     def summary(self, hdi_prob=0.94, ci_kind="eti", round_to=3, include_deterministic=False):

@@ -5,7 +5,7 @@ from networkx import DiGraph
 from collections import deque
 import copy
 
-from ._active_model import _active_model
+from ._active_model._active_model import push_model, pop_model
 from ._parameters import RandomParameter, ObservedParameter, DeterministicParameter
 
 
@@ -46,6 +46,15 @@ def _distribution_dependencies(distribution) -> set[str]:
     return set(getattr(distribution, "parameters", ()))
 
 
+def _sum_log_prob_terms(random_terms, observed_terms):
+    logp = 0.0
+    for parameter in random_terms:
+        logp = logp + parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
+    for observed_parameter in observed_terms:
+        logp = logp + observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
+    return logp
+
+
 class Model:
     def __init__(self):
         self.data = {}
@@ -62,12 +71,16 @@ class Model:
         self._topo_order: list[str] = []
 
     def __enter__(self):
-        _active_model._active_model = self
+        push_model(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        _active_model._active_model = None
-        self.compile()
+        pop_model(self)
+        # Only compile a fully built model. When the block raised, compiling a
+        # half-built graph could raise a second error that hides the first.
+        if exc_type is None:
+            self.compile()
+        return False
 
     def compile(self):
         self._all_params_list = list(self.params.values())
@@ -106,6 +119,53 @@ class Model:
             ]
 
         self._compiled = True
+
+    def block_terms(self, names):
+        """Return the log-density terms that depend on the parameters ``names``.
+
+        These are the prior terms of the parameters themselves, of their random
+        children and of the observed children (children reached through
+        deterministic nodes included). All other terms of ``model_log_prob``
+        are constant while only ``names`` change, so a Gibbs block can work
+        with this Markov blanket instead of the full joint density.
+
+        Returns ``(random_params, observed_params, nodes)``, where ``nodes``
+        is the set of graph nodes needed to differentiate these terms with
+        :meth:`joint_grad_log_prob`.
+        """
+        names = [names] if isinstance(names, str) else list(names)
+        nodes = set(names)
+        random_terms = list(names)
+        observed_terms = []
+        queue = deque(names)
+        while queue:
+            current = queue.popleft()
+            for successor in self.graph.successors(current):
+                if successor in nodes:
+                    continue
+                if successor in self.deterministic_params:
+                    nodes.add(successor)
+                    queue.append(successor)
+                elif successor in self.params:
+                    nodes.add(successor)
+                    random_terms.append(successor)
+                elif successor in self.observed_params:
+                    nodes.add(successor)
+                    observed_terms.append(successor)
+        return (
+            [self.params[n] for n in random_terms],
+            [self.observed_params[n] for n in observed_terms],
+            nodes,
+        )
+
+    def block_log_prob(self, names):
+        """Log density restricted to the terms that depend on ``names``.
+
+        Differs from :meth:`model_log_prob` only by terms that are constant in
+        the parameters ``names``.
+        """
+        random_terms, observed_terms, _ = self.block_terms(names)
+        return _sum_log_prob_terms(random_terms, observed_terms)
 
     def model_log_prob(self):
         if not self._compiled:
@@ -158,7 +218,14 @@ class Model:
             for name, old_value in old_values.items():
                 self.params[name].set_unconstrained_value(old_value)
 
-    def joint_grad_log_prob(self, param_names=None):
+    def joint_grad_log_prob(self, param_names=None, nodes=None):
+        """Gradient of the joint log density w.r.t. the unconstrained ``param_names``.
+
+        ``nodes`` optionally restricts the backward pass to a set of graph
+        nodes, e.g. the ``nodes`` returned by :meth:`block_terms`. Skipping the
+        other nodes is exact for the parameters of that block, because no term
+        outside their Markov blanket depends on them.
+        """
         if not self._compiled:
             self.compile()
 
@@ -168,6 +235,8 @@ class Model:
         cotangents: dict[str, torch.Tensor] = {}
 
         for node_name in reversed(self._topo_order):
+            if nodes is not None and node_name not in nodes:
+                continue
             if node_name in self.observed_params:
                 obs_param = self.observed_params[node_name]
                 observed = obs_param.observed_values
@@ -259,9 +328,9 @@ class Model:
             return grads[name]
 
 
-    def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, start_point_variance=1, blocks=None, **sampler_params):
+    def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, start_point_variance=1, blocks=None, seed=None, **sampler_params):
         from .Samplers import sample as _sample
-        return _sample(n_samples, warmup_length, n_chains=n_chains, model=self, progress_bar=progress_bar, start_point_variance=start_point_variance, blocks=blocks, **sampler_params)
+        return _sample(n_samples, warmup_length, n_chains=n_chains, model=self, progress_bar=progress_bar, start_point_variance=start_point_variance, blocks=blocks, seed=seed, **sampler_params)
 
     def find_MAP(self, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
         from .Variational import find_MAP as _find_MAP
@@ -298,27 +367,30 @@ def condition(model: Model, random_variable_names_and_values: dict = None, **kwa
         conditions.update(random_variable_names_and_values)
     conditions.update(kwargs)
 
-    new_model = copy.deepcopy(model)
-
+    # Validate everything on the original model first, so that nothing is
+    # copied when a condition is invalid.
+    data_values = {}
+    observed_values = {}
+    latent_values = {}
     for k, v in conditions.items():
         name = k.name if hasattr(k, "name") else str(k)
 
-        if name in new_model.deterministic_params:
+        if name in model.deterministic_params:
             raise ValueError(f"Cannot condition deterministic parameter '{name}'. Condition its input random variables instead.")
 
-        if name in new_model.data:
-            new_model.data[name].set_value(v)
+        if name in model.data:
+            data_values[name] = v
             continue
 
-        if name not in new_model.params and name not in new_model.observed_params:
+        if name not in model.params and name not in model.observed_params:
             raise KeyError(f"Variable '{name}' not found in model parameters, observed parameters, or data.")
 
-        if name in new_model.params:
-            param = new_model.params[name]
+        if name in model.params:
+            param = model.params[name]
             dtype = param.constrained_value.dtype
             target_shape = param.constrained_value.shape
         else:
-            param = new_model.observed_params[name]
+            param = model.observed_params[name]
             dtype = param.observed_values.dtype
             target_shape = param.observed_values.shape
 
@@ -339,16 +411,38 @@ def condition(model: Model, random_variable_names_and_values: dict = None, **kwa
             if not contains:
                 raise ValueError(f"Conditioned value {val_tensor} for '{name}' is outside its distribution's state space.")
 
-        if name in new_model.params:
-            param = new_model.params.pop(name)
-            param.set_constrained_value(val_tensor)
-            param._observed_values = val_tensor
-            param.__class__ = ObservedParameter
-            new_model.observed_params[name] = param
-            new_model.graph.nodes[name]["type"] = "observed"
+        if name in model.params:
+            latent_values[name] = val_tensor
         else:
-            param = new_model.observed_params[name]
-            param.observed_values = val_tensor
+            observed_values[name] = val_tensor
+
+    # Each conditioned RandomParameter is replaced by a new ObservedParameter.
+    # Registering the (still empty) replacement in the deepcopy memo makes every
+    # reference to the random parameter in the copy (distributions of its
+    # children, deterministic inputs, the model dictionaries) point to it.
+    replacements = {}
+    memo = {}
+    for name in latent_values:
+        shell = ObservedParameter.__new__(ObservedParameter)
+        replacements[name] = shell
+        memo[id(model.params[name])] = shell
+
+    new_model = copy.deepcopy(model, memo)
+
+    for name, val_tensor in latent_values.items():
+        original = model.params[name]
+        observed = ObservedParameter._from_random_parameter(
+            original, val_tensor, memo=memo, instance=replacements[name],
+        )
+        new_model.params.pop(name)
+        new_model.observed_params[name] = observed
+        new_model.graph.nodes[name]["type"] = "observed"
+
+    for name, val_tensor in observed_values.items():
+        new_model.observed_params[name].observed_values = val_tensor
+
+    for name, value in data_values.items():
+        new_model.data[name].set_value(value)
 
     new_model.compile()
     return new_model

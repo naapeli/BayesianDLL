@@ -6,7 +6,7 @@ import torch
 from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Distributions import Bernoulli, ContinuousReal, DiscreteRange, Exponential, Normal
 from BayesianDLL.Samplers import (
-    Metropolis, NUTS, PredicativeResult, SamplingBlock, SamplingResult,
+    FiniteGibbs, Metropolis, NUTS, PredicativeResult, SamplingBlock, SamplingResult,
     posterior_predicative, sample_predicative, thin,
 )
 from BayesianDLL.Samplers._sample import _build_blocks, _select_sampler
@@ -99,7 +99,7 @@ def test_blocks_pack_unpack_and_auto_selection():
     blocks = _build_blocks(model)
     assert [block.param_names for block in blocks] == [["a", "b"], ["c"]]
     assert isinstance(blocks[0].sampler, NUTS)
-    assert isinstance(blocks[1].sampler, Metropolis)
+    assert isinstance(blocks[1].sampler, FiniteGibbs)
     blocks[0].unpack_and_set(torch.tensor([1.0, 2.0, 3.0]))
     torch.testing.assert_close(model.params["a"].constrained_value, torch.tensor([1.0, 2.0]))
     torch.testing.assert_close(blocks[0].pack(), torch.tensor([1.0, 2.0, 3.0]))

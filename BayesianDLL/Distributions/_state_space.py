@@ -3,6 +3,22 @@ from abc import ABC, abstractmethod
 from ._resolve import resolve
 
 
+def _as_tensor(state):
+    return state if isinstance(state, torch.Tensor) else torch.as_tensor(state)
+
+
+def _bound_like(bound, state):
+    """Resolve a (possibly random) bound to a tensor on the device of ``state``."""
+    bound = resolve(bound)
+    return bound.to(device=state.device)
+
+
+def _is_integer_valued(state):
+    if not (state.is_floating_point() or state.is_complex()):
+        return torch.ones_like(state, dtype=torch.bool)
+    return torch.isfinite(state) & (state == torch.round(state))
+
+
 class StateSpace(ABC):
     @abstractmethod
     def contains(self, state) -> bool:
@@ -39,8 +55,8 @@ class Union(StateSpace):
         self.state_spaces = spaces
         self._continuous = all(space.is_continuous() for space in spaces)
 
-    def contains(self, x):
-        return any(space.contains(x) for space in self.state_spaces)
+    def contains(self, x) -> bool:
+        return any(bool(space.contains(x)) for space in self.state_spaces)
     
     def is_continuous(self):
         return self._continuous
@@ -53,11 +69,13 @@ class DiscreteRange(DiscreteSpace):
         self.low = low
         self.high = high
 
-    def contains(self, state):
-        low = resolve(self.low).item()
-        high = resolve(self.high).item()
-        values = torch.arange(low, high + 1)
-        return state in values
+    def contains(self, state) -> bool:
+        """Return whether every element of ``state`` is an integer in ``[low, high]``."""
+        state = _as_tensor(state)
+        low = _bound_like(self.low, state)
+        high = _bound_like(self.high, state)
+        valid = (state >= low) & (state <= high) & _is_integer_valued(state)
+        return bool(valid.all())
     
     def __iter__(self):
         low = resolve(self.low).item()
@@ -84,8 +102,10 @@ class DiscreteRange(DiscreteSpace):
         return torch.arange(low, high + 1)
 
 class DiscretePositive(DiscreteSpace):
-    def contains(self, state):
-        return state > 0 and (isinstance(state.item(), int) or state.item().is_integer())
+    def contains(self, state) -> bool:
+        """Return whether every element of ``state`` is a positive integer."""
+        state = _as_tensor(state)
+        return bool(((state > 0) & _is_integer_valued(state)).all())
 
     def __iter__(self):
         i = 1
@@ -98,23 +118,28 @@ class ContinuousRange(ContinuousSpace):
         self.low = low
         self.high = high
 
-    def contains(self, state):
-        return torch.all((self.low <= state) & (state <= self.high))
+    def contains(self, state) -> bool:
+        state = _as_tensor(state)
+        low = _bound_like(self.low, state)
+        high = _bound_like(self.high, state)
+        return bool(torch.all((low <= state) & (state <= high)))
 
 class ContinuousPositive(ContinuousSpace):
-    def contains(self, state):
-        return torch.all(state > 0)
+    def contains(self, state) -> bool:
+        return bool(torch.all(_as_tensor(state) > 0))
 
 class ContinuousReal(ContinuousSpace):
-    def contains(self, state):
-        return torch.all(torch.isfinite(state))
+    def contains(self, state) -> bool:
+        return bool(torch.all(torch.isfinite(_as_tensor(state))))
 
 class ContinuousSimplex(ContinuousSpace):
-    def contains(self, state):
-        between_0_and_1 = torch.all((0 <= state) & (state <= 1))
-        sum = torch.sum(state)
-        sum_to_1 = torch.allclose(sum, torch.ones_like(sum))
-        return between_0_and_1 & sum_to_1
+    def contains(self, state) -> bool:
+        state = _as_tensor(state)
+        between_0_and_1 = bool(torch.all((0 <= state) & (state <= 1)))
+        # Each simplex lies along the last dimension; leading dimensions are batches.
+        total = torch.sum(state, dim=-1) if state.ndim > 0 else state
+        sum_to_1 = torch.allclose(total, torch.ones_like(total))
+        return between_0_and_1 and sum_to_1
 
 class JointStateSpace(StateSpace):
     def __init__(self, spaces_dict, slices):
@@ -122,10 +147,10 @@ class JointStateSpace(StateSpace):
         self.slices = slices
         self._is_continuous = all(s.is_continuous() for s in spaces_dict.values())
 
-    def contains(self, theta_flat):
+    def contains(self, theta_flat) -> bool:
         for name, (start, end, shape) in self.slices.items():
             val = theta_flat[start:end].reshape(shape)
-            if not self.spaces_dict[name].contains(val):
+            if not bool(self.spaces_dict[name].contains(val)):
                 return False
         return True
 

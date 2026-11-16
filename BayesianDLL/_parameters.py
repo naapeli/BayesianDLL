@@ -1,6 +1,8 @@
 import torch
 
-from ._active_model import _active_model
+import copy
+
+from ._active_model._active_model import get_active_model
 from ._plate import get_active_plates
 from ._data import Data
 
@@ -47,14 +49,14 @@ class RandomParameter:
         self.state_space = self.distribution.state_space
         self.transformed_state_space = self.distribution.transformed_state_space
 
-        if _active_model._active_model is not None:
-            _active_model._active_model.params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
-            _active_model._active_model._compiled = False
-            graph = _active_model._active_model.graph
+        if get_active_model() is not None:
+            get_active_model().params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            get_active_model()._compiled = False
+            graph = get_active_model().graph
             graph.add_node(self.name, type="random")
             for parameter in self.distribution.parameters:
                 if parameter in graph:
-                    _active_model._active_model.graph.add_edge(parameter, self.name)
+                    get_active_model().graph.add_edge(parameter, self.name)
                 else:
                     raise RuntimeError(f"{self.name} depends on {parameter}, which is not in the computation graph of the model.")
         else:
@@ -82,22 +84,57 @@ class ObservedParameter:
         self.sampler_params = sampler_params
         self.plates = get_active_plates()
 
-        if _active_model._active_model is not None:
-            _active_model._active_model.observed_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
-            _active_model._active_model._compiled = False
-            graph = _active_model._active_model.graph
+        if get_active_model() is not None:
+            get_active_model().observed_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            get_active_model()._compiled = False
+            graph = get_active_model().graph
             graph.add_node(self.name, type="observed")
             if isinstance(self._observed_values, Data):
-                if _active_model._active_model.data.get(self._observed_values.name) is not self._observed_values:
+                if get_active_model().data.get(self._observed_values.name) is not self._observed_values:
                     raise RuntimeError("Observed data must belong to the active model.")
                 graph.add_edge(self._observed_values.name, self.name)
             for parameter in self.distribution.parameters:
                 if parameter in graph:
-                    _active_model._active_model.graph.add_edge(parameter, self.name)
+                    get_active_model().graph.add_edge(parameter, self.name)
                 else:
                     raise RuntimeError(f"{self.name} depends on {parameter}, which is not in the computation graph of the model.")
         else:
             raise RuntimeError("One should select an active model before creating random variables.")
+
+    @classmethod
+    def _from_parts(cls, name, distribution, observed_values, plates=(), sampler="auto", sampler_params=None, instance=None):
+        """Build an ObservedParameter without an active model.
+
+        Nothing is registered and no graph edges are added; the caller is
+        responsible for placing the parameter into a model. ``instance`` lets
+        the caller fill in an object allocated beforehand with ``__new__``.
+        """
+        self = cls.__new__(cls) if instance is None else instance
+        self.name = name
+        self.distribution = distribution
+        self.observed_values = observed_values
+        self.sampler = sampler
+        self.sampler_params = {} if sampler_params is None else dict(sampler_params)
+        self.plates = list(plates)
+        return self
+
+    @classmethod
+    def _from_random_parameter(cls, parameter, observed_values, memo=None, instance=None):
+        """Turn a copy of the RandomParameter ``parameter`` into an observation.
+
+        The distribution, plates and sampler settings are deep-copied with
+        ``memo`` so they share objects with a model copied using the same memo.
+        """
+        memo = {} if memo is None else memo
+        return cls._from_parts(
+            parameter.name,
+            copy.deepcopy(parameter.distribution, memo),
+            observed_values,
+            plates=copy.deepcopy(parameter.plates, memo),
+            sampler=parameter.sampler,
+            sampler_params=copy.deepcopy(parameter.sampler_params, memo),
+            instance=instance,
+        )
 
     @property
     def observed_values(self):
@@ -131,17 +168,17 @@ class DeterministicParameter:
         self.forward_func = forward_func
         self.derivative_func = derivative_func
         self.inputs = inputs
-        self.owner_model = _active_model._active_model
+        self.owner_model = get_active_model()
         self.plates = get_active_plates()
 
-        if _active_model._active_model is not None:
-            _active_model._active_model.deterministic_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
-            _active_model._active_model._compiled = False
-            graph = _active_model._active_model.graph
+        if get_active_model() is not None:
+            get_active_model().deterministic_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            get_active_model()._compiled = False
+            graph = get_active_model().graph
             graph.add_node(self.name, type="deterministic")
             for parameter in self.inputs:
                 if parameter.name in graph:
-                    _active_model._active_model.graph.add_edge(parameter.name, self.name)
+                    get_active_model().graph.add_edge(parameter.name, self.name)
                 else:
                     raise RuntimeError(f"{self.name} depends on {parameter.name}, which is not in the computation graph of the model.")
         else:
