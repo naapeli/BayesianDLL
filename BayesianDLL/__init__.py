@@ -1,5 +1,5 @@
 from ._data import Data
-from ._model import Model, MeanFieldGuide, condition
+from ._model import Model, MeanFieldGuide, condition, marginalize
 from ._parameters import RandomParameter, ObservedParameter, DeterministicParameter, VariationalParameter
 from ._plate import plate
 from .Samplers import (

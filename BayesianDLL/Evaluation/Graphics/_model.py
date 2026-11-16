@@ -68,7 +68,7 @@ def _layered_layout(graph):
 
 def _distribution_name(model, node, node_type):
     if node_type == "random":
-        parameter = model.params.get(node)
+        parameter = model.params.get(node) or getattr(model, "enumerated_params", {}).get(node)
     elif node_type == "observed":
         parameter = model.observed_params.get(node)
     else:
@@ -88,7 +88,7 @@ def _data_shape(model, node):
 def _plate_members(model, visible_nodes):
     members = defaultdict(list)
     sizes = {}
-    collections = (model.params, model.observed_params, model.deterministic_params)
+    collections = (model.params, getattr(model, "enumerated_params", {}), model.observed_params, model.deterministic_params)
     for collection in collections:
         for node, parameter in collection.items():
             if node not in visible_nodes:

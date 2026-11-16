@@ -7,6 +7,7 @@ import copy
 
 from ._active_model._active_model import push_model, pop_model
 from ._parameters import RandomParameter, ObservedParameter, DeterministicParameter
+from ._enumeration import weight_gradient
 
 
 def _sum_to_shape(grad: torch.Tensor, target_shape: tuple) -> torch.Tensor:
@@ -46,22 +47,22 @@ def _distribution_dependencies(distribution) -> set[str]:
     return set(getattr(distribution, "parameters", ()))
 
 
-def _sum_log_prob_terms(random_terms, observed_terms):
-    logp = 0.0
-    for parameter in random_terms:
-        logp = logp + parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
-    for observed_parameter in observed_terms:
-        logp = logp + observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
-    return logp
+def _add_grad(cotangents, name, grad):
+    cotangents[name] = cotangents[name] + grad if name in cotangents else grad
 
 
 class Model:
     def __init__(self):
         self.data = {}
         self.params: dict[str, RandomParameter] = {}
+        # Finite-support discrete parameters that are summed out of the joint
+        # density instead of being sampled (see ``RandomParameter(enumerate=True)``).
+        self.enumerated_params: dict[str, RandomParameter] = {}
         self.observed_params: dict[str, ObservedParameter] = {}
         self.deterministic_params: dict[str, DeterministicParameter] = {}
         self.graph = DiGraph()
+        self._enumeration_groups = []
+        self._enumeration_group_of: dict[str, object] = {}
         self._compiled = False
         self._affected_params: dict[str, list[RandomParameter]] = {}
         self._affected_observed: dict[str, list[ObservedParameter]] = {}
@@ -118,20 +119,19 @@ class Model:
                 self.observed_params[n] for n in visited if n in self.observed_params
             ]
 
+        from ._enumeration import build_groups
+        self._enumeration_groups = build_groups(self)
+        self._enumeration_group_of = {
+            term: group for group in self._enumeration_groups for term in group.terms
+        }
+
         self._compiled = True
 
-    def block_terms(self, names):
-        """Return the log-density terms that depend on the parameters ``names``.
+    def _markov_blanket(self, names):
+        """Names of the log density terms (and graph nodes) that depend on ``names``.
 
-        These are the prior terms of the parameters themselves, of their random
-        children and of the observed children (children reached through
-        deterministic nodes included). All other terms of ``model_log_prob``
-        are constant while only ``names`` change, so a Gibbs block can work
-        with this Markov blanket instead of the full joint density.
-
-        Returns ``(random_params, observed_params, nodes)``, where ``nodes``
-        is the set of graph nodes needed to differentiate these terms with
-        :meth:`joint_grad_log_prob`.
+        Returns ``(random_terms, observed_terms, nodes)``; ``random_terms``
+        starts with ``names`` and may contain enumerated parameters.
         """
         names = [names] if isinstance(names, str) else list(names)
         nodes = set(names)
@@ -146,14 +146,101 @@ class Model:
                 if successor in self.deterministic_params:
                     nodes.add(successor)
                     queue.append(successor)
-                elif successor in self.params:
+                elif successor in self.params or successor in self.enumerated_params:
                     nodes.add(successor)
                     random_terms.append(successor)
                 elif successor in self.observed_params:
                     nodes.add(successor)
                     observed_terms.append(successor)
+        return random_terms, observed_terms, nodes
+
+    def _random_term(self, name):
+        return self.params[name] if name in self.params else self.enumerated_params[name]
+
+    def prepare_enumeration(self):
+        """Check how every enumerated parameter is summed out (raises if it cannot be)."""
+        if not self._compiled:
+            self.compile()
+        for group in self._enumeration_groups:
+            group.prepare(self)
+        return list(self._enumeration_groups)
+
+    def _log_prob_of_terms(self, random_terms, observed_terms):
+        """Sum the given prior and likelihood terms.
+
+        Terms that belong to an enumeration group are replaced by the group's
+        log marginal, which is added once per group.
+        """
+        if self.enumerated_params and not self._compiled:
+            self.compile()
+        group_of = self._enumeration_group_of
+        groups = []
+        logp = 0.0
+        for parameter in random_terms:
+            group = group_of.get(parameter.name)
+            if group is None:
+                logp = logp + parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
+            elif not any(group is g for g in groups):
+                groups.append(group)
+        for observed_parameter in observed_terms:
+            group = group_of.get(observed_parameter.name)
+            if group is None:
+                logp = logp + observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
+            elif not any(group is g for g in groups):
+                groups.append(group)
+        for group in groups:
+            logp = logp + group.log_marginal(self)
+        return logp
+
+    def sample_enumerated(self):
+        """Draw every enumerated parameter from its conditional posterior given the other values.
+
+        The draws are set on the parameters. Returns ``{name: (value,
+        probabilities)}``, where ``probabilities[..., k]`` is the posterior
+        probability that a coordinate takes the ``k``-th support value.
+        """
+        if not self._compiled:
+            self.compile()
+        draws = {}
+        for group in self._enumeration_groups:
+            draws.update(group.sample(self))
+        return draws
+
+    def block_terms(self, names):
+        """Return the log-density terms that depend on the parameters ``names``.
+
+        These are the prior terms of the parameters themselves, of their random
+        children and of the observed children (children reached through
+        deterministic nodes included). All other terms of ``model_log_prob``
+        are constant while only ``names`` change, so a Gibbs block can work
+        with this Markov blanket instead of the full joint density.
+
+        Returns ``(random_params, observed_params, nodes)``, where ``nodes``
+        is the set of graph nodes needed to differentiate these terms with
+        :meth:`joint_grad_log_prob`.
+
+        When a term belongs to the factor group of an enumerated parameter,
+        all terms of that group are included, because the summed-out group
+        contributes a single, non-separable log marginal.
+        """
+        random_terms, observed_terms, nodes = self._markov_blanket(names)
+        if self.enumerated_params:
+            if not self._compiled:
+                self.compile()
+            for term in list(random_terms) + list(observed_terms):
+                group = self._enumeration_group_of.get(term)
+                if group is None:
+                    continue
+                for name in group.enumerated_names + group.random_terms:
+                    if name not in random_terms:
+                        random_terms.append(name)
+                    nodes.add(name)
+                for name in group.observed_terms:
+                    if name not in observed_terms:
+                        observed_terms.append(name)
+                    nodes.add(name)
         return (
-            [self.params[n] for n in random_terms],
+            [self._random_term(n) for n in random_terms],
             [self.observed_params[n] for n in observed_terms],
             nodes,
         )
@@ -165,27 +252,26 @@ class Model:
         the parameters ``names``.
         """
         random_terms, observed_terms, _ = self.block_terms(names)
-        return _sum_log_prob_terms(random_terms, observed_terms)
+        return self._log_prob_of_terms(random_terms, observed_terms)
 
     def model_log_prob(self):
+        """Joint log density in the unconstrained space.
+
+        Enumerated parameters are summed out, so this is the log density of
+        the marginal model.
+        """
         if not self._compiled:
             self.compile()
-
-        logp = 0.0
-        # priors
-        for parameter in self._all_params_list:
-            diff = parameter.distribution._log_prob_unconstrained(parameter.unconstrained_value)
-            logp += diff
-
-        # likelihood
-        for observed_parameter in self.observed_params.values():
-            logp += observed_parameter.distribution.log_pdf(observed_parameter.observed_values).sum()
-
-        return logp
+        random_terms = self._all_params_list + list(self.enumerated_params.values())
+        return self._log_prob_of_terms(random_terms, list(self.observed_params.values()))
 
     def log_prob(self, name, theta):
         if not self._compiled:
             self.compile()
+
+        if self.enumerated_params:
+            with self.temporarily_set(name, theta):
+                return self.block_log_prob(name)
 
         with self.temporarily_set(name, theta):
             logp = 0.0
@@ -200,23 +286,25 @@ class Model:
     @contextmanager
     def temporarily_set(self, name, value):
         try:
-            old_value = self.params[name].unconstrained_value
-            self.params[name].set_unconstrained_value(value)
+            old_value = self._random_term(name).unconstrained_value
+            self._random_term(name).set_unconstrained_value(value)
             yield
         finally:
-            self.params[name].set_unconstrained_value(old_value)
+            self._random_term(name).set_unconstrained_value(old_value)
     
     @contextmanager
     def temporarily_set_many(self, values):
+        """Temporarily set unconstrained values (enumerated parameters included)."""
         try:
             old_values = {}
             for name, value in values.items():
-                old_values[name] = self.params[name].unconstrained_value
-                self.params[name].set_unconstrained_value(value)
+                parameter = self._random_term(name)
+                old_values[name] = parameter.unconstrained_value
+                parameter.set_unconstrained_value(value)
             yield
         finally:
             for name, old_value in old_values.items():
-                self.params[name].set_unconstrained_value(old_value)
+                self._random_term(name).set_unconstrained_value(old_value)
 
     def joint_grad_log_prob(self, param_names=None, nodes=None):
         """Gradient of the joint log density w.r.t. the unconstrained ``param_names``.
@@ -225,6 +313,9 @@ class Model:
         nodes, e.g. the ``nodes`` returned by :meth:`block_terms`. Skipping the
         other nodes is exact for the parameters of that block, because no term
         outside their Markov blanket depends on them.
+
+        Enumerated parameters are summed out: the gradient is the one of the
+        marginal log density (see :mod:`BayesianDLL._enumeration`).
         """
         if not self._compiled:
             self.compile()
@@ -232,27 +323,60 @@ class Model:
         if param_names is None:
             param_names = list(self.params.keys())
 
+        if not self._enumeration_groups:
+            return self._reverse_pass(param_names, nodes=nodes)
+
+        grouped = self._enumeration_group_of
+        result = self._reverse_pass(param_names, nodes=nodes, active_terms=lambda name: name not in grouped)
+        for group in self._enumeration_groups:
+            if nodes is not None and not any(term in nodes for term in group.terms):
+                continue
+            for name, grad in group.grad(self, param_names, nodes=nodes).items():
+                result[name] = result[name] + grad
+        return result
+
+    def _reverse_pass(self, param_names, nodes=None, active_terms=None, term_weights=None):
+        """Hand-written reverse pass over the model graph.
+
+        ``active_terms`` (a container or a predicate on term names) selects the
+        prior and likelihood terms that are differentiated; all terms by
+        default. ``term_weights`` maps a term name to a tensor of the shape of
+        its elementwise log density that multiplies that term elementwise
+        (``None``: weight one), which yields the gradient of a weighted sum of
+        the terms' elementwise log densities.
+        """
+        if active_terms is None:
+            is_active = lambda name: True
+        elif callable(active_terms):
+            is_active = active_terms
+        else:
+            is_active = active_terms.__contains__
+        term_weights = {} if term_weights is None else term_weights
+
         cotangents: dict[str, torch.Tensor] = {}
+
+        def add_param_grads(distribution, value, weight):
+            param_grads = distribution.log_pdf_param_grads(value)
+            dependencies = _distribution_dependencies(distribution)
+            for p_name, p_grad in param_grads.items():
+                if p_name not in dependencies:
+                    continue
+                if p_name in self.params:
+                    target_shape = self.params[p_name].constrained_value.shape
+                elif p_name in self.deterministic_params:
+                    target_shape = self.deterministic_params[p_name].constrained_value.shape
+                else:
+                    continue
+                _add_grad(cotangents, p_name, _sum_to_shape(weight_gradient(p_grad, weight), target_shape))
 
         for node_name in reversed(self._topo_order):
             if nodes is not None and node_name not in nodes:
                 continue
             if node_name in self.observed_params:
+                if not is_active(node_name):
+                    continue
                 obs_param = self.observed_params[node_name]
-                observed = obs_param.observed_values
-                param_grads = obs_param.distribution.log_pdf_param_grads(observed)
-                dependencies = _distribution_dependencies(obs_param.distribution)
-                for p_name, p_grad in param_grads.items():
-                    if p_name not in dependencies:
-                        continue
-                    if p_name in self.params:
-                        target_shape = self.params[p_name].constrained_value.shape
-                        grad_p = _sum_to_shape(p_grad, target_shape)
-                        cotangents[p_name] = cotangents[p_name] + grad_p if p_name in cotangents else grad_p
-                    elif p_name in self.deterministic_params:
-                        target_shape = self.deterministic_params[p_name].constrained_value.shape
-                        grad_p = _sum_to_shape(p_grad, target_shape)
-                        cotangents[p_name] = cotangents[p_name] + grad_p if p_name in cotangents else grad_p
+                add_param_grads(obs_param.distribution, obs_param.observed_values, term_weights.get(node_name))
 
             elif node_name in self.deterministic_params:
                 if node_name in cotangents:
@@ -278,29 +402,23 @@ class Model:
                             else:
                                 vjp = _sum_to_shape(bar_v * det_deriv, target_shape)
 
-                            cotangents[inp_name] = cotangents[inp_name] + vjp if inp_name in cotangents else vjp
+                            _add_grad(cotangents, inp_name, vjp)
 
-            elif node_name in self.params:
-                param = self.params[node_name]
+            elif node_name in self.params or node_name in self.enumerated_params:
+                if not is_active(node_name):
+                    continue
+                param = self._random_term(node_name)
                 if getattr(param.distribution, "parameters", None):
-                    param_grads = param.distribution.log_pdf_param_grads(param.constrained_value)
-                    dependencies = _distribution_dependencies(param.distribution)
-                    for p_name, p_grad in param_grads.items():
-                        if p_name not in dependencies:
-                            continue
-                        if p_name in self.params:
-                            target_shape = self.params[p_name].constrained_value.shape
-                            grad_p = _sum_to_shape(p_grad, target_shape)
-                            cotangents[p_name] = cotangents[p_name] + grad_p if p_name in cotangents else grad_p
-                        elif p_name in self.deterministic_params:
-                            target_shape = self.deterministic_params[p_name].constrained_value.shape
-                            grad_p = _sum_to_shape(p_grad, target_shape)
-                            cotangents[p_name] = cotangents[p_name] + grad_p if p_name in cotangents else grad_p
+                    add_param_grads(param.distribution, param.constrained_value, term_weights.get(node_name))
 
         result = {}
         for name in param_names:
             param = self.params[name]
-            prior_grad = param.distribution._log_prob_grad_unconstrained(param.unconstrained_value)
+            if is_active(name):
+                prior_grad = param.distribution._log_prob_grad_unconstrained(param.unconstrained_value)
+                prior_grad = weight_gradient(prior_grad, term_weights.get(name))
+            else:
+                prior_grad = torch.zeros_like(param.unconstrained_value)
             if name in cotangents:
                 bar_p = cotangents[name]
                 vjp = getattr(param.distribution.transform, "vjp", None)
@@ -319,6 +437,7 @@ class Model:
                 result[name] = prior_grad
 
         return result
+
 
     def grad_log_prob(self, name, theta):
         if not self._compiled:
@@ -354,6 +473,9 @@ class Model:
     def condition(self, random_variable_names_and_values=None, **kwargs):
         return condition(self, random_variable_names_and_values, **kwargs)
 
+    def marginalize(self, names):
+        return marginalize(self, names)
+
 
 class MeanFieldGuide(Model):
     pass
@@ -385,11 +507,12 @@ def condition(model: Model, random_variable_names_and_values: dict = None, **kwa
             data_values[name] = v
             continue
 
-        if name not in model.params and name not in model.observed_params:
+        latent = name in model.params or name in model.enumerated_params
+        if not latent and name not in model.observed_params:
             raise KeyError(f"Variable '{name}' not found in model parameters, observed parameters, or data.")
 
-        if name in model.params:
-            param = model.params[name]
+        if latent:
+            param = model._random_term(name)
             dtype = param.constrained_value.dtype
             target_shape = param.constrained_value.shape
         else:
@@ -414,7 +537,7 @@ def condition(model: Model, random_variable_names_and_values: dict = None, **kwa
             if not contains:
                 raise ValueError(f"Conditioned value {val_tensor} for '{name}' is outside its distribution's state space.")
 
-        if name in model.params:
+        if latent:
             latent_values[name] = val_tensor
         else:
             observed_values[name] = val_tensor
@@ -428,16 +551,17 @@ def condition(model: Model, random_variable_names_and_values: dict = None, **kwa
     for name in latent_values:
         shell = ObservedParameter.__new__(ObservedParameter)
         replacements[name] = shell
-        memo[id(model.params[name])] = shell
+        memo[id(model._random_term(name))] = shell
 
     new_model = copy.deepcopy(model, memo)
 
     for name, val_tensor in latent_values.items():
-        original = model.params[name]
+        original = model._random_term(name)
         observed = ObservedParameter._from_random_parameter(
             original, val_tensor, memo=memo, instance=replacements[name],
         )
-        new_model.params.pop(name)
+        new_model.params.pop(name, None)
+        new_model.enumerated_params.pop(name, None)
         new_model.observed_params[name] = observed
         new_model.graph.nodes[name]["type"] = "observed"
 
@@ -448,4 +572,38 @@ def condition(model: Model, random_variable_names_and_values: dict = None, **kwa
         new_model.data[name].set_value(value)
 
     new_model.compile()
+    return new_model
+
+
+def marginalize(model: Model, names) -> Model:
+    """Return a copy of ``model`` in which the parameters ``names`` are summed out.
+
+    Equivalent to creating the parameters with ``RandomParameter(...,
+    enumerate=True)``: the parameters must have a finite discrete support,
+    they are no longer sampled, every log density and gradient of the new
+    model is that of the marginal model, and :func:`~BayesianDLL.sample`
+    adds exact posterior draws of them to the result.
+    """
+    from ._parameters import _check_enumerable
+    if not isinstance(model, Model):
+        raise TypeError(f"model must be an instance of Model, got {type(model).__name__}.")
+    names = [names] if isinstance(names, str) or hasattr(names, "name") else list(names)
+    names = [n.name if hasattr(n, "name") else str(n) for n in names]
+    for name in names:
+        if name in model.enumerated_params:
+            continue
+        if name not in model.params:
+            raise KeyError(f"Random parameter '{name}' not found in the model.")
+        _check_enumerable(name, model.params[name].distribution)
+
+    new_model = copy.deepcopy(model)
+    for name in names:
+        if name in new_model.enumerated_params:
+            continue
+        parameter = new_model.params.pop(name)
+        parameter.enumerated = True
+        new_model.enumerated_params[name] = parameter
+        new_model.graph.nodes[name]["enumerated"] = True
+    new_model.compile()
+    new_model.prepare_enumeration()
     return new_model
