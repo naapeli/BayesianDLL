@@ -19,7 +19,7 @@ blocks found at the top level of the package (``Model``, ``RandomParameter``,
 The rest of the library is split into the following packages:
 
 - **Distributions:** Probability distributions, their state spaces and the transforms to unconstrained space.
-- **Deterministic:** Deterministic nodes such as ``Linear``, ``Exp``, ``Log`` and ``Sigmoid`` for building model graphs.
+- **Deterministic:** Deterministic nodes such as ``Linear``, ``Exp``, ``Log``, ``Sigmoid``, ``Affine``, ``Index``, ``MatMul``, ``Softmax`` and ``CholeskyCovariance`` for building model graphs.
 - **Samplers:** MCMC samplers (NUTS and Metropolis), sampling utilities and prior / posterior predictive sampling.
 - **Variational:** Maximum a posteriori estimation and black-box variational inference.
 - **GP:** Gaussian process kernels and latent and exact Gaussian processes.

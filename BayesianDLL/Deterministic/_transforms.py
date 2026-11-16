@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .._parameters import DeterministicParameter
+from .._parameters import DeterministicParameter, RandomParameter
 
 
 def _require_named(value, description):
@@ -136,7 +136,34 @@ class Linear(DeterministicParameter):
                     )
             return derivatives
 
-        super().__init__(name, forward, derivative, named_inputs)
+        def vjp(cotangent, *values):
+            inputs_value = _as_tensor(values[0])
+            value_index = 1
+            if _is_named(coefficients):
+                coefficient_value = values[value_index]
+                value_index += 1
+            else:
+                coefficient_value = coefficients
+            coefficient_value = _as_tensor(coefficient_value, device=inputs_value.device)
+            grads = {}
+            if coefficient_value.numel() == 1:
+                if _is_named(coefficients):
+                    grads[coefficients.name] = (cotangent * inputs_value).sum().reshape(coefficient_value.shape)
+                if isinstance(inputs, (RandomParameter, DeterministicParameter)):
+                    grads[inputs.name] = cotangent * coefficient_value.reshape(())
+            else:
+                flat = coefficient_value.reshape(-1)
+                if _is_named(coefficients):
+                    grads[coefficients.name] = (
+                        (cotangent.unsqueeze(-1) * inputs_value).reshape(-1, flat.numel()).sum(0).reshape(coefficient_value.shape)
+                    )
+                if isinstance(inputs, (RandomParameter, DeterministicParameter)):
+                    grads[inputs.name] = cotangent.unsqueeze(-1) * flat
+            if _is_named(intercept):
+                grads[intercept.name] = cotangent
+            return grads
+
+        super().__init__(name, forward, derivative, named_inputs, vjp_func=vjp)
         self.regression_inputs = inputs
         self.coefficients = coefficients
         self.weights = coefficients
@@ -156,7 +183,10 @@ class Exp(DeterministicParameter):
         def derivative(value):
             return {input.name: torch.exp(value)}
 
-        super().__init__(name, forward, derivative, [input])
+        def vjp(cotangent, value):
+            return {input.name: cotangent * derivative(value)[input.name]}
+
+        super().__init__(name, forward, derivative, [input], vjp_func=vjp)
         self.input = input
 
 
@@ -172,7 +202,10 @@ class Log(DeterministicParameter):
         def derivative(value):
             return {input.name: value.reciprocal()}
 
-        super().__init__(name, forward, derivative, [input])
+        def vjp(cotangent, value):
+            return {input.name: cotangent * derivative(value)[input.name]}
+
+        super().__init__(name, forward, derivative, [input], vjp_func=vjp)
         self.input = input
 
 
@@ -189,5 +222,8 @@ class Sigmoid(DeterministicParameter):
             probability = torch.sigmoid(value)
             return {input.name: probability * (1 - probability)}
 
-        super().__init__(name, forward, derivative, [input])
+        def vjp(cotangent, value):
+            return {input.name: cotangent * derivative(value)[input.name]}
+
+        super().__init__(name, forward, derivative, [input], vjp_func=vjp)
         self.input = input
