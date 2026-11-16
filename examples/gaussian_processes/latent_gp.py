@@ -63,7 +63,8 @@ with Model() as model:
 blocks = None
 # A higher target acceptance probability (smaller steps) avoids most divergences in the
 # narrow posterior of the whitened latent GP.
-trace = model.sample(200, 200, blocks=blocks, delta=0.8)
+# Two chains with a capped tree depth keep the example fast.
+trace = model.sample(200, 200, n_chains=2, blocks=blocks, delta=0.8, max_depth=6, seed=0)
 print(trace.summary())
 
 new_inputs = torch.linspace(-0.1, 1.1, 50)

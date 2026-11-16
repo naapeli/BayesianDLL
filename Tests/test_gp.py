@@ -30,6 +30,7 @@ from BayesianDLL.GP import (
     gp_predictive,
     exact_gp_predictive,
     Matern52,
+    RationalQuadratic,
     SparseGP,
     sparse_gp_predictive,
     stable_cholesky,
@@ -774,3 +775,109 @@ def test_sparse_gp_nuts_and_predictive():
     samples = sparse_gp_predictive(function, trace, y, torch.rand(5, 2, dtype=torch.float64), n_samples=3, observation_noise=0.01)
     assert samples.shape == (10, 3, 5)
     assert torch.isfinite(samples).all()
+
+
+# ----------------------------------------------------------------------------
+# Pure-torch Matérn and the rational-quadratic kernel
+# ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("nu", [0.3, 0.8, 1.0, 2.0, 3.7])
+def test_power_bessel_k_matches_scipy(nu):
+    from scipy.special import kv
+
+    from BayesianDLL.GP._kernels import _power_bessel_k
+
+    a = torch.logspace(-8, 2.8, 300, dtype=torch.float64)
+    for order in (nu, nu - 1.0):
+        expected = a ** nu * torch.as_tensor(kv(order, a.numpy()), dtype=torch.float64)
+        actual = _power_bessel_k(nu, order, a)
+        torch.testing.assert_close(actual, expected, rtol=1e-8, atol=0.0)
+
+
+def _scipy_matern(x1, x2, lengthscale, variance, nu):
+    """The previous scipy-based implementation, kept as a test oracle."""
+    from scipy.special import gamma, kv
+
+    s = (((x1[:, None, :] - x2[None, :, :]) / lengthscale) ** 2).sum(-1).sqrt()
+    a = (2 * nu) ** 0.5 * s
+    safe = torch.where(a == 0, torch.ones_like(a), a)
+    value = 2 ** (1 - nu) / gamma(nu) * safe ** nu * torch.as_tensor(kv(nu, safe.numpy()), dtype=a.dtype)
+    return variance * torch.where(a == 0, torch.ones_like(value), value)
+
+
+@pytest.mark.parametrize("nu", [0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 3.5, 3.7, 6.5])
+def test_matern_matches_scipy_reference(nu):
+    kernel = Matern(_ARD_LENGTHSCALE, 1.4, nu=nu)
+    x2 = torch.cat([_ARD_X2, _ARD_X1[:1]])  # includes a zero distance
+    expected = _scipy_matern(_ARD_X1, x2, _ARD_LENGTHSCALE, 1.4, nu)
+    torch.testing.assert_close(kernel(_ARD_X1, x2), expected, rtol=1e-9, atol=1e-12)
+
+
+@pytest.mark.parametrize("nu", [0.5, 1.5, 2.5, 4.5])
+def test_matern_half_integer_closed_form_agrees_with_quadrature(nu):
+    from BayesianDLL.GP._kernels import _half_integer_matern, _half_integer_order, _power_bessel_k
+
+    a = torch.logspace(-4, 2, 100, dtype=torch.float64)
+    value, slope = _half_integer_matern(_half_integer_order(nu), a)
+    coefficient = 2 ** (1 - nu) / torch.exp(torch.lgamma(torch.tensor(nu, dtype=torch.float64)))
+    torch.testing.assert_close(value, coefficient * _power_bessel_k(nu, nu, a), rtol=1e-9, atol=1e-300)
+    torch.testing.assert_close(slope, -coefficient * _power_bessel_k(nu, nu - 1, a), rtol=1e-9, atol=1e-300)
+
+
+@pytest.mark.parametrize("nu", [0.3, 1.0, 2.0, 3.7, 3.5])
+def test_general_matern_ard_derivatives_match_finite_differences(nu):
+    kernel = Matern(SimpleNamespace(name="lengthscale"), SimpleNamespace(name="variance"), nu=nu)
+    values = {"lengthscale": _ARD_LENGTHSCALE.clone(), "variance": torch.tensor([1.4], dtype=torch.float64)}
+    x2 = torch.cat([_ARD_X2, _ARD_X1[:1]])
+    for name in values:
+        analytic = kernel.derivatives(_ARD_X1, x2, parameter_values=values)[name]
+        finite_difference = _finite_difference_kernel_derivative(kernel, values, name, _ARD_X1, x2, step=1e-6)
+        torch.testing.assert_close(analytic, finite_difference, atol=1e-7, rtol=1e-6)
+
+
+def test_matern_runs_in_float32():
+    x = _ARD_X1.to(torch.float32)
+    for nu in (0.8, 2.5):
+        covariance = Matern(_ARD_LENGTHSCALE.to(torch.float32), 1.0, nu=nu)(x, x)
+        assert covariance.dtype == torch.float32
+        expected = _scipy_matern(_ARD_X1, _ARD_X1, _ARD_LENGTHSCALE, 1.0, nu).to(torch.float32)
+        torch.testing.assert_close(covariance, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_rational_quadratic_matches_direct_formula():
+    kernel = RationalQuadratic(_ARD_LENGTHSCALE, 1.4, 0.7)
+    r2 = (((_ARD_X1[:, None, :] - _ARD_X2[None, :, :]) / _ARD_LENGTHSCALE) ** 2).sum(-1)
+    torch.testing.assert_close(kernel(_ARD_X1, _ARD_X2), 1.4 * (1 + r2 / 1.4) ** -0.7)
+    # Large alpha approaches the RBF kernel.
+    torch.testing.assert_close(
+        RationalQuadratic(_ARD_LENGTHSCALE, 1.4, 1e7)(_ARD_X1, _ARD_X2), RBF(_ARD_LENGTHSCALE, 1.4)(_ARD_X1, _ARD_X2),
+        rtol=1e-6, atol=1e-7,
+    )
+
+
+@pytest.mark.parametrize("lengthscale", [torch.tensor([0.8], dtype=torch.float64), _ARD_LENGTHSCALE])
+def test_rational_quadratic_derivatives_match_finite_differences(lengthscale):
+    kernel = RationalQuadratic(SimpleNamespace(name="lengthscale"), SimpleNamespace(name="variance"), SimpleNamespace(name="alpha"))
+    values = {
+        "lengthscale": lengthscale.clone(),
+        "variance": torch.tensor([1.4], dtype=torch.float64),
+        "alpha": torch.tensor([0.7], dtype=torch.float64),
+    }
+    for name in values:
+        analytic = kernel.derivatives(_ARD_X1, _ARD_X2, parameter_values=values)[name]
+        assert analytic.shape == (values[name].numel(), 4, 2)
+        finite_difference = _finite_difference_kernel_derivative(kernel, values, name, _ARD_X1, _ARD_X2, step=1e-6)
+        torch.testing.assert_close(analytic, finite_difference, atol=1e-7, rtol=1e-6)
+
+
+def test_exact_gp_with_rational_quadratic_matches_finite_differences():
+    x, y = _ard_data()
+    with Model() as model:
+        inputs = Data("inputs", x)
+        lengthscale = _ard_lengthscale_node("deterministic")
+        alpha = RandomParameter("alpha", Exponential(1.0), initial_value=torch.tensor([0.9], dtype=torch.float64))
+        noise = RandomParameter("noise", Exponential(1.0), initial_value=torch.tensor([0.2], dtype=torch.float64))
+        kernel = RationalQuadratic(lengthscale, 1.2, alpha)
+        ObservedParameter("observations", ExactGP("function", inputs, kernel, noise_variance=noise), y)
+    _finite_difference_check(model)

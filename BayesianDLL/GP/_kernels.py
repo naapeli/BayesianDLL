@@ -5,9 +5,7 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 
-import numpy as np
 import torch
-from scipy.special import gamma, kv
 
 from ..Distributions._resolve import resolve
 
@@ -75,10 +73,76 @@ def _lengthscale_derivative(value, per_feature):
     return per_feature.reshape(*value.shape, *per_feature.shape[-2:])
 
 
-def _scipy_bessel_k(order, argument, dtype, device):
-    """Evaluate K_order numerically without automatic differentiation."""
-    values = kv(order, argument.detach().cpu().numpy())
-    return torch.as_tensor(np.asarray(values), dtype=dtype, device=device)
+_QUADRATURE_NODES = 96
+_QUADRATURE_TAIL = 40.0
+
+
+def _log_cosh(x):
+    x = x.abs()
+    return x + torch.log1p(torch.exp(-2.0 * x)) - math.log(2.0)
+
+
+def _power_bessel_k(power, order, argument, nodes=_QUADRATURE_NODES):
+    r"""Evaluate ``a^power * K_order(a)`` for ``a > 0`` in pure torch.
+
+    Uses ``K_ν(a) = ∫_0^∞ exp(-a cosh t) cosh(ν t) dt`` (with
+    ``K_{-ν} = K_ν``) and the trapezoidal rule, which converges exponentially
+    for this analytic, rapidly decaying integrand. The upper limit ``T``
+    adapts to ``a`` so that ``a (cosh T - 1) - ν T >= 40``, i.e. the
+    truncated tail is below ``exp(-40)`` relative to the integral. The
+    integrand is evaluated in log space as
+    ``power log a - a - a (cosh t - 1) + log cosh(ν t)``, so neither tiny nor
+    large arguments overflow. Entries with ``a <= 0`` return an arbitrary
+    finite value; callers handle the limit ``a -> 0`` themselves.
+    """
+    order = abs(float(order))
+    a = torch.where(argument > 0, argument, torch.ones_like(argument))
+    # Fixed-point iterations for T = arccosh(1 + (40 + ν T) / a).
+    upper = torch.acosh(1.0 + _QUADRATURE_TAIL / a)
+    for _ in range(4):
+        upper = torch.acosh(1.0 + (_QUADRATURE_TAIL + order * upper) / a)
+    fractions = torch.linspace(0.0, 1.0, nodes, dtype=a.dtype, device=a.device)
+    t = upper.unsqueeze(-1) * fractions  # (..., nodes)
+    step = upper / (nodes - 1)
+    a_column = a.unsqueeze(-1)
+    log_integrand = (
+        power * torch.log(a_column)
+        - a_column
+        - a_column * (torch.cosh(t) - 1.0)
+        + _log_cosh(order * t)
+    )
+    weights = torch.ones(nodes, dtype=a.dtype, device=a.device)
+    weights[0] = 0.5
+    weights[-1] = 0.5
+    return step * (torch.exp(log_integrand) * weights).sum(dim=-1)
+
+
+def _half_integer_order(nu):
+    """Return ``p`` when ``nu = p + 1/2`` for an integer ``p >= 0``, else ``None``."""
+    p = nu - 0.5
+    if p >= 0 and abs(p - round(p)) < 1e-12:
+        return int(round(p))
+    return None
+
+
+def _half_integer_matern(p, u):
+    r"""Return ``f(u)`` and ``f'(u)`` for the half-integer Matérn correlation.
+
+    ``f(u) = exp(-u) p!/(2p)! Σ_{i=0}^{p} (p+i)!/(i!(p-i)!) (2u)^{p-i}`` with
+    ``u = sqrt(2ν) r / l`` and ``ν = p + 1/2``; ``f'(u) = exp(-u)(P'(u) - P(u))``
+    for the polynomial ``P`` in front of the exponential.
+    """
+    leading = math.factorial(p) / math.factorial(2 * p)
+    polynomial = torch.zeros_like(u)
+    polynomial_derivative = torch.zeros_like(u)
+    for i in range(p + 1):
+        coefficient = leading * math.factorial(p + i) / (math.factorial(i) * math.factorial(p - i))
+        degree = p - i
+        polynomial = polynomial + coefficient * (2.0 * u) ** degree
+        if degree > 0:
+            polynomial_derivative = polynomial_derivative + coefficient * 2.0 * degree * (2.0 * u) ** (degree - 1)
+    exponential = torch.exp(-u)
+    return exponential * polynomial, exponential * (polynomial_derivative - polynomial)
 
 
 class Kernel(ABC):
@@ -346,13 +410,18 @@ class Matern(_StationaryDiagonal, Kernel):
 
     With ``s = sqrt(sum_d (x_{1d}-x_{2d})^2 / l_d^2)`` and
     ``a = sqrt(2 nu) s``, ``k = v 2^{1-nu}/Gamma(nu) a^nu K_nu(a)``.
-    ``lengthscale`` may be scalar or hold one value per feature (ARD). Using
-    ``d/da [a^nu K_nu(a)] = -a^nu K_{nu-1}(a)``, the derivative w.r.t. each
-    length-scale component is
+    ``lengthscale`` may be scalar or hold one value per feature (ARD).
 
-    ``dk/dl_d = v 2^{1-nu}/Gamma(nu) a^nu K_{nu-1}(a) sqrt(2 nu) (x_{1d}-x_{2d})^2 / (s l_d^3)``,
+    * Half-integer ``nu = p + 1/2`` (0.5, 1.5, 2.5, ...) uses the exact
+      closed form ``k = v exp(-a) p!/(2p)! Σ_i (p+i)!/(i!(p-i)!) (2a)^{p-i}``.
+    * Any other ``nu`` evaluates ``a^nu K_nu(a)`` with a trapezoidal
+      quadrature of ``K_nu(a) = ∫_0^∞ exp(-a cosh t) cosh(nu t) dt``; the
+      limit ``a -> 0`` gives ``k = v``.
 
-    which tends to zero as ``s -> 0``.
+    Both are pure torch. With ``f(a) = k / v`` the derivative w.r.t. each
+    length-scale component is ``dk/dl_d = -v f'(a) sqrt(2 nu) (x_{1d}-x_{2d})^2 / (s l_d^3)``,
+    where ``f'(a) = -2^{1-nu}/Gamma(nu) a^nu K_{nu-1}(a)`` in general; it
+    tends to zero as ``s -> 0``.
     """
 
     def __init__(self, lengthscale=1.0, variance=1.0, nu=1.5):
@@ -362,6 +431,7 @@ class Matern(_StationaryDiagonal, Kernel):
         self.lengthscale = lengthscale
         self.variance = variance
         self.nu = float(nu)
+        self._half_integer = _half_integer_order(self.nu)
 
     def _geometry(self, x1, x2, parameter_values=None):
         x1 = _feature_matrix(x1)
@@ -372,37 +442,50 @@ class Matern(_StationaryDiagonal, Kernel):
         argument = math.sqrt(2.0 * self.nu) * scaled_distance
         return x1, value, lengthscale, difference, scaled_distance, argument
 
+    def _log_coefficient(self, reference):
+        nu = torch.as_tensor(self.nu, dtype=reference.dtype, device=reference.device)
+        return (1.0 - nu) * math.log(2.0) - torch.lgamma(nu)
+
+    def _correlation(self, argument, derivative=False):
+        """Return ``f(a)`` (and ``f'(a)`` when ``derivative``) with ``f(0) = 1``."""
+        if self._half_integer is not None:
+            value, slope = _half_integer_matern(self._half_integer, argument)
+            return (value, slope) if derivative else value
+        coefficient = torch.exp(self._log_coefficient(argument))
+        positive = argument > 0
+        value = coefficient * _power_bessel_k(self.nu, self.nu, argument)
+        value = torch.where(positive, value, torch.ones_like(value))
+        if not derivative:
+            return value
+        slope = -coefficient * _power_bessel_k(self.nu, self.nu - 1.0, argument)
+        # The slope only enters multiplied by (x_d - x'_d)^2 / s, which
+        # vanishes at s = 0.
+        slope = torch.where(positive, slope, torch.zeros_like(slope))
+        return value, slope
+
     def evaluate(self, x1, x2, parameter_values=None):
         x1, _, _, _, _, argument = self._geometry(x1, x2, parameter_values)
         variance = _parameter_value(self.variance, parameter_values).to(dtype=x1.dtype, device=x1.device)
-        safe_argument = torch.where(argument == 0, torch.ones_like(argument), argument)
-        coefficient = 2.0 ** (1.0 - self.nu) / gamma(self.nu)
-        correlation = coefficient * safe_argument.pow(self.nu) * _scipy_bessel_k(self.nu, safe_argument, x1.dtype, x1.device)
-        correlation = torch.where(argument == 0, torch.ones_like(correlation), correlation)
-        return variance * correlation
+        return variance * self._correlation(argument)
 
     def derivatives(self, x1, x2, parameter_values=None):
         x1, value, lengthscale, difference, scaled_distance, argument = self._geometry(x1, x2, parameter_values)
         variance = _parameter_value(self.variance, parameter_values).to(dtype=x1.dtype, device=x1.device)
+        correlation, slope = self._correlation(argument, derivative=True)
         derivatives = {}
         if _is_named(self.lengthscale):
-            safe_argument = torch.where(argument == 0, torch.ones_like(argument), argument)
-            coefficient = 2.0 ** (1.0 - self.nu) / gamma(self.nu)
-            bessel_previous = _scipy_bessel_k(self.nu - 1.0, safe_argument, x1.dtype, x1.device)
-            radial_factor = coefficient * safe_argument.pow(self.nu) * bessel_previous
-            radial_factor = torch.where(argument == 0, torch.zeros_like(radial_factor), radial_factor)
             safe_distance = torch.where(scaled_distance == 0, torch.ones_like(scaled_distance), scaled_distance)
+            radial = torch.where(scaled_distance == 0, torch.zeros_like(slope), -slope / safe_distance)
             per_feature = (
                 variance
-                * radial_factor
+                * radial.unsqueeze(0)
                 * math.sqrt(2.0 * self.nu)
                 * difference.square().permute(2, 0, 1)
-                / (safe_distance.unsqueeze(0) * lengthscale.reshape(-1, 1, 1).pow(3))
+                / lengthscale.reshape(-1, 1, 1).pow(3)
             )
             derivatives[self.lengthscale.name] = _lengthscale_derivative(value, per_feature)
         if _is_named(self.variance):
-            covariance = self.evaluate(x1, x2, parameter_values=parameter_values)
-            derivatives[self.variance.name] = _parameter_derivative(variance, covariance / variance)
+            derivatives[self.variance.name] = _parameter_derivative(variance, correlation)
         return derivatives
 
 
@@ -414,6 +497,61 @@ class Matern32(Matern):
 class Matern52(Matern):
     def __init__(self, lengthscale=1.0, variance=1.0):
         super().__init__(lengthscale=lengthscale, variance=variance, nu=2.5)
+
+
+class RationalQuadratic(_StationaryDiagonal, Kernel):
+    r"""Rational-quadratic kernel, a scale mixture of RBF kernels.
+
+    .. math::
+
+        k(x_1, x_2) = v\Bigl(1 + \frac{r^2}{2\alpha}\Bigr)^{-\alpha},
+        \qquad r^2 = \sum_{d=1}^D (x_{1d}-x_{2d})^2 / l_d^2,
+
+    with a scalar or ARD ``lengthscale``, ``variance`` ``v`` and shape
+    ``alpha > 0`` (``alpha -> ∞`` recovers the RBF kernel). With
+    ``B = 1 + r^2 / (2 alpha)`` the derivatives are
+    ``dk/dl_d = k (x_{1d}-x_{2d})^2 / (l_d^3 B)`` and
+    ``dk/dalpha = k (r^2 / (2 alpha B) - log B)``.
+    """
+
+    def __init__(self, lengthscale=1.0, variance=1.0, alpha=1.0):
+        super().__init__(lengthscale, variance, alpha)
+        self.lengthscale = lengthscale
+        self.variance = variance
+        self.alpha = alpha
+
+    def _geometry(self, x1, x2, parameter_values=None):
+        x1 = _feature_matrix(x1)
+        x2 = _feature_matrix(x2)
+        value, lengthscale = _lengthscale_vector(self.lengthscale, parameter_values, x1, "RationalQuadratic")
+        variance = _parameter_value(self.variance, parameter_values).to(dtype=x1.dtype, device=x1.device)
+        alpha = _parameter_value(self.alpha, parameter_values).to(dtype=x1.dtype, device=x1.device)
+        if alpha.numel() != 1:
+            raise ValueError("RationalQuadratic alpha must be a scalar.")
+        scaled_square = ((x1[:, None, :] - x2[None, :, :]) / lengthscale.reshape(1, 1, -1)).square().permute(2, 0, 1)
+        squared_distance = scaled_square.sum(dim=0)
+        base = 1.0 + squared_distance / (2.0 * alpha.reshape(()))
+        covariance = variance * base.pow(-alpha.reshape(()))
+        return value, lengthscale, variance, alpha, scaled_square, squared_distance, base, covariance
+
+    def evaluate(self, x1, x2, parameter_values=None):
+        return self._geometry(x1, x2, parameter_values)[-1]
+
+    def derivatives(self, x1, x2, parameter_values=None):
+        value, lengthscale, variance, alpha, scaled_square, squared_distance, base, covariance = self._geometry(
+            x1, x2, parameter_values
+        )
+        derivatives = {}
+        if _is_named(self.lengthscale):
+            per_feature = (covariance / base).unsqueeze(0) * scaled_square / lengthscale.reshape(-1, 1, 1)
+            derivatives[self.lengthscale.name] = _lengthscale_derivative(value, per_feature)
+        if _is_named(self.variance):
+            derivatives[self.variance.name] = _parameter_derivative(variance, covariance / variance)
+        if _is_named(self.alpha):
+            scalar_alpha = alpha.reshape(())
+            alpha_derivative = covariance * (squared_distance / (2.0 * scalar_alpha * base) - torch.log(base))
+            derivatives[self.alpha.name] = _parameter_derivative(alpha, alpha_derivative)
+        return derivatives
 
 
 class Linear(Kernel):

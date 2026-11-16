@@ -18,7 +18,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import RBF, SparseGP, sparse_gp_predictive
+from BayesianDLL.GP import Matern52, SparseGP, sparse_gp_predictive
 
 
 torch.manual_seed(0)
@@ -40,7 +40,7 @@ with Model() as model:
     log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 1.0))
     log_variance = RandomParameter("log_variance", Normal(0.0, 1.0))
     log_noise = RandomParameter("log_noise", Normal(-2.0, 1.0))
-    kernel = RBF(Exp("lengthscale", log_lengthscale), Exp("variance", log_variance))
+    kernel = Matern52(Exp("lengthscale", log_lengthscale), Exp("variance", log_variance))
     f = SparseGP(
         "f",
         inputs,
@@ -66,7 +66,7 @@ print(trace.summary(include_deterministic=True))
 # diagonal of the approximate covariance.
 
 posterior_means = {name: trace[name].reshape(-1, 1).mean(0) for name in ("lengthscale", "variance", "noise")}
-fixed_kernel = RBF(posterior_means["lengthscale"], posterior_means["variance"])
+fixed_kernel = Matern52(posterior_means["lengthscale"], posterior_means["variance"])
 with Model():
     comparison_inputs = Data("comparison_inputs", x)
     for method in ("vfe", "dtc", "fitc"):
