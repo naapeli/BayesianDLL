@@ -49,6 +49,7 @@ class VectorizedBlock:
             if not self.is_continuous:
                 raise RuntimeError("A distribution is incompatable with the chosen sampler. NUTS can only be used with continuous distributions.")
             self.sampler = VectorizedNUTS(self.log_target, self.gradient, self.n_chains, **_filtered(NUTS, merged))
+            self.sampler.value_and_gradient = self.value_and_gradient
         elif kind == "metropolis":
             self.sampler = VectorizedMetropolis(self.log_target, state_space, self.n_chains, **_filtered(Metropolis, merged))
         elif kind == "slice":
@@ -94,8 +95,14 @@ class VectorizedBlock:
             finally:
                 self.model._batch_mode = mode
 
-    def log_target(self, theta):
+    def value_and_gradient(self, theta):
+        """Log target ``(C,)`` and gradient ``(C, d)`` with a single unpacking of ``theta``."""
         self.unpack_and_set(theta)
+        return self.log_target(theta, unpack=False), self.gradient(theta, unpack=False)
+
+    def log_target(self, theta, unpack=True):
+        if unpack:
+            self.unpack_and_set(theta)
         model = self.model
 
         def evaluate():
@@ -107,8 +114,9 @@ class VectorizedBlock:
         value = self._guarded(evaluate, evaluate, failure)
         return torch.as_tensor(value, dtype=theta.dtype, device=theta.device).expand(self.n_chains)
 
-    def gradient(self, theta):
-        self.unpack_and_set(theta)
+    def gradient(self, theta, unpack=True):
+        if unpack:
+            self.unpack_and_set(theta)
         model = self.model
 
         def evaluate():

@@ -396,6 +396,8 @@ class VectorizedNUTS:
         self._reset_welford()
         self._cached_theta = None
         self.last_stats = {}
+        # Optional ``theta -> (log_target, gradient)`` that shares work between the two.
+        self.value_and_gradient = None
 
     # ------------------------------------------------------------ metric
     def set_warmup_length(self, warmup_length):
@@ -474,9 +476,11 @@ class VectorizedNUTS:
 
     # ------------------------------------------------------------ dynamics
     def _evaluate(self, theta):
-        lp = _nan_to_neg_inf(self.log_target(theta))
-        grad = self.gradient(theta)
-        return lp, grad
+        if self.value_and_gradient is not None:
+            lp, grad = self.value_and_gradient(theta)
+        else:
+            lp, grad = self.log_target(theta), self.gradient(theta)
+        return _nan_to_neg_inf(lp), grad
 
     def leapfrog(self, theta, r, grad, step):
         """One leapfrog step per chain with signed step sizes ``step`` (shape ``(C,)``)."""
