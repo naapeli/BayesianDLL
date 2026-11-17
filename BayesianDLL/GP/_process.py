@@ -456,9 +456,20 @@ class SparseGP(Distribution):
     Woodbury identity and the matrix determinant lemma, i.e. in ``O(n m²)``
     time and ``O(n m)`` memory; no ``n x n`` matrix is ever formed.
 
-    The inducing inputs are fixed (a tensor or a ``Data`` node). Kernel
-    hyperparameters, ``noise_variance`` and ``mean`` can be model parameters;
-    their gradients are derived by hand in :meth:`log_pdf_param_grads`.
+    ``inducing_points`` (shape ``(m, D)`` or ``(m,)``) is a tensor, a ``Data``
+    node, or a learnable ``RandomParameter`` / ``DeterministicParameter``,
+    e.g. ``RandomParameter("Z", Normal(Z0, 0.5), initial_value=Z0)`` with
+    ``Z0`` of shape ``(m, D)``. Kernel hyperparameters, ``noise_variance``,
+    ``mean`` and learnable inducing inputs get hand-derived gradients (see
+    :meth:`log_pdf_param_grads`); the inducing-input gradient uses
+    :meth:`Kernel.input_vjp`.
+
+    **Learnable inducing inputs: use VFE.** The VFE bound can only increase
+    towards the exact marginal likelihood as ``Z`` improves, so optimizing or
+    sampling ``Z`` is safe. DTC and FITC are not bounds: moving ``Z`` can
+    raise their likelihood above the exact one (FITC in particular is known
+    to collapse inducing points and underestimate the noise), so they can
+    overfit ``Z``.
     Use it as the distribution of an ``ObservedParameter``::
 
         gp = SparseGP("function", inputs, kernel, inducing_points=Z, noise_variance=noise)
@@ -471,8 +482,6 @@ class SparseGP(Distribution):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
         if not _is_named(inputs):
             raise TypeError("inputs must be a named Data or model parameter node.")
-        if isinstance(inducing_points, (RandomParameter, DeterministicParameter)):
-            raise TypeError("SparseGP inducing_points must be fixed (a tensor or a Data node).")
         method = str(method).lower()
         if method not in _SPARSE_METHODS:
             raise ValueError(f"SparseGP method must be one of {_SPARSE_METHODS}; got {method!r}.")
@@ -585,86 +594,96 @@ class SparseGP(Distribution):
     def log_pdf_grad(self, x):
         return -self._components(x)["alpha"]
 
-    def log_pdf_param_grads(self, x):
-        r"""Hand-derived gradients of the approximate log marginal likelihood.
+    def _cotangents(self, parts):
+        r"""Cotangents of the log density w.r.t. ``K_mn``, ``K_mm`` and ``diag(K_nn)``.
 
-        With ``Σ = Q_nn + Λ``, ``α = Σ⁻¹ r`` and ``W = K_mm⁻¹ K_mn``,
-        ``dQ = dK_nm W + Wᵀ dK_mn - Wᵀ dK_mm W`` and
-        ``d log N(y | mean, Σ) = ½ αᵀ dΣ α - ½ tr(Σ⁻¹ dΣ)``. The traces need
-        only ``P = W Σ⁻¹`` (``m x n``) and ``diag(Σ⁻¹)``, both from Woodbury
-        in ``O(n m²)``:
+        Every gradient below is linear in the covariance differentials, so it
+        is ``⟨G_mn, dK_mn⟩ + ⟨G_mm, dK_mm⟩ + ⟨g_nn, d diag(K_nn)⟩``. With
+        ``Σ = Q_nn + Λ``, ``α = Σ⁻¹ r``, ``W = K_mm⁻¹ K_mn``, ``P = W Σ⁻¹`` and
+        ``ω = ½ (α² - diag(Σ⁻¹))``:
 
-        * ``½ αᵀ dQ α = (dK_mn α)·(Wα) - ½ (Wα)ᵀ dK_mm (Wα)``,
-        * ``½ tr(Σ⁻¹ dQ) = Σ(P ⊙ dK_mn) - ½ Σ((P Wᵀ) ⊙ dK_mm)``,
-        * a diagonal ``dΛ`` contributes ``½ Σ_i dΛ_i (α_i² - (Σ⁻¹)_ii)``, with
-          ``dΛ = dσ² I`` and, for FITC, also ``d diag(K_nn) - diag(dQ)``,
-          ``diag(dQ) = 2 colsum(dK_mn ⊙ W) - colsum(W ⊙ dK_mm W)``,
-        * the VFE trace term adds ``-(tr dK_nn - tr dQ) / (2σ²)`` to the
-          kernel gradients and ``tr(K_nn - Q_nn) / (2σ⁴)`` to the noise one.
+        * Gaussian term (all methods), from ``dQ = dK_nm W + Wᵀ dK_mn - Wᵀ dK_mm W``
+          and ``½ αᵀ dΣ α - ½ tr(Σ⁻¹ dΣ)``:
+          ``G_mn = (Wα) αᵀ - P`` and ``G_mm = -½ (Wα)(Wα)ᵀ + ½ P Wᵀ``;
+        * FITC (``dΛ = d diag(K_nn) - diag(dQ)``):
+          ``G_mn -= 2 W diag(ω)``, ``G_mm += W diag(ω) Wᵀ``, ``g_nn = ω``;
+        * VFE trace term ``-tr(K_nn - Q_nn) / (2σ²)``:
+          ``G_mn += W / σ²``, ``G_mm -= ½ W Wᵀ / σ²``, ``g_nn = -1 / (2σ²)``.
 
-        ``dK_mm`` includes the derivative of the scale-dependent jitter.
+        ``G_mm`` is finally corrected for the scale-dependent jitter
+        ``c max(1, max diag K_mm)``: ``G_mm[i*, i*] += c tr(G_mm) / scale``.
         """
-        parts = self._components(x)
-        x_values, z = parts["x"], parts["z"]
         factor, factor_b, v, lam, alpha = parts["factor"], parts["factor_b"], parts["v"], parts["lam"], parts["alpha"]
-        noise, jitter_info, parameter_values = parts["noise"], parts["jitter_info"], parts["parameter_values"]
-
+        noise = parts["noise"]
         w = torch.linalg.solve_triangular(factor.transpose(-2, -1), v, upper=True)  # K_mm⁻¹ K_mn, (m, n)
         w_alpha = w @ alpha
         # Σ⁻¹ = Λ⁻¹ - Gᵀ G with G = L_B⁻¹ V Λ⁻¹.
         g = torch.linalg.solve_triangular(factor_b, v / lam, upper=False)
         sigma_inverse_diag = 1.0 / lam - g.square().sum(dim=0)
         p = w / lam - (w @ g.transpose(-2, -1)) @ g  # W Σ⁻¹, (m, n)
-        p_w = p @ w.transpose(-2, -1)  # W Σ⁻¹ Wᵀ, (m, m)
-        w_w = w @ w.transpose(-2, -1)
         diag_weight = 0.5 * (alpha.square() - sigma_inverse_diag)
-        is_vfe = self.method == "vfe"
-        is_fitc = self.method == "fitc"
+        g_mn = torch.outer(w_alpha, alpha) - p
+        g_mm = -0.5 * torch.outer(w_alpha, w_alpha) + 0.5 * p @ w.transpose(-2, -1)
+        g_nn = None
+        if self.method == "fitc":
+            g_mn = g_mn - 2.0 * w * diag_weight
+            g_mm = g_mm + (w * diag_weight) @ w.transpose(-2, -1)
+            g_nn = diag_weight
+        elif self.method == "vfe":
+            g_mn = g_mn + w / noise
+            g_mm = g_mm - 0.5 * (w @ w.transpose(-2, -1)) / noise
+            g_nn = torch.full_like(alpha, -0.5) / noise
+        jitter, scale, index = parts["jitter_info"]
+        if index is not None:
+            g_mm = g_mm.clone()
+            g_mm[index, index] = g_mm[index, index] + (jitter / scale) * torch.diagonal(g_mm).sum()
+        return g_mn, g_mm, g_nn, diag_weight
+
+    def log_pdf_param_grads(self, x):
+        r"""Hand-derived gradients of the approximate log marginal likelihood.
+
+        The cotangents ``G_mn``, ``G_mm`` and ``g_nn`` of :meth:`_cotangents`
+        are contracted with the kernel derivatives:
+
+        * a kernel hyperparameter ``θ`` gets
+          ``Σ(G_mn ⊙ ∂K_mn/∂θ) + Σ(G_mm ⊙ ∂K_mm/∂θ) + g_nn · ∂diag(K_nn)/∂θ``;
+        * the noise variance gets ``Σ_i ω_i`` (plus ``tr(K_nn - Q_nn)/(2σ⁴)``
+          for VFE);
+        * learnable inducing inputs ``Z`` get
+          ``kernel.input_vjp(Z, X, G_mn) + kernel.input_vjp(Z, Z, G_mm + G_mmᵀ)``
+          (``K_nn`` does not depend on ``Z``);
+        * the mean gets ``α``.
+        """
+        parts = self._components(x)
+        x_values, z = parts["x"], parts["z"]
+        noise, alpha, parameter_values = parts["noise"], parts["alpha"], parts["parameter_values"]
+        g_mn, g_mm, g_nn, diag_weight = self._cotangents(parts)
 
         cross = self.kernel.derivatives(z, x_values, parameter_values=parameter_values)
         inducing = self.kernel.derivatives(z, z, parameter_values=parameter_values)
-        diagonal = self.kernel.diag_derivatives(x_values, parameter_values=parameter_values) if (is_vfe or is_fitc) else {}
+        diagonal = self.kernel.diag_derivatives(x_values, parameter_values=parameter_values) if g_nn is not None else {}
         gradients = {}
         for name in {**cross, **inducing, **diagonal}:
-            d_mn = _with_parameter_axis(cross.get(name))
-            d_mm = _with_parameter_axis(inducing.get(name))
-            d_nn = diagonal.get(name)
-            if d_mm is not None:
-                d_mm = _jitter_derivative(jitter_info, d_mm)
-            if d_nn is not None and d_nn.ndim == 1:
-                d_nn = d_nn.unsqueeze(0)
-            if d_mn is not None:
-                shape = d_mn.shape[:-2]
-            elif d_mm is not None:
-                shape = d_mm.shape[:-2]
-            else:
-                shape = d_nn.shape[:-1]
-            gradient = alpha.new_zeros(shape)
-            trace_dq = alpha.new_zeros(shape)
-            diag_dq = alpha.new_zeros((*shape, alpha.numel()))
-            if d_mn is not None:
-                gradient = gradient + (d_mn @ alpha) @ w_alpha - (p * d_mn).sum(dim=(-2, -1))
-                trace_dq = trace_dq + 2 * (d_mn * w).sum(dim=(-2, -1))
-                if is_fitc:
-                    diag_dq = diag_dq + 2 * (d_mn * w).sum(dim=-2)
-            if d_mm is not None:
-                gradient = gradient - 0.5 * (d_mm @ w_alpha) @ w_alpha + 0.5 * (p_w * d_mm).sum(dim=(-2, -1))
-                trace_dq = trace_dq - (w_w * d_mm).sum(dim=(-2, -1))
-                if is_fitc:
-                    diag_dq = diag_dq - ((d_mm @ w) * w).sum(dim=-2)
-            if is_fitc:
-                # The clamp in Λ is inactive for a valid kernel; it is treated
-                # as the identity when differentiating.
-                d_lam = -diag_dq if d_nn is None else d_nn - diag_dq
-                gradient = gradient + (d_lam * diag_weight).sum(dim=-1)
-            if is_vfe:
-                trace_d_knn = d_nn.sum(dim=-1) if d_nn is not None else 0.0
-                gradient = gradient - 0.5 * (trace_d_knn - trace_dq) / noise
+            gradient = 0.0
+            if name in cross:
+                gradient = gradient + (g_mn * _with_parameter_axis(cross[name])).sum(dim=(-2, -1))
+            if name in inducing:
+                gradient = gradient + (g_mm * _with_parameter_axis(inducing[name])).sum(dim=(-2, -1))
+            if name in diagonal:
+                d_nn = diagonal[name]
+                if d_nn.ndim == 1:
+                    d_nn = d_nn.unsqueeze(0)
+                gradient = gradient + (d_nn * g_nn).sum(dim=-1)
             gradients[name] = gradient
+
+        if _is_named(self.inducing_points) and not isinstance(self.inducing_points, Data):
+            z_gradient = self.kernel.input_vjp(z, x_values, g_mn, parameter_values=parameter_values)
+            z_gradient = z_gradient + self.kernel.input_vjp_symmetric(z, g_mm, parameter_values=parameter_values)
+            gradients[self.inducing_points.name] = z_gradient.reshape(_input_value(self.inducing_points).shape)
 
         if _is_named(self.noise_variance):
             noise_gradient = diag_weight.sum()
-            if is_vfe:
+            if self.method == "vfe":
                 noise_gradient = noise_gradient + 0.5 * parts["trace_term"] / noise.square()
             gradients[self.noise_variance.name] = noise_gradient.reshape(resolve(self.noise_variance).shape)
 
@@ -901,7 +920,8 @@ def sparse_gp_predictive(
     ``mean = K_*m Σ_u K_mn Λ⁻¹ r`` and ``cov = K_** - Q_** + K_*m Σ_u K_m*``.
 
     All solves use ``m x m`` Cholesky factors, so the cost is linear in the
-    number of training points. The result has shape
+    number of training points. Learnable inducing inputs are read from the
+    trace draw by draw. The result has shape
     ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not isinstance(gp, SparseGP):
@@ -937,10 +957,15 @@ def sparse_gp_predictive(
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
     mean_draws = _trace_draws(trace, gp.mean, n_draws, dtype, device)
     eye_m = torch.eye(_feature_count(inducing_values), dtype=dtype, device=device)
+    learnable_inducing = _is_named(gp.inducing_points) and not isinstance(gp.inducing_points, Data)
+    if learnable_inducing:
+        inducing_draws = _trace_draws(trace, gp.inducing_points, n_draws, dtype, device)
 
     outputs = []
     for draw_index in range(n_draws):
         kernel_values = {name: values[draw_index] for name, values in parameter_draws.items()}
+        if learnable_inducing:
+            inducing_values = inducing_draws[draw_index].reshape(gp._inducing_inputs(dtype, device).shape)
         noise = noise_draws[draw_index].reshape(-1)
         if noise.numel() != 1:
             raise ValueError("Sparse GP noise_variance must be scalar.")

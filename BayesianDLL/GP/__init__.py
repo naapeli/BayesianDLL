@@ -1,4 +1,5 @@
-"""Gaussian-process helpers for latent and exact marginal inference."""
+"""Gaussian processes: latent, exact, sparse (inducing-point) and structured
+(Kronecker grid and Toeplitz) models with hand-derived gradients."""
 
 from ._kernels import (
     Kernel,
@@ -25,6 +26,13 @@ from ._process import (
     gp_predictive,
     stable_cholesky,
 )
+from ._structured import (
+    KroneckerGP,
+    kronecker_gp_predictive,
+    ToeplitzGP,
+    toeplitz_gp_predictive,
+    levinson_solve,
+)
 
 __all__ = [
     "Kernel",
@@ -48,4 +56,9 @@ __all__ = [
     "SparseGP",
     "sparse_gp_predictive",
     "stable_cholesky",
+    "KroneckerGP",
+    "kronecker_gp_predictive",
+    "ToeplitzGP",
+    "toeplitz_gp_predictive",
+    "levinson_solve",
 ]

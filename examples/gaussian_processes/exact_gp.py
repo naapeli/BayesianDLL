@@ -1,113 +1,108 @@
 """
-Exact Gaussian Process
-======================
+Periodic Regression with an Exact GP
+====================================
 
-Fits an exact (marginal) Gaussian process with a periodic kernel to noisy sine data.
-The kernel hyperparameters and the noise variance are sampled with NUTS and the
-posterior predictive mean and credible intervals are plotted.
+A seasonal signal is observed 40 times with Gaussian noise. We model it as
+``y = f(x) + ε`` with a Gaussian-process prior on ``f`` whose periodic
+kernel encodes "the pattern repeats", and ask the data how long the period
+is, how wiggly one cycle is and how large the noise is.
+
+Because the likelihood is Gaussian, ``f`` can be integrated out
+analytically: ``ExactGP`` evaluates ``y ~ Normal(mean, K + σ² I)`` directly,
+so NUTS only has to explore four hyperparameters instead of 40 function
+values plus hyperparameters.
+
+All hyperparameters are positive. Rather than putting priors on them
+directly, they are sampled on the log scale (an unconstrained space where
+NUTS takes uniform steps) and mapped back with the ``Exp`` building block.
 """
+
+import time
 
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, plate
+from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
-from BayesianDLL.Distributions import Uniform, Normal, Exponential
-from BayesianDLL.Evaluation import Graphics
+from BayesianDLL.Distributions import Normal
 from BayesianDLL.GP import ExactGP, Periodic, exact_gp_predictive
 
 
 torch.manual_seed(0)
 
-x = torch.linspace(0.0, 3.0, 24, dtype=torch.float64)
-y = torch.sin(2 * torch.pi * x) + 0.2 ** 0.5 * torch.randn_like(x)
+
+def true_function(x):
+    return torch.sin(2 * torch.pi * x) + 0.4 * torch.cos(4 * torch.pi * x)
+
+
+x = torch.sort(torch.rand(40, dtype=torch.float64) * 4.0).values
+y = true_function(x) + 0.3 * torch.randn_like(x)
+
+# %%
+# The model
+# ---------
+# The prior on the log-period is centred on one time unit with a spread of
+# roughly a factor 1.3, i.e. we know the season length only approximately.
+# The signal and noise variances get log-normal priors around 1 and 0.1.
 
 with Model() as model:
     inputs = Data("inputs", x)
-
-    log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 1.0))
+    log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 0.7))
     log_variance = RandomParameter("log_variance", Normal(0.0, 1.0))
-    # log_period = RandomParameter("log_period", Normal(0.0, 1.0))
-    lengthscale = Exp("lengthscale", log_lengthscale)
-    variance = Exp("variance", log_variance)
-    # period = Exp("period", log_period)
-    period = RandomParameter("period", Uniform(0.5, 1.5))
+    log_period = RandomParameter("log_period", Normal(0.0, 0.25))
+    log_noise = RandomParameter("log_noise", Normal(-2.3, 1.0))
 
-    # noise_variance = 0.05
-    noise_variance = RandomParameter("noise_variance", Exponential(1.0))
-
-    f = ExactGP(
-        "f",
-        inputs,
-        Periodic(lengthscale=lengthscale, variance=variance, period=period),
-        noise_variance=noise_variance,
+    kernel = Periodic(
+        lengthscale=Exp("lengthscale", log_lengthscale),
+        variance=Exp("variance", log_variance),
+        period=Exp("period", log_period),
     )
-    with plate("observations", x):
-        ObservedParameter("y", f, y)
+    f = ExactGP("f", inputs, kernel, noise_variance=Exp("noise_variance", log_noise))
+    ObservedParameter("y", f, y)
 
-    Graphics.plot_model(model)
-    plt.show()
+# %%
+# Sampling
+# --------
 
+start = time.perf_counter()
+trace = model.sample(300, 300, n_chains=2, max_depth=6, seed=1, progress_bar=False)
+elapsed = time.perf_counter() - start
+summary = trace.summary(include_deterministic=True)
+print(summary)
+print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-hat: {summary['r_hat'].max():.3f}")
 
-trace = model.sample(
-    200,
-    400,
-    start_point_variance=0.1,
-    max_depth=6,
-    delta=0.8,
-)
-print(trace.summary())
+# %%
+# Posterior predictive fit
+# ------------------------
+# ``exact_gp_predictive`` conditions the GP on the observations for every
+# posterior draw of the hyperparameters, so the band includes both the
+# uncertainty about ``f`` and about the kernel. The right panels show what the
+# data taught us about the period and the noise level.
 
-new_inputs = torch.linspace(-0.1, 3.1, 100, dtype=x.dtype)
-function_samples = exact_gp_predictive(
-    f,
-    trace,
-    y,
-    x,
-    n_samples=1,
-).squeeze(1)
-predictions = exact_gp_predictive(
-    f,
-    trace,
-    y,
-    new_inputs,
-    n_samples=20,
-)
+grid = torch.linspace(-0.2, 4.6, 200, dtype=torch.float64)
+draws = exact_gp_predictive(f, trace.thin(6), y, grid, n_samples=5).reshape(-1, grid.numel())
+lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
-Graphics.plot_posterior(trace, method="kde", aggregate=True)
+fig = plt.figure(figsize=(12, 5), layout="constrained")
+grid_spec = fig.add_gridspec(2, 3)
+ax = fig.add_subplot(grid_spec[:, :2])
+ax.fill_between(grid, lower, upper, color="tab:blue", alpha=0.25, label="90% band of f")
+ax.plot(grid, median, color="tab:blue", label="median of f")
+ax.plot(grid, true_function(grid), "k--", label="true f")
+ax.scatter(x, y, color="black", s=15, zorder=3, label="observations")
+ax.axvspan(4.0, 4.6, color="0.9", label="extrapolation")
+ax.set(xlabel="x", ylabel="y", title="Exact periodic GP: posterior predictive")
+fig.legend(*ax.get_legend_handles_labels(), loc="outside lower center", ncol=5, fontsize="small")
 
-function_quantiles = torch.quantile(
-    function_samples,
-    torch.tensor([0.05, 0.5, 0.95], dtype=function_samples.dtype),
-    dim=0,
-)
-predictive_samples = predictions.reshape(-1, new_inputs.numel())
-predictive_quantiles = torch.quantile(
-    predictive_samples,
-    torch.tensor([0.05, 0.5, 0.95], dtype=predictive_samples.dtype),
-    dim=0,
-)
+ax_period = fig.add_subplot(grid_spec[0, 2])
+ax_period.hist(trace["period"].reshape(-1), bins=30, color="tab:orange", density=True)
+ax_period.axvline(1.0, color="k", linestyle="--", label="truth")
+ax_period.set(xlabel="period", ylabel="density", title="Posterior of the period")
+ax_period.legend(loc="best", fontsize="small")
 
-fig, ax = plt.subplots(figsize=(9, 5), layout="constrained")
-ax.fill_between(
-    x,
-    function_quantiles[0],
-    function_quantiles[2],
-    color="tab:blue",
-    alpha=0.2,
-    label="Latent 90% interval",
-)
-ax.plot(x, function_quantiles[1], color="tab:blue", label="Latent posterior median")
-ax.fill_between(
-    new_inputs,
-    predictive_quantiles[0],
-    predictive_quantiles[2],
-    color="tab:orange",
-    alpha=0.2,
-    label="Predictive 90% interval",
-)
-ax.plot(new_inputs, predictive_quantiles[1], color="tab:orange", label="Predictive median")
-ax.scatter(x, y, color="black", zorder=3, label="Observations")
-ax.set(title="Exact periodic GP posterior and predictive distribution", xlabel="x", ylabel="y")
-ax.legend()
+ax_noise = fig.add_subplot(grid_spec[1, 2])
+ax_noise.hist(trace["noise_variance"].reshape(-1).sqrt(), bins=30, color="tab:green", density=True)
+ax_noise.axvline(0.3, color="k", linestyle="--", label="truth")
+ax_noise.set(xlabel="noise standard deviation", ylabel="density", title="Posterior of the noise")
+ax_noise.legend(loc="best", fontsize="small")
 plt.show()

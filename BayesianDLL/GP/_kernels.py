@@ -73,6 +73,18 @@ def _lengthscale_derivative(value, per_feature):
     return per_feature.reshape(*value.shape, *per_feature.shape[-2:])
 
 
+def _radial_input_vjp(weights, x1, x2, scale=None):
+    r"""Contract ``Σ_j W_ij (x1_i - x2_j)`` without forming an ``N x M x D`` tensor.
+
+    Returns ``(rowsum(W)[:, None] * x1 - W @ x2) * scale`` with an optional
+    per-feature ``scale`` (shape ``(D,)`` or scalar).
+    """
+    result = weights.sum(dim=-1, keepdim=True) * x1 - weights @ x2
+    if scale is not None:
+        result = result * scale.reshape(1, -1)
+    return result
+
+
 _QUADRATURE_NODES = 96
 _QUADRATURE_TAIL = 40.0
 
@@ -190,6 +202,23 @@ class Kernel(ABC):
                 pieces.setdefault(name, []).append(torch.diagonal(derivative, dim1=-2, dim2=-1))
         return {name: torch.cat(values, dim=-1) for name, values in pieces.items()}
 
+    def input_vjp(self, x1, x2, cotangent, parameter_values=None):
+        r"""Vector-Jacobian product w.r.t. the first input locations.
+
+        Returns ``∂⟨G, K(x1, x2)⟩ / ∂x1`` with shape ``(N, D)`` for the
+        cotangent ``G`` of shape ``(N, M)``, i.e.
+        ``out[i, d] = Σ_j G_ij ∂k(x1_i, x2_j)/∂x1_id``. Each row of ``x1``
+        only affects one row of ``K``, so no ``N x M x N x D`` Jacobian is
+        formed. The gradient of ``⟨G, K(Z, Z)⟩`` w.r.t. ``Z`` (both
+        arguments) is ``input_vjp(Z, Z, G + Gᵀ)`` because kernels are
+        symmetric, ``k(a, b) = k(b, a)``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement input_vjp.")
+
+    def input_vjp_symmetric(self, x, cotangent, parameter_values=None):
+        """``∂⟨G, K(x, x)⟩ / ∂x`` with both arguments moving (shape ``(N, D)``)."""
+        return self.input_vjp(x, x, cotangent + cotangent.transpose(-2, -1), parameter_values=parameter_values)
+
     def __call__(self, x1, x2=None, parameter_values=None):
         if x2 is None:
             x2 = x1
@@ -228,6 +257,10 @@ class Constant(Kernel):
         value = _parameter_value(self.variance, parameter_values).to(dtype=x1.dtype, device=x1.device)
         return {self.variance.name: _parameter_derivative(value, matrix)}
 
+    def input_vjp(self, x1, x2, cotangent, parameter_values=None):
+        """Zero: the kernel does not depend on the input locations."""
+        return torch.zeros_like(_feature_matrix(x1))
+
 
 class WhiteNoise(Kernel):
     """Independent noise on matching input points."""
@@ -256,6 +289,10 @@ class WhiteNoise(Kernel):
         )
         value = _parameter_value(self.variance, parameter_values).to(dtype=x1.dtype, device=x1.device)
         return {self.variance.name: _parameter_derivative(value, matrix)}
+
+    def input_vjp(self, x1, x2, cotangent, parameter_values=None):
+        """Zero: the kernel does not depend on the input locations (the identity pattern is piecewise constant in them)."""
+        return torch.zeros_like(_feature_matrix(x1))
 
 
 class _StationaryDiagonal:
@@ -324,6 +361,13 @@ class RBF(_StationaryDiagonal, Kernel):
         if _is_named(self.variance):
             derivatives[self.variance.name] = _parameter_derivative(variance, covariance / variance)
         return derivatives
+
+    def input_vjp(self, x1, x2, cotangent, parameter_values=None):
+        """``∂k/∂x1_d = -k (x1_d - x2_d) / l_d²``."""
+        x1 = _feature_matrix(x1)
+        x2 = _feature_matrix(x2).to(dtype=x1.dtype)
+        _, lengthscale, _, _, covariance = self._geometry(x1, x2, parameter_values)
+        return -_radial_input_vjp(cotangent * covariance, x1, x2, 1.0 / lengthscale.square())
 
 
 class Periodic(_StationaryDiagonal, Kernel):
@@ -403,6 +447,32 @@ class Periodic(_StationaryDiagonal, Kernel):
             derivatives[self.period.name] = _parameter_derivative(period, period_derivative)
 
         return derivatives
+
+    def input_vjp(self, x1, x2, cotangent, parameter_values=None):
+        r"""Input gradient of the periodic kernel.
+
+        With ``φ = π δ / p`` and ``d sin²φ / dδ = (π/p) sin 2φ``:
+        scalar length-scale (``δ = ‖x1-x2‖``):
+        ``∂k/∂x1 = -k (2π / (p l²)) sin(2φ) (x1 - x2) / δ``;
+        ARD (``δ_d = x1_d - x2_d``):
+        ``∂k/∂x1_d = -k (2π / (p l_d²)) sin(2π δ_d / p)``.
+        """
+        x1 = _feature_matrix(x1)
+        x2 = _feature_matrix(x2).to(dtype=x1.dtype)
+        x1, _, lengthscale, period, sine, distance = self._geometry(x1, x2, parameter_values)
+        _, covariance = self._covariance(x1, lengthscale, sine, parameter_values)
+        weighted = cotangent * covariance
+        if lengthscale.numel() == 1:
+            distance = distance[0]
+            double_sine = torch.sin(2.0 * torch.pi * distance / period)
+            safe = torch.where(distance > 0, distance, torch.ones_like(distance))
+            radial = torch.where(distance > 0, double_sine / safe, torch.full_like(distance, 0.0))
+            factor = -2.0 * torch.pi / (period * lengthscale.square())
+            return factor * _radial_input_vjp(weighted * radial, x1, x2)
+        signed = (x1[:, None, :] - x2[None, :, :]).permute(2, 0, 1)  # (D, N, M)
+        double_sine = torch.sin(2.0 * torch.pi * signed / period)
+        per_feature = (weighted.unsqueeze(0) * double_sine).sum(dim=-1)  # (D, N)
+        return (-2.0 * torch.pi / (period * lengthscale.square().reshape(-1, 1)) * per_feature).transpose(0, 1)
 
 
 class Matern(_StationaryDiagonal, Kernel):
@@ -488,6 +558,25 @@ class Matern(_StationaryDiagonal, Kernel):
             derivatives[self.variance.name] = _parameter_derivative(variance, correlation)
         return derivatives
 
+    def input_vjp(self, x1, x2, cotangent, parameter_values=None):
+        r"""``∂k/∂x1_d = v f'(a) sqrt(2ν) (x1_d - x2_d) / (s l_d²)``.
+
+        ``f'(a) / s`` stays finite as ``s -> 0`` for ``ν > 1/2`` and the
+        factor ``x1_d - x2_d`` vanishes there, so coincident points
+        contribute zero (the one-sided derivative of the ``ν = 1/2`` kernel
+        at zero distance is not defined; zero is used).
+        """
+        x1 = _feature_matrix(x1)
+        x2 = _feature_matrix(x2).to(dtype=x1.dtype)
+        x1, _, lengthscale, _, scaled_distance, argument = self._geometry(x1, x2, parameter_values)
+        variance = _parameter_value(self.variance, parameter_values).to(dtype=x1.dtype, device=x1.device)
+        _, slope = self._correlation(argument, derivative=True)
+        positive = scaled_distance > 0
+        safe = torch.where(positive, scaled_distance, torch.ones_like(scaled_distance))
+        radial = torch.where(positive, slope / safe, torch.zeros_like(slope))
+        weights = cotangent * variance * math.sqrt(2.0 * self.nu) * radial
+        return _radial_input_vjp(weights, x1, x2, 1.0 / lengthscale.square())
+
 
 class Matern32(Matern):
     def __init__(self, lengthscale=1.0, variance=1.0):
@@ -553,6 +642,13 @@ class RationalQuadratic(_StationaryDiagonal, Kernel):
             derivatives[self.alpha.name] = _parameter_derivative(alpha, alpha_derivative)
         return derivatives
 
+    def input_vjp(self, x1, x2, cotangent, parameter_values=None):
+        """``∂k/∂x1_d = -k (x1_d - x2_d) / (l_d² B)``."""
+        x1 = _feature_matrix(x1)
+        x2 = _feature_matrix(x2).to(dtype=x1.dtype)
+        _, lengthscale, _, _, _, _, base, covariance = self._geometry(x1, x2, parameter_values)
+        return -_radial_input_vjp(cotangent * covariance / base, x1, x2, 1.0 / lengthscale.square())
+
 
 class Linear(Kernel):
     def __init__(self, variance=1.0, offset=0.0):
@@ -579,6 +675,14 @@ class Linear(Kernel):
             derivatives[self.offset.name] = variance * (2 * offset - x1[:, None, :] - x2[None, :, :]).permute(2, 0, 1)
         return derivatives
 
+    def input_vjp(self, x1, x2, cotangent, parameter_values=None):
+        """``∂k/∂x1 = v (x2 - c)``, so the VJP is ``v G (x2 - c)``."""
+        x1 = _feature_matrix(x1)
+        x2 = _feature_matrix(x2).to(dtype=x1.dtype)
+        variance = _parameter_value(self.variance, parameter_values).to(dtype=x1.dtype, device=x1.device)
+        offset = _parameter_value(self.offset, parameter_values).to(dtype=x1.dtype, device=x1.device)
+        return variance * (cotangent @ (x2 - offset))
+
 
 class SumKernel(Kernel):
     def __init__(self, *kernels):
@@ -594,6 +698,9 @@ class SumKernel(Kernel):
             for name, derivative in _kernel_derivatives(kernel, x1, x2, parameter_values).items():
                 derivatives[name] = derivatives.get(name, 0) + derivative
         return derivatives
+
+    def input_vjp(self, x1, x2, cotangent, parameter_values=None):
+        return sum(_kernel_input_vjp(kernel, x1, x2, cotangent, parameter_values) for kernel in self.kernels)
 
 
 class ProductKernel(Kernel):
@@ -621,6 +728,18 @@ class ProductKernel(Kernel):
                 derivatives[name] = derivatives.get(name, 0) + contribution
         return derivatives
 
+    def input_vjp(self, x1, x2, cotangent, parameter_values=None):
+        """Product rule: kernel ``k`` receives the cotangent ``G ⊙ Π_{j≠k} K_j``."""
+        values = [_evaluate_kernel(kernel, x1, x2, parameter_values) for kernel in self.kernels]
+        result = 0
+        for index, kernel in enumerate(self.kernels):
+            weighted = cotangent
+            for other_index, value in enumerate(values):
+                if other_index != index:
+                    weighted = weighted * value
+            result = result + _kernel_input_vjp(kernel, x1, x2, weighted, parameter_values)
+        return result
+
 
 def _kernel_parameters(kernel):
     if isinstance(kernel, Kernel):
@@ -640,3 +759,11 @@ def _kernel_derivatives(kernel, x1, x2, parameter_values=None):
     if isinstance(kernel, Kernel):
         return kernel.derivatives(x1, x2, parameter_values=parameter_values)
     return {}
+
+
+def _kernel_input_vjp(kernel, x1, x2, cotangent, parameter_values=None):
+    if isinstance(kernel, Kernel):
+        return kernel.input_vjp(x1, x2, cotangent, parameter_values=parameter_values)
+    if callable(kernel):
+        raise NotImplementedError("Input gradients are not available for plain callables inside a composite kernel.")
+    return torch.zeros_like(_feature_matrix(x1))

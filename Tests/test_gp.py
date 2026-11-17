@@ -720,9 +720,9 @@ def test_sparse_gp_validates_its_arguments():
         inputs = Data("inputs", x)
         with pytest.raises(ValueError, match="method"):
             SparseGP("f", inputs, RBF(1.0), inducing_points=x, method="svgp")
+        # Learnable inducing inputs are accepted (see Tests/test_gp_structured.py).
         z = RandomParameter("z", Normal(0.0, 1.0), shape=(2, 3))
-        with pytest.raises(TypeError, match="fixed"):
-            SparseGP("f", inputs, RBF(1.0), inducing_points=z)
+        SparseGP("f", inputs, RBF(1.0), inducing_points=z)
 
 
 def test_sparse_gp_scales_to_many_observations():
