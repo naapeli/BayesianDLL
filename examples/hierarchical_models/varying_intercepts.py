@@ -24,9 +24,10 @@ The intercepts are sampled directly (the **centered** form,
 ``alpha ~ Normal(mu_alpha, sigma_alpha)``). The eight schools example shows
 that this form fails when every group is weakly informed. Here most groups
 have many observations, which pin their intercepts down and keep the
-funnel away: the centered model samples without divergences about four
-times faster and with five times the effective sample size of the
-non-centered one (``Affine(z, loc=mu_alpha, scale=sigma_alpha)``). The covariate is
+funnel away. With the same settings the centered model samples without
+divergences in about half the time of the non-centered form
+(``Affine(z, loc=mu_alpha, scale=sigma_alpha)``) and with nearly three times
+its smallest effective sample size. The covariate is
 standardised, so the intercepts are the group means at the average ``x``
 and are nearly uncorrelated with the slope. ``Index`` picks every
 observation's intercept and ``Linear`` adds the slope term.
