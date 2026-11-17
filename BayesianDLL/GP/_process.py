@@ -356,7 +356,7 @@ class ExactGP(Distribution):
         alpha = torch.cholesky_solve(residual.reshape(-1, 1), factor).reshape(-1)
         log_det = 2 * torch.log(torch.diagonal(factor)).sum()
         log_probability = -0.5 * (
-            residual.dot(alpha) + log_det + n * torch.log(torch.as_tensor(2 * torch.pi, dtype=x.dtype))
+            residual.dot(alpha) + log_det + n * math.log(2 * math.pi)
         )
         return x, covariance, factor, residual, alpha, log_probability
 
