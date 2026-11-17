@@ -25,6 +25,12 @@ def test_map_history_and_reporting(normal_model, capsys):
     assert history[-1] > history[0]
 
 
+def test_map_records_history_when_silent(normal_model, capsys):
+    history = find_MAP(normal_model, epochs=5, callback_frequency=2, verbose=False)
+    assert len(history) == 3
+    assert capsys.readouterr().out == ""
+
+
 def make_guide(mean_value=0.3, std_value=1.1, requires_grad=False):
     mean = torch.tensor([mean_value], requires_grad=requires_grad)
     std = torch.tensor([std_value], requires_grad=requires_grad)

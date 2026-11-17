@@ -1,26 +1,34 @@
 """
-Variational Exact Gaussian Process
-==================================
+Variational Inference for GP Hyperparameters
+============================================
 
-Fits the hyperparameters of an exact Gaussian process with black-box variational
-inference and plots the resulting predictive distribution.
+Eighteen noisy observations of ``sin(2 pi x)`` are modelled with an exact
+Gaussian process, ``y ~ GP(0, k_RBF) + N(0, noise_variance)``. ``ExactGP``
+integrates the latent function out analytically, so the only latents are
+the three kernel hyperparameters: lengthscale, signal variance and noise
+variance.
+
+All three are positive and span orders of magnitude, so the model puts
+Normal priors on their **logarithms** and recovers them with ``Exp`` blocks.
+In these coordinates the posterior is close to Gaussian, but the
+hyperparameters are correlated (a longer lengthscale can be traded against
+more noise), so the guide is ``AutoMultivariateNormal``, a full-rank
+Normal over the three log-hyperparameters.
+
+NUTS on the same model serves as the reference. The figures show the ELBO,
+the marginal posteriors of the hyperparameters under both methods, and the
+posterior predictive mean and 95% band of the latent function from both,
+over the data.
 """
 
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import Data, MeanFieldGuide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
+from BayesianDLL import AutoMultivariateNormal, Data, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import ExactGP, RBF, exact_gp_predictive
+from BayesianDLL.GP import RBF, ExactGP, exact_gp_predictive
 from BayesianDLL.Variational import BBVI
-from BayesianDLL.Evaluation import Graphics
-
-
-def variational_normal(name, dtype):
-    mean = VariationalParameter(f"{name}_mean", torch.zeros(1, dtype=dtype))
-    std = VariationalParameter(f"{name}_std", torch.ones(1, dtype=dtype), min=1e-3)
-    return RandomParameter(name, Normal(mean, std))
 
 
 torch.manual_seed(0)
@@ -37,53 +45,63 @@ with Model() as model:
     lengthscale = Exp("lengthscale", log_lengthscale)
     variance = Exp("variance", log_variance)
     noise_variance = Exp("noise_variance", log_noise_variance)
-    function = ExactGP(
-        "function", inputs, RBF(lengthscale, variance), noise_variance=noise_variance
-    )
+    gp = ExactGP("f", inputs, RBF(lengthscale, variance), noise_variance=noise_variance)
     with plate("observations", x):
-        ObservedParameter("observations", function, y)
+        ObservedParameter("y", gp, y)
 
-with MeanFieldGuide() as guide:
-    q_log_lengthscale = variational_normal("log_lengthscale", x.dtype)
-    q_log_variance = variational_normal("log_variance", x.dtype)
-    q_log_noise_variance = variational_normal("log_noise_variance", x.dtype)
-    Exp("lengthscale", q_log_lengthscale)
-    Exp("variance", q_log_variance)
-    Exp("noise_variance", q_log_noise_variance)
+# %%
+# Fitting the guide and the reference
+# -----------------------------------
 
-history = BBVI(model, guide, n_samples=4, epochs=1000, lr=5e-3, callback_frequency=50)
+guide = AutoMultivariateNormal(model)
+history = BBVI(model, guide, n_samples=4, epochs=800, lr=0.03, lrd=0.998, callback_frequency=5, verbose=False)
+variational = guide.sample(1200)
+print(f"final ELBO estimate: {sum(history[-20:]) / 20:.2f}")
 
-posterior = guide.sample(
-    n_samples=300,
-    warmup_length=300,
-    n_chains=4,
-)
-Graphics.plot_posterior(posterior)
-Graphics.plot_posterior(posterior, vars="deterministic")
+nuts = model.sample(n_samples=300, warmup_length=300, n_chains=4, progress_bar=False, seed=0, delta=0.9)
+summary = nuts.summary()
+print(summary)
+print(f"NUTS: {sum(nuts.divergences)} divergences, largest R-hat {summary['r_hat'].max():.3f}")
 
-x_prediction = torch.linspace(-0.1, 1.1, 120, dtype=x.dtype)
-predictions = exact_gp_predictive(
-    function, posterior, y, x_prediction, n_samples=8
-)
-predictions = predictions.reshape(-1, x_prediction.numel())
-prediction_mean = predictions.mean(dim=0)
-prediction_lower = predictions.quantile(0.025, dim=0)
-prediction_upper = predictions.quantile(0.975, dim=0)
+# %%
+# Hyperparameters and predictions
+# -------------------------------
+# For every hyperparameter draw, ``exact_gp_predictive`` samples the latent
+# function on a grid from its Gaussian conditional given the data, so the
+# band combines the hyperparameter uncertainty and the GP's own uncertainty.
+# It widens outside the data range ``[0, 1]``.
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-axes[0].plot(history)
-axes[0].set_title("Exact-GP ELBO")
-axes[0].set_xlabel("Optimization epoch")
-axes[0].set_ylabel("ELBO")
-axes[1].scatter(x, y, color="C0", label="Observed data")
-axes[1].plot(x_prediction, prediction_mean, color="black", label="Posterior mean")
-axes[1].fill_between(
-    x_prediction, prediction_lower, prediction_upper,
-    color="C0", alpha=0.2, label="95% credible interval"
-)
-axes[1].set_title("Variational exact GP")
-axes[1].set_xlabel("x")
-axes[1].set_ylabel("y")
-axes[1].legend()
-fig.tight_layout()
+traces = {"AutoMultivariateNormal": variational, "NUTS": nuts}
+predictive_traces = {label: trace.thin(4) for label, trace in traces.items()}  # 300 draws each
+colors = {"AutoMultivariateNormal": "C0", "NUTS": "black"}
+x_new = torch.linspace(-0.2, 1.2, 120, dtype=torch.float64)
+
+fig = plt.figure(figsize=(13, 8), layout="constrained")
+top = fig.subfigures(2, 1)
+upper_axes = top[0].subplots(1, 4)
+upper_axes[0].plot(range(5, 5 * len(history) + 1, 5), history, color="C0")
+upper_axes[0].set_ylim(history[-1] - 30, history[-1] + 8)
+upper_axes[0].set_xlabel("epoch")
+upper_axes[0].set_ylabel("ELBO estimate")
+upper_axes[0].set_title("Optimisation")
+for ax, name in zip(upper_axes[1:], ("lengthscale", "variance", "noise_variance")):
+    for label, trace in traces.items():
+        draws = trace[name].flatten().log10()
+        ax.hist(draws, bins=40, density=True, histtype="step", lw=1.8, color=colors[label], label=label)
+    ax.set_xlabel(f"log10 {name}")
+    ax.set_title(name.replace("_", " "))
+upper_axes[1].legend(fontsize="small")
+
+ax = top[1].subplots()
+for label, trace in predictive_traces.items():
+    draws = exact_gp_predictive(gp, trace, y, x_new, n_samples=4).reshape(-1, x_new.numel())
+    lower, upper = draws.quantile(torch.tensor([0.025, 0.975], dtype=torch.float64), dim=0)
+    ax.plot(x_new, draws.mean(0), color=colors[label], label=f"{label} mean")
+    ax.fill_between(x_new, lower, upper, color=colors[label], alpha=0.15, label=f"{label} 95% band")
+ax.plot(x_new, torch.sin(2 * torch.pi * x_new), color="C2", linestyle=":", label="true function")
+ax.scatter(x, y, color="C3", zorder=3, s=20, label="data")
+ax.set_xlabel("x")
+ax.set_ylabel("f(x)")
+ax.set_title("Posterior predictive of the latent function")
+ax.legend(fontsize="small", ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.12))
 plt.show()
