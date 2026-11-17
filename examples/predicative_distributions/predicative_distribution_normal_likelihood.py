@@ -1,43 +1,60 @@
 """
-Prior Predictive: Normal Likelihood
-===================================
+Prior and Posterior Predictive: Normal Data
+===========================================
 
-Samples the prior predictive distribution of a normal model with unknown mean and
-standard deviation and compares its pdf and cdf to the observed data.
+Normal measurements are modelled with an unknown mean and standard deviation,
+``y ~ Normal(mean, sigma)`` with ``mean ~ Normal(0, 10)`` and
+``sigma ~ HalfNormal(5)``.
 
-The prior predictive is drawn exactly by ancestral sampling: the parameters are
-drawn from their priors and the data from the likelihood, without any MCMC. The
-prior draws of the parameters are returned in ``predicative_distribution.prior``.
+The **prior predictive** distribution shows what data the model expects
+before seeing any: ``sample_prior_predicative`` draws parameters from their
+priors and then data from the likelihood, by ancestral sampling and without
+MCMC. Weakly informative priors should give replicated data on a plausible
+scale that comfortably covers the observations; the prior draws themselves
+are returned in ``predictive.prior``.
+
+The **posterior predictive** distribution uses posterior draws instead (from
+NUTS here), and replicated data should then resemble the observations
+closely. The figure puts both next to each other, as densities and as
+distribution functions, against the data.
 """
 
-import torch
 import matplotlib.pyplot as plt
+import torch
 
-from BayesianDLL.Distributions import Normal, HalfNormal
-from BayesianDLL import Model, RandomParameter, ObservedParameter, sample_prior_predicative, sample_posterior_predicative, plate
-from BayesianDLL.Evaluation.Graphics import plot_predicative_distribution
+from BayesianDLL import Model, ObservedParameter, RandomParameter, plate
+from BayesianDLL.Distributions import HalfNormal, Normal
+from BayesianDLL.Evaluation import Graphics, summary
 
 
 torch.manual_seed(0)
-N = 1000
-mu0 = 0
-tau = 3  # prior standard deviation of the mean
-true_mean, true_variance = 5, 3
-data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N,), dtype=torch.float64)
-print(data.mean(), data.var())
 
-n_samples = 30
+n_obs = 1000
+mean_true, sigma_true = 5.0, 3 ** 0.5
+y = mean_true + sigma_true * torch.randn(n_obs, dtype=torch.float64)
+print(f"data: mean {y.mean():.2f}, standard deviation {y.std():.2f}")
+
 with Model() as model:
-    mean = RandomParameter("mean", Normal(mu0, tau))
-    sigma = RandomParameter("sigma", HalfNormal(3.0))
-    with plate("data", N):
-        likelihood = ObservedParameter("likelihood", Normal(mean, sigma), data)
-    predicative_distribution = model.sample_prior_predicative(n_samples, samples_per_step=10)
-    # predicative_distribution = model.sample_posterior_predicative(n_samples, 1000, samples_per_step=10)
+    mean = RandomParameter("mean", Normal(0.0, 10.0))
+    sigma = RandomParameter("sigma", HalfNormal(5.0))
+    with plate("observations", n_obs):
+        ObservedParameter("y", Normal(mean, sigma), y)
 
-print(predicative_distribution.prior.summary())
+prior_predictive = model.sample_prior_predicative(30, samples_per_step=5, progress_bar=False)
+print("\nprior draws of the parameters")
+print(summary(prior_predictive.prior).to_string())
 
-_, axes = plt.subplots(1, 2, figsize=(12, 5), layout="constrained")
-plot_predicative_distribution(predicative_distribution, data, kind="pdf", ax=axes[0])
-plot_predicative_distribution(predicative_distribution, data, kind="cdf", ax=axes[1])
+result = model.sample(1000, 500, n_chains=4, seed=0, delta=0.85, progress_bar=False)
+print("\nposterior")
+print(summary(result).to_string())
+posterior_predictive = model.posterior_predicative(result, n_samples=30, samples_per_step=5, progress_bar=False)
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
+for row, (label, predictive) in enumerate((("Prior", prior_predictive), ("Posterior", posterior_predictive))):
+    for column, kind in enumerate(("pdf", "cdf")):
+        ax = axes[row, column]
+        Graphics.plot_predicative_distribution(predictive, y, kind=kind, ax=ax)
+        ax.set_title(f"{label} predictive {'density' if kind == 'pdf' else 'distribution function'} vs data")
+        ax.set_xlabel("y")
+        ax.legend(loc="upper left" if kind == "pdf" else "lower right", fontsize="small", frameon=False)
 plt.show()

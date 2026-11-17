@@ -2,9 +2,22 @@
 Conditioning a Model
 ====================
 
-Uses ``condition`` to reuse one linear regression model in several ways: fitting it
-to a new dataset, fixing the intercept to zero for a what-if analysis, and fixing the
-noise level for a sensitivity analysis. The resulting posteriors are compared.
+``model.condition(...)`` (or ``condition(model, {...})``) returns a copy of a
+model in which some nodes take fixed values. The original model is left
+unchanged, so one model definition can be reused for several questions:
+
+* **new data**: replacing the values of ``Data`` nodes fits the same model to
+  another dataset;
+* **what-if**: fixing a parameter, here the intercept to 0, gives the
+  posterior of the remaining parameters under that assumption;
+* **sensitivity**: fixing the noise level to a small and to a large value
+  shows how much the slope estimate depends on it.
+
+The model is a straight line with a ``Normal`` likelihood. The covariate is
+centred at zero, which keeps the intercept and slope nearly uncorrelated, and
+the noise has a weakly informative ``HalfNormal`` prior. The figures show the
+fitted lines with 95% bands for every conditioned copy over its data, together
+with the true lines, and the slope posteriors under the different assumptions.
 """
 
 import matplotlib.pyplot as plt
@@ -12,151 +25,122 @@ import torch
 
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, condition, plate
 from BayesianDLL.Deterministic import Linear
-from BayesianDLL.Distributions import HalfCauchy, Normal
+from BayesianDLL.Distributions import HalfNormal, Normal
 from BayesianDLL.Evaluation import summary
 
 
 torch.manual_seed(42)
 
-N = 30
-true_intercept = 1.5
-true_slope = 2.0
-true_sigma = 0.5
-
-x_raw = torch.linspace(-2.0, 2.0, N, dtype=torch.float64)
-noise = torch.randn(N, dtype=torch.float64) * true_sigma
-y_raw = true_intercept + true_slope * x_raw + noise
-
+n_obs = 30
+a_true, b_true, sigma_true = 1.5, 2.0, 0.5
+x_obs = torch.linspace(-2.0, 2.0, n_obs, dtype=torch.float64)
+y_obs = a_true + b_true * x_obs + sigma_true * torch.randn(n_obs, dtype=torch.float64)
 
 with Model() as model:
-    x_data = Data("x", x_raw)
-    y_data = Data("y", y_raw)
+    x = Data("x", x_obs)
+    y = Data("y", y_obs)
+    intercept = RandomParameter("intercept", Normal(0.0, 5.0))
+    slope = RandomParameter("slope", Normal(0.0, 5.0))
+    sigma = RandomParameter("sigma", HalfNormal(2.0))
+    mu = Linear("mu", x, slope=slope, intercept=intercept)
+    with plate("observations", x):
+        ObservedParameter("y_obs", Normal(mu, sigma), y)
 
-    intercept = RandomParameter("intercept", Normal(0.0, 2.0))
-    slope = RandomParameter("slope", Normal(0.0, 2.0))
-    sigma = RandomParameter("sigma", HalfCauchy(1.0))
-
-    mu = Linear("mu", x_data, slope=slope, intercept=intercept)
-
-    with plate("data", x_data):
-        ObservedParameter("obs", Normal(mu, sigma), y_data)
-
-
-sampling_options = {
-    "n_samples": 1000,
-    "warmup_length": 500,
-    "n_chains": 2,
-    "progress_bar": True,
-    "delta": 0.8,
-}
-
-print("\n--- Sampling Model with Original Dataset ---")
-res_full = model.sample(**sampling_options)
-print(summary(res_full, round_to=3))
+# All chains run in one process (``chain_method="vectorized"``), which avoids
+# starting worker processes for each of the five fits.
+options = {"n_samples": 800, "warmup_length": 400, "n_chains": 4, "delta": 0.85, "chain_method": "vectorized",
+           "progress_bar": False}
 
 
-N_alternative = 18
-alternative_intercept = -0.75
-alternative_slope = -1.25
-x_alternative = torch.linspace(-3.0, 3.0, N_alternative, dtype=torch.float64)
-y_alternative = (
-    alternative_intercept
-    + alternative_slope * x_alternative
-    + torch.randn(N_alternative, dtype=torch.float64) * true_sigma
-)
-
-print("\n--- Conditioning on an Alternative Dataset ---")
-model_alternative_data = model.condition(x=x_alternative, y=y_alternative)
-
-res_alternative_data = model_alternative_data.sample(**sampling_options)
-print(summary(res_alternative_data, round_to=3))
+def fit(conditioned_model, label, seed):
+    result = conditioned_model.sample(seed=seed, **options)
+    names = [name for name in ("intercept", "slope", "sigma") if name in result.trace]
+    print(f"\n{label} ({sum(result.divergences)} divergences)")
+    print(summary({name: result[name] for name in names}).to_string())
+    return result
 
 
-print("\n--- Conditioning on Intercept = 0.0 ---")
-model_zero_intercept = model.condition(intercept=0.0)
+# %%
+# The model as defined
+# --------------------
+original = fit(model, "original data", seed=0)
 
-res_zero_intercept = model_zero_intercept.sample(**sampling_options)
-print(summary(res_zero_intercept, round_to=3))
+# %%
+# The same model on another dataset
+# ---------------------------------
+a_new, b_new = -0.75, -1.25
+x_new = torch.linspace(-3.0, 3.0, 18, dtype=torch.float64)
+y_new = a_new + b_new * x_new + sigma_true * torch.randn(18, dtype=torch.float64)
+new_data = fit(model.condition(x=x_new, y=y_new), "conditioned on a new dataset", seed=1)
 
-print("\n--- Sensitivity Analysis on Observation Noise (sigma) ---")
-model_low_noise = condition(model, {"sigma": 0.02})
-model_high_noise = condition(model, {"sigma": 2})
+# %%
+# What if the line went through the origin?
+# -----------------------------------------
+no_intercept = fit(model.condition(intercept=0.0), "intercept fixed to 0", seed=2)
 
-res_low_noise = model_low_noise.sample(**sampling_options)
-res_high_noise = model_high_noise.sample(**sampling_options)
+# %%
+# Sensitivity to the noise level
+# ------------------------------
+low_noise = fit(condition(model, {"sigma": 0.1}), "sigma fixed to 0.1", seed=3)
+high_noise = fit(condition(model, {"sigma": 2.0}), "sigma fixed to 2", seed=4)
 
-print("\nPosterior summary with assumed low noise (sigma = 0.02):")
-print(summary(res_low_noise, round_to=3))
 
-print("\nPosterior summary with assumed high noise (sigma = 2):")
-print(summary(res_high_noise, round_to=3))
+def line_band(result, x_grid, intercept_value=None):
+    a = result["intercept"].reshape(-1, 1) if intercept_value is None else intercept_value
+    lines = a + result["slope"].reshape(-1, 1) * x_grid
+    return lines.mean(0), lines.quantile(0.025, 0), lines.quantile(0.975, 0)
 
-_, axes = plt.subplots(1, 3, figsize=(18, 5), layout="constrained")
 
-x_line = torch.linspace(
-    min(x_raw.min(), x_alternative.min()),
-    max(x_raw.max(), x_alternative.max()),
-    200,
-    dtype=torch.float64,
-)
+fig, axes = plt.subplots(2, 2, figsize=(12, 9), layout="constrained")
+x_grid = torch.linspace(-3.0, 3.0, 200, dtype=torch.float64)
 
-intercept_full_mean = res_full["intercept"].mean()
-slope_full_mean = res_full["slope"].mean()
-intercept_alternative_mean = res_alternative_data["intercept"].mean()
-slope_alternative_mean = res_alternative_data["slope"].mean()
+ax = axes[0, 0]
+for result, xs, ys, a, b, color, label in (
+    (original, x_obs, y_obs, a_true, b_true, "C0", "original data"),
+    (new_data, x_new, y_new, a_new, b_new, "C4", "new data"),
+):
+    mean, low, high = line_band(result, x_grid)
+    ax.scatter(xs, ys, s=18, color=color, alpha=0.7, label=label)
+    ax.fill_between(x_grid, low, high, color=color, alpha=0.25, linewidth=0)
+    ax.plot(x_grid, mean, color=color)
+    ax.plot(x_grid, a + b * x_grid, color=color, linestyle="--", linewidth=1)
+ax.set_title("Same model, two datasets (dashed: true lines)")
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.legend(frameon=False, fontsize="small")
 
-axes[0].scatter(x_raw, y_raw, color="C0", alpha=0.7, label=f"Original data (n={N})")
-axes[0].scatter(
-    x_alternative,
-    y_alternative,
-    color="C4",
-    marker="D",
-    alpha=0.7,
-    label=f"Conditioned data (n={N_alternative})",
-)
-axes[0].plot(
-    x_line,
-    intercept_full_mean + slope_full_mean * x_line,
-    color="C0",
-    linewidth=2,
-    label="Posterior mean: original",
-)
-axes[0].plot(
-    x_line,
-    intercept_alternative_mean + slope_alternative_mean * x_line,
-    color="C4",
-    linewidth=2,
-    label="Posterior mean: conditioned copy",
-)
-axes[0].set_title("Conditioning the Same Model on New Data", fontsize=11)
-axes[0].set_xlabel("x")
-axes[0].set_ylabel("y")
-axes[0].legend(frameon=False)
-axes[0].grid(alpha=0.2)
+ax = axes[0, 1]
+ax.scatter(x_obs, y_obs, s=18, color="gray", alpha=0.7, label="original data")
+for result, intercept_value, color, label in ((original, None, "C0", "intercept inferred"),
+                                              (no_intercept, 0.0, "C3", "intercept fixed to 0")):
+    mean, low, high = line_band(result, x_grid, intercept_value)
+    ax.fill_between(x_grid, low, high, color=color, alpha=0.25, linewidth=0)
+    ax.plot(x_grid, mean, color=color, label=label)
+ax.plot(x_grid, a_true + b_true * x_grid, color="black", linestyle="--", linewidth=1, label="true line")
+ax.set_title("What-if: line forced through the origin")
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.legend(frameon=False, fontsize="small")
 
-slope_full = res_full["slope"].flatten().numpy()
-slope_zero = res_zero_intercept["slope"].flatten().numpy()
+ax = axes[1, 0]
+ax.scatter(x_obs, y_obs, s=18, color="gray", alpha=0.7, label="original data")
+for result, color, label in ((low_noise, "C2", "sigma = 0.1"), (original, "C0", "sigma inferred"),
+                             (high_noise, "C1", "sigma = 2")):
+    mean, low, high = line_band(result, x_grid)
+    ax.fill_between(x_grid, low, high, color=color, alpha=0.25, linewidth=0, label=f"95% band, {label}")
+ax.set_title("Sensitivity: bands of the mean line")
+ax.set_xlabel("x")
+ax.set_ylabel("y")
+ax.legend(frameon=False, fontsize="small")
 
-axes[1].hist(slope_full, bins=25, density=True, alpha=0.55, color="C0", label="Unconditioned (latent intercept)")
-axes[1].hist(slope_zero, bins=25, density=True, alpha=0.55, color="C3", label="Conditioned: intercept = 0.0")
-axes[1].axvline(true_slope, color="black", linestyle="--", linewidth=1.5, label=f"True slope ({true_slope})")
-axes[1].set_title("What-If Analysis: Effect on Slope with Intercept Fixed to 0", fontsize=11)
-axes[1].set_xlabel("Slope")
-axes[1].set_ylabel("Posterior Density")
-axes[1].legend(frameon=False)
-axes[1].grid(alpha=0.2)
-
-slope_low = res_low_noise["slope"].flatten().numpy()
-slope_high = res_high_noise["slope"].flatten().numpy()
-
-axes[2].hist(slope_low, bins=25, density=True, alpha=0.55, color="C2", label="Low noise (sigma = 0.02)")
-axes[2].hist(slope_full, bins=25, density=True, alpha=0.4, color="C0", label="Inferred noise (sigma ~ HalfCauchy)")
-axes[2].hist(slope_high, bins=25, density=True, alpha=0.55, color="C1", label="High noise (sigma = 2)")
-axes[2].axvline(true_slope, color="black", linestyle="--", linewidth=1.5, label=f"True slope ({true_slope})")
-axes[2].set_title("Sensitivity Analysis: Slope Uncertainty vs Assumed Noise", fontsize=11)
-axes[2].set_xlabel("Slope")
-axes[2].set_ylabel("Posterior Density")
-axes[2].legend(frameon=False)
-axes[2].grid(alpha=0.2)
-
+ax = axes[1, 1]
+for result, color, label in ((low_noise, "C2", "sigma = 0.1"), (original, "C0", "sigma inferred"),
+                             (high_noise, "C1", "sigma = 2"), (no_intercept, "C3", "intercept = 0")):
+    ax.hist(result["slope"].reshape(-1).numpy(), bins=50, density=True, histtype="step", linewidth=1.5,
+            color=color, label=label)
+ax.axvline(b_true, color="black", linestyle="--", label="true slope")
+ax.set_title("Posterior of the slope under each assumption")
+ax.set_xlabel("slope")
+ax.set_ylabel("density")
+ax.legend(frameon=False, fontsize="small")
 plt.show()
