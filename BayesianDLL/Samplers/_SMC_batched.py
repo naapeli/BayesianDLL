@@ -105,6 +105,7 @@ class _BatchedMutation:
         self.scale = 2.38 / math.sqrt(max(self.dim_c, 1))
         self._full = None
         self._discrete = None
+        self._step_size = None
         space = target.discrete_state_space()
         if space is not None:
             if has_finite_support(space):
@@ -175,7 +176,15 @@ class _BatchedMutation:
                 else:
                     self._full = particles
                     self._sampler.invalidate_cache()
-                    new_theta, _, accept_stat, _ = self._sampler.step(particles[:, index].clone(), warmup=self.kernel == "nuts")
+                    theta = particles[:, index].clone()
+                    if self.kernel == "nuts":
+                        self._set_pooled_step_size(theta)
+                    new_theta, _, accept_stat, _ = self._sampler.step(theta, warmup=False)
+                    if self.kernel == "nuts":
+                        # The particles are exchangeable at a fixed temperature, so
+                        # one step size is adapted from their mean acceptance.
+                        mean_accept = float(torch.as_tensor(accept_stat).mean())
+                        self._step_size = min(max(self._step_size * math.exp(2.0 * (mean_accept - 0.8)), 1e-4), 1e2)
                     flat = self._with(index, new_theta)
                     prior, likelihood = self.batched.log_prior_and_likelihood(flat)
                     keep = torch.isfinite(_tempered(prior, likelihood, beta))
@@ -190,11 +199,27 @@ class _BatchedMutation:
                 particles = self._with(discrete_index, new_theta)
                 log_prior, log_likelihood = self.batched.log_prior_and_likelihood(particles)
         if self.dim_c > 0 and self.kernel != "metropolis":
-            sampler = self._sampler
-            self.scale = float(sampler.step_size.mean()) if self.kernel == "nuts" else float(sampler.width.mean())
+            self.scale = self._step_size if self.kernel == "nuts" else float(self._sampler.width.mean())
         if self.dim_c == 0:
             acceptance.fill_(float(self.n_steps))
         return particles, log_prior, log_likelihood, acceptance / max(self.n_steps, 1)
+
+
+def _set_pooled_step_size(self, theta):
+    """Run the next NUTS step with the population's step size (initially the median heuristic one)."""
+    sampler = self._sampler
+    if self._step_size is None:
+        log_prob, gradient = sampler._evaluate(theta)
+        self._step_size = float(sampler.find_reasonable_step_size(theta, gradient, log_prob).median())
+    step = torch.full((self.n,), self._step_size, dtype=theta.dtype, device=theta.device)
+    sampler.step_size = step
+    sampler.step_size_bar = step
+    sampler.mu = torch.log(10 * step)
+    sampler.H_bar = torch.zeros_like(step)
+    sampler.m = 1
+
+
+_BatchedMutation._set_pooled_step_size = _set_pooled_step_size
 
 
 def _real_space():

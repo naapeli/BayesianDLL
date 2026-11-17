@@ -568,3 +568,28 @@ def test_vectorized_explicit_blocks_and_default_chain_method():
     assert result.sample_stats.params == [["mu"], ["sigma"]]
     with pytest.raises(ValueError):
         sample(10, 10, n_chains=2, model=model, chain_method="threads", progress_bar=False)
+
+
+# ============================================================ SMC
+@pytest.mark.parametrize("kernel", ["metropolis", "nuts", "slice"])
+def test_batched_smc_matches_particle_by_particle_smc(kernel):
+    from BayesianDLL import sample_smc
+    # Posterior N(1.6, 4/13) with log evidence of the conjugate model.
+    y = torch.tensor([1.0, 2.0, 2.2])
+    covariance = torch.eye(3) + 4.0 * torch.ones(3, 3)
+    exact = float(MultivariateNormal(torch.zeros(3), covariance).log_pdf(y))
+    results = [
+        sample_smc(conjugate_normal(), n_particles=400, kernel=kernel, seed=4, progress_bar=False, vectorized=flag)
+        for flag in (True, False)
+    ]
+    for result in results:
+        assert result.log_marginal_likelihood == pytest.approx(exact, abs=0.25)
+        assert_moments(result["mean"], 1.6, math.sqrt(4 / 13), tolerance=0.15)
+    assert results[0]["mean"].shape == (1, 400, 1)
+
+
+def test_batched_smc_with_a_model_evaluated_chain_by_chain():
+    from BayesianDLL import sample_smc
+    result = sample_smc(exact_gp_model(), n_particles=40, seed=1, progress_bar=False)
+    assert result["lengthscale"].shape == (1, 40, 1)
+    assert torch.isfinite(torch.as_tensor(result.log_marginal_likelihood))
