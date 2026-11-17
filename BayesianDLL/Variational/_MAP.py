@@ -27,10 +27,11 @@ def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_fre
             new_unconstrained_value = param.unconstrained_value + lr * m_hat / (torch.sqrt(v_hat) + 1e-8)
             param.set_unconstrained_value(new_unconstrained_value)
 
-        if verbose and epoch % callback_frequency == 0:
+        if epoch % callback_frequency == 0:
             logp = model.model_log_prob()
             history.append(logp.item())
-            print(f"Epoch: {epoch + 1} - Log_prob: {logp.item():.2f}")
+            if verbose:
+                print(f"Epoch: {epoch + 1} - Log_prob: {logp.item():.2f}")
 
     return history
 

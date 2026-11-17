@@ -1,119 +1,140 @@
 """
-Variational Latent Gaussian Process
-===================================
+Variational Inference for a Latent GP
+=====================================
 
-Fits a latent Gaussian process with black-box variational inference, optimising the
-variational standard deviations on the log scale, and plots the predictive distribution.
+A latent Gaussian process ``f ~ GP(0, k_RBF)`` is observed with Normal
+noise, ``y_i ~ N(f(x_i), 0.29)``. ``LatentGP`` represents the function in
+**whitened** (non-centred) form: ``f = L z`` with ``z ~ N(0, I)`` and ``L`` the
+Cholesky factor of the kernel matrix. The latent ``z`` has a standard normal
+prior whatever the kernel, which makes it far easier to approximate than
+``f`` itself, whose coordinates are strongly correlated.
+
+To focus on the function, the kernel hyperparameters are fixed. With a
+Gaussian likelihood the posterior of ``f`` is then Gaussian and known in
+closed form, which gives an exact reference. Two guides over ``z`` are
+compared:
+
+* a **hand-written mean-field guide**: the guide contains the same
+  ``LatentGP`` node, fed by an independent Normal for every coordinate of
+  ``z`` with log-scale standard deviations;
+* ``AutoMultivariateNormal``, a full-rank Normal over ``z``, which contains
+  the exact posterior.
+
+The figures show the ELBO of both guides, the posterior standard deviation
+of ``f`` at the training inputs, and the posterior of the function on a grid
+under both guides and the exact posterior. The full-rank guide reproduces the
+exact posterior. The mean-field guide does not: the posterior of ``z`` is
+correlated, and independent noise in ``z`` maps through the triangular
+``L`` to the wrong pattern of uncertainty in ``f``. It is too confident at the
+left end of the data and far too uncertain at the right end, and its ELBO
+is about 8 nats lower.
 """
 
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import Data, MeanFieldGuide, Model, ObservedParameter, RandomParameter, VariationalParameter, condition, plate
-from BayesianDLL.Deterministic import Exp
+from BayesianDLL import AutoMultivariateNormal, Data, MeanFieldGuide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import LatentGP, RBF, gp_predictive
+from BayesianDLL.GP import RBF, LatentGP, gp_predictive
 from BayesianDLL.Variational import BBVI
-from BayesianDLL.Evaluation import Graphics
-
-
-def variational_normal(name, shape, dtype, mean=0.0, std=1.0):
-    shape = (shape,) if isinstance(shape, int) else tuple(shape)
-    mean_parameter = VariationalParameter(
-        f"{name}_mean", torch.full(shape, mean, dtype=dtype)
-    )
-    # Optimizing the standard deviation on the log scale lets Adam take multiplicative
-    # steps, so small posterior standard deviations are reached without overshooting.
-    std_parameter = VariationalParameter(
-        f"{name}_std", torch.full(shape, std, dtype=dtype), min=1e-3, log_scale=True
-    )
-    return RandomParameter(name, Normal(mean_parameter, std_parameter), shape=shape)
 
 
 torch.manual_seed(0)
 
-
 n_observations = 18
+lengthscale, variance, noise_std = 0.37, 1.0, 0.29
 x = torch.linspace(0.0, 1.0, n_observations, dtype=torch.float64)
 y = torch.sin(2 * torch.pi * x) + 0.08 * torch.randn_like(x)
 
 with Model() as model:
     inputs = Data("inputs", x)
-    log_lengthscale = RandomParameter("log_lengthscale", Normal(-1.0, 0.7))
-    log_variance = RandomParameter("log_variance", Normal(0.0, 0.7))
-    log_noise_std = RandomParameter("log_noise_std", Normal(-1.25, 0.35))
-    lengthscale = Exp("lengthscale", log_lengthscale)
-    variance = Exp("variance", log_variance)
-    noise_std = Exp("noise_std", log_noise_std)
-    function = LatentGP("function", inputs, RBF(lengthscale, variance))
+    f = LatentGP("f", inputs, RBF(lengthscale, variance))  # creates the latent "f_white" ~ N(0, I)
     with plate("observations", x):
-        ObservedParameter("observations", Normal(function, noise_std), y)
-
-condition_hyperparameters = True
-
-if condition_hyperparameters:
-    fixed_log_hyperparameters = {
-        "log_lengthscale": torch.tensor([-1.0], dtype=x.dtype),
-        "log_variance": torch.tensor([0.0], dtype=x.dtype),
-        "log_noise_std": torch.tensor([-1.25], dtype=x.dtype),
-    }
-    model = condition(model, fixed_log_hyperparameters)
-    function = model.deterministic_params["function"]
-    fixed_lengthscale = torch.exp(fixed_log_hyperparameters["log_lengthscale"]).item()
-    fixed_variance = torch.exp(fixed_log_hyperparameters["log_variance"]).item()
+        ObservedParameter("y", Normal(f, noise_std), y)
 
 with MeanFieldGuide() as guide:
-    guide_inputs = Data("inputs", x)
-    if condition_hyperparameters:
-        guide_kernel = RBF(fixed_lengthscale, fixed_variance)
-    else:
-        q_log_lengthscale = variational_normal("log_lengthscale", 1, x.dtype)
-        q_log_variance = variational_normal("log_variance", 1, x.dtype)
-        q_log_noise_std = variational_normal("log_noise_std", 1, x.dtype)
-        q_lengthscale = Exp("lengthscale", q_log_lengthscale)
-        q_variance = Exp("variance", q_log_variance)
-        Exp("noise_std", q_log_noise_std)
-        guide_kernel = RBF(q_lengthscale, q_variance)
+    z_loc = VariationalParameter("z_loc", torch.zeros(n_observations, dtype=torch.float64))
+    z_scale = VariationalParameter("z_scale", torch.ones(n_observations, dtype=torch.float64), log_scale=True)
+    z = RandomParameter("f_white", Normal(z_loc, z_scale), shape=(n_observations,))
+    LatentGP("f", Data("inputs", x), RBF(lengthscale, variance), latent=z)
 
-    q_function = LatentGP(
-        "function",
-        guide_inputs,
-        guide_kernel,
-        latent=variational_normal("function_white", n_observations, x.dtype),
-    )
+# %%
+# Fitting both guides
+# -------------------
 
-history = BBVI(model, guide, n_samples=4, epochs=3000, lr=1e-2, lrd=0.999, callback_frequency=10)
+history_mean_field = BBVI(model, guide, n_samples=4, epochs=2000, lr=0.02, lrd=0.999, callback_frequency=10, verbose=False)
+mean_field = guide.sample_prior_predicative(n_samples=1000, samples_per_step=1, progress_bar=False).prior
 
-posterior = guide.sample(
-    n_samples=300,
-    warmup_length=300,
-    n_chains=4,
-)
+full_rank_guide = AutoMultivariateNormal(model)
+history_full_rank = BBVI(model, full_rank_guide, n_samples=4, epochs=2000, lr=0.02, lrd=0.999, callback_frequency=10, verbose=False)
+full_rank = full_rank_guide.sample(1000)
 
-Graphics.plot_posterior(posterior, aggregate=True)
-plt.show()
+for label, history in (("mean-field", history_mean_field), ("full-rank", history_full_rank)):
+    print(f"{label:>10} guide: final ELBO estimate {sum(history[-20:]) / 20:.2f}")
 
-x_prediction = torch.linspace(-0.1, 1.1, 120, dtype=x.dtype)
-predictions = gp_predictive(function, posterior, x_prediction, n_samples=8)
-predictions = predictions.reshape(-1, x_prediction.numel())
-prediction_mean = predictions.mean(dim=0)
-prediction_lower = predictions.quantile(0.025, dim=0)
-prediction_upper = predictions.quantile(0.975, dim=0)
+# %%
+# Exact posterior of f
+# --------------------
+# For fixed hyperparameters, ``f(x*) | y`` is Normal with mean
+# ``K*^T (K + s^2 I)^-1 y`` and covariance ``K** - K*^T (K + s^2 I)^-1 K*``.
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
-axes[0].plot(history)
-axes[0].set_title("Latent-GP ELBO")
-axes[0].set_xlabel("Optimization epoch")
-axes[0].set_ylabel("ELBO")
-axes[1].scatter(x, y, color="C0", label="Observed data")
-axes[1].plot(x_prediction, prediction_mean, color="black", label="Posterior mean")
-axes[1].fill_between(
-    x_prediction, prediction_lower, prediction_upper,
-    color="C0", alpha=0.2, label="95% credible interval"
-)
-axes[1].set_title("Variational latent GP")
-axes[1].set_xlabel("x")
-axes[1].set_ylabel("f(x)")
-axes[1].legend()
-fig.tight_layout()
+kernel = RBF(lengthscale, variance)
+x_new = torch.linspace(-0.2, 1.2, 120, dtype=torch.float64)
+K = kernel(x, x) + noise_std ** 2 * torch.eye(n_observations, dtype=torch.float64)
+factor = torch.linalg.cholesky(K)
+
+
+def exact_posterior(points):
+    cross = kernel(x, points)
+    mean = cross.T @ torch.cholesky_solve(y.unsqueeze(-1), factor).squeeze(-1)
+    covariance = kernel(points, points) - cross.T @ torch.cholesky_solve(cross, factor)
+    return mean, covariance.diagonal().clamp_min(0).sqrt()
+
+
+exact_mean, exact_sd = exact_posterior(x_new)
+_, exact_sd_train = exact_posterior(x)
+
+# %%
+# Comparison
+# ----------
+# ``gp_predictive`` extends each posterior draw of ``f`` at the training
+# inputs to the grid by sampling from the GP conditional.
+
+traces = {"mean-field guide": mean_field, "full-rank guide": full_rank}
+colors = {"mean-field guide": "C1", "full-rank guide": "C0"}
+
+fig = plt.figure(figsize=(13, 8.5), layout="constrained")
+upper, lower_ax = fig.subfigures(2, 1, height_ratios=[1, 1.15])
+history_ax, sd_ax = upper.subplots(1, 2)
+steps = range(10, 10 * len(history_mean_field) + 1, 10)
+history_ax.plot(steps, history_mean_field, color=colors["mean-field guide"], alpha=0.8, label="mean-field guide")
+history_ax.plot(steps, history_full_rank, color=colors["full-rank guide"], alpha=0.8, label="full-rank guide")
+history_ax.set_ylim(history_full_rank[-1] - 40, history_full_rank[-1] + 10)
+history_ax.set_xlabel("epoch")
+history_ax.set_ylabel("ELBO estimate")
+history_ax.set_title("Optimisation")
+history_ax.legend(fontsize="small")
+
+sd_ax.plot(x, exact_sd_train, color="black", lw=3, alpha=0.4, label="exact")
+for label, trace in traces.items():
+    sd_ax.plot(x, trace["f"].reshape(-1, n_observations).std(0), "o--", color=colors[label], ms=4, label=label)
+sd_ax.set_ylim(0, None)
+sd_ax.set_xlabel("x")
+sd_ax.set_ylabel("posterior sd of f(x)")
+sd_ax.set_title("Uncertainty at the training inputs")
+sd_ax.legend(fontsize="small")
+
+ax = lower_ax.subplots()
+ax.fill_between(x_new, exact_mean - 1.96 * exact_sd, exact_mean + 1.96 * exact_sd, color="grey", alpha=0.25, label="exact 95% band")
+ax.plot(x_new, exact_mean, color="black", label="exact mean")
+for label, trace in traces.items():
+    draws = gp_predictive(model.deterministic_params["f"], trace, x_new).reshape(-1, x_new.numel())
+    lower, upper_band = draws.quantile(torch.tensor([0.025, 0.975], dtype=torch.float64), dim=0)
+    ax.plot(x_new, lower, color=colors[label], linestyle="--", lw=1.2, label=f"{label} 95% band")
+    ax.plot(x_new, upper_band, color=colors[label], linestyle="--", lw=1.2)
+ax.scatter(x, y, color="C3", s=20, zorder=3, label="data")
+ax.set_xlabel("x")
+ax.set_ylabel("f(x)")
+ax.set_title("Posterior of the latent function")
+ax.legend(fontsize="small", ncol=3, loc="upper center", bbox_to_anchor=(0.5, -0.12))
 plt.show()
