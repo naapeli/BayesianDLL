@@ -32,8 +32,8 @@ with Model() as model:
     x_data = Data("x", x_raw)
     y_data = Data("y", y_raw)
 
-    intercept = RandomParameter("intercept", Normal(0.0, 5.0))
-    slope = RandomParameter("slope", Normal(0.0, 5.0))
+    intercept = RandomParameter("intercept", Normal(0.0, 2.0))
+    slope = RandomParameter("slope", Normal(0.0, 2.0))
     sigma = RandomParameter("sigma", HalfCauchy(1.0))
 
     mu = Linear("mu", x_data, slope=slope, intercept=intercept)

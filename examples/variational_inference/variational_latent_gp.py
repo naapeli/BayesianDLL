@@ -3,7 +3,7 @@ Variational Latent Gaussian Process
 ===================================
 
 Fits a latent Gaussian process with black-box variational inference, optimising the
-variational variances on the log scale, and plots the predictive distribution.
+variational standard deviations on the log scale, and plots the predictive distribution.
 """
 
 import matplotlib.pyplot as plt
@@ -17,17 +17,17 @@ from BayesianDLL.Variational import BBVI
 from BayesianDLL.Evaluation import Graphics
 
 
-def variational_normal(name, shape, dtype, mean=0.0, variance=1.0):
+def variational_normal(name, shape, dtype, mean=0.0, std=1.0):
     shape = (shape,) if isinstance(shape, int) else tuple(shape)
     mean_parameter = VariationalParameter(
         f"{name}_mean", torch.full(shape, mean, dtype=dtype)
     )
-    # Optimizing the variance on the log scale lets Adam take multiplicative
-    # steps, so small posterior variances are reached without overshooting.
-    variance_parameter = VariationalParameter(
-        f"{name}_variance", torch.full(shape, variance, dtype=dtype), min=1e-6, log_scale=True
+    # Optimizing the standard deviation on the log scale lets Adam take multiplicative
+    # steps, so small posterior standard deviations are reached without overshooting.
+    std_parameter = VariationalParameter(
+        f"{name}_std", torch.full(shape, std, dtype=dtype), min=1e-3, log_scale=True
     )
-    return RandomParameter(name, Normal(mean_parameter, variance_parameter), shape=shape)
+    return RandomParameter(name, Normal(mean_parameter, std_parameter), shape=shape)
 
 
 torch.manual_seed(0)
@@ -39,15 +39,15 @@ y = torch.sin(2 * torch.pi * x) + 0.08 * torch.randn_like(x)
 
 with Model() as model:
     inputs = Data("inputs", x)
-    log_lengthscale = RandomParameter("log_lengthscale", Normal(-1.0, 0.5))
-    log_variance = RandomParameter("log_variance", Normal(0.0, 0.5))
-    log_noise_variance = RandomParameter("log_noise_variance", Normal(-2.5, 0.5))
+    log_lengthscale = RandomParameter("log_lengthscale", Normal(-1.0, 0.7))
+    log_variance = RandomParameter("log_variance", Normal(0.0, 0.7))
+    log_noise_std = RandomParameter("log_noise_std", Normal(-1.25, 0.35))
     lengthscale = Exp("lengthscale", log_lengthscale)
     variance = Exp("variance", log_variance)
-    noise_variance = Exp("noise_variance", log_noise_variance)
+    noise_std = Exp("noise_std", log_noise_std)
     function = LatentGP("function", inputs, RBF(lengthscale, variance))
     with plate("observations", x):
-        ObservedParameter("observations", Normal(function, noise_variance), y)
+        ObservedParameter("observations", Normal(function, noise_std), y)
 
 condition_hyperparameters = True
 
@@ -55,7 +55,7 @@ if condition_hyperparameters:
     fixed_log_hyperparameters = {
         "log_lengthscale": torch.tensor([-1.0], dtype=x.dtype),
         "log_variance": torch.tensor([0.0], dtype=x.dtype),
-        "log_noise_variance": torch.tensor([-2.5], dtype=x.dtype),
+        "log_noise_std": torch.tensor([-1.25], dtype=x.dtype),
     }
     model = condition(model, fixed_log_hyperparameters)
     function = model.deterministic_params["function"]
@@ -69,10 +69,10 @@ with MeanFieldGuide() as guide:
     else:
         q_log_lengthscale = variational_normal("log_lengthscale", 1, x.dtype)
         q_log_variance = variational_normal("log_variance", 1, x.dtype)
-        q_log_noise_variance = variational_normal("log_noise_variance", 1, x.dtype)
+        q_log_noise_std = variational_normal("log_noise_std", 1, x.dtype)
         q_lengthscale = Exp("lengthscale", q_log_lengthscale)
         q_variance = Exp("variance", q_log_variance)
-        Exp("noise_variance", q_log_noise_variance)
+        Exp("noise_std", q_log_noise_std)
         guide_kernel = RBF(q_lengthscale, q_variance)
 
     q_function = LatentGP(

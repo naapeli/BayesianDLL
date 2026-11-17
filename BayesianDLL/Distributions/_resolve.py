@@ -1,12 +1,17 @@
 import torch
 from .. import RandomParameter, DeterministicParameter, VariationalParameter, ObservedParameter
 from .._data import Data
+from .._batching import aligned
 
 
 def resolve(parameter):
     if isinstance(parameter, torch.Tensor):
         return parameter
-    elif isinstance(parameter, RandomParameter | DeterministicParameter | Data | ObservedParameter):
+    elif isinstance(parameter, RandomParameter | DeterministicParameter):
+        # Inside a batched term evaluation, batched nodes are aligned (see
+        # BayesianDLL._batching).
+        return aligned(parameter, parameter.constrained_value)
+    elif isinstance(parameter, Data | ObservedParameter):
         return parameter.constrained_value
     elif isinstance(parameter, VariationalParameter):
          return parameter.value

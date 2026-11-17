@@ -1,12 +1,26 @@
 import torch
 
-from ._active_model import _active_model
+import copy
+
+from ._active_model._active_model import get_active_model
 from ._plate import get_active_plates
 from ._data import Data
 
 
 class RandomParameter:
-    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", **sampler_params):
+    """A latent random variable of the active model.
+
+    With ``enumerate=True`` the parameter is not sampled but summed out of the
+    joint density exactly. This requires a finite discrete support (a
+    ``DiscreteRange``, e.g. ``Bernoulli`` or ``DiscreteUniform``). The other
+    parameters are then sampled from the marginal posterior and posterior
+    draws of the enumerated parameter are added to the sampling result
+    afterwards (see :func:`BayesianDLL.marginalize`).
+    """
+
+    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", enumerate=False, **sampler_params):
+        if enumerate:
+            _check_enumerable(name, distribution)
         # Capture active plates at creation time
         self.plates = get_active_plates()
 
@@ -23,12 +37,13 @@ class RandomParameter:
         full_shape = plate_shape + event_shape
 
         if initial_value is None:
+            dtype, device = _initial_dtype_and_device(distribution)
             if distribution.state_space.is_continuous():
-                unconstrained = torch.zeros(full_shape, dtype=torch.float64)
+                unconstrained = torch.zeros(distribution.transform.unconstrained_shape(full_shape), dtype=dtype, device=device)
                 initial_value = distribution.transform.inverse(unconstrained)
             elif distribution.state_space.is_discrete():
                 first_value = next(iter(distribution.state_space))
-                initial_value = first_value * torch.ones(full_shape, dtype=torch.float64)
+                initial_value = first_value * torch.ones(full_shape, dtype=dtype, device=device)
         else:
             # Ensure initial_value has the right shape
             if initial_value.shape != full_shape:
@@ -47,14 +62,19 @@ class RandomParameter:
         self.state_space = self.distribution.state_space
         self.transformed_state_space = self.distribution.transformed_state_space
 
-        if _active_model._active_model is not None:
-            _active_model._active_model.params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
-            _active_model._active_model._compiled = False
-            graph = _active_model._active_model.graph
-            graph.add_node(self.name, type="random")
+        self.enumerated = bool(enumerate)
+
+        if get_active_model() is not None:
+            if self.enumerated:
+                get_active_model().enumerated_params[name] = self
+            else:
+                get_active_model().params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            get_active_model()._compiled = False
+            graph = get_active_model().graph
+            graph.add_node(self.name, type="random", enumerated=self.enumerated)
             for parameter in self.distribution.parameters:
                 if parameter in graph:
-                    _active_model._active_model.graph.add_edge(parameter, self.name)
+                    get_active_model().graph.add_edge(parameter, self.name)
                 else:
                     raise RuntimeError(f"{self.name} depends on {parameter}, which is not in the computation graph of the model.")
         else:
@@ -73,6 +93,34 @@ class RandomParameter:
         self.unconstrained_value = self.distribution.transform.forward(constrained_value)
 
 
+def _initial_dtype_and_device(distribution):
+    """Dtype and device of the floating tensors a distribution reads.
+
+    Parameters start in float64 on the default device when the distribution
+    has no floating tensor arguments (e.g. ``Normal(0.0, 1.0)``).
+    """
+    from ._model import _distribution_arguments
+    try:
+        for argument, _ in _distribution_arguments(distribution):
+            value = argument if isinstance(argument, torch.Tensor) else getattr(argument, "constrained_value", None)
+            if isinstance(argument, VariationalParameter):
+                value = argument.value
+            if isinstance(value, torch.Tensor) and value.is_floating_point():
+                return value.dtype, value.device
+    except Exception:  # noqa: BLE001 - the defaults are always valid
+        pass
+    return torch.float64, torch.get_default_device()
+
+
+def _check_enumerable(name, distribution):
+    from .Distributions._state_space import DiscreteRange
+    if not isinstance(distribution.state_space, DiscreteRange):
+        raise ValueError(
+            f"Only parameters with a finite discrete support (DiscreteRange) can be enumerated; "
+            f"'{name}' has the state space {type(distribution.state_space).__name__}."
+        )
+
+
 class ObservedParameter:
     def __init__(self, name, distribution, observed_values, sampler="auto", **sampler_params):
         self.name = name
@@ -82,22 +130,57 @@ class ObservedParameter:
         self.sampler_params = sampler_params
         self.plates = get_active_plates()
 
-        if _active_model._active_model is not None:
-            _active_model._active_model.observed_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
-            _active_model._active_model._compiled = False
-            graph = _active_model._active_model.graph
+        if get_active_model() is not None:
+            get_active_model().observed_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            get_active_model()._compiled = False
+            graph = get_active_model().graph
             graph.add_node(self.name, type="observed")
             if isinstance(self._observed_values, Data):
-                if _active_model._active_model.data.get(self._observed_values.name) is not self._observed_values:
+                if get_active_model().data.get(self._observed_values.name) is not self._observed_values:
                     raise RuntimeError("Observed data must belong to the active model.")
                 graph.add_edge(self._observed_values.name, self.name)
             for parameter in self.distribution.parameters:
                 if parameter in graph:
-                    _active_model._active_model.graph.add_edge(parameter, self.name)
+                    get_active_model().graph.add_edge(parameter, self.name)
                 else:
                     raise RuntimeError(f"{self.name} depends on {parameter}, which is not in the computation graph of the model.")
         else:
             raise RuntimeError("One should select an active model before creating random variables.")
+
+    @classmethod
+    def _from_parts(cls, name, distribution, observed_values, plates=(), sampler="auto", sampler_params=None, instance=None):
+        """Build an ObservedParameter without an active model.
+
+        Nothing is registered and no graph edges are added; the caller is
+        responsible for placing the parameter into a model. ``instance`` lets
+        the caller fill in an object allocated beforehand with ``__new__``.
+        """
+        self = cls.__new__(cls) if instance is None else instance
+        self.name = name
+        self.distribution = distribution
+        self.observed_values = observed_values
+        self.sampler = sampler
+        self.sampler_params = {} if sampler_params is None else dict(sampler_params)
+        self.plates = list(plates)
+        return self
+
+    @classmethod
+    def _from_random_parameter(cls, parameter, observed_values, memo=None, instance=None):
+        """Turn a copy of the RandomParameter ``parameter`` into an observation.
+
+        The distribution, plates and sampler settings are deep-copied with
+        ``memo`` so they share objects with a model copied using the same memo.
+        """
+        memo = {} if memo is None else memo
+        return cls._from_parts(
+            parameter.name,
+            copy.deepcopy(parameter.distribution, memo),
+            observed_values,
+            plates=copy.deepcopy(parameter.plates, memo),
+            sampler=parameter.sampler,
+            sampler_params=copy.deepcopy(parameter.sampler_params, memo),
+            instance=instance,
+        )
 
     @property
     def observed_values(self):
@@ -126,22 +209,46 @@ class ObservedParameter:
 
 
 class DeterministicParameter:
-    def __init__(self, name, forward_func, derivative_func, inputs):
+    """A node whose value is a deterministic function of other model nodes.
+
+    ``forward_func(*input_values)`` computes the value from the constrained
+    values of ``inputs`` (named model nodes). The reverse pass of the model
+    needs the derivatives of the output w.r.t. the inputs, given in one of two
+    ways:
+
+    * ``derivative_func(*input_values) -> {input_name: local_derivative}``,
+      where a local derivative is either elementwise (broadcastable to the
+      output) or a dense Jacobian of shape ``(output.numel(), input.numel())``.
+    * ``vjp_func(cotangent, *input_values) -> {input_name: grad}``, a
+      vector-Jacobian product: given the gradient ``cotangent`` w.r.t. the
+      output (shape of the output), return the gradient w.r.t. each input.
+      Gradients are summed onto the input shape when they broadcast. This
+      avoids materialising Jacobians and is used by the reverse pass whenever
+      it is given. Inputs missing from the returned dict get no gradient.
+
+    When only ``vjp_func`` is given, :meth:`derivatives` builds dense
+    Jacobians from it (one VJP per output element).
+    """
+
+    def __init__(self, name, forward_func, derivative_func=None, inputs=(), vjp_func=None):
+        if derivative_func is None and vjp_func is None:
+            raise TypeError("A DeterministicParameter needs derivative_func or vjp_func.")
         self.name = name
         self.forward_func = forward_func
         self.derivative_func = derivative_func
-        self.inputs = inputs
-        self.owner_model = _active_model._active_model
+        self.vjp_func = vjp_func
+        self.inputs = list(inputs)
+        self.owner_model = get_active_model()
         self.plates = get_active_plates()
 
-        if _active_model._active_model is not None:
-            _active_model._active_model.deterministic_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
-            _active_model._active_model._compiled = False
-            graph = _active_model._active_model.graph
+        if get_active_model() is not None:
+            get_active_model().deterministic_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
+            get_active_model()._compiled = False
+            graph = get_active_model().graph
             graph.add_node(self.name, type="deterministic")
             for parameter in self.inputs:
                 if parameter.name in graph:
-                    _active_model._active_model.graph.add_edge(parameter.name, self.name)
+                    get_active_model().graph.add_edge(parameter.name, self.name)
                 else:
                     raise RuntimeError(f"{self.name} depends on {parameter.name}, which is not in the computation graph of the model.")
         else:
@@ -149,15 +256,138 @@ class DeterministicParameter:
 
     @property
     def constrained_value(self):
+        model = self.owner_model
+        if model is not None and model.n_chains is not None and self.name in model._batched_nodes:
+            if model._batch_mode == "loop":
+                return model._loop_over_chains(lambda: self.constrained_value)
+            # The batched value is read many times per evaluation (by every
+            # child and the reverse pass); cache it for the current input
+            # tensors. Values are never modified in place, so the identity
+            # of the input tensors identifies the inputs.
+            values = self.input_values()
+            key = tuple(id(v) for v in values)
+            cache = getattr(self, "_batched_cache", None)
+            if cache is not None and cache[0] == key:
+                return cache[2]
+            out = self.batched_forward(values)
+            self._batched_cache = (key, values, out)
+            return out
         inputs = [self._get_constrained_value(input) for input in self.inputs]
         return self.forward_func(*inputs)
+
+    # ------------------------------------------------------------ batching
+    # In a batched model (see BayesianDLL._batching) the inputs that depend on
+    # a latent parameter have a leading chain dimension. The default batched
+    # evaluation treats every input dimension as a batch dimension: batched
+    # inputs are padded with singleton dimensions after the chain dimension to
+    # a common rank, so that functions built from broadcasting operations
+    # (``a + b * x``) work unchanged. The output is reshaped to
+    # ``(n_chains, *value_shape)``. Subclasses with other semantics (matrix
+    # products, reductions, indexing) override ``batched_forward`` and
+    # ``batched_vjp``.
+    def _batched_flags(self):
+        model = self.owner_model
+        return [(not isinstance(inp, torch.Tensor)) and model._is_batched_object(inp) for inp in self.inputs]
+
+    @staticmethod
+    def _align_batched(values, flags, event_ndims=None):
+        from ._batching import pad_to
+        event_ndims = [0] * len(values) if event_ndims is None else list(event_ndims)
+        batch_rank = 0
+        for value, flag, event_ndim in zip(values, flags, event_ndims):
+            if isinstance(value, torch.Tensor):
+                batch_rank = max(batch_rank, value.ndim - int(flag) - event_ndim)
+        aligned = [
+            pad_to(value, 1 + batch_rank + event_ndim) if flag else value
+            for value, flag, event_ndim in zip(values, flags, event_ndims)
+        ]
+        return aligned, batch_rank
+
+    def _to_batched_output(self, out):
+        """Reshape a raw batched output to ``(n_chains, *value_shape)``."""
+        n_chains = self.owner_model.n_chains
+        out = torch.as_tensor(out)
+        expected = getattr(self, "_ub_ndim", None)
+        if expected is None:
+            return out
+        if out.ndim <= expected:
+            # The output does not depend on the batched inputs.
+            out = out.reshape(*([1] * (expected - out.ndim)), *out.shape)
+            return out.unsqueeze(0).expand(n_chains, *out.shape)
+        while out.ndim > expected + 1 and out.shape[1] == 1:
+            out = out.squeeze(1)
+        return out
+
+    def batched_forward(self, input_values):
+        """Value ``(n_chains, *value_shape)`` from batched/unbatched input values."""
+        aligned, _ = self._align_batched(input_values, self._batched_flags())
+        return self._to_batched_output(self.forward_func(*aligned))
+
+    def batched_vjp(self, cotangent, input_values):
+        """Batched counterpart of :meth:`vjp`: gradients with a leading chain dimension."""
+        from ._batching import pad_to
+        aligned, batch_rank = self._align_batched(input_values, self._batched_flags())
+        expected = getattr(self, "_ub_ndim", None) or 0
+        cotangent = pad_to(cotangent, 1 + max(batch_rank, expected))
+        if self.vjp_func is not None:
+            return self.vjp_func(cotangent, *aligned)
+        locals_ = self.derivative_func(*aligned)
+        grads = {}
+        for inp in self.inputs:
+            name = getattr(inp, "name", None)
+            if name is None or name not in locals_ or name in grads:
+                continue
+            local = torch.as_tensor(locals_[name], dtype=cotangent.dtype, device=cotangent.device)
+            grads[name] = cotangent * local
+        return grads
 
     def derivative(self, name):
         return self.derivatives()[name]
 
     def derivatives(self):
         inputs = [self._get_constrained_value(input) for input in self.inputs]
-        return self.derivative_func(*inputs)
+        if self.derivative_func is not None:
+            return self.derivative_func(*inputs)
+        return self._dense_jacobians(inputs)
+
+    def input_values(self):
+        """Constrained values of ``inputs``, in order."""
+        return [self._get_constrained_value(input) for input in self.inputs]
+
+    def vjp(self, cotangent, input_values=None):
+        """Gradients ``{input_name: cotangent^T J_input}`` (requires ``vjp_func``)."""
+        if self.vjp_func is None:
+            raise NotImplementedError(f"'{self.name}' has no vjp_func.")
+        if input_values is None:
+            input_values = self.input_values()
+        return self.vjp_func(cotangent, *input_values)
+
+    def _dense_jacobians(self, inputs):
+        """Jacobians ``(output.numel(), input.numel())`` built row by row from ``vjp_func``."""
+        output = self.forward_func(*inputs)
+        flat = torch.zeros(output.numel(), dtype=output.dtype, device=output.device)
+        names = [getattr(input, "name", None) for input in self.inputs]
+        shapes = {name: torch.as_tensor(value).shape for name, value in zip(names, inputs) if name is not None}
+        rows = {name: [] for name in shapes}
+        for i in range(output.numel()):
+            flat.zero_()
+            flat[i] = 1
+            grads = self.vjp_func(flat.reshape(output.shape), *inputs)
+            for name, shape in shapes.items():
+                grad = grads.get(name)
+                if grad is None:
+                    grad = torch.zeros(shape, dtype=output.dtype, device=output.device)
+                else:
+                    from ._model import _sum_to_shape
+                    grad = _sum_to_shape(grad, shape)
+                rows[name].append(grad.reshape(-1))
+        result = {}
+        for name, shape in shapes.items():
+            if rows[name]:
+                result[name] = torch.stack(rows[name], dim=0)
+            else:
+                result[name] = torch.zeros((0, shape.numel()), dtype=output.dtype, device=output.device)
+        return result
 
     def _get_constrained_value(self, input):
         if isinstance(input, torch.Tensor):
@@ -165,6 +395,8 @@ class DeterministicParameter:
         if hasattr(input, "name"):
             if input.name in self.owner_model.params:
                 return self.owner_model.params[input.name].constrained_value
+            elif input.name in getattr(self.owner_model, "enumerated_params", {}):
+                return self.owner_model.enumerated_params[input.name].constrained_value
             elif input.name in self.owner_model.observed_params:
                 return self.owner_model.observed_params[input.name].constrained_value
             elif input.name in self.owner_model.deterministic_params:
@@ -213,6 +445,7 @@ class VariationalParameter:
         return f"VariationalParameter {self.name}, value: {self.value}, limits: {(self.min, self.max)}"
 
     def set_new_value(self, value):
-        value = value.reshape(self.value.shape)
-        assert self.value.dtype == value.dtype
+        # The parameter keeps its own dtype and device: gradient steps may be
+        # computed in the model's precision (e.g. float64 for a float32 guide).
+        value = torch.as_tensor(value).to(dtype=self.value.dtype, device=self.value.device).reshape(self.value.shape)
         self.value = torch.clamp(value, self.min, self.max)

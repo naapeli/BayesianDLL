@@ -2,8 +2,8 @@
 Logistic Regression
 ===================
 
-Builds a logistic regression model where ``Linear`` creates the linear predictor and
-``Sigmoid`` turns it into a probability for a Bernoulli likelihood. The model graph
+Builds a logistic regression model where ``Linear`` creates the linear predictor,
+which is passed directly as ``Bernoulli(logits=...)``. The model graph
 is plotted, the posterior is sampled and the fitted probability curve is shown.
 """
 
@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, plate
-from BayesianDLL.Deterministic import Linear, Sigmoid
+from BayesianDLL.Deterministic import Linear
 from BayesianDLL.Distributions import Bernoulli, Normal
 from BayesianDLL.Evaluation import Graphics
 
@@ -25,14 +25,13 @@ y = torch.bernoulli(torch.sigmoid(true_logits))
 
 with Model() as model:
     inputs = Data("inputs", x)
-    intercept = RandomParameter("intercept", Normal(0.0, 2.0))
-    slope = RandomParameter("slope", Normal(0.0, 2.0))
+    intercept = RandomParameter("intercept", Normal(0.0, 1.5))
+    slope = RandomParameter("slope", Normal(0.0, 1.5))
 
     logits = Linear("logits", inputs, slope=slope, intercept=intercept)
-    probability = Sigmoid("probability", logits)
 
     with plate("observations", x):
-        ObservedParameter("observations", Bernoulli(probability), y)
+        ObservedParameter("observations", Bernoulli(logits=logits), y)
 
     Graphics.plot_model(model)
     plt.show()

@@ -3,13 +3,17 @@ Prior Predictive: Normal Likelihood
 ===================================
 
 Samples the prior predictive distribution of a normal model with unknown mean and
-variance and compares its pdf and cdf to the observed data.
+standard deviation and compares its pdf and cdf to the observed data.
+
+The prior predictive is drawn exactly by ancestral sampling: the parameters are
+drawn from their priors and the data from the likelihood, without any MCMC. The
+prior draws of the parameters are returned in ``predicative_distribution.prior``.
 """
 
 import torch
 import matplotlib.pyplot as plt
 
-from BayesianDLL.Distributions import Normal, InvGamma
+from BayesianDLL.Distributions import Normal, HalfNormal
 from BayesianDLL import Model, RandomParameter, ObservedParameter, sample_prior_predicative, sample_posterior_predicative, plate
 from BayesianDLL.Evaluation.Graphics import plot_predicative_distribution
 
@@ -17,21 +21,21 @@ from BayesianDLL.Evaluation.Graphics import plot_predicative_distribution
 torch.manual_seed(0)
 N = 1000
 mu0 = 0
-tau = 10
-a = 2
-b = 2
+tau = 3  # prior standard deviation of the mean
 true_mean, true_variance = 5, 3
 data = torch.normal(mean=true_mean, std=true_variance ** 0.5, size=(N,), dtype=torch.float64)
 print(data.mean(), data.var())
 
-n_samples = 100
+n_samples = 30
 with Model() as model:
     mean = RandomParameter("mean", Normal(mu0, tau))
-    variance = RandomParameter("variance", InvGamma(a, b))
+    sigma = RandomParameter("sigma", HalfNormal(3.0))
     with plate("data", N):
-        likelihood = ObservedParameter("likelihood", Normal(mean, variance), data)
-    predicative_distribution = model.sample_prior_predicative(n_samples, 5000, samples_per_step=10)
+        likelihood = ObservedParameter("likelihood", Normal(mean, sigma), data)
+    predicative_distribution = model.sample_prior_predicative(n_samples, samples_per_step=10)
     # predicative_distribution = model.sample_posterior_predicative(n_samples, 1000, samples_per_step=10)
+
+print(predicative_distribution.prior.summary())
 
 _, axes = plt.subplots(1, 2, figsize=(12, 5), layout="constrained")
 plot_predicative_distribution(predicative_distribution, data, kind="pdf", ax=axes[0])

@@ -36,7 +36,7 @@ with Model() as polynomial_model:
     prior_mean = torch.zeros(D + 1, dtype=torch.float64)
     prior_cov = torch.eye(D + 1, dtype=torch.float64)
     prior_coeffs = RandomParameter("coeffs", MultivariateNormal(prior_mean, prior_cov), min_step_size=1e-2)
-    prior_sigma = RandomParameter("sigma", HalfCauchy(10), min_step_size=1e-2)
+    prior_sigma = RandomParameter("sigma", HalfCauchy(3), min_step_size=1e-2)
 
     design = Data("design", phi_x)
     mu = Linear("mu", design, coefficients=prior_coeffs)
@@ -65,7 +65,7 @@ y_preds = (samples["coeffs"] @ phi_x.T).reshape(-1, len(x))  # (n_chains * n_sam
 y_mean = y_preds.mean(dim=0)
 y_lower = y_preds.quantile(0.025, dim=0)
 y_upper = y_preds.quantile(0.975, dim=0)
-std = samples["sigma"].mean().sqrt()
+std = samples["sigma"].mean()
 
 plt.plot(x, y_mean, label="Posterior mean", color="black")
 plt.fill_between(x.numpy(), y_lower.numpy(), y_upper.numpy(), color="blue", alpha=0.2, label="95% CI for mean")

@@ -27,9 +27,9 @@ y = true_intercept + true_slope * x + torch.normal(0, true_variance ** 0.5, size
 
 with Model() as linear_model:
     # Priors
-    prior_intercept = RandomParameter("intercept", Normal(0, 20))
-    prior_slope = RandomParameter("slope", Normal(0, 20))
-    prior_sigma = RandomParameter("sigma", HalfCauchy(10))
+    prior_intercept = RandomParameter("intercept", Normal(0, 4.5))
+    prior_slope = RandomParameter("slope", Normal(0, 4.5))
+    prior_sigma = RandomParameter("sigma", HalfCauchy(3))
 
     x_data = Data("x", x)
     mu = Linear("mu", x_data, slope=prior_slope, intercept=prior_intercept)
@@ -50,7 +50,7 @@ Graphics.plot_model(linear_model)
 
 
 y_preds = slope * x + intercept
-std = sigma.sqrt()
+std = sigma
 
 plt.figure(figsize=(10, 6))
 plt.plot(x, y, 'o', label="Observed data", alpha=0.6)

@@ -2,9 +2,10 @@ from cycler import cycler
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import colormaps
-from scipy.stats import gaussian_kde
+import torch
 
 from ...Samplers._result import SamplingResult
+from .._numerics import gaussian_kde
 
 
 def plot_posterior(
@@ -98,8 +99,7 @@ def plot_posterior(
                     chain_values = chain.detach().cpu().numpy()
 
                     if method == "kde":
-                        est = gaussian_kde(chain_values)
-                        pdf = est(x_grid)
+                        pdf = gaussian_kde(torch.from_numpy(chain_values), torch.from_numpy(x_grid)).numpy()
                     else:
                         hist, bin_edges = np.histogram(
                             chain_values,

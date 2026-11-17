@@ -3,8 +3,9 @@ Bayesian Deep Learning Library documentation
 
 BayesianDLL is a Python library for Bayesian machine learning built on top of
 PyTorch. It lets you write probabilistic models with probability distributions
-and graphical models, and fit them with Markov chain Monte Carlo (NUTS and
-Metropolis) or variational inference.
+and graphical models, and fit them with Markov chain Monte Carlo (NUTS,
+Metropolis, slice and Gibbs samplers), Sequential Monte Carlo or variational
+inference.
 
 The library is intended as an educational project. It aims for clarity and ease
 of understanding rather than raw performance, so for production work libraries
@@ -19,11 +20,11 @@ blocks found at the top level of the package (``Model``, ``RandomParameter``,
 The rest of the library is split into the following packages:
 
 - **Distributions:** Probability distributions, their state spaces and the transforms to unconstrained space.
-- **Deterministic:** Deterministic nodes such as ``Linear``, ``Exp``, ``Log`` and ``Sigmoid`` for building model graphs.
-- **Samplers:** MCMC samplers (NUTS and Metropolis), sampling utilities and prior / posterior predictive sampling.
-- **Variational:** Maximum a posteriori estimation and black-box variational inference.
-- **GP:** Gaussian process kernels and latent and exact Gaussian processes.
-- **Evaluation:** Convergence diagnostics (R-hat, effective sample size, MCSE), posterior summaries and plotting.
+- **Deterministic:** Deterministic nodes such as ``Linear``, ``Exp``, ``Log``, ``Sigmoid``, ``Affine``, ``Index``, ``MatMul``, ``Softmax`` and ``CholeskyCovariance`` for building model graphs.
+- **Samplers:** MCMC samplers (NUTS, Metropolis, slice and finite Gibbs), Sequential Monte Carlo with marginal likelihood estimates, sampling utilities and exact (ancestral) prior / posterior predictive sampling.
+- **Variational:** Maximum a posteriori estimation, the Laplace approximation and black-box variational inference (hand-written or automatic guides, minibatch training).
+- **GP:** Gaussian process kernels (with ARD lengthscales) and latent, exact and sparse Gaussian processes.
+- **Evaluation:** Convergence diagnostics (R-hat, effective sample size, MCSE, E-BFMI), posterior summaries, model comparison (PSIS-LOO, WAIC), posterior predictive checks and plotting.
 
 Installation
 ------------
@@ -42,16 +43,16 @@ A minimal example
 
    import torch
    from BayesianDLL import Model, RandomParameter, ObservedParameter, sample, plate
-   from BayesianDLL.Distributions import Normal, InvGamma
+   from BayesianDLL.Distributions import Normal, HalfNormal
    from BayesianDLL.Evaluation import summary
 
    data = torch.normal(5.0, 3.0 ** 0.5, size=(100,), dtype=torch.float64)
 
    with Model() as model:
-       mean = RandomParameter("mean", Normal(0, 10))
-       variance = RandomParameter("variance", InvGamma(2, 2))
+       mean = RandomParameter("mean", Normal(0, 3))
+       sigma = RandomParameter("sigma", HalfNormal(3))
        with plate("data", len(data)):
-           ObservedParameter("likelihood", Normal(mean, variance), data)
+           ObservedParameter("likelihood", Normal(mean, sigma), data)
        samples = sample(1000, 500, n_chains=2)
 
    print(summary(samples))

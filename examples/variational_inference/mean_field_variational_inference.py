@@ -17,8 +17,8 @@ from BayesianDLL.Variational import BBVI
 
 torch.manual_seed(0)
 means = [-1, 2]
-variances = [0.5 ** 2, 1 ** 2]
-components = [Normal(mu, var) for mu, var in zip(means, variances)]
+stds = [0.5, 1.0]
+components = [Normal(mu, std) for mu, std in zip(means, stds)]
 weights = [0.3, 0.7]
 distribution = Mixture(components, weights)
 with Model() as model:
@@ -26,8 +26,8 @@ with Model() as model:
 
 with MeanFieldGuide() as guide:
     mean = VariationalParameter("mean", 10)
-    variance = VariationalParameter("variance", 10)
-    RandomParameter("mixture", Normal(mean, variance))
+    std = VariationalParameter("std", 3)
+    RandomParameter("mixture", Normal(mean, std))
 
 history = BBVI(model, guide, epochs=3000, callback_frequency=20, lr=1e-2)
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .._parameters import DeterministicParameter
+from .._parameters import DeterministicParameter, RandomParameter
 
 
 def _require_named(value, description):
@@ -136,12 +136,96 @@ class Linear(DeterministicParameter):
                     )
             return derivatives
 
-        super().__init__(name, forward, derivative, named_inputs)
+        def vjp(cotangent, *values):
+            inputs_value = _as_tensor(values[0])
+            value_index = 1
+            if _is_named(coefficients):
+                coefficient_value = values[value_index]
+                value_index += 1
+            else:
+                coefficient_value = coefficients
+            coefficient_value = _as_tensor(coefficient_value, device=inputs_value.device)
+            grads = {}
+            if coefficient_value.numel() == 1:
+                if _is_named(coefficients):
+                    grads[coefficients.name] = (cotangent * inputs_value).sum().reshape(coefficient_value.shape)
+                if isinstance(inputs, (RandomParameter, DeterministicParameter)):
+                    grads[inputs.name] = cotangent * coefficient_value.reshape(())
+            else:
+                flat = coefficient_value.reshape(-1)
+                if _is_named(coefficients):
+                    grads[coefficients.name] = (
+                        (cotangent.unsqueeze(-1) * inputs_value).reshape(-1, flat.numel()).sum(0).reshape(coefficient_value.shape)
+                    )
+                if isinstance(inputs, (RandomParameter, DeterministicParameter)):
+                    grads[inputs.name] = cotangent.unsqueeze(-1) * flat
+            if _is_named(intercept):
+                grads[intercept.name] = cotangent
+            return grads
+
+        super().__init__(name, forward, derivative, named_inputs, vjp_func=vjp)
         self.regression_inputs = inputs
         self.coefficients = coefficients
         self.weights = coefficients
         self.slope = coefficients
         self.intercept = intercept
+
+    # ------------------------------------------------------------ batching
+    def _batched_parts(self, input_values):
+        flags = self._batched_flags()
+        inputs = _as_tensor(input_values[0])
+        if not inputs.is_floating_point():
+            inputs = inputs.to(torch.get_default_dtype())
+        index = 1
+        if _is_named(self.coefficients):
+            coefficients, coefficients_batched = input_values[index], flags[index]
+            index += 1
+        else:
+            coefficients, coefficients_batched = _as_tensor(self.coefficients, dtype=inputs.dtype, device=inputs.device), False
+        if _is_named(self.intercept):
+            intercept, intercept_batched = input_values[index], flags[index]
+        else:
+            intercept, intercept_batched = _as_tensor(self.intercept, dtype=inputs.dtype, device=inputs.device), False
+        n_chains = self.owner_model.n_chains
+        per_chain = coefficients[0].numel() if coefficients_batched else coefficients.numel()
+        if coefficients_batched:
+            coefficients = coefficients.reshape(n_chains) if per_chain == 1 else coefficients.reshape(n_chains, per_chain)
+        else:
+            coefficients = coefficients.reshape(()) if per_chain == 1 else coefficients.reshape(per_chain)
+        return (inputs, flags[0]), (coefficients, coefficients_batched), (intercept, intercept_batched), per_chain == 1
+
+    def _batched_terms(self, input_values):
+        (x, fx), (w, fw), (b, fb), scalar = self._batched_parts(input_values)
+        if scalar:
+            (xa, wa), _ = self._align_batched([x, w], [fx, fw])
+            product = xa * wa
+        else:
+            (xa, wa), _ = self._align_batched([x, w], [fx, fw], [1, 1])
+            product = (xa * wa).sum(-1)
+        (pa, ba), _ = self._align_batched([product, b], [fx or fw, fb])
+        return xa, wa, pa + ba, scalar
+
+    def batched_forward(self, input_values):
+        return self._to_batched_output(self._batched_terms(input_values)[2])
+
+    def batched_vjp(self, cotangent, input_values):
+        from .._batching import pad_to
+        xa, wa, out, scalar = self._batched_terms(input_values)
+        g = pad_to(cotangent, out.ndim)
+        grads = {}
+        if scalar:
+            if _is_named(self.coefficients):
+                grads[self.coefficients.name] = g * xa
+            if isinstance(self.regression_inputs, (RandomParameter, DeterministicParameter)):
+                grads[self.regression_inputs.name] = g * wa
+        else:
+            if _is_named(self.coefficients):
+                grads[self.coefficients.name] = g.unsqueeze(-1) * xa
+            if isinstance(self.regression_inputs, (RandomParameter, DeterministicParameter)):
+                grads[self.regression_inputs.name] = g.unsqueeze(-1) * wa
+        if _is_named(self.intercept):
+            grads[self.intercept.name] = g
+        return grads
 
 
 class Exp(DeterministicParameter):
@@ -156,7 +240,10 @@ class Exp(DeterministicParameter):
         def derivative(value):
             return {input.name: torch.exp(value)}
 
-        super().__init__(name, forward, derivative, [input])
+        def vjp(cotangent, value):
+            return {input.name: cotangent * derivative(value)[input.name]}
+
+        super().__init__(name, forward, derivative, [input], vjp_func=vjp)
         self.input = input
 
 
@@ -172,7 +259,10 @@ class Log(DeterministicParameter):
         def derivative(value):
             return {input.name: value.reciprocal()}
 
-        super().__init__(name, forward, derivative, [input])
+        def vjp(cotangent, value):
+            return {input.name: cotangent * derivative(value)[input.name]}
+
+        super().__init__(name, forward, derivative, [input], vjp_func=vjp)
         self.input = input
 
 
@@ -189,5 +279,8 @@ class Sigmoid(DeterministicParameter):
             probability = torch.sigmoid(value)
             return {input.name: probability * (1 - probability)}
 
-        super().__init__(name, forward, derivative, [input])
+        def vjp(cotangent, value):
+            return {input.name: cotangent * derivative(value)[input.name]}
+
+        super().__init__(name, forward, derivative, [input], vjp_func=vjp)
         self.input = input

@@ -47,15 +47,15 @@ uv run pytest
 
 ### Logistic regression
 
-`Linear` creates the linear predictor and `Sigmoid` converts it to a
-probability for a Bernoulli likelihood:
+`Linear` creates the linear predictor, which is passed to the Bernoulli
+likelihood as `logits=`:
 
 ```python
 import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, plate
-from BayesianDLL.Deterministic import Linear, Sigmoid
+from BayesianDLL.Deterministic import Linear
 from BayesianDLL.Distributions import Bernoulli, Normal
 from BayesianDLL.Evaluation import Graphics, summary
 
@@ -65,14 +65,13 @@ y = torch.bernoulli(torch.sigmoid(-0.4 + 1.6 * x))
 
 with Model() as model:
     inputs = Data("inputs", x)
-    intercept = RandomParameter("intercept", Normal(0.0, 2.0))
-    slope = RandomParameter("slope", Normal(0.0, 2.0))
+    intercept = RandomParameter("intercept", Normal(0.0, 1.5))
+    slope = RandomParameter("slope", Normal(0.0, 1.5))
 
     logits = Linear("logits", inputs, slope=slope, intercept=intercept)
-    probability = Sigmoid("probability", logits)
 
     with plate("observations", x):
-        ObservedParameter("observations", Bernoulli(probability), y)
+        ObservedParameter("observations", Bernoulli(logits=logits), y)
 
 Graphics.plot_model(model)
 trace = model.sample(500, 500)
@@ -129,7 +128,7 @@ with MeanFieldGuide() as guide:
             name,
             Normal(
                 VariationalParameter(f"{name}_mean", torch.zeros(1, dtype=x.dtype)),
-                VariationalParameter(f"{name}_variance", torch.ones(1, dtype=x.dtype), min=1e-6)
+                VariationalParameter(f"{name}_std", torch.ones(1, dtype=x.dtype), min=1e-3)
             ),
         )
 

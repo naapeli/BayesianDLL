@@ -3,7 +3,7 @@ import math
 from collections import namedtuple
 
 
-Tree = namedtuple("Tree", ["theta_minus", "r_minus", "grad_minus", "theta_plus", "r_plus", "grad_plus", "theta_prime", "grad_prime", "log_prob_prime", "n_prime", "s_prime", "alpha_prime", "n_prime_alpha", "diverging"])
+Tree = namedtuple("Tree", ["theta_minus", "r_minus", "grad_minus", "theta_plus", "r_plus", "grad_plus", "theta_prime", "grad_prime", "log_prob_prime", "n_prime", "s_prime", "alpha_prime", "n_prime_alpha", "diverging", "r_prime"])
 
 def _dot(a, b):
     """Dot product that works for any-shape tensors (flattened)."""
@@ -42,7 +42,23 @@ def _adaptation_windows(warmup_length, init_buffer=75, term_buffer=50, base_wind
 
 
 class NUTS:
-    def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True):
+    """No-U-Turn sampler with dual-averaging step size and windowed metric adaptation.
+
+    ``metric`` selects the inverse metric (posterior covariance estimate)
+    adapted during warmup: ``"diag"`` (default) estimates the marginal
+    variances and ``"dense"`` the full covariance, which helps with strongly
+    correlated posteriors. ``max_depth`` bounds the number of trajectory
+    doublings, i.e. at most ``2**max_depth - 1`` leapfrog steps per iteration.
+
+    After each call of :meth:`step`, ``last_stats`` holds the iteration's
+    statistics: ``step_size`` (used for the trajectory), ``accept_stat``,
+    ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` (Hamiltonian at
+    the selected point) and ``lp`` (log density at the selected point).
+    """
+
+    def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True, metric="diag"):
+        if metric not in ("diag", "dense"):
+            raise ValueError(f"metric must be 'diag' or 'dense', got {metric!r}.")
         self.log_target = log_target
         self.gradient = gradient
         self.inverse_transformation = inverse_transformation
@@ -57,15 +73,21 @@ class NUTS:
         self.max_step_size = max_step_size
         self.max_delta = max_delta
         self.adapt_mass_matrix = adapt_mass_matrix
+        self.metric = metric
 
-        # Diagonal inverse metric (posterior variance estimate). ``None`` means
-        # the identity, which is used until the first adaptation window ends.
+        # Inverse metric (posterior variance / covariance estimate). ``None``
+        # means the identity, which is used until the first adaptation window
+        # ends. For ``metric="dense"`` it is a matrix whose Cholesky factor is
+        # kept in ``_inv_metric_chol``.
         self.inv_metric = None
+        self._inv_metric_chol = None
         self.warmup_length = None
         self._warmup_iteration = 0
         self._window_start = None
         self._window_ends = []
         self._reset_welford()
+        self._cached_theta = None
+        self.last_stats = {}
 
         # save in case of resetting
         self._H_bar = H_bar
@@ -76,11 +98,17 @@ class NUTS:
         self.H_bar = self._H_bar
         self.step_size_bar = self._step_size_bar
         self.inv_metric = None
+        self._inv_metric_chol = None
         self._warmup_iteration = 0
         self._reset_welford()
+        self.invalidate_cache()
+
+    def invalidate_cache(self):
+        """Forget the cached log density and gradient (the target has changed)."""
+        self._cached_theta = None
 
     def set_warmup_length(self, warmup_length):
-        """Enable windowed diagonal mass-matrix adaptation for ``warmup_length`` warmup steps."""
+        """Enable windowed mass-matrix adaptation for ``warmup_length`` warmup steps."""
         self.warmup_length = warmup_length
         self._warmup_iteration = 0
         if self.adapt_mass_matrix:
@@ -97,29 +125,61 @@ class NUTS:
         theta = theta.detach().reshape(-1)
         if self._welford_mean is None:
             self._welford_mean = torch.zeros_like(theta)
-            self._welford_m2 = torch.zeros_like(theta)
+            if self.metric == "dense":
+                self._welford_m2 = torch.zeros(theta.numel(), theta.numel(), dtype=theta.dtype, device=theta.device)
+            else:
+                self._welford_m2 = torch.zeros_like(theta)
         self._welford_n += 1
         delta = theta - self._welford_mean
         self._welford_mean = self._welford_mean + delta / self._welford_n
-        self._welford_m2 = self._welford_m2 + delta * (theta - self._welford_mean)
+        if self.metric == "dense":
+            self._welford_m2 = self._welford_m2 + torch.outer(delta, theta - self._welford_mean)
+        else:
+            self._welford_m2 = self._welford_m2 + delta * (theta - self._welford_mean)
 
     def _metric_like(self, theta):
+        """Diagonal inverse metric shaped like ``theta`` (diagonal metric only)."""
         if self.inv_metric is None:
             return torch.ones_like(theta)
-        return self.inv_metric.reshape(theta.shape).to(dtype=theta.dtype)
+        return self.inv_metric.reshape(theta.shape).to(dtype=theta.dtype, device=theta.device)
+
+    def _dense_active(self):
+        return self.metric == "dense" and self.inv_metric is not None
+
+    def _velocity(self, r):
+        """Return ``M^{-1} r``, the time derivative of the position."""
+        if self._dense_active():
+            inv_metric = self.inv_metric.to(dtype=r.dtype, device=r.device)
+            return (inv_metric @ r.reshape(-1)).reshape(r.shape)
+        return self._metric_like(r) * r
 
     def _sample_momentum(self, theta):
-        return torch.randn_like(theta) / torch.sqrt(self._metric_like(theta))
+        z = torch.randn_like(theta)
+        if self._dense_active():
+            # With M^{-1} = L L^T, r = L^{-T} z has covariance (L L^T)^{-1} = M.
+            chol = self._inv_metric_chol.to(dtype=theta.dtype, device=theta.device)
+            r = torch.linalg.solve_triangular(chol.T, z.reshape(-1, 1), upper=True)
+            return r.reshape(theta.shape)
+        return z / torch.sqrt(self._metric_like(theta))
 
     def _kinetic(self, r):
-        return 0.5 * _dot(r * self._metric_like(r), r)
+        return 0.5 * _dot(r, self._velocity(r))
 
     def _end_adaptation_window(self, theta):
         n = self._welford_n
         if n >= 2:
-            variance = self._welford_m2 / (n - 1)
+            covariance = self._welford_m2 / (n - 1)
             # Regularize towards a small multiple of the identity (as in Stan).
-            self.inv_metric = (n / (n + 5.0)) * variance + 1e-3 * (5.0 / (n + 5.0))
+            if self.metric == "dense":
+                identity = torch.eye(covariance.shape[0], dtype=covariance.dtype, device=covariance.device)
+                inv_metric = (n / (n + 5.0)) * covariance + 1e-3 * (5.0 / (n + 5.0)) * identity
+                inv_metric = 0.5 * (inv_metric + inv_metric.T)
+                chol, info = torch.linalg.cholesky_ex(inv_metric)
+                if int(info) == 0:
+                    self.inv_metric = inv_metric
+                    self._inv_metric_chol = chol
+            else:
+                self.inv_metric = (n / (n + 5.0)) * covariance + 1e-3 * (5.0 / (n + 5.0))
         self._reset_welford()
         # Restart dual averaging for the new metric.
         self.step_size = self.find_reasonable_step_size(theta, self.gradient_cache, self.log_prob_cache)
@@ -130,7 +190,7 @@ class NUTS:
 
     def leapfrog(self, theta, r, grad, step_size):
         r_prime = r + 0.5 * step_size * grad
-        theta_prime = theta + step_size * self._metric_like(r_prime) * r_prime
+        theta_prime = theta + step_size * self._velocity(r_prime)
         log_prob_prime = self.log_target(theta_prime)
         grad_prime = self.gradient(theta_prime)
         r_prime = r_prime + 0.5 * step_size * grad_prime
@@ -178,7 +238,7 @@ class NUTS:
             )
             if non_finite:
                 diverging = True
-                return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, 0, 0, 0.0, 1.0, diverging)
+                return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, 0, 0, 0.0, 1.0, diverging, r_prime)
 
             log_joint_prime = log_prob_prime - self._kinetic(r_prime)
             energy_diff = joint0 - log_joint_prime
@@ -189,18 +249,18 @@ class NUTS:
             )
 
             if diverging:
-                return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, 0, 0, 0.0, 1.0, diverging)
+                return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, 0, 0, 0.0, 1.0, diverging, r_prime)
 
             n_prime = 1 if log_u < log_joint_prime else 0
             s_prime = 1
             log_alpha = log_joint_prime - joint0
             alpha_prime = 1.0 if log_alpha >= 0 else float(torch.exp(log_alpha).clamp(max=1.0))
-            return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, alpha_prime, 1.0, diverging)
+            return Tree(theta_prime, r_prime, grad_prime, theta_prime, r_prime, grad_prime, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, alpha_prime, 1.0, diverging, r_prime)
         else:
             tree = self.build_tree(theta, r, grad, log_u, v, j - 1, step_size, joint0)
             theta_minus, r_minus, grad_minus = tree.theta_minus, tree.r_minus, tree.grad_minus
             theta_plus, r_plus, grad_plus = tree.theta_plus, tree.r_plus, tree.grad_plus
-            theta_prime, grad_prime, log_prob_prime = tree.theta_prime, tree.grad_prime, tree.log_prob_prime
+            theta_prime, grad_prime, log_prob_prime, r_prime = tree.theta_prime, tree.grad_prime, tree.log_prob_prime, tree.r_prime
             n_prime, s_prime, alpha_prime, n_prime_alpha = tree.n_prime, tree.s_prime, tree.alpha_prime, tree.n_prime_alpha
 
             if tree.s_prime == 1:
@@ -213,7 +273,7 @@ class NUTS:
 
                 if tree_prime.s_prime == 1 and (tree.n_prime + tree_prime.n_prime) > 0:
                     if torch.rand(1) < tree_prime.n_prime / (tree.n_prime + tree_prime.n_prime):
-                        theta_prime, grad_prime, log_prob_prime = tree_prime.theta_prime, tree_prime.grad_prime, tree_prime.log_prob_prime
+                        theta_prime, grad_prime, log_prob_prime, r_prime = tree_prime.theta_prime, tree_prime.grad_prime, tree_prime.log_prob_prime, tree_prime.r_prime
 
                 n_prime = tree.n_prime + tree_prime.n_prime
                 s_prime = tree.s_prime * tree_prime.s_prime * self._uturn(theta_minus, theta_plus, r_minus, r_plus)
@@ -222,12 +282,12 @@ class NUTS:
                 diverging = tree.diverging or tree_prime.diverging
             else:
                 diverging = tree.diverging
-            return Tree(theta_minus, r_minus, grad_minus, theta_plus, r_plus, grad_plus, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, alpha_prime, n_prime_alpha, diverging)
+            return Tree(theta_minus, r_minus, grad_minus, theta_plus, r_plus, grad_plus, theta_prime, grad_prime, log_prob_prime, n_prime, s_prime, alpha_prime, n_prime_alpha, diverging, r_prime)
+
 
     def _uturn(self, theta_minus, theta_plus, r_minus, r_plus):
         delta_theta = theta_plus - theta_minus
-        metric = self._metric_like(delta_theta)
-        return _dot(delta_theta, metric * r_minus) >= 0 and _dot(delta_theta, metric * r_plus) >= 0
+        return _dot(delta_theta, self._velocity(r_minus)) >= 0 and _dot(delta_theta, self._velocity(r_plus)) >= 0
 
     def step(self, theta, warmup=False):
         if not hasattr(self, "step_size"):
@@ -237,11 +297,19 @@ class NUTS:
             self.mu = math.log(10 * self.step_size)
             self.gradient_cache = gradient
             self.log_prob_cache = log_prob
+            self._cached_theta = theta
             self.m = 1
+        elif theta is not self._cached_theta:
+            # The caller moved the state (or another Gibbs block changed the
+            # target), so the cached density and gradient are stale.
+            self.log_prob_cache = self.log_target(theta)
+            self.gradient_cache = self.gradient(theta)
+            self._cached_theta = theta
 
+        step_size = self.step_size
         r0 = self._sample_momentum(theta)
         joint = self.log_prob_cache - self._kinetic(r0)
-        log_u = joint + torch.log(torch.rand(1))
+        log_u = joint + math.log(max(torch.rand(1).item(), 1e-300))
 
         theta_minus = theta
         theta_plus = theta
@@ -254,36 +322,40 @@ class NUTS:
         new_theta = theta
         new_log_prob = self.log_prob_cache
         new_gradient = self.gradient_cache
+        new_r = r0
 
         alpha_sum_total = 0.0
         n_alpha_sum_total = 0.0
         diverging = False
 
-        while s == 1 and j <= self.max_depth:
+        while s == 1 and j < self.max_depth:
             v = 1 if torch.rand(1) < 0.5 else -1
             if v == -1:
-                tree = self.build_tree(theta_minus, r_minus, grad_minus, log_u, v, j, self.step_size, joint)
+                tree = self.build_tree(theta_minus, r_minus, grad_minus, log_u, v, j, step_size, joint)
                 theta_minus, r_minus, grad_minus = tree.theta_minus, tree.r_minus, tree.grad_minus
             else:
-                tree = self.build_tree(theta_plus, r_plus, grad_plus, log_u, v, j, self.step_size, joint)
+                tree = self.build_tree(theta_plus, r_plus, grad_plus, log_u, v, j, step_size, joint)
                 theta_plus, r_plus, grad_plus = tree.theta_plus, tree.r_plus, tree.grad_plus
-            
+
             alpha_sum_total += float(tree.alpha_prime)
             n_alpha_sum_total += float(tree.n_prime_alpha)
-            
+
             if tree.s_prime == 1 and n > 0:
                 _tmp = min(1.0, tree.n_prime / n)
                 if torch.rand(1) < _tmp:
                     new_theta = tree.theta_prime
                     new_log_prob = tree.log_prob_prime
                     new_gradient = tree.grad_prime
+                    new_r = tree.r_prime
             n += tree.n_prime
             s = tree.s_prime * self._uturn(theta_minus, theta_plus, r_minus, r_plus)
             j += 1
             diverging = diverging or tree.diverging
-        
+
         mean_alpha = (alpha_sum_total / n_alpha_sum_total) if n_alpha_sum_total > 0 else 0.0
         mean_alpha = min(max(mean_alpha, 0.0), 1.0)
+        # Hamiltonian at the selected point, with the metric of this trajectory.
+        energy = float(-new_log_prob + self._kinetic(new_r))
 
         if warmup:
             eta = 1 / (self.m + self.t0)
@@ -299,6 +371,9 @@ class NUTS:
         if not torch.isnan(new_log_prob) and not torch.isinf(new_log_prob) and not torch.isnan(new_gradient).any():
             self.gradient_cache = new_gradient
             self.log_prob_cache = new_log_prob
+            self._cached_theta = new_theta
+        else:
+            self._cached_theta = None
         self.m += 1
 
         if warmup and self._window_start is not None:
@@ -309,6 +384,15 @@ class NUTS:
                 if iteration in self._window_ends:
                     self._end_adaptation_window(new_theta)
 
+        self.last_stats = {
+            "step_size": float(step_size),
+            "accept_stat": float(mean_alpha),
+            "tree_depth": float(j),
+            "n_leapfrog": float(n_alpha_sum_total),
+            "diverging": float(diverging),
+            "energy": energy,
+            "lp": float(new_log_prob),
+        }
         return new_theta, self.step_size, mean_alpha, diverging
 
     def init_sampler(self):

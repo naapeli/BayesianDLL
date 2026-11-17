@@ -5,10 +5,6 @@ on:
   push:
     branches: ["main"]
 
-  # Build the docs on pull requests to catch errors (no deployment)
-  pull_request:
-    branches: ["main"]
-
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
@@ -47,14 +43,12 @@ jobs:
         run: uv run --no-sync make -C Docs html SPHINXOPTS="--keep-going"
 
       - name: Upload artifact
-        if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v3
         with:
           path: Docs/build/html
           name: sphinx-docs
 
   deploy:
-    if: github.event_name != 'pull_request'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

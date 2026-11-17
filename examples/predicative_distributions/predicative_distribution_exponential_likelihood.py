@@ -4,6 +4,9 @@ Posterior Predictive: Exponential Likelihood
 
 Samples the posterior predictive distribution of an exponential model with a
 HalfCauchy prior on the rate and compares its pdf and cdf to the observed data.
+
+The posterior is sampled with NUTS; for every selected posterior draw the
+replicated data sets are then drawn exactly from the likelihood.
 """
 
 import torch
@@ -26,8 +29,8 @@ with Model() as model:
     rate = RandomParameter("rate", HalfCauchy(prior_scale))
     with plate("data", N):
         likelihood = ObservedParameter("likelihood", Exponential(rate), data)
-    # predicative_distribution = model.sample_prior_predicative(n_samples, 5000, samples_per_step=10)
-    predicative_distribution = model.sample_posterior_predicative(n_samples, 1000, samples_per_step=10, warmup_per_sample=100)
+    # predicative_distribution = model.sample_prior_predicative(n_samples, samples_per_step=10)
+    predicative_distribution = model.sample_posterior_predicative(n_samples, 500, samples_per_step=10)
 
 _, axes = plt.subplots(1, 2, figsize=(12, 5), layout="constrained")
 plot_predicative_distribution(predicative_distribution, data, kind="pdf", ax=axes[0])

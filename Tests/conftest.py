@@ -38,8 +38,8 @@ def numerical_environment():
 
 @pytest.fixture
 def normal_model():
-    """Normal(0, 4) prior and unit-variance data: posterior N(1.6, 4/13)."""
+    """Normal(0, sd 2) prior and unit-variance data: posterior N(1.6, 4/13)."""
     with Model() as model:
-        mean = RandomParameter("mean", Normal(0.0, 4.0))
+        mean = RandomParameter("mean", Normal(0.0, 2.0))
         ObservedParameter("data", Normal(mean, 1.0), torch.tensor([1.0, 2.0, 2.2]))
     return model
