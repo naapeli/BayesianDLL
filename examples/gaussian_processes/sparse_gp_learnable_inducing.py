@@ -136,7 +136,8 @@ plt.show()
 # How the bound and the inducing inputs evolve
 # --------------------------------------------
 # The bound rises towards the exact log marginal likelihood (at the learned
-# hyperparameters) as the inducing inputs migrate to the right.
+# hyperparameters) as the inducing inputs migrate to the right; the first,
+# much lower value at step 0 is cut off. The shaded strip marks the bump.
 
 fig, (ax_bound, ax_path) = plt.subplots(1, 2, figsize=(13, 4), layout="constrained")
 ax_bound.plot(steps, bounds, "o-", color="tab:blue", label="VFE bound, learned Z")
@@ -144,10 +145,10 @@ ax_bound.axhline(fixed_bound, color="tab:orange", linestyle="--", label="VFE bou
 ax_bound.axhline(exact_value, color="black", linestyle=":", label="exact log p(y)")
 ax_bound.set(xlabel="Adam step", ylabel="log marginal likelihood", title="VFE bound during optimisation",
              ylim=(min(bounds[1], fixed_bound) - 50, exact_value + 30))
-ax_bound.legend(loc="lower right", fontsize="small")
+ax_bound.legend(loc="center right", fontsize="small")
 ax_path.plot(steps, paths, color="tab:red", alpha=0.8)
 ax_path.axhspan(6.3, 7.7, color="0.9")
-ax_path.text(steps[-1], 7.0, " bump", va="center", fontsize="small")
+ax_path.text(steps[-1], 7.0, "bump ", va="center", ha="right", fontsize="small")
 ax_path.set(xlabel="Adam step", ylabel="inducing input location", title="Trajectories of the inducing inputs")
 plt.show()
 

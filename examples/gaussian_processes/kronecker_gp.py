@@ -67,7 +67,7 @@ with Model() as model:
     ObservedParameter("y", f, y)
 
 start = time.perf_counter()
-trace = model.sample(300, 300, n_chains=2, max_depth=5, seed=4, progress_bar=False)
+trace = model.sample(400, 300, n_chains=2, max_depth=5, delta=0.9, seed=4, progress_bar=False)
 elapsed = time.perf_counter() - start
 summary = trace.summary(include_deterministic=True)
 print(summary)

@@ -419,31 +419,41 @@ def levinson_solve(first_column, rhs):
     t = first_column
     n = t.shape[0]
     vector = rhs.ndim == 1
-    b = (rhs.reshape(n, -1) / t[0])
-    r = t[1:] / t[0]
+    b = rhs.reshape(n, -1) / t[0]
     x = torch.zeros_like(b)
     x[0] = b[0]
     log_det = n * torch.log(t[0])
     if n == 1:
         return (x.reshape(-1) if vector else x), log_det
+    r = t[1:] / t[0]
+    # Reversed copies avoid a flip (and an allocation) in every step:
+    # r[:k] reversed is reversed_r[n-1-k:], and y[:k] reversed is
+    # reversed_y[n-1-k:]. The scalars α and β are Python floats.
+    reversed_r = r.flip(0).contiguous()
     y = torch.zeros(n - 1, dtype=t.dtype, device=t.device)
-    y[0] = -r[0]
-    beta = torch.ones((), dtype=t.dtype, device=t.device)
-    alpha = -r[0]
-    log_beta = torch.zeros((), dtype=t.dtype, device=t.device)
+    reversed_y = torch.zeros_like(y)
+    alpha = -float(r[0])
+    y[0] = alpha
+    reversed_y[n - 2] = alpha
+    beta = 1.0
+    log_beta = 0.0
     for k in range(1, n):
         beta = (1.0 - alpha * alpha) * beta
-        if not bool(beta > 0):
+        if not beta > 0.0:
             raise RuntimeError("Toeplitz covariance is not positive definite (Levinson recursion broke down).")
-        log_beta = log_beta + torch.log(beta)
-        reversed_r = r[:k].flip(0)
-        mu = (b[k] - reversed_r @ x[:k]) / beta
-        x[:k] = x[:k] + y[:k].flip(0).unsqueeze(-1) * mu
+        log_beta += math.log(beta)
+        start = n - 1 - k
+        r_k = reversed_r[start:]
+        mu = (b[k] - r_k @ x[:k]) / beta
+        x[:k].addr_(reversed_y[start:], mu)
         x[k] = mu
         if k < n - 1:
-            alpha = (-r[k] - reversed_r @ y[:k]) / beta
-            y[:k] = y[:k] + alpha * y[:k].flip(0)
+            alpha = -(float(r[k]) + float(r_k @ y[:k])) / beta
+            forward = y[:k] + alpha * reversed_y[start:]
+            reversed_y[start:].add_(y[:k], alpha=alpha)
+            y[:k] = forward
             y[k] = alpha
+            reversed_y[start - 1] = alpha
     return (x.reshape(-1) if vector else x), log_det + log_beta
 
 
@@ -516,8 +526,12 @@ class ToeplitzGP(Distribution):
     The kernel must be stationary (RBF, Matern, RationalQuadratic,
     Periodic, Constant and their sums/products); ``inputs`` must be equally
     spaced with shape ``(n,)`` or ``(n, 1)``. Levinson's recursion is
-    sequential in ``n`` (a Python loop), so it pays off over a dense
-    Cholesky from a few hundred points on.
+    sequential in ``n`` (a Python loop with a few tensor operations per
+    step), so it overtakes a dense Cholesky factorisation from roughly a
+    thousand points on (on CPU); its memory use is ``O(n)`` throughout.
+    Levinson's recursion is weakly stable for positive-definite matrices;
+    very smooth kernels with a tiny noise variance are ill-conditioned for
+    any solver, and the recursion raises if it breaks down.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=0.0, jitter=1e-6, spacing_tolerance=1e-6):

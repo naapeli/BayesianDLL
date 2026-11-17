@@ -2,7 +2,7 @@
 Regularly Sampled Time Series with a Toeplitz GP
 ================================================
 
-A sensor reports a value every time step: 1000 equally spaced, noisy
+A sensor reports a value every time step: 2000 equally spaced, noisy
 readings of a slowly drifting signal. With a *stationary* kernel the
 covariance between two readings depends only on how many steps apart they
 are, so ``K + σ² I`` is a symmetric Toeplitz matrix, fully described by its
@@ -14,8 +14,14 @@ and ``O(n)`` memory instead of the ``O(n³)`` and ``O(n²)`` of a dense
 Cholesky factorisation. The hand-derived gradients reuse the recursion's
 solution ``T⁻¹ e_0`` (Gohberg-Semencul formula) and FFT correlations.
 
-The kernel is a Matérn-5/2 (twice differentiable sample paths) with
-log-scale hyperparameters.
+The recursion is sequential (one Python-level step per observation), so
+it overtakes a dense Cholesky factorisation from roughly a thousand points
+on; its memory use is linear throughout. With thousands of points a
+gradient still costs a noticeable fraction of a second, so this example
+fits the hyperparameters by type-II maximum likelihood (``find_MAP`` on the
+log scale) instead of running MCMC.
+
+The kernel is a Matérn-5/2 (twice differentiable sample paths).
 """
 
 import time
@@ -36,8 +42,8 @@ def true_signal(t):
     return torch.sin(t / 8.0) + 0.5 * torch.sin(t / 3.0 + 1.0)
 
 
-n = 1000
-t = torch.arange(n, dtype=torch.float64) * 0.1  # one reading every 0.1 time units
+n = 2000
+t = torch.arange(n, dtype=torch.float64) * 0.05  # one reading every 0.05 time units
 y = true_signal(t) + 0.3 * torch.randn(n, dtype=torch.float64)
 
 
@@ -58,25 +64,26 @@ def build(cls, inputs, observations):
 model, f = build(ToeplitzGP, t, y)
 
 # %%
-# Sampling the hyperparameters
-# ----------------------------
+# Fitting the hyperparameters
+# ---------------------------
 
 start = time.perf_counter()
-trace = model.sample(150, 150, n_chains=2, max_depth=4, seed=0, progress_bar=False)
+model.find_MAP(lr=0.1, epochs=60, verbose=False)
 elapsed = time.perf_counter() - start
-summary = trace.summary(include_deterministic=True)
-print(summary)
-print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-hat: {summary['r_hat'].max():.3f}")
+fitted = {name: model.deterministic_params[name].constrained_value.reshape(1, 1, -1)
+          for name in ("lengthscale", "variance", "noise")}
+print(f"type-II ML in {elapsed:.1f} s: lengthscale {fitted['lengthscale'].item():.2f}, "
+      f"variance {fitted['variance'].item():.2f}, noise sd {fitted['noise'].item() ** 0.5:.3f} (true 0.3)")
 
 # %%
-# Posterior predictive on a window and a forecast
-# -----------------------------------------------
-# ``toeplitz_gp_predictive`` also uses Levinson solves, one per prediction
-# point, so no ``n x n`` matrix is formed. The band widens beyond the last
-# reading.
+# Predictive distribution on a window and a forecast
+# --------------------------------------------------
+# ``toeplitz_gp_predictive`` also uses Levinson solves (one right-hand side
+# per prediction point), so no ``n x n`` matrix is formed. The band widens
+# beyond the last reading.
 
 new_t = torch.linspace(80.0, 110.0, 150, dtype=torch.float64)
-draws = toeplitz_gp_predictive(f, trace.thin(30), y, new_t, n_samples=20).reshape(-1, new_t.numel())
+draws = toeplitz_gp_predictive(f, fitted, y, new_t, n_samples=300).reshape(-1, new_t.numel())
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
 # %%
@@ -88,7 +95,7 @@ def time_once(cls, size):
     timing_model, _ = build(cls, t[:size], y[:size])
     timing_model.joint_grad_log_prob()
     best = float("inf")
-    for _ in range(2):
+    for _ in range(1):
         start = time.perf_counter()
         timing_model.model_log_prob()
         timing_model.joint_grad_log_prob()
@@ -96,7 +103,7 @@ def time_once(cls, size):
     return best
 
 
-sizes = [125, 250, 500, 1000]
+sizes = [250, 500, 1000, 2000]
 timings = {cls.__name__: [time_once(cls, s) for s in sizes] for cls in (ExactGP, ToeplitzGP)}
 for name, values in timings.items():
     print(name, ", ".join(f"n={s}: {1000 * v:.0f} ms" for s, v in zip(sizes, values)))
@@ -109,7 +116,7 @@ ax.plot(new_t, median, color="tab:purple", label="median of f")
 ax.plot(new_t, true_signal(new_t), "k--", linewidth=1, label="true signal")
 ax.axvline(float(t[-1]), color="0.4", linestyle=":")
 ax.set(xlabel="time", ylabel="value", title="Last readings and forecast")
-ax.legend(loc="lower left", fontsize="small", ncol=2)
+fig.legend(*ax.get_legend_handles_labels(), loc="outside lower center", ncol=4, fontsize="small")
 for name, values in timings.items():
     ax_time.loglog(sizes, values, "o-", label=name)
 ax_time.set(xlabel="n", ylabel="seconds per log density + gradient", title="Cost per gradient")
