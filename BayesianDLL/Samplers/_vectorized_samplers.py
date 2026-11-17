@@ -221,7 +221,7 @@ class VectorizedFiniteGibbs:
                 proposal[:, index] = value
                 log_probs.append(_nan_to_neg_inf(self.log_target(proposal)))
             log_probs = torch.stack(log_probs, dim=-1)  # (C, K)
-            maximum = log_probs.max(dim=-1, keepdim=True).values
+            maximum = torch.amax(log_probs, dim=-1, keepdim=True)
             possible = torch.isfinite(maximum).squeeze(-1)
             weights = torch.exp(log_probs - torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum)))
             weights = torch.where(possible.unsqueeze(-1), weights, torch.ones_like(weights))

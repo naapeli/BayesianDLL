@@ -12,6 +12,17 @@ def _tiny(x):
     return torch.finfo(x.dtype).tiny
 
 
+def log_sigmoid(x):
+    """``log(sigmoid(x))``, computed as ``-softplus(-x)``.
+
+    Same values as ``torch.nn.functional.logsigmoid``, but much faster on
+    small tensors: the CPU kernel of ``logsigmoid`` always dispatches to the
+    intra-op thread pool, which costs milliseconds per call when the cores
+    are busy (e.g. with several sampling processes).
+    """
+    return -F.softplus(-x, threshold=50.0)
+
+
 class Transform(ABC):
     """A bijection between a constrained space and an unconstrained space.
 
@@ -176,7 +187,7 @@ class LogitTransform(Transform):
     def log_abs_det_jacobian(self, x_unconstrained):
         z = x_unconstrained
         scale = torch.as_tensor(self.scale, dtype=z.dtype, device=z.device)
-        return _bsum(torch.log(scale) + F.logsigmoid(z) + F.logsigmoid(-z))
+        return _bsum(torch.log(scale) + log_sigmoid(z) + log_sigmoid(-z))
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return 1 - 2 * torch.sigmoid(x_unconstrained)
@@ -260,8 +271,8 @@ class StickBreakingTransform(Transform):
     def _parts(self, z):
         """Return (u, log_x, y) where u = z - offset, y = sigmoid(u)."""
         u = z - self._offset(z)
-        log_y = F.logsigmoid(u)
-        log_1my = F.logsigmoid(-u)
+        log_y = log_sigmoid(u)
+        log_1my = log_sigmoid(-u)
         # log of the remaining stick before step k: exclusive cumsum of log(1 - y)
         cum = torch.cumsum(log_1my, dim=-1)
         log_r = torch.cat([torch.zeros_like(cum[..., :1]), cum], dim=-1)  # (..., K)
@@ -309,7 +320,7 @@ class StickBreakingTransform(Transform):
         km1 = u.shape[-1]
         # K - k for k = 1..K-1
         counts = torch.arange(km1, 0, -1, dtype=u.dtype, device=u.device)
-        return F.logsigmoid(u) + counts * F.logsigmoid(-u)
+        return log_sigmoid(u) + counts * log_sigmoid(-u)
 
     def log_abs_det_jacobian(self, x_unconstrained):
         return _bsum(self._log_det_terms(x_unconstrained))
