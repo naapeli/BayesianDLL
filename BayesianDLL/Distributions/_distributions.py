@@ -7,11 +7,11 @@ from abc import ABC, abstractmethod
 from ._transforms import (
     IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform, InverseSoftPlusTransform,
     StickBreakingTransform, CorrCholeskyTransform, ChainTransform, _apply_jacobian_transpose, _log1m_tanh_sq,
-    PositiveDefiniteTransform,
+    PositiveDefiniteTransform, OrderedTransform,
 )
 from ._state_space import (
     ContinuousReal, ContinuousPositive, ContinuousRange, ContinuousSimplex, DiscretePositive, DiscreteRange, Union,
-    DiscreteNonNegative, ContinuousCorrCholesky, ContinuousPositiveDefinite,
+    DiscreteNonNegative, ContinuousCorrCholesky, ContinuousPositiveDefinite, ContinuousOrdered,
 )
 from .._parameters import RandomParameter, DeterministicParameter, ObservedParameter, VariationalParameter
 from .._data import Data
@@ -1993,6 +1993,84 @@ class TransformedDistribution(Distribution):
 
     def icdf(self, u):
         return self.outer.inverse(self.base.icdf(u))
+
+
+class Ordered(Distribution):
+    """Strictly increasing vector of length ``K`` with elementwise density ``base``.
+
+    ``Ordered(base, K)`` is the distribution of a vector ``x`` of shape
+    ``(*batch, K)`` with ``x_0 < x_1 < ... < x_{K-1}`` and (unnormalised)
+    log density ``sum_k base.log_pdf(x_k)``: the density of ``K`` draws of
+    ``base`` restricted to the ordered region. For a base with parameters
+    shared by all elements the normalising constant is ``K!``, which is left
+    out (it does not depend on ``x`` or on the parameters). The parameters of
+    ``base`` broadcast against ``x``, so they may be scalars or have a
+    trailing dimension of size ``K`` (e.g. one prior mean per element).
+
+    The sampler works in an unconstrained space through
+    :class:`OrderedTransform` (``x_0 = y_0``, ``x_k = x_{k-1} + exp(y_k)``).
+    A base with a bounded support (e.g. ``Exponential``) composes its own
+    increasing elementwise transform after the ordering, so the ordered
+    values stay in the base support.
+
+    The typical use is to break the label-switching symmetry of a mixture::
+
+        means = RandomParameter("means", Ordered(Normal(0.0, 5.0), 2))
+    """
+
+    _param_event_ndims = {"base": 1}
+
+    def __init__(self, base, K):
+        if base.event_shape != ():
+            raise ValueError("Ordered needs a univariate base distribution.")
+        if not base.state_space.is_continuous():
+            raise ValueError("Ordered needs a continuous base distribution.")
+        base_transform = base.transform
+        if isinstance(base_transform, IdentityTransform):
+            transform = OrderedTransform()
+        elif isinstance(base_transform, (LogTransform, InverseSoftPlusTransform)) and base_transform.side == "larger" or isinstance(base_transform, LogitTransform):
+            # Increasing elementwise maps keep the order of the ordered vector.
+            transform = ChainTransform(OrderedTransform(), base_transform)
+        else:
+            raise ValueError(f"Ordered does not support a base with the transform {type(base_transform).__name__}.")
+        super().__init__(transform, ContinuousOrdered(base.state_space), ContinuousReal())
+        self.base = base
+        self.K = int(K)
+        if self.K < 1:
+            raise ValueError("K must be positive.")
+        self._add_dependencies_of(base)
+
+    @property
+    def event_shape(self):
+        return (self.K,)
+
+    @property
+    def batch_shape(self):
+        return torch.broadcast_shapes(tuple(self.base.batch_shape), (self.K,))[:-1]
+
+    def log_pdf(self, x):
+        log_p = self.base.log_pdf(x)
+        return log_p.expand(torch.broadcast_shapes(log_p.shape, x.shape)).sum(-1)
+
+    def log_pdf_grad(self, x):
+        grad = self.base.log_pdf_grad(x)
+        return grad.expand(torch.broadcast_shapes(grad.shape, x.shape))
+
+    def log_pdf_param_grads(self, x):
+        # Elementwise in x; the model sums them onto the shapes of the parameters.
+        return self.base.log_pdf_param_grads(x)
+
+    def sample(self, n_samples=1, _reparametrization_trick_grad=False):
+        if _reparametrization_trick_grad:
+            raise self._no_reparam()
+        base_batch = tuple(self.base.batch_shape)
+        if base_batch[-1:] == (self.K,):
+            draws = self.base.sample(n_samples)
+        else:
+            draws = self.base.sample(n_samples * self.K)
+            draws = draws.reshape(n_samples, self.K, *base_batch).movedim(1, -1)
+            draws = draws.expand(n_samples, *self.batch_shape, self.K)
+        return torch.sort(draws, dim=-1).values
 
 
 # ========================= Miscellaneous distributions =========================

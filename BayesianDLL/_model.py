@@ -76,7 +76,11 @@ def _distribution_arguments(distribution, _seen=None):
 
     def visit(value, event_ndim):
         if isinstance(value, (Distribution, Transform)):
-            yield from _distribution_arguments(value, seen)
+            # A wrapper may declare event dimensions for a nested distribution
+            # (e.g. ``Ordered`` evaluates its base on a vector event); they
+            # add to the event dimensions the nested distribution declares.
+            for argument, nested_event_ndim in _distribution_arguments(value, seen):
+                yield argument, nested_event_ndim + event_ndim
         elif isinstance(value, (list, tuple)):
             for item in value:
                 yield from visit(item, event_ndim)

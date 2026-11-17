@@ -201,3 +201,22 @@ class ContinuousPositiveDefinite(ContinuousSpace):
             return False
         _, info = torch.linalg.cholesky_ex(state)
         return bool(torch.all(info == 0))
+
+
+class ContinuousOrdered(ContinuousSpace):
+    """Vectors that are strictly increasing along the last dimension.
+
+    ``base`` (optional) is the support of each element, e.g.
+    ``ContinuousPositive()`` for an ordered vector of positive values.
+    Leading dimensions (e.g. the chain dimension) are batch dimensions.
+    """
+
+    def __init__(self, base=None):
+        self.base = ContinuousReal() if base is None else base
+
+    def contains(self, state) -> bool:
+        state = _as_tensor(state)
+        if state.ndim == 0 or not bool(torch.all(torch.isfinite(state))):
+            return False
+        increasing = bool(torch.all(state[..., 1:] > state[..., :-1]))
+        return increasing and bool(self.base.contains(state))
