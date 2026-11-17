@@ -377,3 +377,194 @@ def test_batched_enumerated_draws_have_per_chain_probabilities(factory):
             model.params[name].set_unconstrained_value(value[chain])
         for name, (_, probabilities) in model.sample_enumerated().items():
             torch.testing.assert_close(draws[name][1][chain], probabilities)
+
+
+# ============================================================ vectorized sampling
+def vectorized(model, n_samples=400, warmup=300, n_chains=8, seed=11, **kwargs):
+    from BayesianDLL import sample
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return sample(n_samples, warmup, n_chains=n_chains, model=model, progress_bar=False,
+                      chain_method="vectorized", seed=seed, **kwargs)
+
+
+def parallel(model, n_samples=400, warmup=300, n_chains=4, seed=11, **kwargs):
+    from BayesianDLL import sample
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return sample(n_samples, warmup, n_chains=n_chains, model=model, progress_bar=False,
+                      chain_method="parallel", seed=seed, **kwargs)
+
+
+def assert_moments(draws, mean, sd, tolerance=0.08):
+    """Posterior mean within ``tolerance`` posterior sds; sd within 15 %."""
+    draws = draws.reshape(-1, *draws.shape[2:]).to(torch.float64)
+    mean = torch.as_tensor(mean, dtype=torch.float64)
+    sd = torch.as_tensor(sd, dtype=torch.float64)
+    assert torch.all((draws.mean(0) - mean).abs() <= tolerance * sd + 1e-3), (draws.mean(0), mean)
+    assert torch.all((draws.std(0) / sd - 1).abs() < 0.15), (draws.std(0), sd)
+
+
+def conjugate_normal():
+    """Normal(0, sd 2) prior and unit-variance data: posterior N(1.6, 4/13)."""
+    with Model() as model:
+        mean = RandomParameter("mean", Normal(0.0, 2.0))
+        ObservedParameter("data", Normal(mean, 1.0), torch.tensor([1.0, 2.0, 2.2]))
+    return model
+
+
+@pytest.mark.parametrize("sampler, kwargs", [
+    ("nuts", {}), ("nuts", {"metric": "dense"}), ("slice", {}), ("metropolis", {}),
+])
+def test_vectorized_samplers_match_conjugate_normal(sampler, kwargs):
+    with Model() as model:
+        mean = RandomParameter("mean", Normal(torch.zeros(2), 2.0), shape=2, sampler=sampler)
+        ObservedParameter("data", Normal(mean, 1.0), torch.tensor([[1.0, -1.0], [2.0, 0.0], [2.2, 0.4]]))
+    n_samples = 1500 if sampler == "metropolis" else 400
+    result = vectorized(model, n_samples=n_samples, n_chains=16, **kwargs)
+    precision = 1 / 4 + 3
+    expected_mean = torch.tensor([5.2, -0.6]) / precision
+    assert_moments(result["mean"], expected_mean, torch.full((2,), precision ** -0.5),
+                   tolerance=0.12 if sampler == "metropolis" else 0.08)
+    assert result.sample_stats[0]["accept_stat"].shape == (16, n_samples)
+
+
+def test_vectorized_matches_analytic_posteriors_through_transforms():
+    # Beta(2, 3) prior, 4 successes in 6 trials: Beta(6, 5).
+    result = vectorized(beta_bernoulli())
+    a, b = 6.0, 5.0
+    assert_moments(result["p"], a / (a + b), math.sqrt(a * b / ((a + b) ** 2 * (a + b + 1))))
+    # Dirichlet(1, 2, 3) prior and category counts (1, 1, 3): Dirichlet(2, 3, 6).
+    result = vectorized(dirichlet_categorical())
+    alpha = torch.tensor([2.0, 3.0, 6.0])
+    total = alpha.sum()
+    assert_moments(result["weights"], alpha / total, (alpha * (total - alpha) / (total ** 2 * (total + 1))).sqrt())
+
+
+def test_vectorized_lkj_prior_correlation_moments():
+    # A correlation of LKJ(eta) in D dimensions is 2 * Beta(b, b) - 1 with b = eta - 1 + D / 2.
+    with Model() as model:
+        RandomParameter("L", LKJCholesky(3, eta=2.0))
+    result = vectorized(model, n_samples=600, n_chains=16)
+    b = 2.0 - 1.0 + 1.5
+    correlation = result["L"][..., 1, 0]
+    assert_moments(correlation, 0.0, math.sqrt(1 / (2 * b + 1)))
+
+
+def test_vectorized_eight_schools_matches_parallel():
+    vector = vectorized(eight_schools(), n_samples=250, warmup=250, n_chains=12, delta=0.85)
+    reference = parallel(eight_schools(), n_samples=500, warmup=250, n_chains=4, delta=0.85)
+    for name in ("mu", "tau", "theta"):
+        a, b = vector[name].reshape(-1, *vector[name].shape[2:]), reference[name].reshape(-1, *reference[name].shape[2:])
+        sd = b.std(0)
+        assert torch.all((a.mean(0) - b.mean(0)).abs() < 0.25 * sd), name
+        assert torch.all((a.std(0) / sd - 1).abs() < 0.25), name
+
+
+def test_vectorized_two_block_gibbs_nuts_matches_exact_posterior():
+    """Gibbs (z) + NUTS (means) blocks against the exact posterior by enumeration of z."""
+    import itertools
+    model = gibbs_index_model()
+    result = vectorized(model, n_samples=600, warmup=200, n_chains=12)
+    assert result.sample_stats.samplers == ["nuts", "gibbs"]
+    y = torch.tensor([-1.0, 2.2, 1.8])
+    log_weights, means = [], []
+    for z in itertools.product([0, 1], repeat=3):
+        z = torch.tensor(z)
+        mean = torch.zeros(2)
+        log_marginal = 3 * math.log(0.5)
+        for k in range(2):
+            members = y[z == k]
+            n = len(members)
+            precision = 1 / 9 + n
+            mean[k] = members.sum() / precision
+            # Marginal likelihood of the members under means[k] ~ N(0, 9), y ~ N(means[k], 1).
+            covariance = torch.eye(n) + 9 * torch.ones(n, n)
+            if n:
+                log_marginal += float(MultivariateNormal(torch.zeros(n), covariance).log_pdf(members))
+        log_weights.append(log_marginal)
+        means.append(mean)
+    weights = torch.softmax(torch.tensor(log_weights), 0)
+    expected = (weights[:, None] * torch.stack(means)).sum(0)
+    draws = result["means"].reshape(-1, 2)
+    assert torch.all((draws.mean(0) - expected).abs() < 0.12), (draws.mean(0), expected)
+
+
+def asymmetric_enumerated_mixture():
+    y = torch.tensor([-2.1, -1.7, -2.5, 1.9, 2.4, 2.2, 1.5])
+    with Model() as model:
+        # A prior tight enough to rule out the label-switched mode.
+        means = RandomParameter("means", Normal(torch.tensor([-2.0, 2.0]), 0.5), shape=2)
+        with plate("data", len(y)):
+            z = RandomParameter("z", Bernoulli(0.4), shape=(), enumerate=True)
+        ObservedParameter("y", Normal(Index("mean", means, z), 0.7), y)
+    return model
+
+
+def test_vectorized_enumerated_mixture_matches_parallel():
+    vector = vectorized(asymmetric_enumerated_mixture(), n_samples=300, warmup=200, n_chains=8)
+    reference = parallel(asymmetric_enumerated_mixture(), n_samples=500, warmup=200, n_chains=4)
+    for name in ("means", "z"):
+        a = vector[name].reshape(-1, *vector[name].shape[2:])
+        b = reference[name].reshape(-1, *reference[name].shape[2:])
+        assert torch.all((a.mean(0) - b.mean(0)).abs() < 0.08), name
+    assert vector.enumerated_probs["z"].shape == (8, 300, 7, 2)
+    assert vector.log_likelihood["y"].shape == (8, 300, 7)
+
+
+def test_vectorized_exact_gp_matches_parallel():
+    vector = vectorized(exact_gp_model(), n_samples=200, warmup=100, n_chains=4)
+    reference = parallel(exact_gp_model(), n_samples=200, warmup=100, n_chains=4)
+    for name in ("lengthscale", "variance", "noise"):
+        a, b = vector[name].reshape(-1), reference[name].reshape(-1)
+        assert abs(float(a.mean() - b.mean())) < 0.3 * float(b.std()), name
+
+
+def test_vectorized_with_mutable_data():
+    model = mutable_data_model()
+    x = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0])
+    y = torch.tensor([0.2, 0.4, 1.1, 1.3, 2.1])
+    model.data["x"].set_value(x)
+    model.data["y_data"].set_value(y)
+    result = vectorized(model, n_chains=8)
+    precision = 1 + float((x ** 2).sum())
+    assert_moments(result["slope"], float((x * y).sum()) / precision, precision ** -0.5)
+    assert result.deterministic_trace["m"].shape == (8, 400, 5)
+
+
+def test_vectorized_result_structure_and_downstream_tools():
+    from BayesianDLL.Evaluation import loo, summary
+    model = linear_regression()
+    result = vectorized(model, n_samples=200, warmup=200, n_chains=6)
+    assert result.trace["w"].shape == (6, 200, 2)
+    assert result.deterministic_trace["mean"].shape == (6, 200, 5)
+    assert result.log_likelihood["y"].shape == (6, 200, 5)
+    assert len(result.divergences) == 6 and len(result.step_sizes) == 6 and len(result.acceptance_probabilities) == 6
+    stats = result.sample_stats[0]
+    assert set(stats) == {"step_size", "accept_stat", "tree_depth", "n_leapfrog", "diverging", "energy", "lp"}
+    for value in stats.values():
+        assert value.shape == (6, 200) and value.dtype == torch.float64
+    assert all(t.device.type == "cpu" for t in result.trace.values())
+    summary(result)
+    loo(result)
+    predictive = model.posterior_predicative(result, n_samples=10, samples_per_step=3, progress_bar=False)
+    assert predictive["y"].shape == (10, 3, 5)
+
+
+def test_vectorized_seeding_is_reproducible():
+    first = vectorized(eight_schools(), n_samples=30, warmup=30, n_chains=4, seed=5)
+    second = vectorized(eight_schools(), n_samples=30, warmup=30, n_chains=4, seed=5)
+    other = vectorized(eight_schools(), n_samples=30, warmup=30, n_chains=4, seed=6)
+    torch.testing.assert_close(first["eta"], second["eta"], rtol=0, atol=0)
+    assert not torch.equal(first["eta"], other["eta"])
+    # The chains differ from each other.
+    assert not torch.equal(first["eta"][0], first["eta"][1])
+
+
+def test_vectorized_explicit_blocks_and_default_chain_method():
+    from BayesianDLL import sample
+    model = normal_normal()
+    result = vectorized(model, n_samples=50, warmup=50, n_chains=3, blocks=[["mu"], ["sigma"]])
+    assert result.sample_stats.params == [["mu"], ["sigma"]]
+    with pytest.raises(ValueError):
+        sample(10, 10, n_chains=2, model=model, chain_method="threads", progress_bar=False)

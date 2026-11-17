@@ -37,12 +37,13 @@ class RandomParameter:
         full_shape = plate_shape + event_shape
 
         if initial_value is None:
+            dtype, device = _initial_dtype_and_device(distribution)
             if distribution.state_space.is_continuous():
-                unconstrained = torch.zeros(distribution.transform.unconstrained_shape(full_shape), dtype=torch.float64)
+                unconstrained = torch.zeros(distribution.transform.unconstrained_shape(full_shape), dtype=dtype, device=device)
                 initial_value = distribution.transform.inverse(unconstrained)
             elif distribution.state_space.is_discrete():
                 first_value = next(iter(distribution.state_space))
-                initial_value = first_value * torch.ones(full_shape, dtype=torch.float64)
+                initial_value = first_value * torch.ones(full_shape, dtype=dtype, device=device)
         else:
             # Ensure initial_value has the right shape
             if initial_value.shape != full_shape:
@@ -90,6 +91,25 @@ class RandomParameter:
             raise TypeError("constrained_value should be a torch.Tensor.")
         self.constrained_value = constrained_value
         self.unconstrained_value = self.distribution.transform.forward(constrained_value)
+
+
+def _initial_dtype_and_device(distribution):
+    """Dtype and device of the floating tensors a distribution reads.
+
+    Parameters start in float64 on the default device when the distribution
+    has no floating tensor arguments (e.g. ``Normal(0.0, 1.0)``).
+    """
+    from ._model import _distribution_arguments
+    try:
+        for argument, _ in _distribution_arguments(distribution):
+            value = argument if isinstance(argument, torch.Tensor) else getattr(argument, "constrained_value", None)
+            if isinstance(argument, VariationalParameter):
+                value = argument.value
+            if isinstance(value, torch.Tensor) and value.is_floating_point():
+                return value.dtype, value.device
+    except Exception:  # noqa: BLE001 - the defaults are always valid
+        pass
+    return torch.float64, torch.get_default_device()
 
 
 def _check_enumerable(name, distribution):
@@ -240,7 +260,18 @@ class DeterministicParameter:
         if model is not None and model.n_chains is not None and self.name in model._batched_nodes:
             if model._batch_mode == "loop":
                 return model._loop_over_chains(lambda: self.constrained_value)
-            return self.batched_forward(self.input_values())
+            # The batched value is read many times per evaluation (by every
+            # child and the reverse pass); cache it for the current input
+            # tensors. Values are never modified in place, so the identity
+            # of the input tensors identifies the inputs.
+            values = self.input_values()
+            key = tuple(id(v) for v in values)
+            cache = getattr(self, "_batched_cache", None)
+            if cache is not None and cache[0] == key:
+                return cache[2]
+            out = self.batched_forward(values)
+            self._batched_cache = (key, values, out)
+            return out
         inputs = [self._get_constrained_value(input) for input in self.inputs]
         return self.forward_func(*inputs)
 

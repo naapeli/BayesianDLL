@@ -103,6 +103,84 @@ def _sampler_name(sampler):
     return type(sampler).__name__
 
 
+def _block_sampler_type(model, param_names, sampler_type, state_space, is_continuous):
+    """The sampler of a block: ``sampler_type`` or, for ``"auto"``, the one its parameters request."""
+    if sampler_type != "auto":
+        return _SAMPLER_ALIASES.get(sampler_type, sampler_type)
+    requested = [_SAMPLER_ALIASES.get(model.params[name].sampler, model.params[name].sampler) for name in param_names]
+    if is_continuous:
+        if "metropolis" in requested:
+            return "metropolis"
+        if "slice" in requested:
+            return "slice"
+        return "nuts"
+    if "slice" in requested:
+        raise ValueError(f"The slice sampler can only be used with continuous parameters: {param_names}")
+    if "metropolis" in requested or not has_finite_support(state_space):
+        return "metropolis"
+    return "gibbs"
+
+
+def _block_state_space(model, param_names):
+    """The (joint) unconstrained state space of a block and the flat slices of its parameters."""
+    slices = {}
+    offset = 0
+    for name in param_names:
+        value = model.params[name].unconstrained_value
+        shape = value.shape[1:] if getattr(model, "n_chains", None) is not None else value.shape
+        numel = shape.numel()
+        slices[name] = (offset, offset + numel, shape)
+        offset += numel
+    if len(param_names) == 1:
+        space = model.params[param_names[0]].distribution.transformed_state_space
+    else:
+        spaces = {name: model.params[name].distribution.transformed_state_space for name in param_names}
+        space = JointStateSpace(spaces, slices)
+    return space, slices, offset
+
+
+def _check_block_parameters(model, param_names):
+    for name in param_names:
+        if name in getattr(model, "enumerated_params", {}):
+            raise ValueError(f"Parameter '{name}' is enumerated (summed out of the model) and cannot be part of a sampling block.")
+        if name not in model.params:
+            raise KeyError(f"Parameter '{name}' not found in model parameters.")
+    is_continuous_list = [model.params[name].distribution.transformed_state_space.is_continuous() for name in param_names]
+    if any(is_continuous_list) and not all(is_continuous_list):
+        raise ValueError(f"Continuous and discrete variables cannot be grouped in the same block: {param_names}")
+    return all(is_continuous_list)
+
+
+def _default_block_specs(model):
+    """Default Gibbs blocks: ``[(param_names, sampler_type), ...]``."""
+    nuts_names = []
+    slice_names = []
+    continuous_metropolis_names = []
+    gibbs_names = []
+    discrete_metropolis_names = []
+    for name, p in model.params.items():
+        space = p.distribution.transformed_state_space
+        requested = _SAMPLER_ALIASES.get(p.sampler, p.sampler)
+        if space.is_continuous():
+            if requested in ("auto", "nuts"):
+                nuts_names.append(name)
+            elif requested == "slice":
+                slice_names.append(name)
+            else:
+                continuous_metropolis_names.append(name)
+        elif requested == "slice":
+            raise ValueError(f"The slice sampler can only be used with continuous parameters, but '{name}' is discrete.")
+        elif requested in ("auto", "gibbs") and has_finite_support(space):
+            gibbs_names.append(name)
+        else:
+            discrete_metropolis_names.append(name)
+    specs = [
+        (nuts_names, "nuts"), (slice_names, "slice"), (continuous_metropolis_names, "metropolis"),
+        (gibbs_names, "gibbs"), (discrete_metropolis_names, "metropolis"),
+    ]
+    return [(names, kind) for names, kind in specs if names]
+
+
 class SamplingBlock:
     """A group of parameters updated jointly by one sampler in a Gibbs scheme.
 
@@ -161,23 +239,8 @@ class SamplingBlock:
             }
             state_space = JointStateSpace(spaces_dict, self.slices)
 
-        if sampler_type == "auto":
-            requested = [_SAMPLER_ALIASES.get(model.params[name].sampler, model.params[name].sampler) for name in self.param_names]
-            if self.is_continuous:
-                if "metropolis" in requested:
-                    sampler_type = "metropolis"
-                elif "slice" in requested:
-                    sampler_type = "slice"
-                else:
-                    sampler_type = "nuts"
-            elif "slice" in requested:
-                raise ValueError(f"The slice sampler can only be used with continuous parameters: {self.param_names}")
-            elif "metropolis" in requested or not has_finite_support(state_space):
-                sampler_type = "metropolis"
-            else:
-                sampler_type = "gibbs"
-
-        self.sampler_type = sampler_type
+        self.sampler_type = _block_sampler_type(model, self.param_names, sampler_type, state_space, self.is_continuous)
+        sampler_type = self.sampler_type
 
         # Only the terms in the Markov blanket of the block change with it.
         self._random_terms, self._observed_terms, self._grad_nodes = model.block_terms(self.param_names)
@@ -290,41 +353,10 @@ def _build_blocks(model, blocks_spec=None, sampler_params=None):
             raise ValueError(f"The following parameters were not included in any block: {missing}")
         return built_blocks
 
-    nuts_names = []
-    slice_names = []
-    continuous_metropolis_names = []
-    gibbs_names = []
-    discrete_metropolis_names = []
-    for name, p in model.params.items():
-        space = p.distribution.transformed_state_space
-        requested = _SAMPLER_ALIASES.get(p.sampler, p.sampler)
-        if space.is_continuous():
-            if requested in ("auto", "nuts"):
-                nuts_names.append(name)
-            elif requested == "slice":
-                slice_names.append(name)
-            else:
-                continuous_metropolis_names.append(name)
-        elif requested == "slice":
-            raise ValueError(f"The slice sampler can only be used with continuous parameters, but '{name}' is discrete.")
-        elif requested in ("auto", "gibbs") and has_finite_support(space):
-            gibbs_names.append(name)
-        else:
-            discrete_metropolis_names.append(name)
-
-    built_blocks = []
-    if nuts_names:
-        built_blocks.append(SamplingBlock(model, nuts_names, sampler_type="nuts", sampler_params=sampler_params))
-    if slice_names:
-        built_blocks.append(SamplingBlock(model, slice_names, sampler_type="slice", sampler_params=sampler_params))
-    if continuous_metropolis_names:
-        built_blocks.append(SamplingBlock(model, continuous_metropolis_names, sampler_type="metropolis", sampler_params=sampler_params))
-    if gibbs_names:
-        built_blocks.append(SamplingBlock(model, gibbs_names, sampler_type="gibbs", sampler_params=sampler_params))
-    if discrete_metropolis_names:
-        built_blocks.append(SamplingBlock(model, discrete_metropolis_names, sampler_type="metropolis", sampler_params=sampler_params))
-
-    return built_blocks
+    return [
+        SamplingBlock(model, names, sampler_type=kind, sampler_params=sampler_params)
+        for names, kind in _default_block_specs(model)
+    ]
 
 
 def _chain_seeds(seed, n_chains):
@@ -333,13 +365,41 @@ def _chain_seeds(seed, n_chains):
     return [int(sequence.generate_state(1, dtype=np.uint64)[0] % (2 ** 63)) for sequence in sequences]
 
 
-def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, check_convergence=True, seed=None, log_likelihood=True, **sampler_params):
-    """Draw posterior samples with one process per chain.
+def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, check_convergence=True, seed=None, log_likelihood=True, chain_method=None, device=None, trace_device="cpu", **sampler_params):
+    """Draw posterior samples from ``n_chains`` MCMC chains.
 
-    ``seed`` makes runs reproducible: every chain gets its own seed derived
-    from it. With ``seed=None`` the base seed is drawn from torch's global
-    generator, so the chains still differ from each other and a preceding
-    ``torch.manual_seed`` also makes the run reproducible.
+    ``chain_method`` selects how the chains run (the names follow NumPyro):
+
+    * ``"parallel"``: one worker process per chain. Every process evaluates
+      the model for its own chain. This is the default for a model on the CPU.
+    * ``"vectorized"``: all chains run in this process in lock step. The
+      model is batched (see :meth:`~BayesianDLL.Model.batch`): every latent
+      parameter gets a leading chain dimension and one log density or
+      gradient evaluation covers all chains. NUTS, Metropolis, the finite
+      Gibbs sampler and the slice sampler have vectorized versions with
+      per-chain step sizes, metrics, adaptation and accept/reject decisions,
+      and Gibbs blocks work as in the parallel mode. This is much faster per
+      chain for many chains, and it is the only mode on a GPU, because worker
+      processes and CUDA do not mix. Nodes that cannot be batched (the GP
+      nodes, or user functions that do not broadcast over a leading chain
+      dimension) are evaluated chain by chain inside the batched computation.
+    * ``None`` (default): ``"vectorized"`` when the model lives on a CUDA (or
+      ROCm) device, ``"parallel"`` otherwise.
+
+    ``device`` moves the model to that device first (``Model.to(device)``,
+    in place); e.g. ``device="cuda"`` samples on the GPU. On AMD GPUs the
+    ROCm build of PyTorch exposes the GPU as device ``"cuda"``. In
+    vectorized mode the traces are kept on the model's device during
+    sampling and moved to ``trace_device`` at the end (``None`` keeps them on
+    the model's device). Both modes return the same :class:`SamplingResult`.
+
+    ``seed`` makes runs reproducible. In parallel mode every chain gets its
+    own seed derived from it; in vectorized mode it seeds torch's generator
+    of the model's device for the run (the global random state is restored
+    afterwards). With ``seed=None`` the parallel base seed is drawn from
+    torch's global generator and the vectorized run uses the global
+    generator, so a preceding ``torch.manual_seed`` also makes runs
+    reproducible.
 
     ``log_likelihood=True`` records the elementwise log-likelihood
     ``log p(y_i | theta)`` of every observed node for every kept draw in
@@ -353,6 +413,18 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     ``metric="dense"`` for NUTS.
     """
     model = get_active_model() if model is None else model
+    if device is not None:
+        model.to(device)
+    on_gpu = model.device.type != "cpu"
+    if chain_method is None:
+        chain_method = "vectorized" if on_gpu else "parallel"
+    if chain_method not in ("parallel", "vectorized"):
+        raise ValueError(f"chain_method must be 'parallel' or 'vectorized', got {chain_method!r}.")
+    if chain_method == "parallel" and on_gpu:
+        raise ValueError(
+            f"chain_method='parallel' runs every chain in a worker process, which does not work with a model on "
+            f"{model.device}. Use chain_method='vectorized'."
+        )
     # Decide how the enumerated parameters are summed out before starting the
     # workers, so a model that cannot be enumerated fails here.
     model.prepare_enumeration()
@@ -360,6 +432,17 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
         log_likelihood_plan, log_likelihood_unavailable = pointwise_log_likelihood_plan(model)
     else:
         log_likelihood_plan, log_likelihood_unavailable = None, {}
+
+    if chain_method == "vectorized":
+        from ._vectorized import sample_vectorized
+        (trace, det_trace, enumerated_probs, log_lik, divergences, acceptance_probabilities, step_sizes,
+         sample_stats, max_depths) = sample_vectorized(
+            n_samples, warmup_length, n_chains, model, progress_bar, start_point_variance, blocks, seed,
+            log_likelihood_plan, sampler_params, trace_device=trace_device,
+        )
+        return _finish_sampling(model, n_samples, n_chains, check_convergence, trace, det_trace, enumerated_probs,
+                                log_lik, divergences, acceptance_probabilities, step_sizes, sample_stats, max_depths,
+                                log_likelihood_unavailable)
 
     if seed is None:
         seed = int(torch.randint(0, 2 ** 62, (1,)).item())
@@ -476,7 +559,15 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     log_lik = None
     if log_likelihood_plan is not None:
         log_lik = {name: torch.stack([res[9][name] for res in results], dim=0) for name in log_likelihood_plan}
+    max_depths = results[0][6] if results else []
+    return _finish_sampling(model, n_samples, n_chains, check_convergence, trace, det_trace, enumerated_probs,
+                            log_lik, divergences, acceptance_probabilities, step_sizes, sample_stats, max_depths,
+                            log_likelihood_unavailable)
 
+
+def _finish_sampling(model, n_samples, n_chains, check_convergence, trace, det_trace, enumerated_probs, log_lik,
+                     divergences, acceptance_probabilities, step_sizes, sample_stats, max_depths, log_likelihood_unavailable):
+    """Convergence diagnostics and the :class:`SamplingResult` of both chain methods."""
     if check_convergence and n_chains > 1:
         if n_samples >= 50:
             r_hats = gelman_rubin({name: trace[name] for name in model.params})
@@ -489,7 +580,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     if sum(divergences) > 0:
         warn(f"There were {sum(divergences)} divergences across all chains after tuning. Increase target acceptance probability or reparameterize the model.")
 
-    _check_hamiltonian_diagnostics(sample_stats, results[0][6] if results else [], n_samples)
+    _check_hamiltonian_diagnostics(sample_stats, max_depths, n_samples)
 
     return SamplingResult(trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=det_trace, sample_stats=sample_stats, enumerated_probs=enumerated_probs, log_likelihood=log_lik, log_likelihood_unavailable=log_likelihood_unavailable)
 
@@ -710,15 +801,18 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
     else:
         if total_samples < n_samples:
             raise RuntimeError(f"n_samples ({n_samples}) must be less than or equal to the total trace length ({total_samples}).")
-        indices = torch.linspace(0, total_samples - 1, steps=n_samples).long()
+        # Integer positions computed on the host (the traces live on the CPU by default).
+        indices = torch.linspace(0, total_samples - 1, steps=n_samples, dtype=torch.float64, device="cpu").long()
 
     missing = [name for name in model.params if name not in flattened_trace]
     if missing:
         raise KeyError(f"The trace has no draws of the random parameter(s) {missing}.")
 
+    device = model.device
+
     def parameter_values(i):
         return {
-            name: parameter.distribution.transform.forward(flattened_trace[name][indices[i]])
+            name: parameter.distribution.transform.forward(flattened_trace[name][indices[i]].to(device))
             for name, parameter in {**model.params, **model.enumerated_params}.items()
             if name in flattened_trace
         }
@@ -761,7 +855,8 @@ class _MCMCFallback:
         if hasattr(sampler, "set_warmup_length"):
             sampler.set_warmup_length(self.warmup)
         transform = self.parameter.distribution.transform
-        theta = _init_theta(self.state_space, transform.unconstrained_shape(tuple(shape)), dtype)
+        device = torch.as_tensor(self.parameter.observed_values).device
+        theta = _init_theta(self.state_space, transform.unconstrained_shape(tuple(shape)), dtype, device)
         draws = []
         for m in range(self.warmup + n):
             theta, _, _, _ = sampler.step(theta, m < self.warmup)
@@ -812,7 +907,8 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
         return fallbacks[parameter.name].draw(n, shape, dtype).to(dtype)
 
     predicative_samples = {
-        parameter.name: torch.empty(size=(n_draws, samples_per_step, *parameter.predictive_shape), dtype=parameter.observed_values.dtype)
+        # Predictive draws are collected on the CPU, like the traces of sample().
+        parameter.name: torch.empty(size=(n_draws, samples_per_step, *parameter.predictive_shape), dtype=parameter.observed_values.dtype, device="cpu")
         for parameter in observed_order
     }
     prior_trace = {parameter.name: [] for parameter in random_order}
@@ -873,12 +969,12 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
         result.prior = SamplingResult(trace, [0], [[]], [[]], deterministic_trace=det_trace)
     return result
 
-def _init_theta(state_space, shape, dtype):
+def _init_theta(state_space, shape, dtype, device=None):
     if state_space.is_continuous():
-        return torch.randn(shape, dtype=dtype)
+        return torch.randn(shape, dtype=dtype, device=device)
     elif state_space.is_discrete():
         first_value = next(iter(state_space))
-        return first_value * torch.ones(shape, dtype=dtype)
+        return first_value * torch.ones(shape, dtype=dtype, device=device)
 
 def _decide_predicative_step(parameter):
     state_space = parameter.distribution.transformed_state_space

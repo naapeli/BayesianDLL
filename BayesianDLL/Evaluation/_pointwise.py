@@ -67,11 +67,22 @@ def pointwise_log_likelihood_plan(model):
 def pointwise_log_likelihood(model, plan):
     """Elementwise log-likelihood of every planned observed node at the model's current values."""
     values = {}
+    n_chains = getattr(model, "n_chains", None)
+    if n_chains is not None and model._batch_mode == "loop":
+        return model._loop_over_chains(lambda: pointwise_log_likelihood(model, plan))
     for name, group in plan.items():
         if group is None:
-            observed = model.observed_params[name]
-            values[name] = observed.distribution.log_pdf(observed.observed_values)
+            if hasattr(model, "_elementwise_term"):
+                value = model._elementwise_term(name)
+                if n_chains is not None and not model._term_is_batched(name):
+                    value = value.unsqueeze(0).expand(n_chains, *value.shape)
+                values[name] = value
+            else:
+                observed = model.observed_params[name]
+                values[name] = observed.distribution.log_pdf(observed.observed_values)
         else:
-            log_terms = group.evaluate(model)["log_terms"]
+            from .._batching import batched_evaluation
+            with batched_evaluation(n_chains):
+                log_terms = group.evaluate(model)["log_terms"]
             values[name] = torch.logsumexp(log_terms, dim=0)
     return values

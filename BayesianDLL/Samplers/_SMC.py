@@ -339,7 +339,7 @@ class _Mutation:
             log_prior[i], log_likelihood[i] = prior, likelihood
 
 
-def sample_smc(model=None, n_particles=1000, kernel="metropolis", n_mutation_steps=None, target_ess=0.5, seed=None, progress_bar=True):
+def sample_smc(model=None, n_particles=1000, kernel="metropolis", n_mutation_steps=None, target_ess=0.5, seed=None, progress_bar=True, vectorized=True):
     """Sequential Monte Carlo sampler with adaptive tempering.
 
     The particles are drawn from the prior and moved through the tempered
@@ -380,6 +380,14 @@ def sample_smc(model=None, n_particles=1000, kernel="metropolis", n_mutation_ste
 
     ``seed`` makes the run reproducible without changing torch's global
     random state; with ``seed=None`` the global generator is used.
+
+    With ``vectorized=True`` (default) the particles are the chain dimension
+    of the batched model (see :meth:`~BayesianDLL.Model.batch`): the
+    weights of all particles are computed with one evaluation and the
+    mutation kernels move all particles at once, also on a GPU. Models with
+    nodes that cannot be batched are evaluated particle by particle inside
+    the same scheme. ``vectorized=False`` uses the particle-by-particle
+    implementation.
     """
     model = get_active_model() if model is None else model
     if kernel not in _KERNELS:
@@ -397,12 +405,17 @@ def sample_smc(model=None, n_particles=1000, kernel="metropolis", n_mutation_ste
     if not model.params:
         raise ValueError("The model has no random parameters to sample.")
 
-    rng = torch.random.fork_rng(devices=[]) if seed is not None else contextlib.nullcontext()
+    device = model.device
+    devices = [device.index if device.index is not None else torch.cuda.current_device()] if device.type == "cuda" else []
+    rng = torch.random.fork_rng(devices=devices) if seed is not None else contextlib.nullcontext()
     saved = {name: p.unconstrained_value for name, p in {**model.params, **model.enumerated_params}.items()}
     try:
         with rng:
             if seed is not None:
                 torch.manual_seed(int(seed))
+            if vectorized:
+                from ._SMC_batched import run_smc_batched
+                return run_smc_batched(model, n_particles, kernel, n_mutation_steps, target_ess, progress_bar)
             return _run_smc(model, n_particles, kernel, n_mutation_steps, target_ess, progress_bar)
     finally:
         for name, value in saved.items():

@@ -690,8 +690,13 @@ class Model:
             return self
         device = self.device if device is None else torch.device(device)
         _move_tensors(self, device, dtype)
-        self._alignment_cache = {}
+        self._clear_batch_caches()
         return self
+
+    def _clear_batch_caches(self):
+        self._alignment_cache = {}
+        for parameter in self.deterministic_params.values():
+            parameter._batched_cache = None
 
     # ------------------------------------------------------------------
     # Batched evaluation (vectorized chains)
@@ -734,7 +739,7 @@ class Model:
             if name in self.deterministic_params and any(p in batched for p in self.graph.predecessors(name)):
                 batched.add(name)
         self._batched_nodes = batched
-        self._alignment_cache = {}
+        self._clear_batch_caches()
         for parameter in list(self.params.values()) + list(self.enumerated_params.values()):
             u = parameter.unconstrained_value
             c = parameter.constrained_value
@@ -764,7 +769,7 @@ class Model:
         self.n_chains = None
         self._batch_mode = None
         self._batched_nodes = set()
-        self._alignment_cache = {}
+        self._clear_batch_caches()
         return self
 
     @contextmanager
@@ -779,7 +784,7 @@ class Model:
             self.n_chains = None
             self._batch_mode = None
             self._batched_nodes = set()
-            self._alignment_cache = {}
+            self._clear_batch_caches()
             for name, (u, c) in saved.items():
                 parameter = self._random_term(name)
                 parameter.unconstrained_value = u
@@ -797,7 +802,7 @@ class Model:
             for name in continuous:
                 u = saved[name][0]
                 if u.is_floating_point():
-                    noise = torch.randn(u.shape, generator=generator, dtype=u.dtype).to(u.device)
+                    noise = torch.randn(u.shape, generator=generator, dtype=u.dtype, device="cpu").to(u.device)
                     self.params[name].set_unconstrained_value(u + 0.3 * noise)
             chains = list(range(min(self.n_chains, n_check)))
             try:
@@ -1007,6 +1012,13 @@ class Model:
                 total = total + self._prior_term(self.params[name])
         return total
 
+    def _prior_gradient(self, names):
+        """Gradient of the sum of all prior terms of the random parameters w.r.t. ``names``."""
+        terms = set(self.params)
+        if self.n_chains is not None and self._batch_mode == "loop":
+            return self._loop_over_chains(lambda: self._reverse_pass(names, active_terms=terms))
+        return self._reverse_pass(names, active_terms=terms)
+
     def _batched_reverse_pass(self, param_names, nodes=None, active_terms=None, term_weights=None):
         """Batched counterpart of :meth:`_reverse_pass` (gradients of shape ``(n_chains, *value_shape)``)."""
         if active_terms is None:
@@ -1121,6 +1133,7 @@ class Model:
 
 
     def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, start_point_variance=1, blocks=None, seed=None, **sampler_params):
+        """Sample the posterior; see :func:`BayesianDLL.sample` (e.g. ``chain_method="vectorized"``, ``device="cuda"``)."""
         from .Samplers import sample as _sample
         return _sample(n_samples, warmup_length, n_chains=n_chains, model=self, progress_bar=progress_bar, start_point_variance=start_point_variance, blocks=blocks, seed=seed, **sampler_params)
 
@@ -1190,7 +1203,8 @@ def condition(model: Model, random_variable_names_and_values: dict = None, **kwa
             dtype = param.observed_values.dtype
             target_shape = param.observed_values.shape
 
-        val_tensor = torch.as_tensor(v, dtype=dtype)
+        device = (param.constrained_value if latent else torch.as_tensor(param.observed_values)).device
+        val_tensor = torch.as_tensor(v, dtype=dtype, device=device)
         if val_tensor.shape != target_shape:
             try:
                 val_tensor = val_tensor.reshape(target_shape)
