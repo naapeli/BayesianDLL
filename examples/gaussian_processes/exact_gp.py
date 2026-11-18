@@ -63,9 +63,15 @@ with Model() as model:
 # %%
 # Sampling
 # --------
+# A periodic posterior has aliases: a function that repeats every time unit
+# also repeats every two, so a period near 2 (with a shorter lengthscale) is a
+# second, much less probable mode. A chain that starts there stays there, and
+# the chains then disagree (R-hat far above 1). We therefore move the model to
+# its MAP first and start the four chains close to it.
 
+model.find_MAP(lr=0.05, epochs=300, verbose=False)
 start = time.perf_counter()
-trace = model.sample(500, 300, n_chains=2, max_depth=6, seed=1, progress_bar=False)
+trace = model.sample(500, 300, n_chains=4, start_point_variance=0.1, seed=0, progress_bar=False)
 elapsed = time.perf_counter() - start
 summary = trace.summary(include_deterministic=True)
 print(summary)
