@@ -14,9 +14,10 @@ and ``O(n)`` memory instead of the ``O(n³)`` and ``O(n²)`` of a dense
 Cholesky factorisation. The hand-derived gradients reuse the recursion's
 solution ``T⁻¹ e_0`` (Gohberg-Semencul formula) and FFT correlations.
 
-The recursion is sequential (one Python-level step per observation), so
-it overtakes a dense Cholesky factorisation from roughly a thousand points
-on; its memory use is linear throughout. With thousands of points a
+The recursion is sequential (one Python-level step per observation), so a
+multi-threaded dense Cholesky factorisation stays competitive up to one or
+two thousand points; beyond that the recursion wins, and its memory use is
+linear throughout. With thousands of points a
 gradient still costs a noticeable fraction of a second, so this example
 computes a type-II MAP estimate of the hyperparameters instead of running
 MCMC: ``find_MAP`` maximises the exact marginal likelihood (``f``

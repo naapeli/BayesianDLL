@@ -490,6 +490,9 @@ def levinson_solve(first_column, rhs):
 def _levinson(t, rhs):
     """Batched Levinson recursion: ``t`` ``(B, n)``, ``rhs`` ``(B', n, k)`` -> ``((B, n, k), (B,))``."""
     size, n = t.shape
+    if size == 1:
+        solution, log_det = _levinson_single(t[0], rhs[0])
+        return solution.unsqueeze(0), log_det.reshape(1)
     t0 = t[:, 0]
     b = (rhs / t0[:, None, None]).expand(size, n, rhs.shape[-1])
     x = torch.zeros(b.shape, dtype=b.dtype, device=b.device)
@@ -527,6 +530,44 @@ def _levinson(t, rhs):
     if not bool((betas > 0).all()):
         raise RuntimeError("Toeplitz covariance is not positive definite (Levinson recursion broke down).")
     return x, log_det + torch.log(betas).sum(-1)
+
+
+def _levinson_single(t, rhs):
+    """Unbatched Levinson recursion with Python-float scalars (fewer tensor operations per step)."""
+    n = t.shape[0]
+    b = rhs / t[0]
+    x = torch.zeros(b.shape, dtype=b.dtype, device=b.device)
+    x[0] = b[0]
+    log_det = n * torch.log(t[0])
+    if n == 1:
+        return x, log_det
+    r = t[1:] / t[0]
+    reversed_r = r.flip(0).contiguous()
+    y = torch.zeros(n - 1, dtype=t.dtype, device=t.device)
+    reversed_y = torch.zeros_like(y)
+    alpha = -float(r[0])
+    y[0] = alpha
+    reversed_y[n - 2] = alpha
+    beta = 1.0
+    log_beta = 0.0
+    for k in range(1, n):
+        beta = (1.0 - alpha * alpha) * beta
+        if not beta > 0.0:
+            raise RuntimeError("Toeplitz covariance is not positive definite (Levinson recursion broke down).")
+        log_beta += math.log(beta)
+        start = n - 1 - k
+        r_k = reversed_r[start:]
+        mu = (b[k] - r_k @ x[:k]) / beta
+        x[:k].addr_(reversed_y[start:], mu)
+        x[k] = mu
+        if k < n - 1:
+            alpha = -(float(r[k]) + float(r_k @ y[:k])) / beta
+            forward = y[:k] + alpha * reversed_y[start:]
+            reversed_y[start:].add_(y[:k], alpha=alpha)
+            y[:k] = forward
+            y[k] = alpha
+            reversed_y[start - 1] = alpha
+    return x, log_det + log_beta
 
 
 def _correlation(f, g):
@@ -599,8 +640,10 @@ class ToeplitzGP(_GPDistribution):
     Periodic, Constant and their sums/products); ``inputs`` must be equally
     spaced with shape ``(n,)`` or ``(n, 1)``. Levinson's recursion is
     sequential in ``n`` (a Python loop with a few tensor operations per
-    step), so it overtakes a dense Cholesky factorisation from roughly a
-    thousand points on (on CPU); its memory use is ``O(n)`` throughout.
+    step, roughly 0.1 ms), so on a CPU a multi-threaded dense Cholesky
+    factorisation stays competitive up to one or two thousand points; the
+    recursion wins beyond that, and its memory use is ``O(n)`` throughout.
+    With vectorized chains the same loop serves all chains.
     Levinson's recursion is weakly stable for positive-definite matrices;
     very smooth kernels with a tiny noise variance are ill-conditioned for
     any solver, and the recursion raises if it breaks down.
