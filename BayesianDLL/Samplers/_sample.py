@@ -380,9 +380,10 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
       per-chain step sizes, metrics, adaptation and accept/reject decisions,
       and Gibbs blocks work as in the parallel mode. This is much faster per
       chain for many chains, and it is the only mode on a GPU, because worker
-      processes and CUDA do not mix. Nodes that cannot be batched (the GP
-      nodes, or user functions that do not broadcast over a leading chain
-      dimension) are evaluated chain by chain inside the batched computation.
+      processes and CUDA do not mix. The GP nodes are batched over the
+      chains as well; nodes that cannot be batched (user functions that do
+      not broadcast over a leading chain dimension) are evaluated chain by
+      chain inside the batched computation.
     * ``None`` (default): ``"vectorized"`` when the model lives on a CUDA (or
       ROCm) device, ``"parallel"`` otherwise.
 

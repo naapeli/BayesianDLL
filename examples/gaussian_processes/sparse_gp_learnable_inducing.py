@@ -13,7 +13,8 @@ inducing inputs start badly placed, bunched in ``[0, 1.5]``. We compare
 * **fixed Z**: the kernel hyperparameters are fitted, ``Z`` stays put;
 * **learned Z**: ``Z`` (a ``RandomParameter`` of shape ``(8, 1)`` with a
   broad Normal prior around the start) is fitted jointly with the
-  hyperparameters by maximising the VFE bound.
+  hyperparameters by a MAP estimate: the VFE bound plus the log priors is
+  maximised.
 
 The gradient of the bound with respect to ``Z`` is hand-derived: the
 kernel's ``input_vjp`` contracts ``∂K_mn/∂Z`` and ``∂K_mm/∂Z`` with the

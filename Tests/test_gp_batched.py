@@ -340,3 +340,17 @@ def test_timing_vectorized_against_loop(node, n):
     loop_time = _time(model, values, "loop")
     print(f"{cls.__name__} n={n}, C=8: vectorized {1000 * tensor_time:.0f} ms, "
           f"chain-by-chain loop {1000 * loop_time:.0f} ms (x{loop_time / tensor_time:.1f})")
+
+
+def test_plain_callable_with_batched_inducing_points_falls_back_to_the_loop_mode():
+    """The one documented unsupported case: a plain callable cannot evaluate per-chain inputs."""
+    x = torch.linspace(0, 1, 8, dtype=DTYPE)
+    y = torch.sin(4 * x)
+    z0 = torch.linspace(0, 1, 3, dtype=DTYPE)
+    with Model() as model:
+        z = RandomParameter("z", Normal(z0, 0.3), shape=3, initial_value=z0)
+        kernel = RBF(0.4, 1.0) + (lambda a, b: 0.1 * torch.ones(a.shape[0], b.shape[0], dtype=DTYPE))
+        ObservedParameter("y", SparseGP("f", Data("x", x), kernel, inducing_points=z, noise_variance=0.1), y)
+    with pytest.warns(UserWarning, match="chain by chain"):
+        with model.batched(3, mode="auto"):
+            assert model._batch_mode == "loop"

@@ -12,6 +12,19 @@ and the linear algebra (Cholesky factorisations, triangular solves) is
 batched over ``C``. An unbatched evaluation is the ``B = 1`` case, so both
 paths run the same code. Data-dependent jitter (:func:`stable_cholesky`
 retries) is chosen per chain.
+
+What is *not* batched:
+
+* A user kernel that only implements the unbatched ``evaluate`` /
+  ``derivatives`` / ``input_vjp`` is called once per chain inside the
+  batched computation (the GP linear algebra stays batched).
+* A plain callable (not a :class:`Kernel`) inside a ``SumKernel`` /
+  ``ProductKernel`` cannot evaluate per-chain inputs (learnable inputs or
+  inducing points). It raises, and ``Model.batch`` then falls back to the
+  chain-by-chain loop mode with a warning.
+* The predictive functions and ``sample()`` work draw by draw (unbatched).
+* Gradients w.r.t. learnable grid inputs of ``KroneckerGP`` /
+  ``ToeplitzGP`` are not implemented (in batched or unbatched mode).
 """
 
 from __future__ import annotations
