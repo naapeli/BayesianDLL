@@ -291,10 +291,6 @@ def _finish(value, batched):
     return value[0]
 
 
-def _named_model_inputs(values):
-    return {value.name: tensor for value, tensor in values if _is_named(value)}
-
-
 # ----------------------------------------------------------------------------
 # Latent (whitened) GP
 # ----------------------------------------------------------------------------
@@ -617,12 +613,6 @@ class ExactGP(_GPDistribution):
 
 
 _SPARSE_METHODS = ("vfe", "dtc", "fitc")
-
-
-def _with_parameter_axis(derivative):
-    if derivative is not None and derivative.ndim == 2:
-        return derivative.unsqueeze(0)
-    return derivative
 
 
 class SparseGP(_GPDistribution):

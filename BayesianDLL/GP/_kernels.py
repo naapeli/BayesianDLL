@@ -395,10 +395,6 @@ class Kernel(ABC):
         return ProductKernel(other, self)
 
 
-def _batch_shape_of(x1, x2, *values):
-    return max(x1.shape[0], x2.shape[0], *(v.shape[0] for v in values))
-
-
 class Constant(Kernel):
     def __init__(self, variance=1.0):
         super().__init__(variance)
