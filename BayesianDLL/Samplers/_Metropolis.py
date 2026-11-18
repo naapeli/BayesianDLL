@@ -245,7 +245,7 @@ class FiniteGibbs(_CachedTarget):
     def _draw(log_probs):
         """Indices drawn from the normalised ``exp(log_probs)`` along the last dim, and which rows are possible."""
         log_probs = torch.nan_to_num(log_probs, nan=-math.inf)
-        maximum = log_probs.max(dim=-1, keepdim=True).values
+        maximum = torch.amax(log_probs, dim=-1, keepdim=True)
         valid = torch.isfinite(maximum).squeeze(-1)
         weights = torch.exp(log_probs - torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum)))
         weights = torch.where(valid.unsqueeze(-1), weights, torch.ones_like(weights))

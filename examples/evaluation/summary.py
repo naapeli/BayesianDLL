@@ -1,90 +1,86 @@
 """
-Posterior Summary
-=================
+Posterior Summary Table
+=======================
 
-Creates simulated posterior traces and prints a summary table of the means, standard
-deviations, credible intervals and diagnostics with ``summary``. The results are
-compared against ``arviz.summary``.
+``summary(result)`` (or ``result.summary()``) turns posterior draws into a
+table with one row per scalar component: the mean and standard deviation, an
+equal-tailed (``ci_kind="eti"``) or highest-density (``"hdi"``) credible
+interval, the bulk and tail effective sample sizes, R-hat and the Monte Carlo
+standard errors of the mean and of the standard deviation. Deterministic
+nodes are added with ``include_deterministic=True``. A plain dict of draws
+with shape ``(n_chains, n_draws, ...)`` works as well.
+
+The draws here are simulated from known distributions and wrapped in a
+``SamplingResult``, so the table can be checked against the true values and
+against ``arviz.summary``. The figure shows the 94% intervals from both
+libraries next to the true means.
 """
 
-import torch
-import numpy as np
 import arviz as az
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 
 from BayesianDLL.Evaluation import summary
 from BayesianDLL.Samplers._result import SamplingResult
 
 
-print("=" * 80)
-print("TESTING BAYESIANDLL MCMC SUMMARY FUNCTION")
-print("=" * 80)
-
 torch.manual_seed(42)
-np.random.seed(42)
+n_chains, n_draws = 4, 1000
 
-n_chains = 4
-n_samples = 1000
 
-# 1. Create realistic simulated posterior traces with double precision:
-intercept_draws = torch.randn(n_chains, n_samples, dtype=torch.float64) * 0.2 + 1.5
-slope_draws = torch.randn(n_chains, n_samples, dtype=torch.float64) * 0.1 + 2.5
-weights_draws = torch.randn(n_chains, n_samples, 2, dtype=torch.float64) * 0.3 + torch.tensor([0.5, -0.5], dtype=torch.float64)
-sigma_draws = torch.abs(torch.randn(n_chains, n_samples, dtype=torch.float64) * 0.2 + 0.8)
-r2_draws = 0.85 + 0.02 * torch.randn(n_chains, n_samples, dtype=torch.float64)
+def normal_draws(mean, sd, *shape):
+    mean = torch.as_tensor(mean, dtype=torch.float64)
+    return mean + sd * torch.randn(n_chains, n_draws, *shape, dtype=torch.float64)
 
+
+# sigma is |Normal(0.8, 0.2)|, whose mean is 0.8 to three decimals.
+true_means = {"intercept": 1.5, "slope": 2.5, "weights[0]": 0.5, "weights[1]": -0.5, "sigma": 0.8, "R2": 0.85}
 trace = {
-    "intercept": intercept_draws,
-    "slope": slope_draws,
-    "weights": weights_draws,
-    "sigma": sigma_draws,
+    "intercept": normal_draws(1.5, 0.2),
+    "slope": normal_draws(2.5, 0.1),
+    "weights": normal_draws([0.5, -0.5], 0.3, 2),
+    "sigma": normal_draws(0.8, 0.2).abs(),
 }
-deterministic_trace = {
-    "R2": r2_draws
-}
-
-sampling_result = SamplingResult(
+result = SamplingResult(
     trace=trace,
-    divergences=[0, 0, 0, 0],
-    acceptance_probabilities=[[0.8], [0.8], [0.8], [0.8]],
-    step_sizes=[[0.05], [0.05], [0.05], [0.05]],
-    deterministic_trace=deterministic_trace
+    divergences=[0] * n_chains,
+    acceptance_probabilities=[[0.8]] * n_chains,
+    step_sizes=[[0.05]] * n_chains,
+    deterministic_trace={"R2": normal_draws(0.85, 0.02)},
 )
 
-print("\n--- BayesianDLL sampling_result.summary(hdi_prob=0.94) ---")
-df_summary = sampling_result.summary(hdi_prob=0.94, round_to=3, include_deterministic=True)
-print(df_summary)
+table = result.summary(hdi_prob=0.94, include_deterministic=True)
+print("BayesianDLL summary")
+print(table.to_string())
 
-print("\n--- ArviZ az.summary() on the exact same draws ---")
-az_dict = {
-    "intercept": intercept_draws.numpy(),
-    "slope": slope_draws.numpy(),
-    "weights": weights_draws.numpy(),
-    "sigma": sigma_draws.numpy(),
-    "R2": r2_draws.numpy()
-}
-idata = az.convert_to_dataset(az_dict)
-az_df = az.summary(idata, ci_prob=0.94, ci_kind="eti")
-print(az_df)
+draws = {**result.trace, **result.deterministic_trace}
+idata = az.convert_to_dataset({name: value.numpy() for name, value in draws.items()})
+reference = az.summary(idata, ci_prob=0.94, ci_kind="eti", round_to="none")
+print("\nArviZ summary of the same draws")
+print(reference.to_string())
 
-print("\n" + "=" * 80)
-print("EXACT NUMERICAL COMPARISON CHECK (Unrounded raw values):")
-print("=" * 80)
-df_summary_raw = sampling_result.summary(hdi_prob=0.94, round_to=None, include_deterministic=True)
-az_df_raw = az.summary(idata, ci_prob=0.94, ci_kind="eti", round_to="none")
+raw = result.summary(hdi_prob=0.94, round_to=None, include_deterministic=True)
+columns = {"mean": "mean", "sd": "sd", "eti_3%": "eti94_lb", "eti_97%": "eti94_ub", "ess_bulk": "ess_bulk",
+           "ess_tail": "ess_tail", "r_hat": "r_hat", "mcse_mean": "mcse_mean", "mcse_sd": "mcse_sd"}
+print("\nlargest absolute difference to ArviZ per column")
+for ours, theirs in columns.items():
+    difference = np.max(np.abs(raw[ours].to_numpy(float) - reference[theirs].to_numpy(float)))
+    print(f"  {ours:10s} {difference:.2e}")
 
-col_pairs = [
-    ("mean", "mean"),
-    ("sd", "sd"),
-    ("eti_3%", "eti94_lb"),
-    ("eti_97%", "eti94_ub"),
-    ("ess_bulk", "ess_bulk"),
-    ("ess_tail", "ess_tail"),
-    ("r_hat", "r_hat"),
-    ("mcse_mean", "mcse_mean"),
-    ("mcse_sd", "mcse_sd"),
-]
-for col_bdll, col_az in col_pairs:
-    if col_bdll in df_summary_raw.columns and col_az in az_df_raw.columns:
-        diff = np.max(np.abs(df_summary_raw[col_bdll].values.astype(float) - az_df_raw[col_az].values.astype(float)))
-        print(f"  Max absolute difference on '{col_bdll}': {diff:.10f}")
-print("=" * 80)
+fig, ax = plt.subplots(figsize=(8, 4.5), layout="constrained")
+rows = list(raw.index)
+positions = np.arange(len(rows))
+ax.errorbar(raw["mean"], positions - 0.12, xerr=[raw["mean"] - raw["eti_3%"], raw["eti_97%"] - raw["mean"]],
+            fmt="o", capsize=3, label="BayesianDLL")
+ax.errorbar(reference["mean"], positions + 0.12,
+            xerr=[reference["mean"] - reference["eti94_lb"], reference["eti94_ub"] - reference["mean"]],
+            fmt="s", capsize=3, label="ArviZ")
+truth = [true_means.get(row, true_means.get(row.split("[")[0], np.nan)) for row in rows]
+ax.plot(truth, positions, "k|", markersize=16, label="true mean")
+ax.set_yticks(positions, rows)
+ax.invert_yaxis()
+ax.set_xlabel("value")
+ax.set_title("Posterior means with 94% equal-tailed intervals")
+ax.legend(frameon=False, fontsize="small", loc="lower right")
+plt.show()

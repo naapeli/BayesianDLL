@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 from ._transforms import (
     IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform, InverseSoftPlusTransform,
     StickBreakingTransform, CorrCholeskyTransform, ChainTransform, _apply_jacobian_transpose, _log1m_tanh_sq,
-    PositiveDefiniteTransform, OrderedTransform,
+    PositiveDefiniteTransform, OrderedTransform, log_sigmoid,
 )
 from ._state_space import (
     ContinuousReal, ContinuousPositive, ContinuousRange, ContinuousSimplex, DiscretePositive, DiscreteRange, Union,
@@ -504,8 +504,8 @@ class Beta(Distribution):
 
     def _log_prob_unconstrained(self, x_unconstrained):
         a, b = _as_float(self.a, self.b)
-        log_x = F.logsigmoid(x_unconstrained)
-        log_1_minus_x = F.logsigmoid(-x_unconstrained)
+        log_x = log_sigmoid(x_unconstrained)
+        log_1_minus_x = log_sigmoid(-x_unconstrained)
         log_prob = a * log_x + b * log_1_minus_x - (torch.lgamma(a) + torch.lgamma(b) - torch.lgamma(a + b))
         return _bsum(log_prob)
 
@@ -687,7 +687,7 @@ class Uniform(Distribution):
     def _log_prob_unconstrained(self, x_unconstrained):
         # log(1/(high-low)) + log|dx/dz| = log sigmoid(z) + log sigmoid(-z): independent of the bounds.
         z = x_unconstrained
-        return _bsum(F.logsigmoid(z) + F.logsigmoid(-z))
+        return _bsum(log_sigmoid(z) + log_sigmoid(-z))
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         z = x_unconstrained
@@ -1351,7 +1351,7 @@ class _ProbsOrLogits:
         """(log p, log(1-p)) computed stably."""
         if self.logits is not None:
             logits = _as_float(self.logits)
-            return F.logsigmoid(logits), F.logsigmoid(-logits)
+            return log_sigmoid(logits), log_sigmoid(-logits)
         p = _as_float(self.p)
         return torch.log(p), torch.log1p(-p)
 
@@ -1375,7 +1375,7 @@ class Geometric(_ProbsOrLogits, Distribution):
     def log_pdf(self, x):
         if self.logits is not None:
             logits = _as_float(self.logits)
-            return F.logsigmoid(logits) + (x - 1) * F.logsigmoid(-logits)
+            return log_sigmoid(logits) + (x - 1) * log_sigmoid(-logits)
         p = _as_float(self.p)
         return torch.log(p) + torch.special.xlog1py(x - 1, -p)
 
@@ -1573,7 +1573,7 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
         log_norm = torch.lgamma(x + r) - torch.lgamma(r) - torch.lgamma(x + 1)
         if self.logits is not None:
             logits = _as_float(self.logits)
-            return log_norm + x * F.logsigmoid(logits) + r * F.logsigmoid(-logits)
+            return log_norm + x * log_sigmoid(logits) + r * log_sigmoid(-logits)
         p = _as_float(self.p)
         return log_norm + torch.xlogy(x, p) + r * torch.log1p(-p)
 
@@ -2173,6 +2173,6 @@ class Mixture(Distribution):
 
 
 def _logsumexp(log_values, dim=0):
-    max_val, _ = torch.max(log_values, dim=dim, keepdim=True)
+    max_val = torch.amax(log_values, dim=dim, keepdim=True)
     sum_exp = torch.sum(torch.exp(log_values - max_val), dim=dim, keepdim=True)
     return (max_val + torch.log(sum_exp)).squeeze(dim)

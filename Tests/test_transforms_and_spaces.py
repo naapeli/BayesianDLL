@@ -77,3 +77,26 @@ def test_union_and_joint_spaces():
     assert joint.is_continuous()
     assert joint.contains(torch.tensor([-3.0, 0.0, 1.0]))
     assert not joint.contains(torch.tensor([-3.0, 0.0, -1.0]))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_log_sigmoid_matches_torch(dtype):
+    # Regression test: log_sigmoid replaces torch.nn.functional.logsigmoid,
+    # whose CPU kernel always uses the thread pool and is very slow on busy
+    # machines. It must give the same values, also far in the tails.
+    from BayesianDLL.Distributions._transforms import log_sigmoid
+
+    x = torch.cat([torch.linspace(-60.0, 60.0, 241, dtype=dtype), torch.tensor([-1e4, 1e4], dtype=dtype)])
+    expected = torch.nn.functional.logsigmoid(x)
+    assert torch.allclose(log_sigmoid(x), expected, rtol=1e-6 if dtype == torch.float32 else 1e-12, atol=0)
+    assert torch.isfinite(log_sigmoid(x)).all()
+
+
+def test_mixture_logsumexp_matches_torch():
+    # Regression test: _logsumexp uses torch.amax instead of torch.max(dim=...),
+    # whose CPU kernel (values and indices) is very slow on busy machines.
+    from BayesianDLL.Distributions._distributions import _logsumexp
+
+    x = torch.randn(3, 5, 2, dtype=torch.float64) * 10
+    for dim in (0, 1, -1):
+        assert torch.allclose(_logsumexp(x, dim=dim), torch.logsumexp(x, dim=dim))
