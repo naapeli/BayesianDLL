@@ -22,7 +22,8 @@ What is *not* batched:
   ``ProductKernel`` cannot evaluate per-chain inputs (learnable inputs or
   inducing points). It raises, and ``Model.batch`` then falls back to the
   chain-by-chain loop mode with a warning.
-* The predictive functions and ``sample()`` work draw by draw (unbatched).
+* The predictive functions and ``sample()`` work draw by draw (unbatched),
+  except :func:`sparse_latent_gp_predictive`, which batches the draws.
 * Gradients w.r.t. learnable grid inputs of ``KroneckerGP`` /
   ``ToeplitzGP`` are not implemented (in batched or unbatched mode).
 """
@@ -1193,3 +1194,297 @@ def sparse_gp_predictive(
         )
 
     return torch.stack(outputs)
+
+
+# ----------------------------------------------------------------------------
+# Sparse latent (whitened inducing-point) GP
+# ----------------------------------------------------------------------------
+
+
+class SparseLatentGP(DeterministicParameter):
+    r"""A whitened inducing-point latent GP function node (DTC / projected process).
+
+    With ``m`` inducing inputs ``Z``, ``L Lᵀ = K_mm(Z) + jitter I`` and a
+    standard-normal *whitened* vector ``v`` of shape ``(m,)``, the value is
+
+    ``f(X) = mean + K_nm L⁻ᵀ v``.
+
+    Equivalently ``u = L v ~ Normal(0, K_mm)`` are the function values at
+    ``Z`` and ``f = K_nm K_mm⁻¹ u`` is their kernel interpolation, so the
+    prior covariance of ``f`` is the Nyström / DTC approximation
+    ``Q_nn = K_nm K_mm⁻¹ K_mn`` of ``K_nn``. Only ``m x m`` matrices are
+    factorised and ``m`` latent values are sampled, whatever the number of
+    training inputs ``n``; with ``Z = X`` (``m = n``) the node equals
+    :class:`LatentGP` up to the jitter.
+
+    No FITC-style diagonal correction ``diag(K_nn - Q_nn)`` is added to the
+    prior: it would need ``n`` further latent values and a square root whose
+    derivative is infinite where the correction vanishes. The prior variance
+    of ``f`` is therefore smaller than ``k(x, x)`` away from the inducing
+    inputs; this is the DTC approximation, and it is why the inducing inputs
+    should cover the data (or be learned).
+
+    Arguments:
+
+    * ``inputs``: a named ``Data`` node (or a learnable parameter) of shape
+      ``(n, D)`` or ``(n,)``;
+    * ``inducing_points``: ``(m, D)`` or ``(m,)``; a fixed tensor, a ``Data``
+      node, or a learnable ``RandomParameter`` / ``DeterministicParameter``
+      (e.g. ``RandomParameter("Z", Normal(Z0, 1.0), initial_value=Z0)``);
+    * ``whitened_values``: a ``RandomParameter`` with ``m`` values and a
+      ``Normal(0, 1)`` prior; ``None`` creates ``<name>_white``;
+    * ``mean``: a scalar, a vector with one value per input, or a named
+      parameter.
+
+    **Gradients** (hand-derived VJP). For a cotangent ``g`` of ``f`` let
+    ``a = L⁻ᵀ v``, so that ``f = mean + K_nm a``:
+
+    * ``v`` gets ``c = L⁻¹ K_mn g``;
+    * ``K_mn = K(Z, X)`` gets ``G_mn = a gᵀ``;
+    * ``L`` gets ``L̄ = -a cᵀ`` (from ``da = -L⁻ᵀ dLᵀ a``), and the Cholesky
+      VJP maps it to ``G_mm = sym(L⁻ᵀ Φ(Lᵀ L̄) L⁻¹)`` with ``Lᵀ L̄ = -v cᵀ``
+      (``Φ`` takes the lower triangle and halves the diagonal), plus the
+      correction for the scale-dependent jitter;
+    * a kernel hyperparameter ``θ`` gets
+      ``⟨G_mn, ∂K_mn/∂θ⟩ + ⟨G_mm, ∂K_mm/∂θ⟩``;
+    * learnable inducing inputs get
+      ``kernel.input_vjp(Z, X, G_mn) + kernel.input_vjp_symmetric(Z, G_mm)``
+      and learnable training inputs ``kernel.input_vjp(X, Z, G_mnᵀ)``;
+    * the mean gets ``g``.
+
+    With vectorized chains everything is batched over the chain dimension
+    (``v`` ``(C, m)``, ``Z`` ``(C, m, D)``, hyperparameters ``(C, ...)``).
+    Use :func:`sparse_latent_gp_predictive` for predictions at new inputs.
+    """
+
+    def __init__(
+        self,
+        name,
+        inputs,
+        kernel: Kernel,
+        inducing_points,
+        whitened_values=None,
+        mean=0.0,
+        jitter=1e-6,
+    ):
+        if not isinstance(kernel, Kernel):
+            raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
+        if not _is_named(inputs):
+            raise TypeError("inputs must be a named Data or model parameter node.")
+        if not _is_named(inducing_points):
+            inducing_points = _as_tensor(inducing_points)
+            if not inducing_points.is_floating_point():
+                inducing_points = inducing_points.to(torch.get_default_dtype())
+        m = _feature_count(inducing_points)
+        if whitened_values is None:
+            whitened_values = RandomParameter(f"{name}_white", Normal(0.0, 1.0), shape=m)
+        if not _is_named(whitened_values) or isinstance(whitened_values, Data):
+            raise TypeError("whitened_values must be a named model parameter node.")
+        if whitened_values.constrained_value.numel() != m:
+            raise ValueError(
+                f"whitened_values must contain one value per inducing input ({m}); "
+                f"got {whitened_values.constrained_value.numel()}."
+            )
+
+        kernel_parameters = list(kernel.parameters)
+        model_inputs = [inputs, whitened_values]
+        self._inducing_index = None
+        if _is_named(inducing_points):
+            self._inducing_index = len(model_inputs)
+            model_inputs.append(inducing_points)
+        self._kernel_start = len(model_inputs)
+        model_inputs.extend(kernel_parameters)
+        mean_input = mean if _is_named(mean) else None
+        if mean_input is not None:
+            model_inputs.append(mean_input)
+        self._kernel_parameters = kernel_parameters
+        self._mean_input = mean_input
+        self._fixed_inducing = None if _is_named(inducing_points) else inducing_points
+
+        def forward(*values):
+            return self._batched_function(values, [False] * len(values))[0][0]
+
+        def vjp(cotangent, *values):
+            flags = [False] * len(values)
+            return _finish(self._batched_vjp(_as_tensor(cotangent).unsqueeze(0), values, flags), False)
+
+        super().__init__(name, forward, None, model_inputs, vjp_func=vjp)
+        self.gp_inputs = inputs
+        self.gp_inducing_points = inducing_points
+        self.gp_latent = whitened_values
+        self.gp_kernel = kernel
+        self.gp_mean = mean
+        self.gp_jitter = jitter
+
+    @staticmethod
+    def _learnable(node):
+        return not isinstance(node, Data) and isinstance(node, (RandomParameter, DeterministicParameter))
+
+    def _batched_function(self, values, flags):
+        """``(f, pieces)`` in batched form for input ``values`` with chain flags ``flags``."""
+        context = _BatchContext({id(node): bool(flag) for node, flag in zip(self.inputs, flags)})
+        v = context.value(self.inputs[1], raw=values[1])
+        v = v.reshape(v.shape[0], -1)
+        dtype, device = v.dtype, v.device
+        x = context.inputs(self.inputs[0], dtype, device, raw=values[0])
+        if self._inducing_index is not None:
+            z = context.inputs(self.inputs[self._inducing_index], dtype, device, raw=values[self._inducing_index])
+        else:
+            z = context.inputs(self._fixed_inducing, dtype, device)
+        stop = self._kernel_start + len(self._kernel_parameters)
+        raw = {p.name: value for p, value in zip(self.inputs[self._kernel_start:stop], values[self._kernel_start:stop])}
+        kernel_values = context.kernel_values(self.gp_kernel, dtype, device, raw)
+        k_mm = self.gp_kernel.batch_evaluate(z, z, kernel_values)
+        k_mn = self.gp_kernel.batch_evaluate(z, x, kernel_values)
+        size = max(k_mm.shape[0], k_mn.shape[0], v.shape[0])
+        factor, jitter_info = batched_stable_cholesky(_expand_batch(k_mm, size), jitter=self.gp_jitter)
+        # a = L⁻ᵀ v, so that f = mean + K_nm a.
+        a = torch.linalg.solve_triangular(factor.transpose(-2, -1), v.unsqueeze(-1), upper=True)
+        n = x.shape[1]
+        if self._mean_input is not None:
+            mean = _batched_mean(context, self._mean_input, n, dtype, device, "SparseLatentGP", raw=values[-1])
+        else:
+            mean = _mean_value(self.gp_mean, torch.zeros(n, dtype=dtype, device=device)).reshape(1, n)
+        f = mean + (k_mn.transpose(-2, -1) @ a).squeeze(-1)
+        return f, (context, x, z, v, kernel_values, k_mn, factor, jitter_info, a)
+
+    def _batched_vjp(self, cotangent, values, flags):
+        _, (context, x, z, v, kernel_values, k_mn, factor, jitter_info, a) = self._batched_function(values, flags)
+        g = cotangent.reshape(cotangent.shape[0], -1).to(dtype=v.dtype)
+
+        def shape_of(node, value):
+            value = _as_tensor(value)
+            return tuple(value.shape[1:]) if context.is_batched(node) else tuple(value.shape)
+
+        grads = {}
+        # v gets c = L⁻¹ K_mn g.
+        c = torch.linalg.solve_triangular(factor, k_mn @ g.unsqueeze(-1), upper=False)  # (B, m, 1)
+        latent = self.inputs[1]
+        grads[latent.name] = c.reshape(c.shape[0], *shape_of(latent, values[1]))
+        # K_mn gets G_mn = a gᵀ.
+        g_mn = a * g.unsqueeze(-2)  # (B, m, n)
+        # L gets L̄ = -a cᵀ; Lᵀ L̄ = -v cᵀ, which the Cholesky VJP maps to K_mm.
+        outer = -(v.unsqueeze(-1) * c.transpose(-2, -1))
+        lower = torch.tril(outer, diagonal=-1) + 0.5 * torch.diag_embed(torch.diagonal(outer, dim1=-2, dim2=-1))
+        left = torch.linalg.solve_triangular(factor.transpose(-2, -1), lower, upper=True)
+        g_mm = torch.linalg.solve_triangular(factor, left, upper=False, left=False)
+        g_mm = _jitter_cotangent(jitter_info, 0.5 * (g_mm + g_mm.transpose(-2, -1)))
+        size = max(g_mn.shape[0], g_mm.shape[0])
+        g_mn, g_mm = _expand_batch(g_mn, size), _expand_batch(g_mm, size)
+
+        cross = self.gp_kernel.batch_derivatives(z, x, kernel_values)
+        inducing = self.gp_kernel.batch_derivatives(z, z, kernel_values)
+        for name in {**cross, **inducing}:
+            gradient = 0.0
+            if name in cross:
+                gradient = gradient + _contract(g_mn, cross[name])
+            if name in inducing:
+                gradient = gradient + _contract(g_mm, inducing[name])
+            parameter = next(p for p in self._kernel_parameters if p.name == name)
+            value = values[self.inputs.index(parameter)]
+            grads[name] = _to_parameter_shape(gradient, shape_of(parameter, value))
+
+        if self._inducing_index is not None and self._learnable(self.inputs[self._inducing_index]):
+            node = self.inputs[self._inducing_index]
+            z_full = _expand_batch(z, size)
+            z_gradient = self.gp_kernel.batch_input_vjp(z_full, x, g_mn, kernel_values)
+            z_gradient = z_gradient + self.gp_kernel.batch_input_vjp_symmetric(z_full, g_mm, kernel_values)
+            grads[node.name] = z_gradient.reshape(size, *shape_of(node, values[self._inducing_index]))
+        if self._learnable(self.inputs[0]):
+            node = self.inputs[0]
+            x_gradient = self.gp_kernel.batch_input_vjp(_expand_batch(x, size), z, g_mn.transpose(-2, -1), kernel_values)
+            grads[node.name] = x_gradient.reshape(size, *shape_of(node, values[0]))
+        if self._mean_input is not None:
+            grads[self._mean_input.name] = _to_parameter_shape(g, shape_of(self._mean_input, values[-1]))
+        return grads
+
+    # -- vectorized chains -------------------------------------------------
+    def batched_forward(self, input_values):
+        f, _ = self._batched_function(input_values, self._batched_flags())
+        return _expand_batch(f, self.owner_model.n_chains)
+
+    def batched_vjp(self, cotangent, input_values):
+        flags = self._batched_flags()
+        grads = self._batched_vjp(cotangent, input_values, flags)
+        result = {}
+        for node, flag in zip(self.inputs, flags):
+            name = getattr(node, "name", None)
+            if flag and name in grads:
+                result[name] = _expand_batch(grads[name], self.owner_model.n_chains)
+        return result
+
+
+def _draws_of(trace, node, n_draws, dtype, device):
+    """``(n_draws, *shape)`` draws of ``node`` from ``trace``, or ``(1, *shape)`` when it is not traced."""
+    if _is_named(node) and not isinstance(node, Data) and node.name in trace:
+        values = torch.as_tensor(trace[node.name])
+        values = values.reshape(-1, *values.shape[2:]) if values.ndim >= 2 else values.reshape(-1, 1)
+        if values.shape[0] != n_draws:
+            raise ValueError(f"The trace of '{node.name}' has {values.shape[0]} draws; expected {n_draws}.")
+        return values.to(dtype=dtype, device=device)
+    value = _input_value(node) if _is_named(node) else _as_tensor(node)
+    return torch.as_tensor(value).to(dtype=dtype, device=device).unsqueeze(0)
+
+
+def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_variance=False, chunk_size=64):
+    r"""Values of a :class:`SparseLatentGP` at new inputs for every draw of ``trace``.
+
+    Under the DTC approximation the function is deterministic given the
+    whitened values ``v``, the inducing inputs and the hyperparameters:
+    ``f* = mean + K_*m L⁻ᵀ v``. With ``conditional_variance=True``
+    independent Normal noise with the FITC-style variance
+    ``diag(K_** - Q_**)`` (the prior variance that the inducing values do not
+    explain) is added to every sample.
+
+    ``trace`` is a ``SamplingResult`` (from NUTS or ``guide.sample``) or a
+    mapping with values of shape ``(n_chains, n_draws, *shape)``. It must
+    contain the whitened values; learnable inducing inputs, kernel
+    parameters and a named mean are read from it as well (a node missing
+    from the trace keeps its current value). Draws are evaluated in batches
+    of ``chunk_size`` with the batched kernel API. The result has shape
+    ``(n_parameter_draws, n_samples, n_new)``.
+    """
+    if not isinstance(gp, SparseLatentGP):
+        raise TypeError("gp must be a SparseLatentGP node returned by BayesianDLL.GP.SparseLatentGP.")
+    if not hasattr(trace, "__getitem__"):
+        raise TypeError("trace must be a SamplingResult or mapping-like object.")
+    if n_samples < 1:
+        raise ValueError("n_samples must be at least 1.")
+    latent = torch.as_tensor(trace[gp.gp_latent.name])
+    dtype, device = latent.dtype, latent.device
+    v = latent.reshape(-1, latent.shape[-1])
+    n_draws = v.shape[0]
+
+    z = _draws_of(trace, gp.gp_inducing_points, n_draws, dtype, device)
+    if z.ndim == 2:
+        z = z.unsqueeze(-1)
+    new = torch.as_tensor(_input_value(new_inputs)).to(dtype=dtype, device=device)
+    new = (new.reshape(-1, 1) if new.ndim <= 1 else new).unsqueeze(0)
+    kernel_draws = {p.name: _draws_of(trace, p, n_draws, dtype, device) for p in gp.gp_kernel.parameters}
+    mean = _draws_of(trace, gp.gp_mean, n_draws, dtype, device)
+    mean = mean.reshape(mean.shape[0], -1)
+    if mean.shape[-1] != 1:
+        raise ValueError("sparse_latent_gp_predictive supports only a scalar mean.")
+
+    def take(tensor, start, stop):
+        return tensor if tensor.shape[0] == 1 else tensor[start:stop]
+
+    outputs = []
+    for start in range(0, n_draws, chunk_size):
+        stop = min(start + chunk_size, n_draws)
+        size = stop - start
+        values = {name: take(draws, start, stop) for name, draws in kernel_draws.items()}
+        z_chunk = take(z, start, stop)
+        k_mm = gp.gp_kernel.batch_evaluate(z_chunk, z_chunk, values)
+        k_ms = gp.gp_kernel.batch_evaluate(z_chunk, new, values)
+        factor, _ = batched_stable_cholesky(_expand_batch(k_mm, size), jitter=gp.gp_jitter)
+        a = torch.linalg.solve_triangular(factor.transpose(-2, -1), v[start:stop].unsqueeze(-1), upper=True)
+        f = take(mean, start, stop) + (k_ms.transpose(-2, -1) @ a).squeeze(-1)  # (size, n_new)
+        f = f.unsqueeze(1).expand(size, n_samples, f.shape[-1])
+        if conditional_variance:
+            projected = torch.linalg.solve_triangular(factor, _expand_batch(k_ms, size), upper=False)
+            k_diag = _expand_batch(gp.gp_kernel.batch_diag(new, values), size)
+            variance = (k_diag - projected.square().sum(-2)).clamp_min(0.0)
+            f = f + variance.sqrt().unsqueeze(1) * torch.randn(f.shape, dtype=dtype, device=device)
+        outputs.append(f)
+    return torch.cat(outputs)

@@ -18,6 +18,8 @@ from ._kernels import (
 from ._process import (
     ExactGP,
     LatentGP,
+    SparseLatentGP,
+    sparse_latent_gp_predictive,
     exact_gp_predictive,
     SparseGP,
     sparse_gp_predictive,
@@ -47,6 +49,8 @@ __all__ = [
     "SumKernel",
     "ProductKernel",
     "LatentGP",
+    "SparseLatentGP",
+    "sparse_latent_gp_predictive",
     "ExactGP",
     "gp_predictive",
     "exact_gp_predictive",
