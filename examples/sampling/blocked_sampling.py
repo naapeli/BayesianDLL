@@ -75,13 +75,13 @@ def robust_model(samplers):
 # Hand-picked samplers and blocks
 # -------------------------------
 custom_model = robust_model({"sigma": "slice", "w": "metropolis", "z": "gibbs"})
-custom = custom_model.sample(800, 300, n_chains=4, seed=5, chain_method="vectorized", progress_bar=False,
+custom = custom_model.sample(600, 300, n_chains=4, seed=5, chain_method="vectorized", progress_bar=False,
                              blocks=[["alpha", "beta"], "sigma", "w", "z"])
 
 # %%
 # Automatic choice
 # ----------------
-automatic = robust_model({}).sample(800, 300, n_chains=4, seed=6, chain_method="vectorized", progress_bar=False)
+automatic = robust_model({}).sample(600, 300, n_chains=4, seed=6, chain_method="vectorized", progress_bar=False)
 
 for label, result in (("hand-picked", custom), ("automatic", automatic)):
     print(f"\n{label} blocks:")

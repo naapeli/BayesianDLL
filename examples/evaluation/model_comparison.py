@@ -103,7 +103,7 @@ def curvature(dataset):
 
 checks = {}
 for name, model in models.items():
-    predictive = model.posterior_predicative(results[name], n_samples=100, samples_per_step=10, progress_bar=False)
+    predictive = model.posterior_predicative(results[name], n_samples=50, samples_per_step=20, progress_bar=False)
     checks[name] = ppc_pvalue(predictive, y, curvature)
     print(f"{name}: P(T(y_rep) >= T(y)) = {checks[name].p_value:.3f}")
 
