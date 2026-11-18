@@ -1,4 +1,31 @@
-"""Latent and exact Gaussian processes for MCMC and variational inference."""
+"""Latent, exact and sparse Gaussian processes for MCMC and variational inference.
+
+Vectorized chains
+-----------------
+All GP nodes are evaluated in a *batched form*: every quantity carries a
+leading batch dimension ``B`` that is either the number of chains ``C`` (for
+values that depend on a latent parameter of a batched model, see
+:mod:`BayesianDLL._batching`) or ``1`` (shared values: data, constants, and
+everything in an unbatched model). Kernels evaluate batched hyperparameters
+``(C, *shape)`` and batched inputs ``(C, N, D)`` to ``(C, N, M)`` matrices,
+and the linear algebra (Cholesky factorisations, triangular solves) is
+batched over ``C``. An unbatched evaluation is the ``B = 1`` case, so both
+paths run the same code. Data-dependent jitter (:func:`stable_cholesky`
+retries) is chosen per chain.
+
+What is *not* batched:
+
+* A user kernel that only implements the unbatched ``evaluate`` /
+  ``derivatives`` / ``input_vjp`` is called once per chain inside the
+  batched computation (the GP linear algebra stays batched).
+* A plain callable (not a :class:`Kernel`) inside a ``SumKernel`` /
+  ``ProductKernel`` cannot evaluate per-chain inputs (learnable inputs or
+  inducing points). It raises, and ``Model.batch`` then falls back to the
+  chain-by-chain loop mode with a warning.
+* The predictive functions and ``sample()`` work draw by draw (unbatched).
+* Gradients w.r.t. learnable grid inputs of ``KroneckerGP`` /
+  ``ToeplitzGP`` are not implemented (in batched or unbatched mode).
+"""
 
 from __future__ import annotations
 
@@ -6,12 +33,64 @@ import math
 
 import torch
 
+from .. import _batching
 from .._data import Data
 from .._parameters import DeterministicParameter, RandomParameter
 from ..Distributions._distributions import Distribution
 from ..Distributions._resolve import resolve
 from ..Distributions import Normal
 from ._kernels import Kernel, _is_named
+
+
+# ----------------------------------------------------------------------------
+# Cholesky factorisation with per-chain jitter
+# ----------------------------------------------------------------------------
+
+
+def batched_stable_cholesky(matrix, jitter=1e-6, max_tries=6):
+    """Batched :func:`stable_cholesky` for ``(B, n, n)`` matrices; the jitter is chosen per matrix.
+
+    Returns ``(factor, (jitter, scale, index))`` with tensors of shape
+    ``(B,)``: the jitter added to each diagonal, ``max(1, max|diag|)`` and the
+    index of the largest diagonal entry when it exceeds one (``-1``
+    otherwise; then the jitter does not depend on the matrix). A matrix that
+    needs a larger jitter does not change the others.
+    """
+    matrix = (matrix + matrix.transpose(-2, -1)) / 2
+    if not torch.isfinite(matrix).all():
+        raise ValueError("GP covariance contains non-finite values.")
+    n = matrix.shape[-1]
+    eye = torch.eye(n, dtype=matrix.dtype, device=matrix.device)
+    diagonal = torch.diagonal(matrix, dim1=-2, dim2=-1).abs()
+    largest, argmax = diagonal.max(dim=-1)
+    scale = largest.clamp_min(1.0)
+    # The jitter is proportional to the largest diagonal entry only when that
+    # entry exceeds one; otherwise the scale is the constant 1.
+    index = torch.where(largest > 1.0, argmax, torch.full_like(argmax, -1))
+    current = (torch.as_tensor(jitter, dtype=matrix.dtype, device=matrix.device) * scale).clamp_min(
+        torch.finfo(matrix.dtype).eps * scale
+    )
+    failed = None
+    for _ in range(max_tries):
+        factor, info = torch.linalg.cholesky_ex(matrix + current[:, None, None] * eye)
+        failed = info != 0
+        if not bool(failed.any()):
+            return factor, (current, scale, index)
+        current = torch.where(failed, current * 10, current)
+
+    # A covariance assembled in finite precision can have a small negative
+    # eigenvalue even when the kernel is theoretically positive semidefinite.
+    # Correct the smallest eigenvalue of the failing matrices directly as a
+    # final fallback for difficult MCMC proposals; the correction is treated
+    # as a constant.
+    minimum = torch.linalg.eigvalsh(matrix).amin(dim=-1)
+    correction = (-minimum + torch.finfo(matrix.dtype).eps * scale).clamp_min(current)
+    current = torch.where(failed, correction, current)
+    index = torch.where(failed, torch.full_like(index, -1), index)
+    factor, info = torch.linalg.cholesky_ex(matrix + current[:, None, None] * eye)
+    if bool((info != 0).any()):
+        raise RuntimeError(f"Could not compute a positive-definite Cholesky factor after {max_tries} jitter attempts.")
+    return factor, (current, scale, index)
 
 
 def stable_cholesky(matrix, jitter=1e-6, max_tries=6, return_jitter=False):
@@ -21,56 +100,42 @@ def stable_cholesky(matrix, jitter=1e-6, max_tries=6, return_jitter=False):
     multiplied by 10 for every failed attempt. With ``return_jitter=True`` the
     result is ``(factor, jitter_info)``, where ``jitter_info`` describes the
     added jitter so that derivatives can account for its dependence on the
-    covariance (see :func:`_jitter_derivative`).
+    covariance (see :func:`_jitter_derivative`). A batch ``(B, n, n)`` is
+    factorised with a jitter per matrix (see :func:`batched_stable_cholesky`).
     """
-    matrix = (matrix + matrix.transpose(-2, -1)) / 2
-    if not torch.isfinite(matrix).all():
-        raise ValueError("GP covariance contains non-finite values.")
-    eye = torch.eye(matrix.shape[-1], dtype=matrix.dtype, device=matrix.device)
-    diagonal = torch.diagonal(matrix, dim1=-2, dim2=-1).abs()
-    diagonal_scale = diagonal.max().clamp_min(1.0)
-    # The jitter is proportional to the largest diagonal entry only when that
-    # entry exceeds one; otherwise the scale is the constant 1.
-    scale_index = int(diagonal.argmax()) if bool(diagonal.max() > 1.0) else None
-    current_jitter = torch.as_tensor(jitter, dtype=matrix.dtype, device=matrix.device) * diagonal_scale
-    current_jitter = current_jitter.clamp_min(torch.finfo(matrix.dtype).eps * diagonal_scale)
-    error = None
-    for _ in range(max_tries):
-        factor, info = torch.linalg.cholesky_ex(matrix + current_jitter * eye)
-        if int(info) == 0:
-            if return_jitter:
-                return factor, (current_jitter, diagonal_scale, scale_index)
-            return factor
-        error = RuntimeError(f"Cholesky decomposition failed (info={int(info)}).")
-        current_jitter = current_jitter * 10
+    if matrix.ndim == 3:
+        factor, info = batched_stable_cholesky(matrix, jitter=jitter, max_tries=max_tries)
+        return (factor, info) if return_jitter else factor
+    factor, (current, scale, index) = batched_stable_cholesky(matrix.unsqueeze(0), jitter=jitter, max_tries=max_tries)
+    if return_jitter:
+        position = int(index[0])
+        return factor[0], (current[0], scale[0], None if position < 0 else position)
+    return factor[0]
 
-    # A covariance assembled in finite precision can have a small negative
-    # eigenvalue even when the kernel is theoretically positive semidefinite.
-    # Correct the smallest eigenvalue directly as a final, differentiability-
-    # free fallback for difficult MCMC proposals.
-    minimum_eigenvalue = torch.linalg.eigvalsh(matrix).amin()
-    correction = (-minimum_eigenvalue + torch.finfo(matrix.dtype).eps * diagonal_scale).clamp_min(current_jitter)
-    try:
-        factor = torch.linalg.cholesky(matrix + correction * eye)
-        if return_jitter:
-            # The eigenvalue correction is treated as a constant.
-            return factor, (correction, diagonal_scale, None)
-        return factor
-    except RuntimeError as exc:
-        error = exc
-    raise RuntimeError(
-        f"Could not compute a positive-definite Cholesky factor after {max_tries} jitter attempts."
-    ) from error
+
+def _jitter_coefficient(jitter_info):
+    """``d(jitter) / d(K_ii*)`` per matrix: ``c`` when the scale is a diagonal entry, else 0."""
+    current, scale, index = jitter_info
+    return torch.where(index >= 0, current / scale, torch.zeros_like(current))
+
+
+def _jitter_cotangent(jitter_info, cotangent):
+    """Fold the scale-dependent jitter into a cotangent ``G`` of ``K`` (``(B, n, n)``).
+
+    ``stable_cholesky`` factorises ``K + c max(1, max|diag K|) I``; when the
+    largest diagonal entry ``K_ii*`` exceeds one, ``⟨G, dK + c dK_i*i* I⟩ =
+    ⟨G + c tr(G) e_i* e_i*ᵀ, dK⟩``.
+    """
+    current, scale, index = jitter_info
+    coefficient = _jitter_coefficient(jitter_info)
+    n = cotangent.shape[-1]
+    one_hot = (torch.arange(n, device=cotangent.device) == index.clamp_min(0)[:, None]).to(cotangent.dtype)
+    trace = torch.diagonal(cotangent, dim1=-2, dim2=-1).sum(-1)
+    return cotangent + torch.diag_embed(one_hot * (coefficient * trace)[:, None])
 
 
 def _jitter_derivative(jitter_info, covariance_derivative):
-    """Add the derivative of the scale-dependent jitter to ``dK``.
-
-    ``stable_cholesky`` factorizes ``K + c * max(1, max|diag K|) * I``. When the
-    largest diagonal entry exceeds one, the jitter changes with the covariance
-    and its derivative ``c * d(K_ii)`` (``i`` being the largest diagonal entry)
-    must be included for the gradient to match the factorized matrix.
-    """
+    """Add the derivative of the scale-dependent (unbatched) jitter to ``dK`` ``(..., n, n)``."""
     jitter, scale, index = jitter_info
     if index is None:
         return covariance_derivative
@@ -78,6 +143,11 @@ def _jitter_derivative(jitter_info, covariance_derivative):
     eye = torch.eye(n, dtype=covariance_derivative.dtype, device=covariance_derivative.device)
     scale_derivative = covariance_derivative[..., index, index]
     return covariance_derivative + (jitter / scale) * scale_derivative[..., None, None] * eye
+
+
+# ----------------------------------------------------------------------------
+# Values in batched form
+# ----------------------------------------------------------------------------
 
 
 def _as_tensor(value):
@@ -94,13 +164,17 @@ def _input_value(value):
     return _as_tensor(value)
 
 
-def _named_model_inputs(values):
-    return {value.name: tensor for value, tensor in values if _is_named(value)}
-
-
 def _feature_count(x):
     x = _input_value(x)
     return x.shape[0] if x.ndim > 0 else 1
+
+
+def _resolved_value(value, dtype, device, parameter_values=None):
+    if parameter_values is not None and _is_named(value) and value.name in parameter_values:
+        value = parameter_values[value.name]
+    else:
+        value = resolve(value)
+    return torch.as_tensor(value, dtype=dtype, device=device)
 
 
 def _mean_value(mean, x):
@@ -112,55 +186,139 @@ def _mean_value(mean, x):
     return mean
 
 
-def _resolved_value(value, dtype, device, parameter_values=None):
-    if parameter_values is not None and _is_named(value) and value.name in parameter_values:
-        value = parameter_values[value.name]
-    else:
-        value = resolve(value)
-    return torch.as_tensor(value, dtype=dtype, device=device)
+class _BatchContext:
+    """Which nodes carry a chain dimension in the current evaluation.
 
-
-def _cholesky_output_derivative(factor, covariance_derivative, latent):
-    """Differentiate ``chol(K) @ latent`` from a covariance differential.
-
-    For ``K = L Lᵀ`` and ``A = L⁻¹ dK L⁻ᵀ``:
-
-    ``dL = L @ (tril(A, -1) + 0.5 * diag(diag(A)))``.
-
-    The leading dimensions of ``covariance_derivative`` are parameter
-    dimensions. They are returned after the output dimension so they match
-    the Jacobian convention used by ``Model.joint_grad_log_prob``.
+    Inside a batched term evaluation (``Model.batch`` in tensor mode) the
+    batched nodes of the term are the keys of the active alignment (see
+    :mod:`BayesianDLL._batching`); their values have shape
+    ``(C, *value_shape)``. Every other value is shared and gets a leading
+    batch dimension of one.
     """
-    if covariance_derivative.ndim == 2:
-        covariance_derivative = covariance_derivative.unsqueeze(0)
-    parameter_shape = covariance_derivative.shape[:-2]
-    flat_derivatives = covariance_derivative.reshape(-1, factor.shape[-1], factor.shape[-1])
-    output_derivatives = []
-    for derivative in flat_derivatives:
-        left_solve = torch.linalg.solve_triangular(factor, derivative, upper=False)
-        normalized = torch.linalg.solve_triangular(
-            factor,
-            left_solve.transpose(-2, -1),
-            upper=False,
-        ).transpose(-2, -1)
-        lower = torch.tril(normalized, diagonal=-1)
-        diagonal = 0.5 * torch.diag(torch.diagonal(normalized))
-        factor_derivative = factor @ (lower + diagonal)
-        output_derivatives.append(factor_derivative @ latent)
-    return torch.stack(output_derivatives, dim=-1).reshape(latent.numel(), *parameter_shape)
+
+    def __init__(self, flags=None):
+        self._flags = flags
+        frame = _batching.current()
+        self.pad = frame.pad if frame is not None and frame.n_chains is not None and frame.pad else {}
+
+    def is_batched(self, node):
+        if self._flags is not None:
+            return self._flags.get(id(node), False)
+        return id(node) in self.pad
+
+    def any(self, nodes):
+        return any(self.is_batched(node) for node in nodes if _is_named(node))
+
+    def value(self, node, dtype=None, device=None, raw=None):
+        """Value of ``node`` with a leading batch dimension (``raw`` overrides the node's value)."""
+        if raw is not None:
+            value = _as_tensor(raw)
+        elif _is_named(node):
+            value = _as_tensor(_input_value(node))
+        else:
+            value = _as_tensor(node)
+        if dtype is not None:
+            value = value.to(dtype=dtype, device=device)
+        return value if (_is_named(node) and self.is_batched(node)) else value.unsqueeze(0)
+
+    def inputs(self, node, dtype=None, device=None, raw=None):
+        """Inputs as ``(B, N, D)``."""
+        value = self.value(node, dtype, device, raw)
+        if value.ndim == 1:
+            return value.reshape(value.shape[0], 1, 1)
+        if value.ndim == 2:
+            return value.unsqueeze(-1)
+        return value
+
+    def kernel_values(self, kernel, dtype, device, raw=None):
+        raw = raw or {}
+        return {p.name: self.value(p, dtype, device, raw.get(p.name)) for p in kernel.parameters}
+
+
+def _contract(cotangent, derivative):
+    """``Σ_ij G_bij dK_b...ij``: cotangent ``(B, N, M)``, derivative ``(B', *P, N, M)`` -> ``(B, *P)``."""
+    if derivative.ndim == 3:
+        derivative = derivative.unsqueeze(1)
+    view = cotangent.reshape(cotangent.shape[0], *([1] * (derivative.ndim - 3)), *cotangent.shape[-2:])
+    return (view * derivative).sum(dim=(-2, -1))
+
+
+def _contract_diagonal(weights, derivative):
+    """``Σ_i g_bi d_b...i``: weights ``(B, N)``, derivative ``(B', *P, N)`` -> ``(B, *P)``."""
+    if derivative.ndim == 2:
+        derivative = derivative.unsqueeze(1)
+    view = weights.reshape(weights.shape[0], *([1] * (derivative.ndim - 2)), weights.shape[-1])
+    return (view * derivative).sum(dim=-1)
+
+
+def _parameter_shape(context, node):
+    value = _as_tensor(_input_value(node))
+    return tuple(value.shape[1:]) if context.is_batched(node) else tuple(value.shape)
+
+
+def _to_parameter_shape(gradient, shape):
+    """Reshape a batched gradient ``(B, *g)`` to ``(B, *shape)``; scalar parameters get the sum."""
+    if tuple(gradient.shape[1:]) == tuple(shape):
+        return gradient
+    if math.prod(gradient.shape[1:]) == math.prod(shape):
+        return gradient.reshape(gradient.shape[0], *shape)
+    if math.prod(shape) == 1:
+        return gradient.reshape(gradient.shape[0], -1).sum(-1).reshape(gradient.shape[0], *shape)
+    raise ValueError(f"Cannot map a gradient of shape {tuple(gradient.shape[1:])} to a parameter of shape {tuple(shape)}.")
+
+
+def _batched_mean(context, mean, n, dtype, device, what, raw=None):
+    value = context.value(mean, dtype, device, raw)
+    flat = value.reshape(value.shape[0], -1)
+    if flat.shape[1] == 1:
+        return flat.expand(flat.shape[0], n)
+    if flat.shape[1] != n:
+        raise ValueError(f"{what} mean must be scalar or contain one value per input ({n}); got {flat.shape[1]} values.")
+    return flat
+
+
+def _expand_batch(tensor, size):
+    return tensor.expand(size, *tensor.shape[1:]) if tensor.shape[0] != size else tensor
+
+
+def _finish(value, batched):
+    """Drop the batch dimension of an unbatched evaluation."""
+    if batched:
+        return value
+    if isinstance(value, dict):
+        return {name: v[0] for name, v in value.items()}
+    return value[0]
+
+
+def _named_model_inputs(values):
+    return {value.name: tensor for value, tensor in values if _is_named(value)}
+
+
+# ----------------------------------------------------------------------------
+# Latent (whitened) GP
+# ----------------------------------------------------------------------------
 
 
 class LatentGP(DeterministicParameter):
-    """An explicit whitened latent GP function node.
+    r"""An explicit whitened latent GP function node.
 
     The object is a ``DeterministicParameter`` whose value is
-    ``mean(inputs) + L @ z``. If ``latent`` is omitted, a standard-normal
-    latent vector named ``<name>_white`` is created automatically. This is a
-    non-centred parameterization intended for NUTS and variational inference.
+    ``mean(inputs) + L @ z`` with ``L Lᵀ = K``. If ``latent`` is omitted, a
+    standard-normal latent vector named ``<name>_white`` is created
+    automatically. This is a non-centred parameterization intended for NUTS
+    and variational inference.
 
     ``inputs`` should normally be a ``Data`` object containing shape ``(N, D)``
     or ``(N,)``. The likelihood can then use the returned function directly,
     for example ``ObservedParameter("y", Normal(f, noise), y)``.
+
+    **Gradients** (vector-Jacobian product, hand-derived). For a cotangent
+    ``ḡ`` of ``f``: ``z`` gets ``Lᵀ ḡ``; with ``dL = L Φ(L⁻¹ dK L⁻ᵀ)``
+    (``Φ`` takes the lower triangle and halves the diagonal) every kernel
+    hyperparameter gets ``⟨G_K, ∂K/∂θ⟩`` with
+    ``G_K = sym(L⁻ᵀ S L⁻¹)``, ``S = Φ(Lᵀ ḡ zᵀ)``. Learnable inputs get
+    ``kernel.input_vjp(X, X, G_K + G_Kᵀ)``. With vectorized chains all of
+    this is batched over the chain dimension.
     """
 
     def __init__(
@@ -194,61 +352,20 @@ class LatentGP(DeterministicParameter):
         mean_input = mean if _is_named(mean) else None
         if mean_input is not None:
             model_inputs.append(mean_input)
+        self._kernel_parameters = kernel_parameters
+        self._mean_input = mean_input
 
         def forward(*values):
-            x = values[0]
-            z = values[1].reshape(-1)
-            if not isinstance(x, torch.Tensor):
-                x = _as_tensor(x)
-            if x.dtype != z.dtype:
-                x = x.to(dtype=z.dtype)
-            kernel_values = _named_model_inputs(zip(model_inputs[2:], values[2:]))
-            covariance = kernel(x, x, parameter_values=kernel_values)
-            factor = stable_cholesky(covariance, jitter=jitter)
-            mean_value = values[2 + len(kernel_parameters)] if mean_input is not None else mean
-            return _mean_value(mean_value, x) + factor @ z
+            return self._batched_function(values, [False] * len(values))[0][0]
 
         def derivative(*values):
-            latent_value = values[1].reshape(-1)
-            x = values[0]
-            if not isinstance(x, torch.Tensor):
-                x = _as_tensor(x)
-            if x.dtype != latent_value.dtype:
-                x = x.to(dtype=latent_value.dtype)
-            kernel_values = _named_model_inputs(zip(model_inputs[2:], values[2:]))
-            covariance = kernel(x, x, parameter_values=kernel_values)
-            factor, jitter_info = stable_cholesky(covariance, jitter=jitter, return_jitter=True)
-            derivatives = {latent.name: factor}
+            return self._jacobians(values)
 
-            covariance_derivatives = kernel.derivatives(x, x, parameter_values=kernel_values)
-            for parameter in kernel_parameters:
-                if parameter.name in covariance_derivatives:
-                    covariance_derivative = covariance_derivatives[parameter.name]
-                    if covariance_derivative.ndim == 2:
-                        covariance_derivative = covariance_derivative.unsqueeze(0)
-                    # Flatten the parameter axes into one Jacobian column per
-                    # parameter component, as ``Model.joint_grad_log_prob``
-                    # expects for vector-valued (e.g. ARD) parameters.
-                    derivatives[parameter.name] = _cholesky_output_derivative(
-                        factor,
-                        _jitter_derivative(jitter_info, covariance_derivative),
-                        latent_value,
-                    ).reshape(latent_value.numel(), -1)
+        def vjp(cotangent, *values):
+            flags = [False] * len(values)
+            return _finish(self._batched_vjp(_as_tensor(cotangent).unsqueeze(0), values, flags), False)
 
-            if mean_input is not None:
-                mean_value = values[2 + len(kernel_parameters)]
-                mean_tensor = _as_tensor(mean_value)
-                if mean_tensor.ndim == 0 or mean_tensor.numel() == 1:
-                    derivatives[mean_input.name] = torch.ones(
-                        (x.shape[0], 1), dtype=x.dtype, device=x.device
-                    )
-                else:
-                    derivatives[mean_input.name] = torch.eye(
-                        x.shape[0], dtype=x.dtype, device=x.device
-                    )
-            return derivatives
-
-        super().__init__(name, forward, derivative, model_inputs)
+        super().__init__(name, forward, derivative, model_inputs, vjp_func=vjp)
         self.gp_inputs = inputs
         self.gp_latent = latent
         # Public aliases make the latent variable easy to inspect when it was
@@ -259,12 +376,122 @@ class LatentGP(DeterministicParameter):
         self.gp_mean = mean
         self.gp_jitter = jitter
 
+    def _context(self, values, flags):
+        return _BatchContext({id(node): bool(flag) for node, flag in zip(self.inputs, flags)})
+
+    def _batched_function(self, values, flags):
+        """``(f, pieces)`` in batched form for input ``values`` with chain flags ``flags``."""
+        context = self._context(values, flags)
+        z = context.value(self.inputs[1], raw=values[1])
+        z = z.reshape(z.shape[0], -1)
+        dtype, device = z.dtype, z.device
+        x = context.inputs(self.inputs[0], dtype, device, raw=values[0])
+        raw = {p.name: v for p, v in zip(self.inputs[2:2 + len(self._kernel_parameters)], values[2:])}
+        kernel_values = context.kernel_values(self.gp_kernel, dtype, device, raw)
+        covariance = self.gp_kernel.batch_evaluate(x, x, kernel_values)
+        size = max(covariance.shape[0], z.shape[0])
+        factor, jitter_info = batched_stable_cholesky(_expand_batch(covariance, size), jitter=self.gp_jitter)
+        n = z.shape[-1]
+        if self._mean_input is not None:
+            mean = _batched_mean(context, self._mean_input, n, dtype, device, "LatentGP", raw=values[-1])
+        else:
+            mean = _mean_value(self.gp_mean, torch.zeros(n, dtype=dtype, device=device)).reshape(1, n)
+        f = mean + (factor @ z.unsqueeze(-1)).squeeze(-1)
+        return f, (context, x, z, kernel_values, factor, jitter_info)
+
+    def _batched_vjp(self, cotangent, values, flags):
+        _, (context, x, z, kernel_values, factor, jitter_info) = self._batched_function(values, flags)
+        cotangent = cotangent.reshape(cotangent.shape[0], -1).to(dtype=z.dtype)
+        projected = (factor.transpose(-2, -1) @ cotangent.unsqueeze(-1)).squeeze(-1)  # Lᵀ ḡ
+        latent = self.inputs[1]
+        latent_shape = tuple(_as_tensor(values[1]).shape[1:]) if context.is_batched(latent) else tuple(_as_tensor(values[1]).shape)
+        grads = {latent.name: projected.reshape(projected.shape[0], *latent_shape)}
+        outer = projected.unsqueeze(-1) * z.unsqueeze(-2)
+        lower = torch.tril(outer, diagonal=-1) + 0.5 * torch.diag_embed(torch.diagonal(outer, dim1=-2, dim2=-1))
+        left = torch.linalg.solve_triangular(factor.transpose(-2, -1), lower, upper=True)
+        covariance_cotangent = torch.linalg.solve_triangular(factor, left, upper=False, left=False)
+        covariance_cotangent = 0.5 * (covariance_cotangent + covariance_cotangent.transpose(-2, -1))
+        covariance_cotangent = _jitter_cotangent(jitter_info, covariance_cotangent)
+        for name, derivative in self.gp_kernel.batch_derivatives(x, x, kernel_values).items():
+            parameter = next(p for p in self._kernel_parameters if p.name == name)
+            value = values[self.inputs.index(parameter)]
+            shape = tuple(_as_tensor(value).shape[1:]) if context.is_batched(parameter) else tuple(_as_tensor(value).shape)
+            grads[name] = _to_parameter_shape(_contract(covariance_cotangent, derivative), shape)
+        inputs_node = self.inputs[0]
+        if not isinstance(inputs_node, Data) and isinstance(inputs_node, (RandomParameter, DeterministicParameter)):
+            input_gradient = self.gp_kernel.batch_input_vjp_symmetric(x, covariance_cotangent, kernel_values)
+            shape = tuple(_as_tensor(values[0]).shape[1:]) if context.is_batched(inputs_node) else tuple(_as_tensor(values[0]).shape)
+            grads[inputs_node.name] = input_gradient.reshape(input_gradient.shape[0], *shape)
+        if self._mean_input is not None:
+            value = values[-1]
+            shape = tuple(_as_tensor(value).shape[1:]) if context.is_batched(self._mean_input) else tuple(_as_tensor(value).shape)
+            grads[self._mean_input.name] = _to_parameter_shape(cotangent, shape)
+        return grads
+
+    def _jacobians(self, values):
+        """Dense Jacobians ``(n, parameter.numel())`` of ``f`` (unbatched; for ``derivatives()``)."""
+        n = _as_tensor(values[1]).numel()
+        dtype = _as_tensor(values[1]).dtype
+        rows = []
+        for i in range(n):
+            unit = torch.zeros(n, dtype=dtype, device=_as_tensor(values[1]).device)
+            unit[i] = 1.0
+            rows.append(self.vjp_func(unit, *values))
+        jacobians = {}
+        for name in rows[0]:
+            jacobians[name] = torch.stack([row[name].reshape(-1) for row in rows])
+        latent_name = self.inputs[1].name
+        if latent_name in jacobians:
+            jacobians[latent_name] = jacobians[latent_name].reshape(n, n)
+        return jacobians
+
+    # -- vectorized chains -------------------------------------------------
+    def batched_forward(self, input_values):
+        f, _ = self._batched_function(input_values, self._batched_flags())
+        return _expand_batch(f, self.owner_model.n_chains)
+
+    def batched_vjp(self, cotangent, input_values):
+        flags = self._batched_flags()
+        grads = self._batched_vjp(cotangent, input_values, flags)
+        result = {}
+        for node, flag in zip(self.inputs, flags):
+            name = getattr(node, "name", None)
+            if flag and name in grads:
+                result[name] = _expand_batch(grads[name], self.owner_model.n_chains)
+        return result
+
 
 # Backwards-compatible name retained for existing models and notebooks.
 GaussianProcess = LatentGP
 
 
-class ExactGP(Distribution):
+# ----------------------------------------------------------------------------
+# Exact GP
+# ----------------------------------------------------------------------------
+
+
+class _GPDistribution(Distribution):
+    """Shared plumbing of the GP likelihood nodes.
+
+    The kernel's parameter nodes are stored in ``_kernel_parameter_nodes`` so
+    that the model's batching machinery sees them as arguments of the term
+    (and marks the batched ones).
+    """
+
+    def _register_kernel(self, kernel):
+        self._kernel_parameter_nodes = list(kernel.parameters)
+        for parameter in kernel.parameters:
+            self.add_dependency(parameter)
+
+    @property
+    def batch_shape(self):
+        return torch.Size()
+
+    def pdf(self, x):
+        return torch.exp(self.log_pdf(x))
+
+
+class ExactGP(_GPDistribution):
     """Gaussian-process marginal likelihood with the latent function integrated out.
 
     If ``f ~ Normal(mean, K)`` and ``y | f ~ Normal(f, noise_variance * I)``,
@@ -279,7 +506,8 @@ class ExactGP(Distribution):
 
     Unlike :class:`LatentGP`, this does not create a latent random
     variable. Kernel and noise hyperparameters remain ordinary model
-    parameters and can be sampled with MCMC.
+    parameters and can be sampled with MCMC. With vectorized chains the
+    covariance matrices of all chains are factorised as one batch.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=0.0, jitter=1e-6):
@@ -296,8 +524,7 @@ class ExactGP(Distribution):
         self.jitter = jitter
 
         self.add_dependency(inputs)
-        for parameter in kernel.parameters:
-            self.add_dependency(parameter)
+        self._register_kernel(kernel)
         self.add_dependency(noise_variance)
         self.add_dependency(mean)
 
@@ -305,117 +532,84 @@ class ExactGP(Distribution):
     def event_shape(self):
         return (_feature_count(self.inputs),)
 
-    @property
-    def batch_shape(self):
-        return torch.Size()
-
-    def _components(self, observed, parameter_values=None):
-        x = _input_value(self.inputs)
-        if x.ndim == 0:
-            x = x.reshape(1)
-        x = torch.as_tensor(x)
-        observed = torch.as_tensor(observed, dtype=x.dtype, device=x.device).reshape(-1)
-        n = _feature_count(x)
-        if observed.numel() != n:
-            raise ValueError(
-                f"Exact GP observations must contain one value per input ({n}); "
-                f"got {observed.numel()} values."
-            )
-
-        kernel_values = parameter_values
-        covariance = self.kernel(x, x, parameter_values=kernel_values)
-        covariance = (covariance + covariance.transpose(-2, -1)) / 2
-        noise = _resolved_value(
-            self.noise_variance,
-            dtype=x.dtype,
-            device=x.device,
-            parameter_values=parameter_values,
-        ).reshape(-1)
-        if noise.numel() != 1:
-            raise ValueError("Exact GP noise_variance must be scalar.")
-
-        mean = _resolved_value(
-            self.mean,
-            dtype=x.dtype,
-            device=x.device,
-            parameter_values=parameter_values,
-        )
-        if mean.numel() == 1:
-            mean = mean.reshape(()).expand(n)
-        else:
-            mean = mean.reshape(-1)
-            if mean.numel() != n:
-                raise ValueError(
-                    f"Exact GP mean must be scalar or contain one value per input ({n}); "
-                    f"got {mean.numel()} values."
-                )
-
-        covariance = covariance + noise[0] * torch.eye(n, dtype=x.dtype, device=x.device)
-        factor, self._jitter_info = stable_cholesky(covariance, jitter=self.jitter, return_jitter=True)
-        residual = observed - mean
-        alpha = torch.cholesky_solve(residual.reshape(-1, 1), factor).reshape(-1)
-        log_det = 2 * torch.log(torch.diagonal(factor)).sum()
-        log_probability = -0.5 * (
-            residual.dot(alpha) + log_det + n * math.log(2 * math.pi)
-        )
-        return x, covariance, factor, residual, alpha, log_probability
-
     def _named_parameter_values(self):
         values = {}
-        parameters = [*self.kernel.parameters, self.noise_variance, self.mean]
-        for parameter in parameters:
+        for parameter in [*self.kernel.parameters, self.noise_variance, self.mean]:
             if _is_named(parameter):
                 values[parameter.name] = resolve(parameter)
         return values
 
-    def pdf(self, x):
-        return torch.exp(self.log_pdf(x))
+    def _components(self, observed):
+        context = _BatchContext()
+        x_value = _as_tensor(_input_value(self.inputs))
+        dtype = x_value.dtype if x_value.is_floating_point() else torch.get_default_dtype()
+        device = x_value.device
+        x = context.inputs(self.inputs, dtype, device)
+        n = x.shape[1]
+        observed = torch.as_tensor(observed, dtype=dtype, device=device).reshape(-1)
+        if observed.numel() != n:
+            raise ValueError(
+                f"Exact GP observations must contain one value per input ({n}); got {observed.numel()} values."
+            )
+        kernel_values = context.kernel_values(self.kernel, dtype, device)
+        covariance = self.kernel.batch_evaluate(x, x, kernel_values)
+        noise = context.value(self.noise_variance, dtype, device)
+        noise = noise.reshape(noise.shape[0], -1)
+        if noise.shape[1] != 1:
+            raise ValueError("Exact GP noise_variance must be scalar.")
+        mean = _batched_mean(context, self.mean, n, dtype, device, "Exact GP")
+        size = max(covariance.shape[0], noise.shape[0], mean.shape[0])
+        eye = torch.eye(n, dtype=dtype, device=device)
+        covariance = _expand_batch(covariance, size) + noise[:, :1, None] * eye
+        factor, jitter_info = batched_stable_cholesky(covariance, jitter=self.jitter)
+        residual = observed - mean
+        alpha = torch.cholesky_solve(residual.unsqueeze(-1), factor).squeeze(-1)
+        alpha = _expand_batch(alpha, size)
+        log_det = 2 * torch.log(torch.diagonal(factor, dim1=-2, dim2=-1)).sum(-1)
+        log_probability = -0.5 * ((residual * alpha).sum(-1) + log_det + n * math.log(2 * math.pi))
+        batched = context.any([self.inputs, self.noise_variance, self.mean, *self.kernel.parameters])
+        return {
+            "context": context, "x": x, "kernel_values": kernel_values, "factor": factor, "jitter_info": jitter_info,
+            "alpha": alpha, "log_probability": log_probability, "batched": batched,
+        }
 
     def log_pdf(self, x):
-        return self._components(x)[-1]
+        parts = self._components(x)
+        return _finish(parts["log_probability"], parts["batched"])
 
     def log_pdf_grad(self, x):
-        return -self._components(x)[4]
+        parts = self._components(x)
+        return _finish(-parts["alpha"], parts["batched"])
 
     def log_pdf_param_grads(self, x):
-        x_values, covariance, factor, _, alpha, _ = self._components(x)
-        jitter_info = self._jitter_info
-        n = x_values.shape[0]
-        inverse = torch.cholesky_solve(
-            torch.eye(n, dtype=x_values.dtype, device=x_values.device),
-            factor,
-        )
-        sensitivity = 0.5 * (alpha[:, None] * alpha[None, :] - inverse)
-        parameter_values = self._named_parameter_values()
+        r"""``d log p = ⟨½(ααᵀ - Σ⁻¹), dΣ⟩`` for ``Σ = K + σ² I`` (+ jitter), batched over chains."""
+        parts = self._components(x)
+        context, factor, alpha, jitter_info = parts["context"], parts["factor"], parts["alpha"], parts["jitter_info"]
+        inverse = torch.cholesky_inverse(factor)
+        sensitivity = 0.5 * (alpha.unsqueeze(-1) * alpha.unsqueeze(-2) - inverse)
+        sensitivity = _jitter_cotangent(jitter_info, sensitivity)
         gradients = {}
-
-        for name, derivative in self.kernel.derivatives(
-            x_values,
-            x_values,
-            parameter_values=parameter_values,
-        ).items():
-            if derivative.ndim == 2:
-                derivative = derivative.unsqueeze(0)
-            derivative = _jitter_derivative(jitter_info, derivative)
-            gradients[name] = (sensitivity * derivative).sum(dim=(-2, -1))
-
+        x_values = parts["x"]
+        for name, derivative in self.kernel.batch_derivatives(x_values, x_values, parts["kernel_values"]).items():
+            parameter = next(p for p in self.kernel.parameters if p.name == name)
+            gradients[name] = _to_parameter_shape(_contract(sensitivity, derivative), _parameter_shape(context, parameter))
+        inputs = self.inputs
+        if isinstance(inputs, (RandomParameter, DeterministicParameter)):
+            input_gradient = self.kernel.batch_input_vjp_symmetric(x_values, sensitivity, parts["kernel_values"])
+            shape = _parameter_shape(context, inputs)
+            gradients[inputs.name] = input_gradient.reshape(input_gradient.shape[0], *shape)
         if _is_named(self.noise_variance):
-            # d(K + noise * I + jitter * I) / d(noise) = (1 + d(jitter)/d(noise)) * I.
-            jitter, scale, index = jitter_info
-            noise_scale = 1.0 + (jitter / scale if index is not None else 0.0)
-            gradients[self.noise_variance.name] = (0.5 * (
-                alpha.square().sum() - torch.diagonal(inverse).sum()
-            ) * noise_scale).reshape(resolve(self.noise_variance).shape)
-
+            # d(K + σ² I + jitter I) / dσ² = I + c e_i* e_i*ᵀ is folded into the sensitivity.
+            noise_gradient = torch.diagonal(sensitivity, dim1=-2, dim2=-1).sum(-1, keepdim=True)
+            gradients[self.noise_variance.name] = _to_parameter_shape(noise_gradient, _parameter_shape(context, self.noise_variance))
         if _is_named(self.mean):
-            gradients[self.mean.name] = alpha
-
-        return gradients
+            gradients[self.mean.name] = _to_parameter_shape(alpha, _parameter_shape(context, self.mean))
+        return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
         x = _input_value(self.inputs)
         zero = torch.zeros(_feature_count(x), dtype=x.dtype, device=x.device)
-        _, _, factor, _, _, _ = self._components(zero)
+        factor = self._components(zero)["factor"][0]
         mean = _resolved_value(self.mean, x.dtype, x.device)
         if mean.numel() == 1:
             mean = mean.reshape(()).expand(zero.numel())
@@ -428,6 +622,11 @@ class ExactGP(Distribution):
 ExactGaussianProcess = ExactGP
 
 
+# ----------------------------------------------------------------------------
+# Sparse (inducing-point) GP
+# ----------------------------------------------------------------------------
+
+
 _SPARSE_METHODS = ("vfe", "dtc", "fitc")
 
 
@@ -437,7 +636,7 @@ def _with_parameter_axis(derivative):
     return derivative
 
 
-class SparseGP(Distribution):
+class SparseGP(_GPDistribution):
     r"""Inducing-point approximation of the GP marginal likelihood.
 
     With ``m`` inducing inputs ``Z`` and ``Q_nn = K_nm K_mm⁻¹ K_mn``, the
@@ -454,7 +653,8 @@ class SparseGP(Distribution):
 
     Everything is evaluated with Cholesky factors of ``m x m`` matrices, the
     Woodbury identity and the matrix determinant lemma, i.e. in ``O(n m²)``
-    time and ``O(n m)`` memory; no ``n x n`` matrix is ever formed.
+    time and ``O(n m)`` memory; no ``n x n`` matrix is ever formed. With
+    vectorized chains all matrices carry a leading chain dimension.
 
     ``inducing_points`` (shape ``(m, D)`` or ``(m,)``) is a tensor, a ``Data``
     node, or a learnable ``RandomParameter`` / ``DeterministicParameter``,
@@ -470,6 +670,7 @@ class SparseGP(Distribution):
     raise their likelihood above the exact one (FITC in particular is known
     to collapse inducing points and underestimate the noise), so they can
     overfit ``Z``.
+
     Use it as the distribution of an ``ObservedParameter``::
 
         gp = SparseGP("function", inputs, kernel, inducing_points=Z, noise_variance=noise)
@@ -496,18 +697,13 @@ class SparseGP(Distribution):
 
         self.add_dependency(inputs)
         self.add_dependency(inducing_points)
-        for parameter in kernel.parameters:
-            self.add_dependency(parameter)
+        self._register_kernel(kernel)
         self.add_dependency(noise_variance)
         self.add_dependency(mean)
 
     @property
     def event_shape(self):
         return (_feature_count(self.inputs),)
-
-    @property
-    def batch_shape(self):
-        return torch.Size()
 
     def _named_parameter_values(self):
         values = {}
@@ -528,74 +724,76 @@ class SparseGP(Distribution):
             z = z.reshape(1)
         return z
 
+    def _learnable_inducing(self):
+        return _is_named(self.inducing_points) and not isinstance(self.inducing_points, Data)
+
     def _components(self, observed):
-        x = self._training_inputs()
-        dtype, device = x.dtype, x.device
-        z = self._inducing_inputs(dtype, device)
+        context = _BatchContext()
+        x_value = self._training_inputs()
+        dtype = x_value.dtype if x_value.is_floating_point() else torch.get_default_dtype()
+        device = x_value.device
+        x = context.inputs(self.inputs, dtype, device)
+        z = context.inputs(self.inducing_points, dtype, device)
+        n = x.shape[1]
         observed = torch.as_tensor(observed, dtype=dtype, device=device).reshape(-1)
-        n = _feature_count(x)
         if observed.numel() != n:
             raise ValueError(
                 f"Sparse GP observations must contain one value per input ({n}); got {observed.numel()} values."
             )
-        parameter_values = self._named_parameter_values()
-        noise = _resolved_value(self.noise_variance, dtype, device).reshape(-1)
-        if noise.numel() != 1:
+        noise = context.value(self.noise_variance, dtype, device)
+        noise = noise.reshape(noise.shape[0], -1)
+        if noise.shape[1] != 1:
             raise ValueError("Sparse GP noise_variance must be scalar.")
-        noise = noise[0]
-        mean = _resolved_value(self.mean, dtype, device)
-        if mean.numel() == 1:
-            mean = mean.reshape(()).expand(n)
-        else:
-            mean = mean.reshape(-1)
-            if mean.numel() != n:
-                raise ValueError(
-                    f"Sparse GP mean must be scalar or contain one value per input ({n}); got {mean.numel()} values."
-                )
+        noise = noise[:, 0]
+        mean = _batched_mean(context, self.mean, n, dtype, device, "Sparse GP")
+        kernel_values = context.kernel_values(self.kernel, dtype, device)
 
-        k_mm = self.kernel(z, z, parameter_values=parameter_values)
-        k_mn = self.kernel(z, x, parameter_values=parameter_values)
-        k_diag = self.kernel.diag(x, parameter_values=parameter_values)
-        factor, jitter_info = stable_cholesky(k_mm, jitter=self.jitter, return_jitter=True)
+        k_mm = self.kernel.batch_evaluate(z, z, kernel_values)
+        k_mn = self.kernel.batch_evaluate(z, x, kernel_values)
+        k_diag = self.kernel.batch_diag(x, kernel_values)
+        size = max(k_mm.shape[0], k_mn.shape[0], k_diag.shape[0], noise.shape[0], mean.shape[0])
+        k_mm, k_mn = _expand_batch(k_mm, size), _expand_batch(k_mn, size)
+        k_diag, noise = _expand_batch(k_diag, size), _expand_batch(noise, size)
+        factor, jitter_info = batched_stable_cholesky(k_mm, jitter=self.jitter)
         # V = L⁻¹ K_mn, so Q_nn = Vᵀ V and diag(Q_nn) = colsum(V ⊙ V).
         v = torch.linalg.solve_triangular(factor, k_mn, upper=False)
-        q_diag = v.square().sum(dim=0)
+        q_diag = v.square().sum(dim=-2)
         if self.method == "fitc":
-            lam = (k_diag - q_diag).clamp_min(0.0) + noise
+            lam = (k_diag - q_diag).clamp_min(0.0) + noise[:, None]
         else:
-            lam = noise.expand(n)
-        residual = observed - mean
-        eye_m = torch.eye(v.shape[0], dtype=dtype, device=device)
-        v_scaled = v / lam
+            lam = noise[:, None].expand(size, n)
+        residual = _expand_batch(observed - mean, size)
+        eye_m = torch.eye(v.shape[-2], dtype=dtype, device=device)
+        v_scaled = v / lam.unsqueeze(-2)
         # Σ = Vᵀ V + Λ and B = I + V Λ⁻¹ Vᵀ = L_B L_Bᵀ, so |Σ| = |Λ| |B|.
         factor_b = torch.linalg.cholesky(eye_m + v_scaled @ v.transpose(-2, -1))
         # Woodbury: Σ⁻¹ r = Λ⁻¹ r - Λ⁻¹ Vᵀ L_B⁻ᵀ c with c = L_B⁻¹ V Λ⁻¹ r.
-        c = torch.linalg.solve_triangular(factor_b, (v_scaled @ residual).reshape(-1, 1), upper=False)
-        correction = torch.linalg.solve_triangular(factor_b.transpose(-2, -1), c, upper=True).reshape(-1)
-        alpha = (residual - v.transpose(-2, -1) @ correction) / lam
-        log_det = torch.log(lam).sum() + 2 * torch.log(torch.diagonal(factor_b)).sum()
-        quadratic = (residual.square() / lam).sum() - c.square().sum()
+        c = torch.linalg.solve_triangular(factor_b, (v_scaled @ residual.unsqueeze(-1)), upper=False)
+        correction = torch.linalg.solve_triangular(factor_b.transpose(-2, -1), c, upper=True).squeeze(-1)
+        alpha = (residual - (v.transpose(-2, -1) @ correction.unsqueeze(-1)).squeeze(-1)) / lam
+        log_det = torch.log(lam).sum(-1) + 2 * torch.log(torch.diagonal(factor_b, dim1=-2, dim2=-1)).sum(-1)
+        quadratic = (residual.square() / lam).sum(-1) - c.square().sum(dim=(-2, -1))
         log_probability = -0.5 * (quadratic + log_det + n * math.log(2 * math.pi))
-        trace_term = (k_diag - q_diag).sum()
+        trace_term = (k_diag - q_diag).sum(-1)
         if self.method == "vfe":
             log_probability = log_probability - 0.5 * trace_term / noise
+        batched = context.any([self.inputs, self.inducing_points, self.noise_variance, self.mean, *self.kernel.parameters])
         return {
-            "x": x, "z": z, "noise": noise, "factor": factor, "jitter_info": jitter_info,
+            "context": context, "x": x, "z": z, "noise": noise, "factor": factor, "jitter_info": jitter_info,
             "v": v, "lam": lam, "factor_b": factor_b, "alpha": alpha, "trace_term": trace_term,
-            "parameter_values": parameter_values, "log_probability": log_probability,
+            "kernel_values": kernel_values, "log_probability": log_probability, "batched": batched,
         }
 
-    def pdf(self, x):
-        return torch.exp(self.log_pdf(x))
-
     def log_pdf(self, x):
-        return self._components(x)["log_probability"]
+        parts = self._components(x)
+        return _finish(parts["log_probability"], parts["batched"])
 
     def log_pdf_grad(self, x):
-        return -self._components(x)["alpha"]
+        parts = self._components(x)
+        return _finish(-parts["alpha"], parts["batched"])
 
     def _cotangents(self, parts):
-        r"""Cotangents of the log density w.r.t. ``K_mn``, ``K_mm`` and ``diag(K_nn)``.
+        r"""Cotangents of the log density w.r.t. ``K_mn``, ``K_mm`` and ``diag(K_nn)`` (batched).
 
         Every gradient below is linear in the covariance differentials, so it
         is ``⟨G_mn, dK_mn⟩ + ⟨G_mm, dK_mm⟩ + ⟨g_nn, d diag(K_nn)⟩``. With
@@ -611,32 +809,29 @@ class SparseGP(Distribution):
           ``G_mn += W / σ²``, ``G_mm -= ½ W Wᵀ / σ²``, ``g_nn = -1 / (2σ²)``.
 
         ``G_mm`` is finally corrected for the scale-dependent jitter
-        ``c max(1, max diag K_mm)``: ``G_mm[i*, i*] += c tr(G_mm) / scale``.
+        ``c max(1, max diag K_mm)``: ``G_mm[i*, i*] += c tr(G_mm)``.
         """
         factor, factor_b, v, lam, alpha = parts["factor"], parts["factor_b"], parts["v"], parts["lam"], parts["alpha"]
         noise = parts["noise"]
-        w = torch.linalg.solve_triangular(factor.transpose(-2, -1), v, upper=True)  # K_mm⁻¹ K_mn, (m, n)
-        w_alpha = w @ alpha
+        w = torch.linalg.solve_triangular(factor.transpose(-2, -1), v, upper=True)  # K_mm⁻¹ K_mn, (B, m, n)
+        w_alpha = (w @ alpha.unsqueeze(-1)).squeeze(-1)
         # Σ⁻¹ = Λ⁻¹ - Gᵀ G with G = L_B⁻¹ V Λ⁻¹.
-        g = torch.linalg.solve_triangular(factor_b, v / lam, upper=False)
-        sigma_inverse_diag = 1.0 / lam - g.square().sum(dim=0)
-        p = w / lam - (w @ g.transpose(-2, -1)) @ g  # W Σ⁻¹, (m, n)
+        g = torch.linalg.solve_triangular(factor_b, v / lam.unsqueeze(-2), upper=False)
+        sigma_inverse_diag = 1.0 / lam - g.square().sum(dim=-2)
+        p = w / lam.unsqueeze(-2) - (w @ g.transpose(-2, -1)) @ g  # W Σ⁻¹, (B, m, n)
         diag_weight = 0.5 * (alpha.square() - sigma_inverse_diag)
-        g_mn = torch.outer(w_alpha, alpha) - p
-        g_mm = -0.5 * torch.outer(w_alpha, w_alpha) + 0.5 * p @ w.transpose(-2, -1)
+        g_mn = w_alpha.unsqueeze(-1) * alpha.unsqueeze(-2) - p
+        g_mm = -0.5 * w_alpha.unsqueeze(-1) * w_alpha.unsqueeze(-2) + 0.5 * p @ w.transpose(-2, -1)
         g_nn = None
         if self.method == "fitc":
-            g_mn = g_mn - 2.0 * w * diag_weight
-            g_mm = g_mm + (w * diag_weight) @ w.transpose(-2, -1)
+            g_mn = g_mn - 2.0 * w * diag_weight.unsqueeze(-2)
+            g_mm = g_mm + (w * diag_weight.unsqueeze(-2)) @ w.transpose(-2, -1)
             g_nn = diag_weight
         elif self.method == "vfe":
-            g_mn = g_mn + w / noise
-            g_mm = g_mm - 0.5 * (w @ w.transpose(-2, -1)) / noise
-            g_nn = torch.full_like(alpha, -0.5) / noise
-        jitter, scale, index = parts["jitter_info"]
-        if index is not None:
-            g_mm = g_mm.clone()
-            g_mm[index, index] = g_mm[index, index] + (jitter / scale) * torch.diagonal(g_mm).sum()
+            g_mn = g_mn + w / noise[:, None, None]
+            g_mm = g_mm - 0.5 * (w @ w.transpose(-2, -1)) / noise[:, None, None]
+            g_nn = (-0.5 / noise)[:, None].expand_as(alpha)
+        g_mm = _jitter_cotangent(parts["jitter_info"], g_mm)
         return g_mn, g_mm, g_nn, diag_weight
 
     def log_pdf_param_grads(self, x):
@@ -655,42 +850,41 @@ class SparseGP(Distribution):
         * the mean gets ``α``.
         """
         parts = self._components(x)
-        x_values, z = parts["x"], parts["z"]
-        noise, alpha, parameter_values = parts["noise"], parts["alpha"], parts["parameter_values"]
+        context, x_values, z = parts["context"], parts["x"], parts["z"]
+        noise, alpha, kernel_values = parts["noise"], parts["alpha"], parts["kernel_values"]
         g_mn, g_mm, g_nn, diag_weight = self._cotangents(parts)
 
-        cross = self.kernel.derivatives(z, x_values, parameter_values=parameter_values)
-        inducing = self.kernel.derivatives(z, z, parameter_values=parameter_values)
-        diagonal = self.kernel.diag_derivatives(x_values, parameter_values=parameter_values) if g_nn is not None else {}
+        cross = self.kernel.batch_derivatives(z, x_values, kernel_values)
+        inducing = self.kernel.batch_derivatives(z, z, kernel_values)
+        diagonal = self.kernel.batch_diag_derivatives(x_values, kernel_values) if g_nn is not None else {}
         gradients = {}
         for name in {**cross, **inducing, **diagonal}:
             gradient = 0.0
             if name in cross:
-                gradient = gradient + (g_mn * _with_parameter_axis(cross[name])).sum(dim=(-2, -1))
+                gradient = gradient + _contract(g_mn, cross[name])
             if name in inducing:
-                gradient = gradient + (g_mm * _with_parameter_axis(inducing[name])).sum(dim=(-2, -1))
+                gradient = gradient + _contract(g_mm, inducing[name])
             if name in diagonal:
-                d_nn = diagonal[name]
-                if d_nn.ndim == 1:
-                    d_nn = d_nn.unsqueeze(0)
-                gradient = gradient + (d_nn * g_nn).sum(dim=-1)
-            gradients[name] = gradient
+                gradient = gradient + _contract_diagonal(g_nn, diagonal[name])
+            parameter = next(p for p in self.kernel.parameters if p.name == name)
+            gradients[name] = _to_parameter_shape(gradient, _parameter_shape(context, parameter))
 
-        if _is_named(self.inducing_points) and not isinstance(self.inducing_points, Data):
-            z_gradient = self.kernel.input_vjp(z, x_values, g_mn, parameter_values=parameter_values)
-            z_gradient = z_gradient + self.kernel.input_vjp_symmetric(z, g_mm, parameter_values=parameter_values)
-            gradients[self.inducing_points.name] = z_gradient.reshape(_input_value(self.inducing_points).shape)
+        if self._learnable_inducing():
+            z_gradient = self.kernel.batch_input_vjp(z, x_values, g_mn, kernel_values)
+            z_gradient = z_gradient + self.kernel.batch_input_vjp_symmetric(z, g_mm, kernel_values)
+            shape = _parameter_shape(context, self.inducing_points)
+            gradients[self.inducing_points.name] = z_gradient.reshape(z_gradient.shape[0], *shape)
 
         if _is_named(self.noise_variance):
-            noise_gradient = diag_weight.sum()
+            noise_gradient = diag_weight.sum(-1)
             if self.method == "vfe":
                 noise_gradient = noise_gradient + 0.5 * parts["trace_term"] / noise.square()
-            gradients[self.noise_variance.name] = noise_gradient.reshape(resolve(self.noise_variance).shape)
+            gradients[self.noise_variance.name] = _to_parameter_shape(noise_gradient.unsqueeze(-1), _parameter_shape(context, self.noise_variance))
 
         if _is_named(self.mean):
-            gradients[self.mean.name] = alpha
+            gradients[self.mean.name] = _to_parameter_shape(alpha, _parameter_shape(context, self.mean))
 
-        return gradients
+        return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
         """Draw from the approximate prior ``Normal(mean, Q_nn + Λ)``.
@@ -700,7 +894,7 @@ class SparseGP(Distribution):
         """
         x = self._training_inputs()
         parts = self._components(torch.zeros(_feature_count(x), dtype=x.dtype, device=x.device))
-        v, lam = parts["v"], parts["lam"]
+        v, lam = parts["v"][0], parts["lam"][0]
         mean = _resolved_value(self.mean, x.dtype, x.device)
         if mean.numel() == 1:
             mean = mean.reshape(()).expand(lam.numel())
@@ -1011,9 +1205,3 @@ def sparse_gp_predictive(
         )
 
     return torch.stack(outputs)
-
-
-# Batched (vectorized) chains evaluate GP nodes chain by chain (see Model.batch).
-LatentGP._batchable = False
-ExactGP._batchable = False
-SparseGP._batchable = False

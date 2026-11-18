@@ -65,7 +65,7 @@ with Model() as model:
 # --------
 
 start = time.perf_counter()
-trace = model.sample(300, 300, n_chains=2, max_depth=6, seed=1, progress_bar=False)
+trace = model.sample(500, 300, n_chains=2, max_depth=6, seed=1, progress_bar=False)
 elapsed = time.perf_counter() - start
 summary = trace.summary(include_deterministic=True)
 print(summary)
@@ -80,7 +80,7 @@ print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-
 # data taught us about the period and the noise level.
 
 grid = torch.linspace(-0.2, 4.6, 200, dtype=torch.float64)
-draws = exact_gp_predictive(f, trace.thin(6), y, grid, n_samples=5).reshape(-1, grid.numel())
+draws = exact_gp_predictive(f, trace.thin(10), y, grid, n_samples=5).reshape(-1, grid.numel())
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
 fig = plt.figure(figsize=(12, 5), layout="constrained")

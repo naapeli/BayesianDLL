@@ -14,12 +14,15 @@ and ``O(n)`` memory instead of the ``O(n³)`` and ``O(n²)`` of a dense
 Cholesky factorisation. The hand-derived gradients reuse the recursion's
 solution ``T⁻¹ e_0`` (Gohberg-Semencul formula) and FFT correlations.
 
-The recursion is sequential (one Python-level step per observation), so
-it overtakes a dense Cholesky factorisation from roughly a thousand points
-on; its memory use is linear throughout. With thousands of points a
+The recursion is sequential (one Python-level step per observation), so a
+multi-threaded dense Cholesky factorisation stays competitive up to one or
+two thousand points; beyond that the recursion wins, and its memory use is
+linear throughout. With thousands of points a
 gradient still costs a noticeable fraction of a second, so this example
-fits the hyperparameters by type-II maximum likelihood (``find_MAP`` on the
-log scale) instead of running MCMC.
+computes a type-II MAP estimate of the hyperparameters instead of running
+MCMC: ``find_MAP`` maximises the exact marginal likelihood (``f``
+integrated out) times the log-normal priors of the hyperparameters, working
+on their log scale.
 
 The kernel is a Matérn-5/2 (twice differentiable sample paths).
 """
@@ -64,15 +67,15 @@ def build(cls, inputs, observations):
 model, f = build(ToeplitzGP, t, y)
 
 # %%
-# Fitting the hyperparameters
-# ---------------------------
+# Type-II MAP estimate of the hyperparameters
+# -------------------------------------------
 
 start = time.perf_counter()
 model.find_MAP(lr=0.1, epochs=60, verbose=False)
 elapsed = time.perf_counter() - start
 fitted = {name: model.deterministic_params[name].constrained_value.reshape(1, 1, -1)
           for name in ("lengthscale", "variance", "noise")}
-print(f"type-II ML in {elapsed:.1f} s: lengthscale {fitted['lengthscale'].item():.2f}, "
+print(f"type-II MAP estimate in {elapsed:.1f} s: lengthscale {fitted['lengthscale'].item():.2f}, "
       f"variance {fitted['variance'].item():.2f}, noise sd {fitted['noise'].item() ** 0.5:.3f} (true 0.3)")
 
 # %%

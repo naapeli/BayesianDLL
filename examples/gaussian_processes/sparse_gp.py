@@ -15,13 +15,13 @@ in how they treat what ``u`` cannot explain:
   ``Q_nn + diag(K_nn - Q_nn)``, i.e. heteroscedastic extra noise.
 * **VFE** (Titsias) uses DTC's Gaussian term minus the penalty
   ``tr(K_nn - Q_nn) / (2σ²)``. It is a lower bound on the exact log
-  marginal likelihood, so maximising it never overfits the approximation.
+  marginal likelihood, so maximising it cannot overfit the approximation.
 
 Here 400 noisy observations of a 1-D function are fitted with ``m = 10``
 fixed, evenly spaced inducing inputs. Each method's hyperparameters are set
-to their type-II maximum-likelihood values (``find_MAP`` on log-scale
-parameters with weak priors), and the four fits are compared with the exact
-GP. Finally NUTS samples the VFE hyperparameter posterior.
+to a type-II MAP estimate (``find_MAP`` maximises the method's marginal
+likelihood times weak log-normal priors), and the four fits are compared
+with the exact GP. Finally NUTS samples the VFE hyperparameter posterior.
 """
 
 import time
@@ -79,8 +79,8 @@ def band(f, trace, method):
 
 
 # %%
-# Type-II maximum likelihood for each method
-# ------------------------------------------
+# Type-II MAP estimate for each method
+# -----------------------------------
 
 fits = {}
 for method in ("exact", "vfe", "dtc", "fitc"):

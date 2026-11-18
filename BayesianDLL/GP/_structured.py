@@ -11,6 +11,9 @@ structure of ``K`` instead of a dense Cholesky factorization:
   ``K`` is symmetric Toeplitz. Levinson recursion gives the solve and the
   log determinant in ``O(n²)`` time and ``O(n)`` memory instead of
   ``O(n³)`` / ``O(n²)``.
+
+Both are evaluated for all vectorized chains at once (leading chain
+dimension; see :mod:`BayesianDLL.GP._process`).
 """
 
 from __future__ import annotations
@@ -20,7 +23,6 @@ import math
 import torch
 
 from .._data import Data
-from ..Distributions._distributions import Distribution
 from ..Distributions._resolve import resolve
 from ._kernels import (
     Constant,
@@ -34,7 +36,21 @@ from ._kernels import (
     _feature_matrix,
     _is_named,
 )
-from ._process import _input_value, _resolved_value, _trace_draws
+from ._process import (
+    _BatchContext,
+    _GPDistribution,
+    _batched_mean,
+    _contract,
+    _contract_diagonal,
+    _expand_batch,
+    _finish,
+    _input_value,
+    _parameter_shape,
+    _resolved_value,
+    _to_parameter_shape,
+    _trace_draws,
+    stable_cholesky,
+)
 
 
 def _with_parameter_axis(derivative):
@@ -69,12 +85,28 @@ def _draw_count(trace):
     return first_value.shape[0] * first_value.shape[1] if first_value.ndim >= 2 else first_value.shape[0]
 
 
+def _batched_mode_product(tensor, matrix, mode):
+    """Batched ``tensor ×_mode matrix``: ``tensor`` is ``(B, n_1, …, n_P)``, ``matrix`` ``(B', n, n_mode)``."""
+    moved = torch.movedim(tensor, mode + 1, -1).unsqueeze(-2)  # (B, ..., 1, n_mode)
+    rest = moved.ndim - 3
+    view = matrix.transpose(-2, -1).reshape(matrix.shape[0], *([1] * rest), matrix.shape[-1], matrix.shape[-2])
+    return torch.movedim((moved @ view).squeeze(-2), -1, mode + 1)
+
+
+def _batched_kronecker_eigenvalues(eigenvalues):
+    """``λ_1 ⊗ … ⊗ λ_P`` per batch element: ``(B, n_1, …, n_P)`` from ``(B_p, n_p)``."""
+    result = eigenvalues[0]
+    for values in eigenvalues[1:]:
+        result = result.unsqueeze(-1) * values.reshape(values.shape[0], *([1] * (result.ndim - 1)), values.shape[-1])
+    return result
+
+
 # ----------------------------------------------------------------------------
 # Kronecker-structured GP
 # ----------------------------------------------------------------------------
 
 
-class KroneckerGP(Distribution):
+class KroneckerGP(_GPDistribution):
     r"""Exact GP marginal likelihood for inputs on a complete Cartesian grid.
 
     The inputs are ``X = X_1 × … × X_P`` (``grid_inputs[p]`` has shape
@@ -92,7 +124,9 @@ class KroneckerGP(Distribution):
 
     The cost is ``O(Σ_p n_p³ + N Σ_p n_p)`` time and ``O(N + Σ_p n_p²)``
     memory: a 100 x 100 grid (``N = 10⁴``) needs two 100 x 100
-    eigendecompositions instead of a 10⁴ x 10⁴ Cholesky factor.
+    eigendecompositions instead of a 10⁴ x 10⁴ Cholesky factor. With
+    vectorized chains the factors of all chains are decomposed as one batch
+    and the mode products carry the chain dimension.
 
     **Observations.** ``y`` has shape ``(n_1, …, n_P)`` or is flattened in
     row-major (C) order, i.e. the grid point ``(i_1, …, i_P)`` is entry
@@ -139,9 +173,9 @@ class KroneckerGP(Distribution):
         self.jitter = jitter
         for grid in grid_inputs:
             self.add_dependency(grid)
-        for kernel in kernels:
-            for parameter in kernel.parameters:
-                self.add_dependency(parameter)
+        self._kernel_parameter_nodes = [p for kernel in kernels for p in kernel.parameters]
+        for parameter in self._kernel_parameter_nodes:
+            self.add_dependency(parameter)
         self.add_dependency(noise_variance)
         self.add_dependency(mean)
 
@@ -160,10 +194,6 @@ class KroneckerGP(Distribution):
     def event_shape(self):
         return self.grid_shape
 
-    @property
-    def batch_shape(self):
-        return torch.Size()
-
     def _named_parameter_values(self):
         values = {}
         for kernel in self.kernels:
@@ -172,6 +202,7 @@ class KroneckerGP(Distribution):
         return values
 
     def _decompose(self, xs, parameter_values):
+        """Unbatched eigendecompositions of the factors (used for prediction and sampling)."""
         matrices, eigenvalues, eigenvectors = [], [], []
         for kernel, x in zip(self.kernels, xs):
             matrix = kernel(x, x, parameter_values=parameter_values)
@@ -192,54 +223,71 @@ class KroneckerGP(Distribution):
         return mean.reshape(shape)
 
     def _components(self, observed):
-        xs = self._factor_inputs()
-        dtype, device = xs[0].dtype, xs[0].device
-        shape = tuple(x.shape[0] for x in xs)
+        context = _BatchContext()
+        reference = self._factor_inputs()[0]
+        dtype, device = reference.dtype, reference.device
+        xs = [context.inputs(grid, dtype, device) for grid in self.grid_inputs]
+        shape = tuple(x.shape[1] for x in xs)
         n = math.prod(shape)
         observed = torch.as_tensor(observed, dtype=dtype, device=device)
         if observed.numel() != n:
             raise ValueError(f"KroneckerGP observations must contain one value per grid point ({n}); got {observed.numel()}.")
-        observed = observed.reshape(shape)
-        parameter_values = self._named_parameter_values()
-        noise = _resolved_value(self.noise_variance, dtype, device).reshape(-1)
-        if noise.numel() != 1:
+        noise = context.value(self.noise_variance, dtype, device)
+        noise = noise.reshape(noise.shape[0], -1)
+        if noise.shape[1] != 1:
             raise ValueError("KroneckerGP noise_variance must be scalar.")
-        noise = noise[0]
-        residual = observed - self._mean_tensor(shape, dtype, device)
-        matrices, eigenvalues, eigenvectors = self._decompose(xs, parameter_values)
+        noise = noise[:, 0]
+        mean = _batched_mean(context, self.mean, n, dtype, device, "KroneckerGP")
+        kernel_values, matrices, eigenvalues, eigenvectors = [], [], [], []
+        for kernel, x in zip(self.kernels, xs):
+            values = context.kernel_values(kernel, dtype, device)
+            matrix = kernel.batch_evaluate(x, x, values)
+            matrix = (matrix + matrix.transpose(-2, -1)) / 2
+            lam, vectors = torch.linalg.eigh(matrix)
+            kernel_values.append(values)
+            matrices.append(matrix)
+            eigenvalues.append(lam)
+            eigenvectors.append(vectors)
+        size = max(noise.shape[0], mean.shape[0], *(m.shape[0] for m in matrices))
+        residual = _expand_batch((observed.reshape(1, n) - mean).reshape(-1, *shape), size)
         # Round-off can make tiny eigenvalues of a PSD factor slightly negative.
-        denominator = _kronecker_eigenvalues(eigenvalues).clamp_min(0.0) + noise + self.jitter
+        noise_view = (noise + self.jitter).reshape(-1, *([1] * len(shape)))
+        denominator = _expand_batch(_batched_kronecker_eigenvalues(eigenvalues).clamp_min(0.0) + noise_view, size)
         rotated = residual
         for mode, vectors in enumerate(eigenvectors):
-            rotated = _mode_product(rotated, vectors.transpose(-2, -1), mode)
+            rotated = _batched_mode_product(rotated, vectors.transpose(-2, -1), mode)
         scaled = rotated / denominator
         alpha = scaled
         for mode, vectors in enumerate(eigenvectors):
-            alpha = _mode_product(alpha, vectors, mode)
+            alpha = _batched_mode_product(alpha, vectors, mode)
+        alpha = _expand_batch(alpha, size)
+        reduce = tuple(range(1, 1 + len(shape)))
         log_probability = -0.5 * (
-            (rotated * scaled).sum() + torch.log(denominator).sum() + n * math.log(2 * math.pi)
+            (rotated * scaled).sum(reduce) + torch.log(denominator).sum(reduce) + n * math.log(2 * math.pi)
         )
+        batched = context.any([*self.grid_inputs, self.noise_variance, self.mean, *self._kernel_parameter_nodes])
         return {
-            "xs": xs, "shape": shape, "noise": noise, "matrices": matrices, "eigenvalues": eigenvalues,
-            "eigenvectors": eigenvectors, "denominator": denominator, "alpha": alpha,
-            "parameter_values": parameter_values, "log_probability": log_probability,
+            "context": context, "xs": xs, "shape": shape, "noise": noise, "matrices": matrices,
+            "eigenvalues": eigenvalues, "eigenvectors": eigenvectors, "denominator": denominator, "alpha": alpha,
+            "kernel_values": kernel_values, "log_probability": log_probability, "batched": batched,
         }
 
     # -- Distribution interface ----------------------------------------------
-    def pdf(self, x):
-        return torch.exp(self.log_pdf(x))
-
     def log_pdf(self, x):
-        return self._components(x)["log_probability"]
+        parts = self._components(x)
+        return _finish(parts["log_probability"], parts["batched"])
 
     def log_pdf_grad(self, x):
-        return -self._components(x)["alpha"].reshape(torch.as_tensor(x).shape)
+        parts = self._components(x)
+        alpha = parts["alpha"].reshape(parts["alpha"].shape[0], *torch.as_tensor(x).shape)
+        return _finish(-alpha, parts["batched"])
 
     def factor_cotangents(self, parts):
-        """The matrices ``G_p`` with ``d log p = Σ_p ⟨G_p, dK_p⟩`` (see the class docstring)."""
+        """The matrices ``G_p`` ``(B, n_p, n_p)`` with ``d log p = Σ_p ⟨G_p, dK_p⟩`` (see the class docstring)."""
         alpha, eigenvalues, eigenvectors = parts["alpha"], parts["eigenvalues"], parts["eigenvectors"]
         matrices, inverse = parts["matrices"], 1.0 / parts["denominator"]
         n_modes = len(matrices)
+        size = alpha.shape[0]
         cotangents = []
         for p in range(n_modes):
             projected = alpha
@@ -247,35 +295,44 @@ class KroneckerGP(Distribution):
             for q in range(n_modes):
                 if q == p:
                     continue
-                projected = _mode_product(projected, matrices[q], q)
-                view = [1] * n_modes
-                view[q] = -1
+                projected = _batched_mode_product(projected, matrices[q], q)
+                view = [eigenvalues[q].shape[0]] + [1] * n_modes
+                view[q + 1] = -1
                 weights = weights * eigenvalues[q].reshape(view)
-            unfolded_alpha = torch.movedim(alpha, p, 0).reshape(alpha.shape[p], -1)
-            unfolded_projected = torch.movedim(projected, p, 0).reshape(alpha.shape[p], -1)
-            trace_weights = torch.movedim(weights, p, 0).reshape(alpha.shape[p], -1).sum(dim=-1)
+            n_p = alpha.shape[p + 1]
+            unfolded_alpha = torch.movedim(alpha, p + 1, 1).reshape(size, n_p, -1)
+            unfolded_projected = _expand_batch(torch.movedim(projected, p + 1, 1), size).reshape(size, n_p, -1)
+            trace_weights = _expand_batch(torch.movedim(weights, p + 1, 1), size).reshape(size, n_p, -1).sum(dim=-1)
             vectors = eigenvectors[p]
             cotangents.append(
                 0.5 * unfolded_alpha @ unfolded_projected.transpose(-2, -1)
-                - 0.5 * (vectors * trace_weights) @ vectors.transpose(-2, -1)
+                - 0.5 * (vectors * trace_weights.unsqueeze(-2)) @ vectors.transpose(-2, -1)
             )
         return cotangents
 
     def log_pdf_param_grads(self, x):
         parts = self._components(x)
+        context = parts["context"]
         cotangents = self.factor_cotangents(parts)
         gradients = {}
-        for kernel, x_p, cotangent in zip(self.kernels, parts["xs"], cotangents):
-            for name, derivative in kernel.derivatives(x_p, x_p, parameter_values=parts["parameter_values"]).items():
-                gradient = (cotangent * _with_parameter_axis(derivative)).sum(dim=(-2, -1))
+        for kernel, x_p, values, cotangent in zip(self.kernels, parts["xs"], parts["kernel_values"], cotangents):
+            for name, derivative in kernel.batch_derivatives(x_p, x_p, values).items():
+                gradient = _contract(cotangent, derivative)
                 gradients[name] = gradients[name] + gradient if name in gradients else gradient
+        for name in list(gradients):
+            parameter = next(p for p in self._kernel_parameter_nodes if p.name == name)
+            gradients[name] = _to_parameter_shape(gradients[name], _parameter_shape(context, parameter))
         alpha = parts["alpha"]
+        flat_alpha = alpha.reshape(alpha.shape[0], -1)
         if _is_named(self.noise_variance):
-            noise_gradient = 0.5 * (alpha.square().sum() - (1.0 / parts["denominator"]).sum())
-            gradients[self.noise_variance.name] = noise_gradient.reshape(resolve(self.noise_variance).shape)
+            inverse = (1.0 / parts["denominator"]).reshape(alpha.shape[0], -1)
+            noise_gradient = 0.5 * (flat_alpha.square().sum(-1) - inverse.sum(-1))
+            gradients[self.noise_variance.name] = _to_parameter_shape(
+                noise_gradient.unsqueeze(-1), _parameter_shape(context, self.noise_variance)
+            )
         if _is_named(self.mean):
-            gradients[self.mean.name] = _mean_gradient(alpha, self.mean)
-        return gradients
+            gradients[self.mean.name] = _to_parameter_shape(flat_alpha, _parameter_shape(context, self.mean))
+        return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
         """Draws of shape ``(n_samples, n_1, …, n_P)``: ``mean + Q (sqrt(λ) ⊙ ε₁) + σ ε₂``."""
@@ -406,29 +463,85 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
 
 
 def levinson_solve(first_column, rhs):
-    r"""Solve ``T X = B`` for a symmetric positive-definite Toeplitz ``T``.
+    r"""Solve ``T X = B`` for symmetric positive-definite Toeplitz matrices ``T``.
 
-    ``first_column`` is ``t`` with ``T_ij = t_|i-j|`` and ``rhs`` has shape
-    ``(n,)`` or ``(n, k)``. Returns ``(X, log det T)``. This is Levinson's
-    recursion (Golub & Van Loan, Alg. 4.7.2) on ``T / t_0``: the Durbin
-    vector solves the Yule-Walker systems and the prediction-error variances
-    ``β_k`` give ``log det T = n log t_0 + Σ_k log β_k``. ``O(n²)`` time per
-    right-hand side and ``O(n)`` memory; the recursion is sequential in
-    ``n``. Raises ``RuntimeError`` if ``T`` is not positive definite.
+    ``first_column`` is ``t`` with ``T_ij = t_|i-j|``; ``rhs`` has shape
+    ``(n,)`` or ``(n, k)``. Returns ``(X, log det T)``. A batch of systems is
+    solved at once when ``first_column`` has shape ``(B, n)``; ``rhs`` then
+    has shape ``(B, n)`` or ``(B, n, k)`` and ``log det T`` shape ``(B,)``.
+
+    This is Levinson's recursion (Golub & Van Loan, Alg. 4.7.2) on
+    ``T / t_0``: the Durbin vector solves the Yule-Walker systems and the
+    prediction-error variances ``β_k`` give
+    ``log det T = n log t_0 + Σ_k log β_k``. ``O(n²)`` time per right-hand
+    side and ``O(n)`` memory. The recursion is sequential in ``n``: one
+    Python step per row, each step operating on the whole batch. Raises
+    ``RuntimeError`` if a ``T`` is not positive definite.
     """
-    t = first_column
+    if first_column.ndim == 1:
+        vector = rhs.ndim == 1
+        solution, log_det = _levinson(first_column.unsqueeze(0), rhs.reshape(1, rhs.shape[0], -1))
+        return (solution[0, :, 0] if vector else solution[0]), log_det[0]
+    vector = rhs.ndim == 2
+    solution, log_det = _levinson(first_column, rhs.reshape(rhs.shape[0], rhs.shape[1], -1))
+    return (solution[..., 0] if vector else solution), log_det
+
+
+def _levinson(t, rhs):
+    """Batched Levinson recursion: ``t`` ``(B, n)``, ``rhs`` ``(B', n, k)`` -> ``((B, n, k), (B,))``."""
+    size, n = t.shape
+    if size == 1:
+        solution, log_det = _levinson_single(t[0], rhs[0])
+        return solution.unsqueeze(0), log_det.reshape(1)
+    t0 = t[:, 0]
+    b = (rhs / t0[:, None, None]).expand(size, n, rhs.shape[-1])
+    x = torch.zeros(b.shape, dtype=b.dtype, device=b.device)
+    x[:, 0] = b[:, 0]
+    log_det = n * torch.log(t0)
+    if n == 1:
+        return x, log_det
+    r = t[:, 1:] / t0[:, None]
+    # Reversed copies avoid a flip (and an allocation) in every step:
+    # r[:k] reversed is reversed_r[n-1-k:], and y[:k] reversed is
+    # reversed_y[n-1-k:].
+    reversed_r = r.flip(-1).contiguous()
+    y = torch.zeros_like(r)
+    reversed_y = torch.zeros_like(r)
+    alpha = -r[:, 0]
+    y[:, 0] = alpha
+    reversed_y[:, n - 2] = alpha
+    beta = torch.ones_like(t0)
+    betas = torch.empty((size, n - 1), dtype=t.dtype, device=t.device)
+    for k in range(1, n):
+        beta = (1.0 - alpha * alpha) * beta
+        betas[:, k - 1] = beta
+        start = n - 1 - k
+        r_k = reversed_r[:, start:]
+        mu = (b[:, k] - (r_k.unsqueeze(-2) @ x[:, :k]).squeeze(-2)) / beta[:, None]
+        x[:, :k] += reversed_y[:, start:, None] * mu[:, None, :]
+        x[:, k] = mu
+        if k < n - 1:
+            alpha = -(r[:, k] + (r_k * y[:, :k]).sum(-1)) / beta
+            forward = torch.addcmul(y[:, :k], alpha[:, None], reversed_y[:, start:])
+            reversed_y[:, start:].addcmul_(alpha[:, None], y[:, :k])
+            y[:, :k] = forward
+            y[:, k] = alpha
+            reversed_y[:, start - 1] = alpha
+    if not bool((betas > 0).all()):
+        raise RuntimeError("Toeplitz covariance is not positive definite (Levinson recursion broke down).")
+    return x, log_det + torch.log(betas).sum(-1)
+
+
+def _levinson_single(t, rhs):
+    """Unbatched Levinson recursion with Python-float scalars (fewer tensor operations per step)."""
     n = t.shape[0]
-    vector = rhs.ndim == 1
-    b = rhs.reshape(n, -1) / t[0]
-    x = torch.zeros_like(b)
+    b = rhs / t[0]
+    x = torch.zeros(b.shape, dtype=b.dtype, device=b.device)
     x[0] = b[0]
     log_det = n * torch.log(t[0])
     if n == 1:
-        return (x.reshape(-1) if vector else x), log_det
+        return x, log_det
     r = t[1:] / t[0]
-    # Reversed copies avoid a flip (and an allocation) in every step:
-    # r[:k] reversed is reversed_r[n-1-k:], and y[:k] reversed is
-    # reversed_y[n-1-k:]. The scalars α and β are Python floats.
     reversed_r = r.flip(0).contiguous()
     y = torch.zeros(n - 1, dtype=t.dtype, device=t.device)
     reversed_y = torch.zeros_like(y)
@@ -454,37 +567,36 @@ def levinson_solve(first_column, rhs):
             y[:k] = forward
             y[k] = alpha
             reversed_y[start - 1] = alpha
-    return (x.reshape(-1) if vector else x), log_det + log_beta
+    return x, log_det + log_beta
 
 
 def _correlation(f, g):
-    """``c_k = Σ_u f_u g_{u+k}`` for ``k = 0..n-1`` with an FFT (``O(n log n)``)."""
-    n = f.shape[0]
+    """``c_k = Σ_u f_u g_{u+k}`` for ``k = 0..n-1`` along the last axis, with an FFT (``O(n log n)``)."""
+    n = f.shape[-1]
     size = 2 * n
-    spectrum = torch.conj(torch.fft.rfft(f, size)) * torch.fft.rfft(g, size)
-    return torch.fft.irfft(spectrum, size)[:n]
+    spectrum = torch.conj(torch.fft.rfft(f, size, dim=-1)) * torch.fft.rfft(g, size, dim=-1)
+    return torch.fft.irfft(spectrum, size, dim=-1)[..., :n]
 
 
 def _lower_toeplitz_diagonal_sums(a):
-    r"""Sums of the diagonals of ``L(a) L(a)ᵀ`` (``L(a)``: lower Toeplitz, first column ``a``).
+    r"""Sums of the diagonals of ``L(a) L(a)ᵀ`` (``L(a)``: lower Toeplitz, first column ``a``), batched.
 
     ``s_k = Σ_u (n - k - u) a_u a_{u+k}`` for ``k = 0..n-1``.
     """
-    n = a.shape[0]
+    n = a.shape[-1]
     lags = torch.arange(n, dtype=a.dtype, device=a.device)
-    positions = torch.arange(n, dtype=a.dtype, device=a.device)
-    return (n - lags) * _correlation(a, a) - _correlation(positions * a, a)
+    return (n - lags) * _correlation(a, a) - _correlation(lags * a, a)
 
 
 def _toeplitz_inverse_diagonal_sums(inverse_first_column):
-    r"""``D_k = Σ_i (T⁻¹)_{i+k, i}`` from ``x = T⁻¹ e_0`` (Gohberg-Semencul).
+    r"""``D_k = Σ_i (T⁻¹)_{i+k, i}`` from ``x = T⁻¹ e_0`` (Gohberg-Semencul), batched over leading axes.
 
     For symmetric positive-definite Toeplitz ``T``,
     ``T⁻¹ = (L(x) L(x)ᵀ - L(c) L(c)ᵀ) / x_0`` with ``c = (0, x_{n-1}, …, x_1)``.
     """
     x = inverse_first_column
-    c = torch.cat([x.new_zeros(1), x[1:].flip(0)])
-    return (_lower_toeplitz_diagonal_sums(x) - _lower_toeplitz_diagonal_sums(c)) / x[0]
+    c = torch.cat([torch.zeros_like(x[..., :1]), x[..., 1:].flip(-1)], dim=-1)
+    return (_lower_toeplitz_diagonal_sums(x) - _lower_toeplitz_diagonal_sums(c)) / x[..., :1]
 
 
 _TOEPLITZ_KERNELS = (RBF, Matern, RationalQuadratic, Periodic, Constant)
@@ -502,7 +614,7 @@ def _check_stationary(kernel):
         )
 
 
-class ToeplitzGP(Distribution):
+class ToeplitzGP(_GPDistribution):
     r"""Exact GP marginal likelihood for equally spaced 1-D inputs (Toeplitz covariance).
 
     For a stationary kernel on ``x_i = x_0 + i h`` the covariance
@@ -510,7 +622,8 @@ class ToeplitzGP(Distribution):
     ``t_k = k(0, k h) + σ² δ_k0``. :func:`levinson_solve` gives
     ``α = (K + σ² I)⁻¹ (y - mean)`` and the log determinant in ``O(n²)``
     time and ``O(n)`` memory (a dense Cholesky needs ``O(n³)`` and
-    ``O(n²)``).
+    ``O(n²)``). With vectorized chains one Levinson recursion of ``n`` steps
+    runs on ``(C, …)`` tensors, i.e. all chains in the same Python loop.
 
     **Gradients** (hand-derived, ``O(n log n)`` on top of the solve). A
     hyperparameter changes the first column by ``dt``; with ``c_k = Σ_i α_i α_{i+k}``
@@ -521,14 +634,16 @@ class ToeplitzGP(Distribution):
 
     with ``w_0 = 1`` and ``w_k = 2`` for ``k > 0``. The noise variance only
     changes ``t_0``. ``jitter`` matches :class:`ExactGP`: ``jitter * max(1, t_0)``
-    is added to the diagonal (including its derivative).
+    is added to the diagonal (including its derivative), per chain.
 
     The kernel must be stationary (RBF, Matern, RationalQuadratic,
     Periodic, Constant and their sums/products); ``inputs`` must be equally
     spaced with shape ``(n,)`` or ``(n, 1)``. Levinson's recursion is
     sequential in ``n`` (a Python loop with a few tensor operations per
-    step), so it overtakes a dense Cholesky factorisation from roughly a
-    thousand points on (on CPU); its memory use is ``O(n)`` throughout.
+    step, roughly 0.1 ms), so on a CPU a multi-threaded dense Cholesky
+    factorisation stays competitive up to one or two thousand points; the
+    recursion wins beyond that, and its memory use is ``O(n)`` throughout.
+    With vectorized chains the same loop serves all chains.
     Levinson's recursion is weakly stable for positive-definite matrices;
     very smooth kernels with a tiny noise variance are ill-conditioned for
     any solver, and the recursion raises if it breaks down.
@@ -553,8 +668,7 @@ class ToeplitzGP(Distribution):
             if not bool((steps - steps[0]).abs().max() <= spacing_tolerance * steps[0].abs().clamp_min(1e-300)) or not bool(steps[0] != 0):
                 raise ValueError("ToeplitzGP inputs must be equally spaced.")
         self.add_dependency(inputs)
-        for parameter in kernel.parameters:
-            self.add_dependency(parameter)
+        self._register_kernel(kernel)
         self.add_dependency(noise_variance)
         self.add_dependency(mean)
 
@@ -568,22 +682,28 @@ class ToeplitzGP(Distribution):
     def event_shape(self):
         return (self._training_inputs().shape[0],)
 
-    @property
-    def batch_shape(self):
-        return torch.Size()
-
     def _named_parameter_values(self):
         return {parameter.name: resolve(parameter) for parameter in self.kernel.parameters}
 
-    def _first_column(self, x, parameter_values, noise):
-        """First column of ``K + σ² I + jitter``, and ``d t_0 / d (k(0) + σ²)``."""
-        column = self.kernel(x[:1], x, parameter_values=parameter_values).reshape(-1).clone()
-        diagonal = column[0] + noise
+    def _batched_first_column(self, x, kernel_values, noise):
+        """First columns ``(B, n)`` of ``K + σ² I + jitter`` and ``d t_0 / d (k(0) + σ²)`` ``(B,)``."""
+        column = self.kernel.batch_evaluate(x[:, :1], x, kernel_values)[:, 0, :]
+        size = max(column.shape[0], noise.shape[0])
+        column = _expand_batch(column, size).clone()
+        diagonal = column[:, 0] + noise
         scale = diagonal.abs().clamp_min(1.0)
         jitter = max(self.jitter, torch.finfo(x.dtype).eps)
-        column[0] = diagonal + jitter * scale
-        diagonal_scale = 1.0 + (jitter if bool(diagonal.abs() > 1.0) else 0.0)
+        column[:, 0] = diagonal + jitter * scale
+        diagonal_scale = 1.0 + jitter * (diagonal.abs() > 1.0).to(x.dtype)
         return column, diagonal_scale
+
+    def _first_column(self, x, parameter_values, noise):
+        """Unbatched first column (used by :func:`toeplitz_gp_predictive`)."""
+        values = {name: torch.as_tensor(value).unsqueeze(0) for name, value in parameter_values.items()}
+        column, diagonal_scale = self._batched_first_column(
+            _feature_matrix(x).unsqueeze(0), values, torch.as_tensor(noise).reshape(1)
+        )
+        return column[0], diagonal_scale[0]
 
     def _mean_vector(self, n, dtype, device):
         mean = _resolved_value(self.mean, dtype, device)
@@ -594,71 +714,79 @@ class ToeplitzGP(Distribution):
         return mean.reshape(n)
 
     def _components(self, observed, need_inverse=False):
-        x = self._training_inputs()
-        dtype, device = x.dtype, x.device
-        n = x.shape[0]
+        context = _BatchContext()
+        reference = self._training_inputs()
+        dtype, device = reference.dtype, reference.device
+        x = context.inputs(self.inputs, dtype, device)
+        n = x.shape[1]
         observed = torch.as_tensor(observed, dtype=dtype, device=device).reshape(-1)
         if observed.numel() != n:
             raise ValueError(f"ToeplitzGP observations must contain one value per input ({n}); got {observed.numel()}.")
-        parameter_values = self._named_parameter_values()
-        noise = _resolved_value(self.noise_variance, dtype, device).reshape(-1)
-        if noise.numel() != 1:
+        noise = context.value(self.noise_variance, dtype, device)
+        noise = noise.reshape(noise.shape[0], -1)
+        if noise.shape[1] != 1:
             raise ValueError("ToeplitzGP noise_variance must be scalar.")
-        noise = noise[0]
-        column, diagonal_scale = self._first_column(x, parameter_values, noise)
-        residual = observed - self._mean_vector(n, dtype, device)
+        kernel_values = context.kernel_values(self.kernel, dtype, device)
+        column, diagonal_scale = self._batched_first_column(x, kernel_values, noise[:, 0])
+        mean = _batched_mean(context, self.mean, n, dtype, device, "ToeplitzGP")
+        size = max(column.shape[0], mean.shape[0])
+        column, diagonal_scale = _expand_batch(column, size), _expand_batch(diagonal_scale, size)
+        residual = _expand_batch(observed - mean, size)
         if need_inverse:
-            unit = torch.zeros(n, dtype=dtype, device=device)
-            unit[0] = 1.0
-            solution, log_det = levinson_solve(column, torch.stack([residual, unit], dim=-1))
-            alpha, inverse_column = solution[:, 0], solution[:, 1]
+            unit = torch.zeros_like(residual)
+            unit[:, 0] = 1.0
+            solution, log_det = _levinson(column, torch.stack([residual, unit], dim=-1))
+            alpha, inverse_column = solution[..., 0], solution[..., 1]
         else:
-            alpha, log_det = levinson_solve(column, residual)
-            inverse_column = None
-        log_probability = -0.5 * (residual.dot(alpha) + log_det + n * math.log(2 * math.pi))
+            solution, log_det = _levinson(column, residual.unsqueeze(-1))
+            alpha, inverse_column = solution[..., 0], None
+        log_probability = -0.5 * ((residual * alpha).sum(-1) + log_det + n * math.log(2 * math.pi))
+        batched = context.any([self.inputs, self.noise_variance, self.mean, *self.kernel.parameters])
         return {
-            "x": x, "alpha": alpha, "inverse_column": inverse_column, "diagonal_scale": diagonal_scale,
-            "parameter_values": parameter_values, "log_probability": log_probability,
+            "context": context, "x": x, "alpha": alpha, "inverse_column": inverse_column,
+            "diagonal_scale": diagonal_scale, "kernel_values": kernel_values,
+            "log_probability": log_probability, "batched": batched,
         }
 
-    def pdf(self, x):
-        return torch.exp(self.log_pdf(x))
-
     def log_pdf(self, x):
-        return self._components(x)["log_probability"]
+        parts = self._components(x)
+        return _finish(parts["log_probability"], parts["batched"])
 
     def log_pdf_grad(self, x):
-        return -self._components(x)["alpha"]
+        parts = self._components(x)
+        return _finish(-parts["alpha"], parts["batched"])
 
     def column_cotangent(self, parts):
-        """``g`` with ``d log p = g · dt`` for a change ``dt`` of the first column."""
+        """``g`` ``(B, n)`` with ``d log p = g · dt`` for a change ``dt`` of the first column."""
         alpha = parts["alpha"]
-        weights = torch.full_like(alpha, 2.0)
-        weights[0] = 1.0
+        weights = torch.full_like(alpha[:1], 2.0)
+        weights[:, 0] = 1.0
         quadratic = _correlation(alpha, alpha)
         trace = _toeplitz_inverse_diagonal_sums(parts["inverse_column"])
         return 0.5 * weights * (quadratic - trace)
 
     def log_pdf_param_grads(self, x):
         parts = self._components(x, need_inverse=True)
+        context = parts["context"]
         cotangent = self.column_cotangent(parts)
         # The scale-dependent jitter multiplies the derivative of t_0.
         cotangent_kernel = cotangent.clone()
-        cotangent_kernel[0] = cotangent[0] * parts["diagonal_scale"]
+        cotangent_kernel[:, 0] = cotangent[:, 0] * parts["diagonal_scale"]
         x_values = parts["x"]
         gradients = {}
-        for name, derivative in self.kernel.derivatives(x_values[:1], x_values, parameter_values=parts["parameter_values"]).items():
-            derivative = _with_parameter_axis(derivative)
-            gradients[name] = (derivative[..., 0, :] * cotangent_kernel).sum(dim=-1)
+        for name, derivative in self.kernel.batch_derivatives(x_values[:, :1], x_values, parts["kernel_values"]).items():
+            parameter = next(p for p in self.kernel.parameters if p.name == name)
+            gradient = _contract_diagonal(cotangent_kernel, derivative[..., 0, :])
+            gradients[name] = _to_parameter_shape(gradient, _parameter_shape(context, parameter))
         if _is_named(self.noise_variance):
-            gradients[self.noise_variance.name] = (cotangent[0] * parts["diagonal_scale"]).reshape(resolve(self.noise_variance).shape)
+            noise_gradient = (cotangent[:, 0] * parts["diagonal_scale"]).unsqueeze(-1)
+            gradients[self.noise_variance.name] = _to_parameter_shape(noise_gradient, _parameter_shape(context, self.noise_variance))
         if _is_named(self.mean):
-            gradients[self.mean.name] = _mean_gradient(parts["alpha"], self.mean)
-        return gradients
+            gradients[self.mean.name] = _to_parameter_shape(parts["alpha"], _parameter_shape(context, self.mean))
+        return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
         """Prior predictive draws (dense Cholesky; intended for small ``n``)."""
-        from ._process import stable_cholesky
         x = self._training_inputs()
         noise = _resolved_value(self.noise_variance, x.dtype, x.device).reshape(())
         covariance = self.kernel(x, x, parameter_values=self._named_parameter_values())
@@ -711,6 +839,3 @@ def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obse
         outputs.append(predictive_mean + torch.randn((n_samples, n_new), dtype=dtype, device=device) @ factor.transpose(-2, -1))
     return torch.stack(outputs)
 
-
-KroneckerGP._batchable = False
-ToeplitzGP._batchable = False

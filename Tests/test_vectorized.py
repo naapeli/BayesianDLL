@@ -337,11 +337,11 @@ def matmul_lambda_model():
     return model
 
 
-@pytest.mark.parametrize("factory, expect_warning", [
-    (exact_gp_model, False), (latent_gp_model, False), (matmul_lambda_model, True),
+@pytest.mark.parametrize("factory, batchable", [
+    (exact_gp_model, True), (latent_gp_model, True), (matmul_lambda_model, False),
 ])
-def test_loop_fallback_matches_chain_by_chain(factory, expect_warning):
-    """Nodes that cannot be batched are evaluated chain by chain, with identical results."""
+def test_loop_fallback_matches_chain_by_chain(factory, batchable):
+    """GP nodes are batched; nodes that cannot be batched are evaluated chain by chain. Same results either way."""
     model = factory()
     n_chains = 3
     values = random_values(model, n_chains, torch.Generator().manual_seed(3))
@@ -350,14 +350,15 @@ def test_loop_fallback_matches_chain_by_chain(factory, expect_warning):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         with model.batched(n_chains, values=values):
-            assert model._batch_mode == "loop"
-            assert model.batch_fallback_reason
+            assert model._batch_mode == ("tensor" if batchable else "loop")
+            assert bool(model.batch_fallback_reason) != batchable
             lp = model.model_log_prob()
             grads = model.joint_grad_log_prob(names)
-    assert any("chain by chain" in str(w.message) for w in caught) == expect_warning
-    torch.testing.assert_close(lp, expected_lp, rtol=1e-12, atol=1e-12)
+    assert any("chain by chain" in str(w.message) for w in caught) != batchable
+    tolerance = 1e-10 if batchable else 1e-12
+    torch.testing.assert_close(lp, expected_lp, rtol=tolerance, atol=tolerance)
     for n in names:
-        torch.testing.assert_close(grads[n], expected_grads[n], rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(grads[n], expected_grads[n], rtol=tolerance, atol=tolerance)
 
 
 @pytest.mark.parametrize("factory", [enumerated_mixture, brute_force_enumeration])
