@@ -7,7 +7,7 @@ from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, 
 from BayesianDLL.Distributions import Bernoulli, ContinuousReal, DiscreteRange, Exponential, Normal
 from BayesianDLL.Samplers import (
     FiniteGibbs, Metropolis, NUTS, PredicativeResult, SamplingBlock, SamplingResult,
-    posterior_predicative, sample_predicative, thin,
+    posterior_predicative,
 )
 from BayesianDLL.Samplers._sample import _build_blocks, _select_sampler
 
@@ -132,12 +132,11 @@ def test_public_sampling_runs_multiple_chains_and_records_deterministics():
     assert model.params["x"].constrained_value.item() == 0
 
 
-@pytest.mark.parametrize("wrapper", [sample_predicative, posterior_predicative])
-def test_predictive_sampling_shapes_and_restoration(normal_model, wrapper):
+def test_predictive_sampling_shapes_and_restoration(normal_model):
     normal_model.observed_params["data"].sampler = "metropolis"
     original = normal_model.params["mean"].constrained_value.clone()
     trace = {"mean": torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])}
-    result = wrapper(trace, n_samples=3, samples_per_step=6, warmup_per_sample=3, model=normal_model, progress_bar=False)
+    result = posterior_predicative(trace, n_samples=3, samples_per_step=6, warmup_per_sample=3, model=normal_model, progress_bar=False)
     assert isinstance(result, PredicativeResult)
     assert result["data"].shape == (3, 6, 3)
     assert torch.isfinite(result["data"]).all()
@@ -146,7 +145,7 @@ def test_predictive_sampling_shapes_and_restoration(normal_model, wrapper):
 
 def test_predictive_default_uses_all_trace_draws(normal_model):
     normal_model.observed_params["data"].sampler = "metropolis"
-    result = sample_predicative({"mean": torch.zeros(2, 3, 1)}, samples_per_step=2, warmup_per_sample=1, model=normal_model, progress_bar=False)
+    result = posterior_predicative({"mean": torch.zeros(2, 3, 1)}, samples_per_step=2, warmup_per_sample=1, model=normal_model, progress_bar=False)
     assert result["data"].shape == (6, 2, 3)
 
 
@@ -182,23 +181,18 @@ def test_predictive_sampling_resolves_data_backed_plate_at_runtime():
 
 def test_predictive_rejects_more_draws_than_trace(normal_model):
     with pytest.raises(RuntimeError, match="total trace length"):
-        sample_predicative({"mean": torch.zeros(1, 2, 1)}, n_samples=3, model=normal_model, progress_bar=False)
+        posterior_predicative({"mean": torch.zeros(1, 2, 1)}, n_samples=3, model=normal_model, progress_bar=False)
 
 
-@pytest.mark.parametrize("prior", [False, True])
-def test_predictive_wrappers_condition_on_correct_model(normal_model, monkeypatch, prior):
+def test_prior_predictive_runs_no_mcmc(normal_model, monkeypatch):
     module = importlib.import_module("BayesianDLL.Samplers._sample")
     original = normal_model.observed_params
     calls = []
-    def fake_sample(*args, **kwargs):
-        calls.append(set(normal_model.observed_params))
-        return {"mean": torch.zeros(1, 2, 1)}
-    monkeypatch.setattr(module, "sample", fake_sample)
+    monkeypatch.setattr(module, "sample", lambda *args, **kwargs: calls.append(args))
     normal_model.observed_params["data"].sampler = "metropolis"
-    wrapper = normal_model.sample_prior_predicative if prior else normal_model.sample_posterior_predicative
-    result = wrapper(n_samples=2, warmup_length=1, samples_per_step=2, warmup_per_sample=1, progress_bar=False)
+    result = normal_model.sample_prior_predicative(n_samples=2, samples_per_step=2, warmup_per_sample=1, progress_bar=False)
     # The prior predictive is drawn by ancestral sampling and runs no MCMC.
-    assert calls == ([] if prior else [{"data"}])
+    assert calls == []
     assert normal_model.observed_params is original
     assert result["data"].shape == (2, 2, 3)
 
@@ -222,7 +216,7 @@ def test_predictive_restores_parameters_on_failure(normal_model, monkeypatch):
         raise ValueError("step failed")
     monkeypatch.setattr(distribution, "sample", fail)
     with pytest.raises(ValueError, match="step failed"):
-        sample_predicative({"mean": torch.full((1, 2, 1), 2.0)}, n_samples=1, model=normal_model, progress_bar=False)
+        posterior_predicative({"mean": torch.full((1, 2, 1), 2.0)}, n_samples=1, model=normal_model, progress_bar=False)
     torch.testing.assert_close(normal_model.params["mean"].unconstrained_value, original)
 
 
@@ -240,7 +234,7 @@ def test_predictive_falls_back_to_mcmc_without_sampler(normal_model, monkeypatch
     monkeypatch.setattr(module, "_decide_predicative_step", spy)
     trace = {"mean": torch.full((1, 4, 1), 2.0)}
     with pytest.warns(UserWarning, match="falling back to MCMC"):
-        result = sample_predicative(trace, n_samples=2, samples_per_step=30, warmup_per_sample=30, model=normal_model, progress_bar=False)
+        result = posterior_predicative(trace, n_samples=2, samples_per_step=30, warmup_per_sample=30, model=normal_model, progress_bar=False)
     assert calls == ["data"]
     assert result["data"].shape == (2, 30, 3)
     assert abs(result["data"].mean().item() - 2.0) < 0.6
@@ -251,7 +245,7 @@ def test_predictive_transforms_constrained_priors_and_observations():
         rate = RandomParameter("rate", Exponential(1.0))
         ObservedParameter("data", Exponential(rate), torch.ones(1), sampler="metropolis")
     trace = SamplingResult({"rate": torch.tensor([[[2.0], [3.0]]])}, [], [], [], {"twice": torch.tensor([[[4.0], [6.0]]])})
-    result = sample_predicative(trace, n_samples=2, samples_per_step=8, warmup_per_sample=5, model=model, progress_bar=False)
+    result = posterior_predicative(trace, n_samples=2, samples_per_step=8, warmup_per_sample=5, model=model, progress_bar=False)
     assert (result["data"] > 0).all()
     assert rate.constrained_value.item() == 1
 
@@ -285,14 +279,6 @@ def test_sampling_result_thin_with_slice():
     thinned = res.thin(slice(2, 8, 2))
     assert thinned["x"].shape == (2, 3, 1)
     torch.testing.assert_close(thinned["x"], trace["x"][:, 2:8:2])
-
-
-def test_sampling_result_standalone_thin():
-    trace = {"x": torch.arange(20.0).reshape(2, 10, 1)}
-    res = SamplingResult(trace, [0, 0], [[0.8]], [[0.1]])
-    t1 = res.thin(3)
-    t2 = thin(res, 3)
-    torch.testing.assert_close(t1["x"], t2["x"])
 
 
 def test_sampling_result_thin_validation():
@@ -335,17 +321,9 @@ def test_predicative_result_thin():
     assert thinned_slice["data"].shape == (4, 3, 2)
     torch.testing.assert_close(thinned_slice["data"], samples["data"][:, 1:4])
 
-    # Standalone function
-    torch.testing.assert_close(thin(res, 2)["data"], thinned_pred["data"])
-
     # Invalid dim
     with pytest.raises(ValueError, match="dim must be 0, 1, or"):
         res.thin(2, dim=2)
-
-
-def test_thin_unsupported_type():
-    with pytest.raises(TypeError, match="does not support thinning"):
-        thin([1, 2, 3], 2)
 
 
 def test_sampling_result_thin_with_summary():

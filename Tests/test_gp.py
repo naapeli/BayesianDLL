@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from BayesianDLL import (
     Data,
     DeterministicParameter,
-    MeanFieldGuide,
+    Guide,
     Model,
     ObservedParameter,
     RandomParameter,
@@ -18,8 +18,6 @@ from BayesianDLL.Distributions import Exponential, Normal, Uniform
 from BayesianDLL.GP import (
     Constant,
     ExactGP,
-    GaussianProcess,
-    ExactGaussianProcess,
     Linear,
     LatentGP,
     Matern,
@@ -204,11 +202,6 @@ def test_gp_adds_whitened_latent_and_has_finite_gradients():
     assert all(torch.isfinite(value).all() for value in gradients.values())
 
 
-def test_gp_legacy_names_are_compatible_aliases():
-    assert GaussianProcess is LatentGP
-    assert ExactGaussianProcess is ExactGP
-
-
 def test_condition_can_fix_latent_gp_hyperparameters():
     x = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
     y = torch.sin(2 * torch.pi * x)
@@ -240,11 +233,10 @@ def test_gp_accepts_an_explicit_latent_variable():
     with Model() as model:
         inputs = Data("inputs", x)
         z = RandomParameter("z", Normal(0.0, 1.0), shape=x.numel())
-        function = GaussianProcess("function", inputs, RBF(0.5, 1.0), latent=z)
+        function = LatentGP("function", inputs, RBF(0.5, 1.0), latent=z)
 
     assert model.params["z"] is z
     assert "function_white" not in model.params
-    assert function.latent is z
     assert function.gp_latent is z
 
 
@@ -279,7 +271,7 @@ def test_gp_variance_gradient_matches_full_model_finite_difference():
             Exponential(1.0),
             initial_value=torch.tensor([1.2], dtype=torch.float64),
         )
-        function = GaussianProcess("function", inputs, RBF(0.5, variance), latent=z)
+        function = LatentGP("function", inputs, RBF(0.5, variance), latent=z)
         # The literal likelihood variance must not be confused with the GP
         # hyperparameter named "variance".
         ObservedParameter("observations", Normal(function, 0.1 ** 0.5), y)
@@ -312,7 +304,7 @@ def test_gp_mcmc_promotes_float32_inputs_to_inference_dtype():
         inputs = Data("inputs", x)
         lengthscale = RandomParameter("lengthscale", Exponential(1.0))
         variance = RandomParameter("variance", Exponential(1.0))
-        function = GaussianProcess("function", inputs, RBF(lengthscale, variance))
+        function = LatentGP("function", inputs, RBF(lengthscale, variance))
         ObservedParameter("observations", Normal(function, 0.1 ** 0.5), y)
     # A two-step warmup leaves the step size untuned (every post-warmup step
     # diverged); ten warmup steps are still cheap.
@@ -374,7 +366,7 @@ def test_exact_gp_mcmc_and_predictive_samples():
 
 def test_whitened_gp_is_usable_in_variational_inference():
     model, _, _ = build_gp_model(n=3)
-    with MeanFieldGuide() as guide:
+    with Guide() as guide:
         RandomParameter(
             "function_white",
             Normal(

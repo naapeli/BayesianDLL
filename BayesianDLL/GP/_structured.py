@@ -22,7 +22,6 @@ import math
 
 import torch
 
-from .._data import Data
 from ..Distributions._resolve import resolve
 from ._kernels import (
     Constant,
@@ -53,10 +52,6 @@ from ._process import (
 )
 
 
-def _with_parameter_axis(derivative):
-    return derivative.unsqueeze(0) if derivative.ndim == 2 else derivative
-
-
 def _mode_product(tensor, matrix, mode):
     """``tensor ×_mode matrix``: contract axis ``mode`` of ``tensor`` with the columns of ``matrix``."""
     result = torch.tensordot(matrix, tensor, dims=([1], [mode]))
@@ -69,15 +64,6 @@ def _kronecker_eigenvalues(eigenvalues):
     for values in eigenvalues[1:]:
         result = result.unsqueeze(-1) * values
     return result
-
-
-def _mean_gradient(alpha, mean_parameter):
-    """Gradient ``α`` shaped like the mean parameter (scalar means get ``Σ α``)."""
-    shape = resolve(mean_parameter).shape
-    flat = alpha.reshape(-1)
-    if math.prod(shape) == flat.numel():
-        return flat.reshape(shape)
-    return flat.sum().reshape(shape)
 
 
 def _draw_count(trace):

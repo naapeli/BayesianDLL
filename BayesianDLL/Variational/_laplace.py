@@ -6,7 +6,8 @@ from warnings import warn
 import torch
 
 from ._MAP import find_MAP
-from ._auto_guides import LatentLayout, trace_from_unconstrained
+from ._auto_guides import LatentLayout
+from ._guide import trace_from_unconstrained
 
 
 def _log_joint(model, layout, flat):
@@ -103,11 +104,8 @@ class LaplaceApproximation:
         eps = torch.randn(n, self.layout.dim, dtype=self.mean.dtype, device=self.mean.device)
         return self.mean + eps @ self.scale_tril.T
 
-    def sample(self, n_samples=1000, warmup_length=None, n_chains=1, **ignored):
-        """Independent draws as a :class:`SamplingResult` in the constrained space (deterministics included).
-
-        ``warmup_length`` and other sampler arguments are ignored.
-        """
+    def sample(self, n_samples=1000, n_chains=1):
+        """Independent draws as a :class:`SamplingResult` in the constrained space (deterministics included)."""
         draws = self.sample_unconstrained(n_chains * n_samples).reshape(n_chains, n_samples, self.layout.dim)
         return trace_from_unconstrained(self.model, self.layout, draws)
 

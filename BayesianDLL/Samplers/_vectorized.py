@@ -10,7 +10,7 @@ from ._vectorized_samplers import VectorizedFiniteGibbs, VectorizedMetropolis, V
 from ._NUTS import NUTS
 from ._Metropolis import Metropolis, FiniteGibbs
 from ._Slice import Slice
-from ._result import SamplingResult, SampleStats
+from ._result import SampleStats
 
 
 _NUMERICAL_ERRORS = (ValueError, RuntimeError, OverflowError, ZeroDivisionError)

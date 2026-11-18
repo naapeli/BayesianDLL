@@ -3,8 +3,7 @@ import pytest
 import torch
 
 from BayesianDLL.Evaluation import (
-    effective_sample_size, ess_bulk, ess_mean, ess_tail, gelman_rubin,
-    mcse, mcse_mean, mcse_sd, summary,
+    effective_sample_size, gelman_rubin, mcse, summary,
 )
 from BayesianDLL.Samplers import PredicativeResult, SamplingResult
 
@@ -44,24 +43,21 @@ def test_ess_detects_autocorrelation(trace, method):
     assert (actual < independent / 2).all()
 
 
-@pytest.mark.parametrize("wrapper,method", [(ess_mean, "mean"), (ess_bulk, "bulk"), (ess_tail, "tail")])
-def test_ess_convenience_functions(trace, wrapper, method):
-    torch.testing.assert_close(wrapper(trace)["x"], effective_sample_size(trace, method=method)["x"])
-
-
 def test_tail_probability_pair_matches_scalar(trace):
-    torch.testing.assert_close(ess_tail(trace, prob=0.9)["x"], ess_tail(trace, prob=(0.1, 0.9))["x"])
+    torch.testing.assert_close(
+        effective_sample_size(trace, method="tail", prob=0.9)["x"],
+        effective_sample_size(trace, method="tail", prob=(0.1, 0.9))["x"],
+    )
 
 
 def test_mcse_matches_moment_formulas(trace):
     x = trace["x"]
-    ess = ess_mean(trace)["x"]
+    ess = effective_sample_size(trace, method="mean")["x"]
     flat = x.flatten(0, 1)
-    torch.testing.assert_close(mcse_mean(trace)["x"], flat.std(0) / ess.sqrt())
+    torch.testing.assert_close(mcse(trace, method="mean")["x"], flat.std(0) / ess.sqrt())
     squared = (flat - flat.mean(0)).square()
     variance = squared.mean(0)
     expected_sd = ((squared.square().mean(0) - variance.square()) / ess / variance / 4).sqrt()
-    torch.testing.assert_close(mcse_sd(trace)["x"], expected_sd)
     torch.testing.assert_close(mcse(trace, method="sd")["x"], expected_sd)
 
 
@@ -81,9 +77,9 @@ def test_diagnostics_preserve_multidimensional_feature_shape(function):
 def test_constant_chain_diagnostics():
     trace = {"x": torch.ones(4, 100, 1)}
     assert gelman_rubin(trace)["x"].item() == 1
-    assert ess_mean(trace)["x"].item() == 400
-    assert mcse_mean(trace)["x"].item() == 0
-    assert mcse_sd(trace)["x"].item() == 0
+    assert effective_sample_size(trace, method="mean")["x"].item() == 400
+    assert mcse(trace, method="mean")["x"].item() == 0
+    assert mcse(trace, method="sd")["x"].item() == 0
 
 
 def test_sampling_result_mapping(trace):

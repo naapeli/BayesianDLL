@@ -81,13 +81,3 @@ def mcse(samples: dict[str, torch.Tensor], method: str = "mean") -> dict[str, to
             results[name] = mcse_vals
     return results
 
-
-def mcse_mean(samples: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Compute MCSE for posterior mean."""
-    return mcse(samples, method="mean")
-
-
-def mcse_sd(samples: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Compute MCSE for posterior standard deviation."""
-    return mcse(samples, method="sd")
-

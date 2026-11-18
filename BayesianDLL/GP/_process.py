@@ -368,10 +368,6 @@ class LatentGP(DeterministicParameter):
         super().__init__(name, forward, derivative, model_inputs, vjp_func=vjp)
         self.gp_inputs = inputs
         self.gp_latent = latent
-        # Public aliases make the latent variable easy to inspect when it was
-        # supplied explicitly, while retaining the more specific GP metadata.
-        self.latent = latent
-        self.latent_name = latent.name
         self.gp_kernel = kernel
         self.gp_mean = mean
         self.gp_jitter = jitter
@@ -459,10 +455,6 @@ class LatentGP(DeterministicParameter):
             if flag and name in grads:
                 result[name] = _expand_batch(grads[name], self.owner_model.n_chains)
         return result
-
-
-# Backwards-compatible name retained for existing models and notebooks.
-GaussianProcess = LatentGP
 
 
 # ----------------------------------------------------------------------------
@@ -616,10 +608,6 @@ class ExactGP(_GPDistribution):
         return mean + torch.randn(
             (n_samples, zero.numel()), dtype=zero.dtype, device=zero.device
         ) @ factor.transpose(-2, -1)
-
-
-# Backwards-compatible name retained for existing exact-GP models.
-ExactGaussianProcess = ExactGP
 
 
 # ----------------------------------------------------------------------------

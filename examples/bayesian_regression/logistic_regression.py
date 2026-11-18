@@ -40,7 +40,7 @@ with Model() as model:
     z = Data("z", (x - x_mean) / x_sd)
     alpha = RandomParameter("alpha", Normal(0.0, 2.5))
     beta = RandomParameter("beta", Normal(0.0, 2.5))
-    logits = Linear("logits", z, slope=beta, intercept=alpha)
+    logits = Linear("logits", z, coefficients=beta, intercept=alpha)
 
     # Coefficients per unit of the original covariate x.
     b = Multiply("b", beta, 1.0 / x_sd)

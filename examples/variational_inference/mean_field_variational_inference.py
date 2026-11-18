@@ -4,7 +4,7 @@ Writing a Variational Guide by Hand
 
 The target is a one-dimensional, two-component Gaussian mixture
 ``0.3 N(-2, 0.5) + 0.7 N(2, 0.8)``, and the guide is a single Normal
-``q(x) = N(m, s)``. The guide is written by hand in a ``MeanFieldGuide``
+``q(x) = N(m, s)``. The guide is written by hand in a ``Guide``
 block: a ``RandomParameter`` with the same name as the model's latent,
 whose distribution has the ``VariationalParameter`` objects ``m`` and ``s``.
 ``s`` is created with ``log_scale=True``, so the optimiser updates
@@ -29,7 +29,7 @@ component: ``-log 0.3 = 1.20`` and ``-log 0.7 = 0.36``.
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import MeanFieldGuide, Model, RandomParameter, VariationalParameter
+from BayesianDLL import Guide, Model, RandomParameter, VariationalParameter
 from BayesianDLL.Distributions import Mixture, Normal
 from BayesianDLL.Variational import BBVI
 
@@ -42,7 +42,7 @@ with Model() as model:
 
 
 def normal_guide(initial_mean):
-    with MeanFieldGuide() as guide:
+    with Guide() as guide:
         m = VariationalParameter("m", torch.tensor([initial_mean], dtype=torch.float64))
         s = VariationalParameter("s", torch.tensor([1.0], dtype=torch.float64), log_scale=True)
         RandomParameter("x", Normal(m, s))

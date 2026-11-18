@@ -150,17 +150,3 @@ def effective_sample_size(samples: dict[str, torch.Tensor], method: str = "bulk"
             results[name] = ess_vals
     return results
 
-
-def ess_bulk(samples: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Compute rank-normalized bulk ESS."""
-    return effective_sample_size(samples, method="bulk")
-
-
-def ess_tail(samples: dict[str, torch.Tensor], prob: float = 0.89) -> dict[str, torch.Tensor]:
-    """Compute tail ESS using quantile indicators at coverage `prob` (default 0.89)."""
-    return effective_sample_size(samples, method="tail", prob=prob)
-
-
-def ess_mean(samples: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Compute split mean ESS for posterior mean."""
-    return effective_sample_size(samples, method="mean")

@@ -233,8 +233,6 @@ class Model:
         self._affected_params: dict[str, list[RandomParameter]] = {}
         self._affected_observed: dict[str, list[ObservedParameter]] = {}
         self._all_params_list: list[RandomParameter] = []
-        self._topo_deterministic_params: list[DeterministicParameter] = []
-        self._successors: dict[str, list[str]] = {}
         self._topo_order: list[str] = []
         # Batched (vectorized chains) evaluation; see BayesianDLL._batching.
         self.n_chains = None
@@ -256,7 +254,6 @@ class Model:
 
     def compile(self):
         self._all_params_list = list(self.params.values())
-        self._successors = {n: list(self.graph.successors(n)) for n in self.graph.nodes}
 
         try:
             topo_order = list(nx.topological_sort(self.graph))
@@ -264,9 +261,6 @@ class Model:
             topo_order = list(self.graph.nodes)
 
         self._topo_order = topo_order
-        self._topo_deterministic_params = [
-            self.deterministic_params[n] for n in topo_order if n in self.deterministic_params
-        ]
 
         self._affected_params = {}
         self._affected_observed = {}
@@ -1145,27 +1139,21 @@ class Model:
         from .Variational import find_MAP as _find_MAP
         return _find_MAP(self, lr=lr, epochs=epochs, betas=betas, callback_frequency=callback_frequency, verbose=verbose)
     
-    def sample_posterior_predicative(self, n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, progress_bar=True):
-        from .Samplers import sample_posterior_predicative as _spp
-        return _spp(n_samples, warmup_length, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)
-
-    def posterior_predicative(self, trace, n_samples=20, samples_per_step=500, warmup_per_sample=100, progress_bar=True):
+    def posterior_predicative(self, trace, n_samples=None, samples_per_step=20, warmup_per_sample=20, progress_bar=True):
+        """Posterior predictive draws for ``trace``; see :func:`BayesianDLL.posterior_predicative`."""
         from .Samplers import posterior_predicative as _pp
         return _pp(trace, n_samples=n_samples, samples_per_step=samples_per_step, warmup_per_sample=warmup_per_sample, model=self, progress_bar=progress_bar)
 
-    def sample_prior_predicative(self, n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, progress_bar=True):
+    def sample_prior_predicative(self, n_samples=20, samples_per_step=500, warmup_per_sample=100, progress_bar=True):
+        """Prior predictive draws; see :func:`BayesianDLL.sample_prior_predicative`."""
         from .Samplers import sample_prior_predicative as _spp
-        return _spp(n_samples, warmup_length, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)
+        return _spp(n_samples, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)
 
     def condition(self, random_variable_names_and_values=None, **kwargs):
         return condition(self, random_variable_names_and_values, **kwargs)
 
     def marginalize(self, names):
         return marginalize(self, names)
-
-
-class MeanFieldGuide(Model):
-    pass
 
 
 def condition(model: Model, random_variable_names_and_values: dict = None, **kwargs) -> Model:

@@ -9,7 +9,6 @@ from BayesianDLL.Distributions import (
 )
 from BayesianDLL.Distributions._transforms import (
     IdentityTransform, InverseSoftPlusTransform, LogitTransform, LogTransform,
-    SoftMaxTransform,
 )
 
 
@@ -28,16 +27,6 @@ def test_elementwise_transform_round_trip_and_jacobian(transform):
     log_det = transform.log_abs_det_jacobian(z)
     expected = torch.autograd.grad(log_det, z)[0] if log_det.requires_grad else torch.zeros_like(z)
     torch.testing.assert_close(transform.grad_log_abs_det_jacobian(z), expected)
-
-
-def test_softmax_round_trip_and_full_jacobian():
-    transform = SoftMaxTransform()
-    z = torch.tensor([-2.0, 0.3, 1.0])
-    x = transform.inverse(z)
-    assert ContinuousSimplex().contains(x)
-    torch.testing.assert_close(transform.inverse(transform.forward(x)), x)
-    torch.testing.assert_close(transform.inverse(z + 1000), x)
-    torch.testing.assert_close(transform.derivative(z), torch.autograd.functional.jacobian(transform.inverse, z))
 
 
 @pytest.mark.parametrize("space,inside,outside", [

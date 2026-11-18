@@ -206,7 +206,6 @@ class _Mutation:
         self._discrete = None
         space = target.discrete_state_space()
         if space is not None:
-            self._discrete_space = space
             sampler_class = FiniteGibbs if has_finite_support(space) else Metropolis
             self._discrete = sampler_class(self._discrete_log_target, space)
         self._full = None

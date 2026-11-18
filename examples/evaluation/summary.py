@@ -21,7 +21,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from BayesianDLL.Evaluation import summary
 from BayesianDLL.Samplers._result import SamplingResult
 
 

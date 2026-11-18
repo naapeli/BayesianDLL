@@ -5,7 +5,7 @@ from functools import reduce
 from abc import ABC, abstractmethod
 
 from ._transforms import (
-    IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform, InverseSoftPlusTransform,
+    IdentityTransform, LogitTransform, LogTransform, InverseSoftPlusTransform,
     StickBreakingTransform, CorrCholeskyTransform, ChainTransform, _apply_jacobian_transpose, _log1m_tanh_sq,
     PositiveDefiniteTransform, OrderedTransform, log_sigmoid,
 )
@@ -1357,44 +1357,38 @@ class InverseWishart(_WishartFamily):
 
 # ========================= DISCRETE =========================
 class _ProbsOrLogits:
-    """Mixin for distributions parameterised by a probability ``p`` or by ``logits``."""
+    """Mixin for distributions parameterised by a probability ``probs`` or by ``logits``."""
 
-    def _init_probs(self, p, logits):
-        _check_exactly_one(["p", "logits"], [p, logits])
-        self.p = p
+    def _init_probs(self, probs, logits):
+        _check_exactly_one(["probs", "logits"], [probs, logits])
+        self.probs = probs
         self.logits = logits
-        self.add_dependency(p if p is not None else logits)
+        self.add_dependency(probs if probs is not None else logits)
 
     @property
     def _param(self):
-        return self.p if self.p is not None else self.logits
+        return self.probs if self.probs is not None else self.logits
 
-    @property
-    def probs(self):
-        if self.p is not None:
-            return resolve(self.p)
-        return torch.sigmoid(resolve(self.logits))
-
-    def _log_p_log_q(self, dtype=None):
+    def _log_p_log_q(self):
         """(log p, log(1-p)) computed stably."""
         if self.logits is not None:
             logits = _as_float(self.logits)
             return log_sigmoid(logits), log_sigmoid(-logits)
-        p = _as_float(self.p)
+        p = _as_float(self.probs)
         return torch.log(p), torch.log1p(-p)
 
     def _probs_float(self):
-        if self.p is not None:
-            return _as_float(self.p)
+        if self.probs is not None:
+            return _as_float(self.probs)
         return torch.sigmoid(_as_float(self.logits))
 
 
 class Geometric(_ProbsOrLogits, Distribution):
     """Number of trials up to and including the first success (support 1, 2, ...)."""
 
-    def __init__(self, p=None, logits=None):
+    def __init__(self, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscretePositive(), DiscretePositive())
-        self._init_probs(p, logits)
+        self._init_probs(probs, logits)
 
     @property
     def batch_shape(self):
@@ -1410,7 +1404,7 @@ class Geometric(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             logits = _as_float(self.logits)
             return _restrict(log_sigmoid(logits) + (x - 1) * log_sigmoid(-logits), inside)
-        p = _as_float(self.p)
+        p = _as_float(self.probs)
         return _restrict(torch.log(p) + torch.special.xlog1py(x - 1, -p), inside)
 
     def log_pdf_grad(self, x):
@@ -1421,8 +1415,8 @@ class Geometric(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             s = torch.sigmoid(_as_float(self.logits))
             return {self.resolve_name("logits", self.logits): _zero_outside(1 - x * s, inside)}
-        p = _as_float(self.p)
-        return {self.resolve_name("p", self.p): _zero_outside(1 / p - (x - 1) / (1 - p), inside)}
+        p = _as_float(self.probs)
+        return {self.resolve_name("probs", self.probs): _zero_outside(1 / p - (x - 1) / (1 - p), inside)}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1433,9 +1427,9 @@ class Geometric(_ProbsOrLogits, Distribution):
 
 
 class Bernoulli(_ProbsOrLogits, Distribution):
-    def __init__(self, p=None, logits=None):
+    def __init__(self, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscreteRange(0, 1), DiscreteRange(0, 1))
-        self._init_probs(p, logits)
+        self._init_probs(probs, logits)
 
     @property
     def batch_shape(self):
@@ -1451,7 +1445,7 @@ class Bernoulli(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             logits = _as_float(self.logits)
             return _restrict(x * logits - F.softplus(logits), inside)
-        p = _as_float(self.p)
+        p = _as_float(self.probs)
         return _restrict(torch.xlogy(x, p) + torch.special.xlog1py(1 - x, -p), inside)
 
     def log_pdf_grad(self, x):
@@ -1462,8 +1456,8 @@ class Bernoulli(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             grad = x - torch.sigmoid(_as_float(self.logits))
             return {self.resolve_name("logits", self.logits): _zero_outside(grad, inside)}
-        p = _as_float(self.p)
-        return {self.resolve_name("p", self.p): _zero_outside(x / p - (1 - x) / (1 - p), inside)}
+        p = _as_float(self.probs)
+        return {self.resolve_name("probs", self.probs): _zero_outside(x / p - (1 - x) / (1 - p), inside)}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1474,11 +1468,11 @@ class Bernoulli(_ProbsOrLogits, Distribution):
 
 
 class Binomial(_ProbsOrLogits, Distribution):
-    def __init__(self, n, p=None, logits=None):
+    def __init__(self, n, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscreteRange(0, n), DiscreteRange(0, n))
         self.n = n
         self.add_dependency(n)
-        self._init_probs(p, logits)
+        self._init_probs(probs, logits)
 
     @property
     def batch_shape(self):
@@ -1504,7 +1498,7 @@ class Binomial(_ProbsOrLogits, Distribution):
             logits = _as_float(self.logits)
             log_p = self._log_binom_coeff(x) + x * logits - n * F.softplus(logits)
         else:
-            p = _as_float(self.p)
+            p = _as_float(self.probs)
             log_p = self._log_binom_coeff(x) + torch.xlogy(x, p) + torch.special.xlog1py(n - x, -p)
         return _restrict(log_p, inside)
 
@@ -1517,8 +1511,8 @@ class Binomial(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             grad = x - n * torch.sigmoid(_as_float(self.logits))
             return {self.resolve_name("logits", self.logits): _zero_outside(grad, inside)}
-        p = _as_float(self.p)
-        return {self.resolve_name("p", self.p): _zero_outside(x / p - (n - x) / (1 - p), inside)}
+        p = _as_float(self.probs)
+        return {self.resolve_name("probs", self.probs): _zero_outside(x / p - (n - x) / (1 - p), inside)}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1613,17 +1607,17 @@ class Poisson(Distribution):
 
 
 class NegativeBinomial(_ProbsOrLogits, Distribution):
-    """Number of successes before ``total_count`` failures, success probability ``p``.
+    """Number of successes before ``total_count`` failures, success probability ``probs``.
 
     ``log p(k) = log C(k + r - 1, k) + r log(1 - p) + k log p`` (the PyTorch /
     Pyro convention), mean ``r p / (1 - p)``.
     """
 
-    def __init__(self, total_count, p=None, logits=None):
+    def __init__(self, total_count, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscreteNonNegative(), DiscreteNonNegative())
         self.total_count = total_count
         self.add_dependency(total_count)
-        self._init_probs(p, logits)
+        self._init_probs(probs, logits)
 
     @property
     def batch_shape(self):
@@ -1641,7 +1635,7 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             logits = _as_float(self.logits)
             return _restrict(log_norm + x * log_sigmoid(logits) + r * log_sigmoid(-logits), inside)
-        p = _as_float(self.p)
+        p = _as_float(self.probs)
         return _restrict(log_norm + torch.xlogy(x, p) + r * torch.log1p(-p), inside)
 
     def log_pdf_grad(self, x):
@@ -1655,8 +1649,8 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             grads[self.resolve_name("logits", self.logits)] = x - (x + r) * torch.sigmoid(_as_float(self.logits))
         else:
-            p = _as_float(self.p)
-            grads[self.resolve_name("p", self.p)] = x / p - r / (1 - p)
+            p = _as_float(self.probs)
+            grads[self.resolve_name("probs", self.probs)] = x / p - r / (1 - p)
         return {name: _zero_outside(grad, inside) for name, grad in grads.items()}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
@@ -1665,7 +1659,7 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             odds = torch.exp(_as_float(self.logits))
         else:
-            p = _as_float(self.p)
+            p = _as_float(self.probs)
             odds = p / (1 - p)
         r = _as_float(self.total_count).to(odds.dtype)
         shape = _sample_shape(n_samples, self.batch_shape)

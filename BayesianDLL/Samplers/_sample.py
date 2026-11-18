@@ -23,7 +23,6 @@ from ..Distributions._state_space import JointStateSpace
 
 
 _SAMPLER_CLASSES = {"nuts": NUTS, "metropolis": Metropolis, "gibbs": FiniteGibbs, "slice": Slice}
-_SAMPLER_ALIASES = {"finite_gibbs": "gibbs", "finitegibbs": "gibbs"}
 # Constructor arguments supplied by the library itself, not by sampler_params.
 _INTERNAL_ARGUMENTS = {"self", "log_target", "gradient", "inverse_transformation", "state_space", "elementwise_log_target"}
 
@@ -56,7 +55,6 @@ def _select_sampler(log_target, state_space, gradient=None, sampler="auto", samp
 
     is_continuous = state_space.is_continuous()
     is_discrete = state_space.is_discrete()
-    sampler = _SAMPLER_ALIASES.get(sampler, sampler)
 
     if sampler == "auto":
         if is_continuous and gradient is not None:
@@ -106,8 +104,8 @@ def _sampler_name(sampler):
 def _block_sampler_type(model, param_names, sampler_type, state_space, is_continuous):
     """The sampler of a block: ``sampler_type`` or, for ``"auto"``, the one its parameters request."""
     if sampler_type != "auto":
-        return _SAMPLER_ALIASES.get(sampler_type, sampler_type)
-    requested = [_SAMPLER_ALIASES.get(model.params[name].sampler, model.params[name].sampler) for name in param_names]
+        return sampler_type
+    requested = [model.params[name].sampler for name in param_names]
     if is_continuous:
         if "metropolis" in requested:
             return "metropolis"
@@ -160,7 +158,7 @@ def _default_block_specs(model):
     discrete_metropolis_names = []
     for name, p in model.params.items():
         space = p.distribution.transformed_state_space
-        requested = _SAMPLER_ALIASES.get(p.sampler, p.sampler)
+        requested = p.sampler
         if space.is_continuous():
             if requested in ("auto", "nuts"):
                 nuts_names.append(name)
@@ -731,25 +729,7 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     max_depths = [getattr(block.sampler, "max_depth", None) for block in blocks]
     return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes, stats, max_depths, chain_enum_trace, chain_enum_probs, chain_log_lik
 
-def sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
-    """Sample the posterior with MCMC and draw from its predictive distribution.
-
-    The posterior is sampled with :func:`sample` (``warmup_length`` warmup
-    steps, four chains); the predictive draws are then generated exactly with
-    :func:`sample_predicative`. ``samples_per_step`` is the number of
-    replicated data sets per posterior draw and ``warmup_per_sample`` is only
-    used by the MCMC fallback for likelihoods without a sampler.
-    """
-    model = get_active_model() if model is None else model
-    trace = sample(n_samples, warmup_length, 4, model, progress_bar, check_convergence=False)
-    return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
-
-def posterior_predicative(trace, n_samples=20, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
-    """Posterior predictive draws for an existing ``trace``; see :func:`sample_predicative`."""
-    model = get_active_model() if model is None else model
-    return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
-
-def sample_prior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
+def sample_prior_predicative(n_samples=20, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
     """Draw from the prior predictive distribution by ancestral sampling.
 
     For each of the ``n_samples`` prior draws, the random parameters are
@@ -763,14 +743,13 @@ def sample_prior_predicative(n_samples=20, warmup_length=100, samples_per_step=5
     with the prior draws of the random and deterministic parameters, so
     ``summary`` and the posterior plots work on it.
 
-    ``warmup_length`` is ignored and only kept for backward compatibility;
     ``warmup_per_sample`` is only used by the MCMC fallback for distributions
     that cannot be sampled directly.
     """
     model = get_active_model() if model is None else model
     return _ancestral_predictive(model, n_samples, samples_per_step, None, progress_bar, warmup_per_sample)
 
-def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
+def posterior_predicative(trace, n_samples=None, samples_per_step=20, warmup_per_sample=20, model=None, progress_bar=True):
     """Posterior predictive samples by exact ancestral sampling.
 
     ``n_samples`` evenly spaced draws are taken from ``trace`` (all draws when
@@ -784,8 +763,7 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
 
     A likelihood without a sampler (``sample`` raising ``NotImplementedError``
     or missing) falls back to MCMC for that node only, with a warning; the
-    fallback uses ``warmup_per_sample`` warmup steps. Otherwise
-    ``warmup_per_sample`` is ignored.
+    fallback uses ``warmup_per_sample`` warmup steps.
 
     Returns a :class:`PredicativeResult` of tensors with shape
     ``(n_samples, samples_per_step, *predictive_shape)``.

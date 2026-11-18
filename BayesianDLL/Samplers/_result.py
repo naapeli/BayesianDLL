@@ -184,9 +184,3 @@ class PredicativeResult:
 
     def __repr__(self):
         return f"PredicativeResult(samples={list(self.samples.keys())})"
-
-
-def thin(result, step: int | slice = 1, **kwargs):
-    if hasattr(result, "thin") and callable(result.thin):
-        return result.thin(step, **kwargs)
-    raise TypeError(f"Object of type '{type(result).__name__}' does not support thinning.")

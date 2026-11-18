@@ -5,8 +5,8 @@ import math
 import torch
 
 from .._parameters import VariationalParameter
-from ..Samplers._result import SamplingResult
 from ._ELBO import scaled_log_joint, scaled_log_joint_grad
+from ._guide import BaseGuide, trace_from_unconstrained
 
 
 _LOG_2PI = math.log(2 * math.pi)
@@ -63,33 +63,6 @@ class LatentLayout:
         return {name: model.params[name].distribution.transform.inverse(value) for name, value in self.unpack(flat).items()}
 
 
-def trace_from_unconstrained(model, layout, draws):
-    """A :class:`SamplingResult` from unconstrained draws of shape ``(n_chains, n_samples, D)``.
-
-    The trace holds constrained values of the latents and the values of the
-    deterministic nodes, like the result of :func:`BayesianDLL.sample`.
-    """
-    n_chains, n_samples = draws.shape[:2]
-    trace = {name: [] for name in layout.names}
-    det_trace = {name: [] for name in model.deterministic_params}
-    for flat in draws.reshape(n_chains * n_samples, layout.dim):
-        with model.temporarily_set_many(layout.unpack(flat)):
-            for name in layout.names:
-                trace[name].append(model.params[name].constrained_value.clone())
-            for name, parameter in model.deterministic_params.items():
-                det_trace[name].append(torch.as_tensor(parameter.constrained_value).clone())
-
-    def stack(values):
-        stacked = torch.stack(values, dim=0)
-        return stacked.reshape(n_chains, n_samples, *stacked.shape[1:])
-
-    return SamplingResult(
-        {name: stack(values) for name, values in trace.items()},
-        [0] * n_chains, [[] for _ in range(n_chains)], [[] for _ in range(n_chains)],
-        deterministic_trace={name: stack(values) for name, values in det_trace.items() if values},
-    )
-
-
 def _lower(matrix, diagonal=0):
     """``torch.tril`` by masking (elementwise, cheap for small matrices)."""
     n, m = matrix.shape[-2:]
@@ -128,8 +101,12 @@ class ScaleTrilParameter(VariationalParameter):
         self.set_new_value(value)
 
 
-class AutoGuide:
-    """Base class of the Gaussian guides over the concatenated unconstrained latents.
+class AutoGuide(BaseGuide):
+    """Base class of the automatic Gaussian guides over the concatenated unconstrained latents.
+
+    The guide is built from ``model``: every latent gets a Normal family on
+    its unconstrained value. For other variational families write a
+    :class:`Guide` by hand.
 
     ``guide.sample(n)`` draws directly from the guide (no MCMC) and returns a
     :class:`SamplingResult` in the constrained space, including the
@@ -180,12 +157,8 @@ class AutoGuide:
     def sample_unconstrained(self, n):
         return self._transform(self._noise(n))
 
-    def sample(self, n_samples=1000, warmup_length=None, n_chains=1, **ignored):
-        """Draw ``n_chains * n_samples`` independent draws from the guide.
-
-        ``warmup_length`` and other sampler arguments are accepted for
-        compatibility with :meth:`Model.sample` and ignored.
-        """
+    def sample(self, n_samples=1000, n_chains=1):
+        """Draw ``n_chains * n_samples`` independent draws from the guide."""
         draws = self.sample_unconstrained(n_chains * n_samples).reshape(n_chains, n_samples, self.layout.dim)
         return trace_from_unconstrained(self.model, self.layout, draws)
 
@@ -200,7 +173,7 @@ class AutoGuide:
 
 
 class AutoNormal(AutoGuide):
-    """Mean-field Normal guide over every latent's unconstrained value.
+    """A Normal on every unconstrained latent, built automatically (mean-field, diagonal covariance).
 
     For each latent ``name`` the guide has the VariationalParameters
     ``f"{name}_loc"`` and ``f"{name}_scale"`` (optimised on the log scale).
@@ -246,7 +219,7 @@ class AutoNormal(AutoGuide):
 
 
 class AutoMultivariateNormal(AutoGuide):
-    """Full-rank Normal guide over the concatenated unconstrained latents.
+    """A full-rank multivariate Normal over the concatenated unconstrained latents, built automatically.
 
     ``z = loc + L eps`` with a lower-triangular ``L = scale_tril`` whose
     diagonal is kept positive (log-diagonal parameterisation). The hand-written

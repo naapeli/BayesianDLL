@@ -10,7 +10,7 @@ A straight-line regression with unknown noise,
     \\sigma \\sim \\text{HalfNormal}(1), \\quad y_i \\sim N(a + b x_i, \\sigma),
 
 is approximated with a mean-field guide written by hand in a
-``MeanFieldGuide`` block:
+``Guide`` block:
 
 * ``a`` and ``b`` get Normal factors with a free mean and a standard
   deviation that is a ``VariationalParameter`` with ``log_scale=True``, so
@@ -32,7 +32,7 @@ and the fitted line with its 90% band and a 95% predictive band.
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import AutoNormal, Data, MeanFieldGuide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
+from BayesianDLL import AutoNormal, Data, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
 from BayesianDLL.Deterministic import Exp, Linear
 from BayesianDLL.Distributions import HalfNormal, Normal
 from BayesianDLL.Variational import BBVI
@@ -53,7 +53,7 @@ with Model() as model:
     sigma = RandomParameter("sigma", HalfNormal(1.0))
     x_data = Data("x", x)
     with plate("observations", x_data):
-        line = Linear("line", x_data, slope=slope, intercept=intercept)
+        line = Linear("line", x_data, coefficients=slope, intercept=intercept)
         ObservedParameter("y", Normal(line, sigma), y)
 
 
@@ -64,7 +64,7 @@ def normal_factor(name, mean=0.0, sd=1.0):
     return RandomParameter(name, Normal(loc, scale))
 
 
-with MeanFieldGuide() as guide:
+with Guide() as guide:
     normal_factor("intercept")
     normal_factor("slope")
     Exp("sigma", normal_factor("log_sigma", mean=-1.0, sd=0.5))
@@ -72,12 +72,12 @@ with MeanFieldGuide() as guide:
 # %%
 # Fitting the guides and the reference
 # ------------------------------------
-# A hand-written guide is sampled by running it forwards (ancestral sampling
-# of its graph), which ``sample_prior_predicative`` does; its ``prior``
-# attribute holds the draws of every guide node, including ``sigma``.
+# ``guide.sample`` draws every guide latent directly from its distribution
+# (no MCMC) and maps the draws onto the model, so the result holds the model
+# latents ``intercept``, ``slope`` and ``sigma``, like the other traces.
 
 history = BBVI(model, guide, n_samples=8, epochs=800, lr=0.02, lrd=0.998, callback_frequency=5, verbose=False)
-handwritten = guide.sample_prior_predicative(n_samples=4000, samples_per_step=1, progress_bar=False).prior
+handwritten = guide.sample(4000)
 
 auto_guide = AutoNormal(model)
 auto_history = BBVI(model, auto_guide, n_samples=8, epochs=800, lr=0.02, lrd=0.998, callback_frequency=5, verbose=False)

@@ -113,7 +113,7 @@ def scalar_slope_regression():
         x = Data("x", torch.tensor([0.0, 0.5, 1.0, 1.5]))
         a = RandomParameter("a", Normal(0.0, 1.0))
         b = RandomParameter("b", Normal(0.0, 1.0))
-        mean = Linear("mean", x, slope=b, intercept=a)
+        mean = Linear("mean", x, coefficients=b, intercept=a)
         ObservedParameter("y", Normal(mean, 0.5), torch.tensor([0.1, 0.4, 1.2, 1.4]))
     return model
 

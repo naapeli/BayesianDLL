@@ -77,7 +77,7 @@ with Model() as logistic_model:
     slope = RandomParameter("slope", Normal(0.0, 2.5))
     x_data = Data("x", x)
     with plate("observations", x_data):
-        logits = Linear("logits", x_data, slope=slope, intercept=intercept)
+        logits = Linear("logits", x_data, coefficients=slope, intercept=intercept)
         ObservedParameter("y", Bernoulli(logits=logits), labels)
 
 logistic_laplace = laplace_approximation(logistic_model, map_epochs=500, lr=0.05)

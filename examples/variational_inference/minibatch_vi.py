@@ -49,7 +49,7 @@ with Model() as model:
     slope = RandomParameter("slope", Normal(0.0, 5.0))
     x_data = Data("x", x)
     with plate("observations", x_data):
-        line = Linear("line", x_data, slope=slope, intercept=intercept)
+        line = Linear("line", x_data, coefficients=slope, intercept=intercept)
         ObservedParameter("y", Normal(line, noise), y)
 
 # Exact Gaussian posterior of (intercept, slope): known noise and Normal priors.

@@ -69,10 +69,6 @@ class ELPDResult:
     def lppd(self):
         return self.elpd + self.p
 
-    def __getitem__(self, key):
-        aliases = {f"elpd_{self.kind}": "elpd", f"p_{self.kind}": "p", f"{self.kind}_i": "elpd_i"}
-        return getattr(self, aliases.get(key, key))
-
     def __repr__(self):
         lines = [
             f"Computed from {self.n_samples} posterior samples and {self.n_data_points} observations.",

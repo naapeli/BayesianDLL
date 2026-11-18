@@ -894,11 +894,3 @@ def _batch_kernel_input_vjp(kernel, x1, x2, cotangent, parameter_values):
         raise NotImplementedError("Input gradients are not available for plain callables inside a composite kernel.")
     return torch.zeros((_batch_size(x1, cotangent), *x1.shape[1:]), dtype=x1.dtype, device=x1.device)
 
-
-# Backwards-compatible helpers used by the GP nodes.
-def _evaluate_kernel(kernel, x1, x2, parameter_values=None):
-    if isinstance(kernel, Kernel):
-        return kernel.evaluate(x1, x2, parameter_values=parameter_values)
-    if callable(kernel):
-        return kernel(x1, x2)
-    return torch.as_tensor(kernel, dtype=_feature_matrix(x1).dtype, device=_feature_matrix(x1).device)

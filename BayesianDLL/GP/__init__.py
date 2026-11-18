@@ -17,8 +17,6 @@ from ._kernels import (
 )
 from ._process import (
     ExactGP,
-    ExactGaussianProcess,
-    GaussianProcess,
     LatentGP,
     exact_gp_predictive,
     SparseGP,
@@ -49,9 +47,7 @@ __all__ = [
     "SumKernel",
     "ProductKernel",
     "LatentGP",
-    "GaussianProcess",
     "ExactGP",
-    "ExactGaussianProcess",
     "gp_predictive",
     "exact_gp_predictive",
     "SparseGP",

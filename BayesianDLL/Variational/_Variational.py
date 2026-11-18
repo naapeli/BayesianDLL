@@ -1,9 +1,7 @@
-from contextlib import nullcontext
-
 import torch
 
-from ._ELBO import _elbo, variational_parameters
-from .. import Model
+from .._model import Model
+from ._guide import BaseGuide
 
 
 def BBVI(model: Model, guide, n_samples=1, epochs=100, lr=1e-2, betas=(0.9, 0.999), clip_norm=10.0, lrd=1.0, callback_frequency=1, verbose=True, batch_size=None, subsample_plate=None):
@@ -15,7 +13,7 @@ def BBVI(model: Model, guide, n_samples=1, epochs=100, lr=1e-2, betas=(0.9, 0.99
 
     Args:
         model: the model.
-        guide: a :class:`MeanFieldGuide`, :class:`AutoNormal` or
+        guide: a :class:`Guide` (hand-written), :class:`AutoNormal` or
             :class:`AutoMultivariateNormal`.
         n_samples: Monte Carlo samples per ELBO estimate.
         epochs: number of optimisation steps.
@@ -41,7 +39,9 @@ def BBVI(model: Model, guide, n_samples=1, epochs=100, lr=1e-2, betas=(0.9, 0.99
 
     Returns the list of recorded ELBO values.
     """
-    table = variational_parameters(guide)
+    if not isinstance(guide, BaseGuide):
+        raise TypeError(f"guide must be a Guide, AutoNormal or AutoMultivariateNormal, got {type(guide).__name__}.")
+    table = guide.variational_parameters()
     m = {key: torch.zeros_like(parameter.unconstrained_value) for key, parameter in table.items()}
     v = {key: torch.zeros_like(parameter.unconstrained_value) for key, parameter in table.items()}
     current_lr = lr
@@ -55,10 +55,10 @@ def BBVI(model: Model, guide, n_samples=1, epochs=100, lr=1e-2, betas=(0.9, 0.99
     for epoch in range(1, epochs + 1):
         current_lr *= lrd
         if subsampler is None:
-            current_elbo, grads = _elbo(model, guide, n_samples)
+            current_elbo, grads = guide._elbo(model, n_samples)
         else:
             with subsampler.minibatch() as scales:
-                current_elbo, grads = _elbo(model, guide, n_samples, scales=scales)
+                current_elbo, grads = guide._elbo(model, n_samples, scales=scales)
 
         for key, grad in grads.items():
             if key not in table:

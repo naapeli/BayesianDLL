@@ -51,7 +51,7 @@ with Model() as model:
     beta = RandomParameter("beta", Normal(0.0, 5.0))
     sigma = RandomParameter("sigma", HalfNormal(2.0))
 
-    mu = Linear("mu", x_centred, slope=beta, intercept=alpha)
+    mu = Linear("mu", x_centred, coefficients=beta, intercept=alpha)
     Affine("a", beta, loc=alpha, scale=-x_center)  # intercept at x = 0
 
     with plate("observations", x_centred):

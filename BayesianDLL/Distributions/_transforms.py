@@ -210,36 +210,6 @@ class IdentityTransform(Transform):
         return torch.zeros_like(x_unconstrained)
 
 
-class SoftMaxTransform(Transform):
-    """Softmax map R^K -> simplex.
-
-    .. warning:: This map is **not** a bijection (it is invariant to adding a
-       constant to every coordinate), so it cannot be used as the sampling
-       transform of a distribution on the simplex. Use
-       :class:`StickBreakingTransform` instead. It is kept for backward
-       compatibility.
-    """
-
-    def __init__(self, dim=-1):
-        self.dim = dim
-
-    def forward(self, x_constrained):
-        return torch.log(x_constrained.clamp(min=_tiny(x_constrained)))
-
-    def inverse(self, x_unconstrained):
-        return torch.softmax(x_unconstrained, dim=self.dim)
-
-    def derivative(self, x_unconstrained):
-        sm = self.inverse(x_unconstrained)
-        return torch.diag_embed(sm) - sm.unsqueeze(-1) @ sm.unsqueeze(-2)
-
-    def log_abs_det_jacobian(self, x_unconstrained):
-        return torch.zeros((), dtype=x_unconstrained.dtype, device=x_unconstrained.device)
-
-    def grad_log_abs_det_jacobian(self, x_unconstrained):
-        return torch.zeros_like(x_unconstrained)
-
-
 class StickBreakingTransform(Transform):
     """Bijection between ``R^{K-1}`` and the open ``(K-1)``-simplex in ``R^K``.
 
@@ -523,10 +493,6 @@ class PositiveDefiniteTransform(Transform):
 
     def _indices(self, device):
         return torch.tril_indices(self.dim, self.dim, offset=0, device=device)
-
-    def _is_diag(self, device):
-        rows, cols = self._indices(device)
-        return rows == cols
 
     def _diag_weights(self, dtype, device):
         """(D + 1 - i) on diagonal positions, 0 elsewhere."""

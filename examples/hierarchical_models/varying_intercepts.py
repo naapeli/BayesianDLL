@@ -76,7 +76,7 @@ with Model() as model:
     sigma = RandomParameter("sigma", HalfNormal(1.0))
 
     with plate("observations", x_data):
-        mean = Linear("mean", x_data, slope=beta, intercept=Index("alpha_obs", alpha, group_data))
+        mean = Linear("mean", x_data, coefficients=beta, intercept=Index("alpha_obs", alpha, group_data))
         ObservedParameter("y", Normal(mean, sigma), y)
 
 trace = model.sample(n_samples=500, warmup_length=500, n_chains=4, progress_bar=False, seed=0, delta=0.9,

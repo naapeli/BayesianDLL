@@ -62,7 +62,7 @@ def robust_model(samplers):
         # A one-dimensional random walk mixes best at about 44% acceptance.
         w_settings = {"target_accept_rate": 0.44} if choice("w") == "metropolis" else {}
         w = RandomParameter("w", Beta(1.0, 9.0), sampler=choice("w"), **w_settings)
-        mu = Linear("mu", z_cov, slope=beta, intercept=alpha)
+        mu = Linear("mu", z_cov, coefficients=beta, intercept=alpha)
         with plate("observations", n_obs):
             z = RandomParameter("z", Bernoulli(w), shape=(), sampler=choice("z"))
             factor = Affine("factor", z, loc=1.0, scale=outlier_inflation - 1.0)

@@ -2,7 +2,7 @@
 
 Guide semantics
 ---------------
-A guide (a :class:`MeanFieldGuide`) contains one ``RandomParameter`` per
+A hand-written guide (a :class:`Guide`) contains one ``RandomParameter`` per
 latent of the model, with the same name, whose distribution has
 :class:`VariationalParameter` arguments. What a guide value means depends on
 the support of the guide distribution:
@@ -37,27 +37,13 @@ transform derivatives. Other guide distributions use the score-function
 the other draws, or a running mean of earlier calls for ``n_samples=1``).
 """
 
-import math
-
 import torch
 
 from .._model import Model, _sum_to_shape
-from ..Distributions._state_space import ContinuousReal
 from ..Samplers._ancestral import draw_shaped
 
 
 _BASELINE_DECAY = 0.9
-
-
-def variational_parameters(guide):
-    """``{key: VariationalParameter}`` of a guide, with the keys used by :func:`elbo`."""
-    if not isinstance(guide, Model) and hasattr(guide, "variational_parameters"):
-        return dict(guide.variational_parameters())
-    table = {}
-    for name, parameter in guide.params.items():
-        for parameter_name, variational_parameter in parameter.distribution.variational_parameters.items():
-            table[f"{name}_{parameter_name}"] = variational_parameter
-    return table
 
 
 def scaled_log_joint(model, scales=None):
@@ -83,100 +69,6 @@ def scaled_log_joint_grad(model, names, scales=None):
     return grads
 
 
-def _is_real(distribution):
-    return isinstance(distribution.state_space, ContinuousReal)
-
-
-def _bounds_are_constant(transform):
-    for attribute in ("border", "low", "high"):
-        value = getattr(transform, attribute, None)
-        if value is not None and not isinstance(value, int | float | torch.Tensor):
-            return False
-    for attribute in ("first", "second"):
-        inner = getattr(transform, attribute, None)
-        if inner is not None and not _bounds_are_constant(inner):
-            return False
-    return True
-
-
-class _Plan:
-    """How each guide latent maps onto the model."""
-
-    def __init__(self, model, guide):
-        if not model._compiled:
-            model.compile()
-        if not guide._compiled:
-            guide.compile()
-        guide_nodes = set(guide.params) | set(guide.deterministic_params) | set(guide.observed_params)
-        enumerated = getattr(model, "enumerated_params", {})
-
-        self.modes = {}
-        for name, parameter in guide.params.items():
-            distribution = parameter.distribution
-            if set(distribution.parameters) & guide_nodes:
-                raise NotImplementedError(
-                    f"The guide distribution of '{name}' depends on other guide nodes. Only mean-field guides "
-                    "(distributions whose arguments are VariationalParameters, constants or Data) are supported."
-                )
-            if name in enumerated:
-                raise ValueError(f"'{name}' is enumerated (summed out) in the model and must not appear in the guide.")
-            if name not in model.params:
-                self.modes[name] = "auxiliary"
-                continue
-            latent = model.params[name]
-            if _is_real(distribution) and latent.state_space.is_continuous():
-                expected = latent.unconstrained_value.shape
-                self.modes[name] = "unconstrained"
-            else:
-                if type(distribution.state_space) is not type(latent.state_space):
-                    raise ValueError(
-                        f"The guide distribution of '{name}' has support {type(distribution.state_space).__name__}, "
-                        f"but the model latent has support {type(latent.state_space).__name__}. Use a guide with "
-                        "the same support (it then describes the constrained value) or a guide on the real line "
-                        "(it then describes the unconstrained value)."
-                    )
-                if not _bounds_are_constant(latent.distribution.transform):
-                    raise NotImplementedError(
-                        f"The support of '{name}' depends on other latents; use a guide on the real line for it."
-                    )
-                expected = latent.constrained_value.shape
-                self.modes[name] = "constrained"
-            if tuple(parameter.constrained_value.shape) != tuple(expected):
-                raise ValueError(
-                    f"The guide value of '{name}' has shape {tuple(parameter.constrained_value.shape)}, "
-                    f"expected {tuple(expected)}."
-                )
-
-        # Guide deterministic nodes that give the constrained value of a model latent.
-        self.targets = {}
-        used_sources = set()
-        for name, deterministic in guide.deterministic_params.items():
-            if name not in model.params:
-                continue
-            sources = [getattr(i, "name", None) for i in deterministic.inputs if getattr(i, "name", None) in guide.params]
-            if len(sources) != 1 or self.modes[sources[0]] != "auxiliary" or sources[0] in used_sources:
-                raise NotImplementedError(
-                    f"The guide deterministic '{name}' must be a function of exactly one auxiliary guide latent "
-                    "that feeds no other model latent."
-                )
-            used_sources.add(sources[0])
-            self.targets[name] = (deterministic, sources[0])
-        self.sources = {source: target for target, (_, source) in self.targets.items()}
-
-        covered = {n for n, mode in self.modes.items() if mode != "auxiliary"} | set(self.targets)
-        missing = [name for name in model.params if name not in covered]
-        if missing:
-            raise ValueError(f"The guide has no distribution for the model latent(s) {missing}.")
-
-        # Auxiliary latents that feed no model latent do not enter the ELBO.
-        self.active = [n for n, mode in self.modes.items() if mode != "auxiliary" or n in self.sources]
-        self.reparametrized = {
-            name: bool(getattr(guide.params[name].distribution, "has_rsample", False))
-            and guide.params[name].distribution.state_space.is_continuous()
-            for name in self.active
-        }
-
-
 def _set_guide_values(guide, values):
     saved = {name: guide.params[name].unconstrained_value for name in values}
     for name, value in values.items():
@@ -200,9 +92,9 @@ def _derivative_of_source(deterministic, source, like):
     return derivative
 
 
-def _guide_elbo(model, guide, n_samples, scales=None):
-    plan = _Plan(model, guide)
-    table = variational_parameters(guide)
+def _guide_elbo(model, guide, plan, n_samples, scales=None):
+    """ELBO estimate of a hand-written :class:`Guide` with the validated ``plan``."""
+    table = guide.variational_parameters()
 
     draws, dz = {}, {}
     for name in plan.active:
@@ -340,13 +232,6 @@ def elbo(model: Model, guide, n_samples=1):
     Returns ``(elbo, grads)`` with ``grads[f"{latent}_{variational_parameter}"]``
     the gradient of the ELBO (to be *maximised*). See the module docstring
     for how guide values map onto the model latents. ``guide`` is a
-    :class:`MeanFieldGuide` or an automatic guide (``AutoNormal``,
-    ``AutoMultivariateNormal``).
+    :class:`Guide`, :class:`AutoNormal` or :class:`AutoMultivariateNormal`.
     """
-    return _elbo(model, guide, n_samples)
-
-
-def _elbo(model, guide, n_samples, scales=None):
-    if not isinstance(guide, Model) and hasattr(guide, "_elbo"):
-        return guide._elbo(model, n_samples, scales=scales)
-    return _guide_elbo(model, guide, n_samples, scales=scales)
+    return guide._elbo(model, n_samples)

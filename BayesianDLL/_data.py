@@ -1,6 +1,6 @@
 import torch
 
-from ._active_model import _active_model
+from ._active_model._active_model import get_active_model
 
 
 class Data:
@@ -17,7 +17,7 @@ class Data:
     """
 
     def __init__(self, name, value, event_ndim=0):
-        model = _active_model._active_model
+        model = get_active_model()
         if model is None:
             raise RuntimeError("One should select an active model before creating data.")
         if not isinstance(name, str) or not name:

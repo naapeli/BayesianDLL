@@ -63,35 +63,17 @@ class Linear(DeterministicParameter):
     """A linear predictor with an optional intercept.
 
     For one-dimensional inputs and a scalar coefficient, this evaluates
-    ``inputs * slope + intercept``. For a design matrix with shape ``(N, D)``
-    and a coefficient vector with shape ``(D,)``, it evaluates
+    ``inputs * coefficients + intercept``. For a design matrix with shape
+    ``(N, D)`` and a coefficient vector with shape ``(D,)``, it evaluates
     ``inputs @ coefficients + intercept`` with shape ``(N,)``; this includes
     a single feature, ``D = 1``, where the coefficient may also be a scalar.
 
     Parameters may be model nodes or constants. Named parameters are included
-    in the model graph and receive analytic derivatives. ``slope`` and
-    ``weights`` are accepted as readable aliases for ``coefficients``.
+    in the model graph and receive analytic derivatives.
     """
 
-    def __init__(
-        self,
-        name,
-        inputs,
-        coefficients=None,
-        intercept=0.0,
-        *,
-        slope=None,
-        weights=None,
-    ):
+    def __init__(self, name, inputs, coefficients, intercept=0.0):
         _require_named(inputs, "inputs")
-        supplied_coefficients = [
-            value for value in (coefficients, slope, weights) if value is not None
-        ]
-        if len(supplied_coefficients) != 1:
-            raise TypeError(
-                "Provide exactly one of coefficients, slope, or weights."
-            )
-        coefficients = supplied_coefficients[0]
 
         named_inputs = [inputs]
         for value, description in (

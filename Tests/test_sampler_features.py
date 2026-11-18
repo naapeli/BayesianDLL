@@ -2,7 +2,6 @@
 
 import math
 import threading
-import warnings
 
 import pytest
 import torch
@@ -10,10 +9,9 @@ import torch
 from BayesianDLL import DeterministicParameter, Model, ObservedParameter, RandomParameter, condition, plate
 from BayesianDLL.Distributions import Bernoulli, ContinuousReal, DiscretePositive, DiscreteRange, Normal
 from BayesianDLL.Distributions._state_space import ContinuousPositive, ContinuousSimplex, JointStateSpace
-from BayesianDLL.Evaluation import bfmi, ess_bulk
+from BayesianDLL.Evaluation import bfmi, effective_sample_size
 from BayesianDLL.Samplers import FiniteGibbs, Metropolis, NUTS, SampleStats, SamplingBlock, SamplingResult
 from BayesianDLL.Samplers._sample import _build_blocks, _check_hamiltonian_diagnostics, _select_sampler
-from BayesianDLL._active_model import _active_model
 from BayesianDLL._active_model._active_model import get_active_model
 from BayesianDLL._parameters import ObservedParameter as ObservedParameterClass
 
@@ -343,7 +341,7 @@ def test_dense_metric_learns_correlation_and_beats_diagonal():
             if i >= 400:
                 draws.append(theta)
         draws = torch.stack(draws)
-        results[metric] = (sampler, draws, ess_bulk({"x": draws.unsqueeze(0)})["x"].min().item())
+        results[metric] = (sampler, draws, effective_sample_size({"x": draws.unsqueeze(0)}, method="bulk")["x"].min().item())
 
     dense, dense_draws, dense_ess = results["dense"]
     diag, _, diag_ess = results["diag"]
@@ -433,17 +431,17 @@ def test_seed_makes_runs_reproducible_and_chains_distinct():
 
 # -------------------------------------------------------------- model internals
 def test_active_model_is_a_thread_local_stack():
-    assert _active_model._active_model is None
+    assert get_active_model() is None
     with Model() as outer:
         assert get_active_model() is outer
         with Model() as inner:
-            assert _active_model._active_model is inner
+            assert get_active_model() is inner
             seen = []
             thread = threading.Thread(target=lambda: seen.append(get_active_model()))
             thread.start()
             thread.join()
             assert seen == [None]
-        assert _active_model._active_model is outer
+        assert get_active_model() is outer
         RandomParameter("x", Normal(0.0, 1.0))
     assert get_active_model() is None
     assert "x" in outer.params and "x" not in inner.params

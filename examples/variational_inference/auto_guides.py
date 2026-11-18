@@ -44,7 +44,7 @@ with Model() as model:
     sigma = RandomParameter("sigma", HalfNormal(1.0))
     x_data = Data("x", x)
     with plate("observations", x_data):
-        line = Linear("line", x_data, slope=slope, intercept=intercept)
+        line = Linear("line", x_data, coefficients=slope, intercept=intercept)
         ObservedParameter("y", Normal(line, sigma), y)
 
 # %%

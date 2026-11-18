@@ -19,7 +19,7 @@ An argument with ``e`` event dimensions then has shape
 ``(C, 1, ..., 1, *value_shape)`` with ``1 + B + e`` dimensions, and ordinary
 right-aligned broadcasting lines everything up. The alignment of a term is a
 map ``id(node) -> rank`` that :func:`BayesianDLL.Distributions._resolve.resolve`
-consults while the term is evaluated (see :func:`term_alignment`).
+consults while the term is evaluated (see :func:`batched_evaluation`).
 
 Reductions that sum a log density to a scalar (``_log_prob_unconstrained``,
 ``log_abs_det_jacobian``) use :func:`bsum`, which keeps the chain dimension
@@ -71,15 +71,6 @@ def batched_evaluation(n_chains, pad=None):
         yield stack[-1]
     finally:
         stack.pop()
-
-
-@contextmanager
-def term_alignment(pad):
-    """Align the nodes in ``pad`` (``id(node) -> rank``) while a term is evaluated."""
-    frame = current()
-    n_chains = frame.n_chains if frame is not None else None
-    with batched_evaluation(n_chains, pad) as new:
-        yield new
 
 
 def aligned(node, value):

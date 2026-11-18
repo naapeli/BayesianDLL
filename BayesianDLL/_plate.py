@@ -1,5 +1,4 @@
 import threading
-from contextlib import contextmanager
 
 
 # Thread-local storage for plate stack
