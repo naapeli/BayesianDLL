@@ -126,6 +126,25 @@ def test_finite_gibbs_samples_exact_conditionals():
     torch.testing.assert_close(frequencies, probs.double(), atol=0.03, rtol=0)
 
 
+@pytest.mark.parametrize("chain_method", ["parallel", "vectorized"])
+def test_gibbs_with_impossible_support_values(chain_method):
+    # Binomial(n = tau) observes y = 3, so tau < 3 has log density -inf: the
+    # Gibbs conditionals must give those values probability zero without NaNs.
+    from BayesianDLL.Distributions import Binomial, DiscreteUniform
+    with Model() as model:
+        tau = RandomParameter("tau", DiscreteUniform(0, 5))
+        ObservedParameter("y", Binomial(tau, 0.5), torch.tensor(3.0))
+    result = model.sample(1500, 100, n_chains=2, progress_bar=False, check_convergence=False, seed=0,
+                          chain_method=chain_method)
+    assert result.sample_stats.samplers == ["gibbs"]
+    draws = result["tau"].reshape(-1)
+    assert torch.isfinite(draws).all() and bool((draws >= 3).all())
+    weights = torch.tensor([math.comb(k, 3) / 2 ** k for k in (3, 4, 5)])
+    expected = weights / weights.sum()
+    frequencies = torch.stack([(draws == k).double().mean() for k in (3, 4, 5)])
+    torch.testing.assert_close(frequencies, expected, atol=0.04, rtol=0)
+
+
 def test_finite_gibbs_elementwise_update_and_auto_selection():
     p = torch.tensor([0.1, 0.9])
     sampler = FiniteGibbs(
@@ -153,6 +172,65 @@ def test_sampler_settings_are_routed_to_the_samplers_that_accept_them():
     assert blocks[1].sampler.proposal_scale == 0.2
     with pytest.raises(TypeError, match="Unknown sampler setting"):
         _build_blocks(model, sampler_params={"not_a_setting": 1})
+
+
+def _metropolis_nuts_model():
+    with Model() as model:
+        RandomParameter("a", Normal(0.0, 1.0), shape=2)
+        RandomParameter("d", Normal(0.0, 1.0), sampler="metropolis")
+    return model
+
+
+def test_nuts_delta_passed_to_sample_does_not_reach_metropolis():
+    # ``sample(..., delta=0.9)`` sets NUTS's target acceptance statistic; the
+    # Metropolis block must keep its own target acceptance rate (and its own
+    # adaptation rate, although NUTS also has a ``kappa``).
+    settings = {"delta": 0.9, "kappa": 0.75}
+    blocks = _build_blocks(_metropolis_nuts_model(), sampler_params=settings)
+    nuts, metropolis = blocks[0].sampler, blocks[1].sampler
+    assert isinstance(nuts, NUTS) and isinstance(metropolis, Metropolis)
+    assert nuts.delta == 0.9 and nuts.kappa == 0.75
+    assert metropolis.target_accept_rate == pytest.approx(0.234)
+    assert metropolis.adaptation_rate == pytest.approx(0.05)
+
+    from BayesianDLL.Samplers._vectorized import _build_vectorized_blocks
+    from BayesianDLL.Samplers._vectorized_samplers import VectorizedMetropolis
+    model = _metropolis_nuts_model()
+    initial = {name: p.unconstrained_value.unsqueeze(0).expand(3, *p.unconstrained_value.shape).clone()
+               for name, p in model.params.items()}
+    with model.batched(3, values=initial):
+        blocks = _build_vectorized_blocks(model, None, settings)
+    metropolis = next(block.sampler for block in blocks if isinstance(block.sampler, VectorizedMetropolis))
+    assert metropolis.target_accept_rate == pytest.approx(0.234)
+    assert metropolis.adaptation_rate == pytest.approx(0.05)
+
+    # The Metropolis target is set through its own name, per parameter or per sample().
+    with Model() as model:
+        RandomParameter("d", Normal(0.0, 1.0), sampler="metropolis", target_accept_rate=0.44)
+    assert _build_blocks(model)[0].sampler.target_accept_rate == 0.44
+
+
+def test_nuts_default_target_acceptance_is_0_8():
+    from BayesianDLL.Samplers._vectorized_samplers import VectorizedNUTS
+    log_target = lambda theta: -0.5 * (theta ** 2).sum(-1)
+    gradient = lambda theta: -theta
+    assert NUTS(log_target, gradient, lambda x: x).delta == 0.8
+    assert VectorizedNUTS(log_target, gradient, 2).delta == 0.8
+
+
+def test_sampler_setting_names_are_not_shared_between_samplers():
+    from BayesianDLL.Samplers import _vectorized_samplers as vs
+    from BayesianDLL.Samplers._sample import _SAMPLER_CLASSES, _tunable_arguments
+    names = {kind: _tunable_arguments(cls) for kind, cls in _SAMPLER_CLASSES.items()}
+    kinds = list(names)
+    for i, first in enumerate(kinds):
+        for second in kinds[i + 1:]:
+            assert not names[first] & names[second], (first, second, names[first] & names[second])
+    # The vectorized samplers take the settings filtered for their scalar counterparts.
+    vectorized = {"nuts": vs.VectorizedNUTS, "metropolis": vs.VectorizedMetropolis,
+                  "gibbs": vs.VectorizedFiniteGibbs, "slice": vs.VectorizedSlice}
+    for kind, cls in vectorized.items():
+        assert _tunable_arguments(cls) - {"n_chains"} == names[kind], kind
 
 
 # ---------------------------------------------------------------- block targets

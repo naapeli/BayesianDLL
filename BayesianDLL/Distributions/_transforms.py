@@ -12,6 +12,17 @@ def _tiny(x):
     return torch.finfo(x.dtype).tiny
 
 
+def log_sigmoid(x):
+    """``log(sigmoid(x))``, computed as ``-softplus(-x)``.
+
+    Same values as ``torch.nn.functional.logsigmoid``, but much faster on
+    small tensors: the CPU kernel of ``logsigmoid`` always dispatches to the
+    intra-op thread pool, which costs milliseconds per call when the cores
+    are busy (e.g. with several sampling processes).
+    """
+    return -F.softplus(-x, threshold=50.0)
+
+
 class Transform(ABC):
     """A bijection between a constrained space and an unconstrained space.
 
@@ -176,7 +187,7 @@ class LogitTransform(Transform):
     def log_abs_det_jacobian(self, x_unconstrained):
         z = x_unconstrained
         scale = torch.as_tensor(self.scale, dtype=z.dtype, device=z.device)
-        return _bsum(torch.log(scale) + F.logsigmoid(z) + F.logsigmoid(-z))
+        return _bsum(torch.log(scale) + log_sigmoid(z) + log_sigmoid(-z))
 
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         return 1 - 2 * torch.sigmoid(x_unconstrained)
@@ -260,8 +271,8 @@ class StickBreakingTransform(Transform):
     def _parts(self, z):
         """Return (u, log_x, y) where u = z - offset, y = sigmoid(u)."""
         u = z - self._offset(z)
-        log_y = F.logsigmoid(u)
-        log_1my = F.logsigmoid(-u)
+        log_y = log_sigmoid(u)
+        log_1my = log_sigmoid(-u)
         # log of the remaining stick before step k: exclusive cumsum of log(1 - y)
         cum = torch.cumsum(log_1my, dim=-1)
         log_r = torch.cat([torch.zeros_like(cum[..., :1]), cum], dim=-1)  # (..., K)
@@ -309,7 +320,7 @@ class StickBreakingTransform(Transform):
         km1 = u.shape[-1]
         # K - k for k = 1..K-1
         counts = torch.arange(km1, 0, -1, dtype=u.dtype, device=u.device)
-        return F.logsigmoid(u) + counts * F.logsigmoid(-u)
+        return log_sigmoid(u) + counts * log_sigmoid(-u)
 
     def log_abs_det_jacobian(self, x_unconstrained):
         return _bsum(self._log_det_terms(x_unconstrained))
@@ -572,3 +583,54 @@ class PositiveDefiniteTransform(Transform):
     def grad_log_abs_det_jacobian(self, x_unconstrained):
         z = x_unconstrained
         return self._diag_weights(z.dtype, z.device).expand(z.shape).clone()
+
+
+class OrderedTransform(Transform):
+    """Bijection between ``R^K`` and strictly increasing vectors in ``R^K``.
+
+    Stan's parameterisation of an ordered vector, applied along the last
+    dimension (all leading dimensions, e.g. the chain dimension, are batch
+    dimensions):
+
+    .. math::
+        x_0 = y_0, \\quad x_k = x_{k-1} + \\exp(y_k) \\quad (k \\geq 1),
+
+    i.e. ``x = cumsum([y_0, exp(y_1), ..., exp(y_{K-1})])``. The Jacobian of
+    the inverse map is lower triangular with ``J[i, k] = e_k`` for ``k <= i``
+    (``e_0 = 1``, ``e_k = exp(y_k)``), so ``log|det J| = sum_{k>=1} y_k``.
+    """
+
+    @staticmethod
+    def _increments(y):
+        """``(y_0, exp(y_1), ..., exp(y_{K-1}))``: the derivative of ``x_i`` w.r.t. ``y_k`` for ``k <= i``."""
+        return torch.cat([torch.ones_like(y[..., :1]), torch.exp(y[..., 1:])], dim=-1)
+
+    def forward(self, x_constrained):
+        x = x_constrained
+        gaps = (x[..., 1:] - x[..., :-1]).clamp(min=_tiny(x))
+        return torch.cat([x[..., :1], torch.log(gaps)], dim=-1)
+
+    def inverse(self, x_unconstrained):
+        y = x_unconstrained
+        return torch.cumsum(torch.cat([y[..., :1], torch.exp(y[..., 1:])], dim=-1), dim=-1)
+
+    def derivative(self, x_unconstrained):
+        """Full Jacobian of shape ``(..., K, K)``."""
+        y = x_unconstrained
+        K = y.shape[-1]
+        lower = torch.tril(torch.ones(K, K, dtype=y.dtype, device=y.device))
+        return lower * self._increments(y).unsqueeze(-2)
+
+    def vjp(self, x_unconstrained, cotangent):
+        """``J^T @ cotangent``: ``e_k * sum_{i >= k} v_i`` (a reversed cumulative sum)."""
+        tail = torch.flip(torch.cumsum(torch.flip(cotangent, dims=[-1]), dim=-1), dims=[-1])
+        return self._increments(x_unconstrained) * tail
+
+    def log_abs_det_jacobian(self, x_unconstrained):
+        # Summed over the event dimension first so that K = 1 (no terms) works in a batched evaluation.
+        return _bsum(x_unconstrained[..., 1:].sum(-1))
+
+    def grad_log_abs_det_jacobian(self, x_unconstrained):
+        grad = torch.ones_like(x_unconstrained)
+        grad[..., :1] = 0
+        return grad

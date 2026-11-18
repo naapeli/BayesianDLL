@@ -7,11 +7,11 @@ from abc import ABC, abstractmethod
 from ._transforms import (
     IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform, InverseSoftPlusTransform,
     StickBreakingTransform, CorrCholeskyTransform, ChainTransform, _apply_jacobian_transpose, _log1m_tanh_sq,
-    PositiveDefiniteTransform,
+    PositiveDefiniteTransform, OrderedTransform, log_sigmoid,
 )
 from ._state_space import (
     ContinuousReal, ContinuousPositive, ContinuousRange, ContinuousSimplex, DiscretePositive, DiscreteRange, Union,
-    DiscreteNonNegative, ContinuousCorrCholesky, ContinuousPositiveDefinite,
+    DiscreteNonNegative, ContinuousCorrCholesky, ContinuousPositiveDefinite, ContinuousOrdered,
 )
 from .._parameters import RandomParameter, DeterministicParameter, ObservedParameter, VariationalParameter
 from .._data import Data
@@ -102,6 +102,34 @@ def _uniform(shape, dtype, device):
 
 def _discrete_grad_error():
     return NotImplementedError("Gradient w.r.t. x is undefined for discrete distributions.")
+
+
+def _is_integer(x):
+    if not x.is_floating_point():
+        return torch.ones_like(x, dtype=torch.bool)
+    return x == torch.floor(x)
+
+
+def _in_support(x, inside, fill=0):
+    """``(inside, x_safe)``: the support mask and ``x`` with ``fill`` outside the support.
+
+    The density is evaluated at ``x_safe`` and masked afterwards, so values
+    outside the support (e.g. ``lgamma`` of a negative count) never produce
+    NaNs in the selected branch or in its gradients.
+    """
+    if x.shape != inside.shape:
+        x = x.expand(inside.shape)
+    return inside, torch.where(inside, x, torch.full_like(x, fill))
+
+
+def _restrict(log_p, inside):
+    """``log_p`` inside the support and ``-inf`` outside."""
+    return torch.where(inside, log_p, torch.full_like(log_p, -math.inf))
+
+
+def _zero_outside(grad, inside):
+    """A parameter gradient of ``log_p``: zero where ``log_p`` is a constant ``-inf``."""
+    return torch.where(inside, grad, torch.zeros_like(grad))
 
 
 def _check_exactly_one(names, values):
@@ -504,8 +532,8 @@ class Beta(Distribution):
 
     def _log_prob_unconstrained(self, x_unconstrained):
         a, b = _as_float(self.a, self.b)
-        log_x = F.logsigmoid(x_unconstrained)
-        log_1_minus_x = F.logsigmoid(-x_unconstrained)
+        log_x = log_sigmoid(x_unconstrained)
+        log_1_minus_x = log_sigmoid(-x_unconstrained)
         log_prob = a * log_x + b * log_1_minus_x - (torch.lgamma(a) + torch.lgamma(b) - torch.lgamma(a + b))
         return _bsum(log_prob)
 
@@ -687,7 +715,7 @@ class Uniform(Distribution):
     def _log_prob_unconstrained(self, x_unconstrained):
         # log(1/(high-low)) + log|dx/dz| = log sigmoid(z) + log sigmoid(-z): independent of the bounds.
         z = x_unconstrained
-        return _bsum(F.logsigmoid(z) + F.logsigmoid(-z))
+        return _bsum(log_sigmoid(z) + log_sigmoid(-z))
 
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         z = x_unconstrained
@@ -1351,7 +1379,7 @@ class _ProbsOrLogits:
         """(log p, log(1-p)) computed stably."""
         if self.logits is not None:
             logits = _as_float(self.logits)
-            return F.logsigmoid(logits), F.logsigmoid(-logits)
+            return log_sigmoid(logits), log_sigmoid(-logits)
         p = _as_float(self.p)
         return torch.log(p), torch.log1p(-p)
 
@@ -1372,22 +1400,29 @@ class Geometric(_ProbsOrLogits, Distribution):
     def batch_shape(self):
         return resolve(self._param).shape
 
+    @staticmethod
+    def _support(x):
+        x = torch.as_tensor(x)
+        return _in_support(x, (x >= 1) & _is_integer(x), fill=1)
+
     def log_pdf(self, x):
+        inside, x = self._support(x)
         if self.logits is not None:
             logits = _as_float(self.logits)
-            return F.logsigmoid(logits) + (x - 1) * F.logsigmoid(-logits)
+            return _restrict(log_sigmoid(logits) + (x - 1) * log_sigmoid(-logits), inside)
         p = _as_float(self.p)
-        return torch.log(p) + torch.special.xlog1py(x - 1, -p)
+        return _restrict(torch.log(p) + torch.special.xlog1py(x - 1, -p), inside)
 
     def log_pdf_grad(self, x):
         raise _discrete_grad_error()
 
     def log_pdf_param_grads(self, x):
+        inside, x = self._support(x)
         if self.logits is not None:
             s = torch.sigmoid(_as_float(self.logits))
-            return {self.resolve_name("logits", self.logits): 1 - x * s}
+            return {self.resolve_name("logits", self.logits): _zero_outside(1 - x * s, inside)}
         p = _as_float(self.p)
-        return {self.resolve_name("p", self.p): 1 / p - (x - 1) / (1 - p)}
+        return {self.resolve_name("p", self.p): _zero_outside(1 / p - (x - 1) / (1 - p), inside)}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1406,21 +1441,29 @@ class Bernoulli(_ProbsOrLogits, Distribution):
     def batch_shape(self):
         return resolve(self._param).shape
 
+    @staticmethod
+    def _support(x):
+        x = torch.as_tensor(x)
+        return _in_support(x, (x == 0) | (x == 1))
+
     def log_pdf(self, x):
+        inside, x = self._support(x)
         if self.logits is not None:
             logits = _as_float(self.logits)
-            return x * logits - F.softplus(logits)
+            return _restrict(x * logits - F.softplus(logits), inside)
         p = _as_float(self.p)
-        return torch.xlogy(x, p) + torch.special.xlog1py(1 - x, -p)
+        return _restrict(torch.xlogy(x, p) + torch.special.xlog1py(1 - x, -p), inside)
 
     def log_pdf_grad(self, x):
         raise _discrete_grad_error()
 
     def log_pdf_param_grads(self, x):
+        inside, x = self._support(x)
         if self.logits is not None:
-            return {self.resolve_name("logits", self.logits): x - torch.sigmoid(_as_float(self.logits))}
+            grad = x - torch.sigmoid(_as_float(self.logits))
+            return {self.resolve_name("logits", self.logits): _zero_outside(grad, inside)}
         p = _as_float(self.p)
-        return {self.resolve_name("p", self.p): x / p - (1 - x) / (1 - p)}
+        return {self.resolve_name("p", self.p): _zero_outside(x / p - (1 - x) / (1 - p), inside)}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1450,23 +1493,32 @@ class Binomial(_ProbsOrLogits, Distribution):
         n = self._count(x)
         return torch.lgamma(n + 1) - torch.lgamma(x + 1) - torch.lgamma(n - x + 1)
 
+    def _support(self, x):
+        x = torch.as_tensor(x)
+        return _in_support(x, (x >= 0) & (x <= self._count(x)) & _is_integer(x))
+
     def log_pdf(self, x):
+        inside, x = self._support(x)
         n = self._count(x)
         if self.logits is not None:
             logits = _as_float(self.logits)
-            return self._log_binom_coeff(x) + x * logits - n * F.softplus(logits)
-        p = _as_float(self.p)
-        return self._log_binom_coeff(x) + torch.xlogy(x, p) + torch.special.xlog1py(n - x, -p)
+            log_p = self._log_binom_coeff(x) + x * logits - n * F.softplus(logits)
+        else:
+            p = _as_float(self.p)
+            log_p = self._log_binom_coeff(x) + torch.xlogy(x, p) + torch.special.xlog1py(n - x, -p)
+        return _restrict(log_p, inside)
 
     def log_pdf_grad(self, x):
         raise _discrete_grad_error()
 
     def log_pdf_param_grads(self, x):
+        inside, x = self._support(x)
         n = self._count(x)
         if self.logits is not None:
-            return {self.resolve_name("logits", self.logits): x - n * torch.sigmoid(_as_float(self.logits))}
+            grad = x - n * torch.sigmoid(_as_float(self.logits))
+            return {self.resolve_name("logits", self.logits): _zero_outside(grad, inside)}
         p = _as_float(self.p)
-        return {self.resolve_name("p", self.p): x / p - (n - x) / (1 - p)}
+        return {self.resolve_name("p", self.p): _zero_outside(x / p - (n - x) / (1 - p), inside)}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1502,16 +1554,18 @@ class DiscreteUniform(Distribution):
         return low.to(dtype), high.to(dtype)
 
     def log_pdf(self, x):
+        x = torch.as_tensor(x)
         low, high = self._bounds(x)
-        inside = (x >= low) & (x <= high)
-        return torch.where(inside, -torch.log(high - low + 1), torch.full_like(x, -torch.inf))
+        inside = (x >= low) & (x <= high) & _is_integer(x)
+        return torch.where(inside, -torch.log(high - low + 1), torch.full_like(x, -torch.inf, dtype=low.dtype))
 
     def log_pdf_grad(self, x):
         raise _discrete_grad_error()
 
     def log_pdf_param_grads(self, x):
+        x = torch.as_tensor(x)
         low, high = self._bounds(x)
-        inside = (x >= low) & (x <= high)
+        inside = (x >= low) & (x <= high) & _is_integer(x)
         inv = torch.where(inside, 1 / (high - low + 1), torch.zeros_like(x))
         return {self.resolve_name("low", self.low): inv, self.resolve_name("high", self.high): -inv}
 
@@ -1533,16 +1587,23 @@ class Poisson(Distribution):
     def batch_shape(self):
         return resolve(self.rate).shape
 
+    @staticmethod
+    def _support(x):
+        x = torch.as_tensor(x)
+        return _in_support(x, (x >= 0) & _is_integer(x))
+
     def log_pdf(self, x):
+        inside, x = self._support(x)
         rate = _as_float(self.rate)
-        return torch.xlogy(x, rate) - rate - torch.lgamma(x + 1)
+        return _restrict(torch.xlogy(x, rate) - rate - torch.lgamma(x + 1), inside)
 
     def log_pdf_grad(self, x):
         raise _discrete_grad_error()
 
     def log_pdf_param_grads(self, x):
+        inside, x = self._support(x)
         rate = _as_float(self.rate)
-        return {self.resolve_name("rate", self.rate): x / rate - 1}
+        return {self.resolve_name("rate", self.rate): _zero_outside(x / rate - 1, inside)}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1568,19 +1629,26 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
     def batch_shape(self):
         return torch.broadcast_shapes(resolve(self.total_count).shape, resolve(self._param).shape)
 
+    @staticmethod
+    def _support(x):
+        x = torch.as_tensor(x)
+        return _in_support(x, (x >= 0) & _is_integer(x))
+
     def log_pdf(self, x):
+        inside, x = self._support(x)
         r = _as_float(self.total_count).to(_float_dtype(x, resolve(self._param)))
         log_norm = torch.lgamma(x + r) - torch.lgamma(r) - torch.lgamma(x + 1)
         if self.logits is not None:
             logits = _as_float(self.logits)
-            return log_norm + x * F.logsigmoid(logits) + r * F.logsigmoid(-logits)
+            return _restrict(log_norm + x * log_sigmoid(logits) + r * log_sigmoid(-logits), inside)
         p = _as_float(self.p)
-        return log_norm + torch.xlogy(x, p) + r * torch.log1p(-p)
+        return _restrict(log_norm + torch.xlogy(x, p) + r * torch.log1p(-p), inside)
 
     def log_pdf_grad(self, x):
         raise _discrete_grad_error()
 
     def log_pdf_param_grads(self, x):
+        inside, x = self._support(x)
         r = _as_float(self.total_count).to(_float_dtype(x, resolve(self._param)))
         _, log_q = self._log_p_log_q()
         grads = {self.resolve_name("total_count", self.total_count): torch.digamma(x + r) - torch.digamma(r) + log_q}
@@ -1589,7 +1657,7 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
         else:
             p = _as_float(self.p)
             grads[self.resolve_name("p", self.p)] = x / p - r / (1 - p)
-        return grads
+        return {name: _zero_outside(grad, inside) for name, grad in grads.items()}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1637,29 +1705,36 @@ class Categorical(Distribution):
         p = _as_float(self.probs)
         return torch.log(p) - torch.log(p.sum(-1, keepdim=True))
 
-    def _one_hot(self, x, like):
-        idx = x.long()
+    def _support(self, x):
+        """The support mask and the category indices (0 outside the support)."""
+        x = torch.as_tensor(x)
+        inside = (x >= 0) & (x <= self.n_categories - 1) & _is_integer(x)
+        return inside, torch.where(inside, x, torch.zeros_like(x)).long()
+
+    def _one_hot(self, idx, like):
         shape = torch.broadcast_shapes(idx.shape, like.shape[:-1])
         return F.one_hot(idx.expand(shape), self.n_categories).to(like.dtype)
 
     def log_pdf(self, x):
+        inside, idx = self._support(x)
         logp = self._log_probs()
-        idx = x.long()
         shape = torch.broadcast_shapes(idx.shape, logp.shape[:-1])
-        return logp.expand(*shape, self.n_categories).gather(-1, idx.expand(shape).unsqueeze(-1)).squeeze(-1)
+        log_p = logp.expand(*shape, self.n_categories).gather(-1, idx.expand(shape).unsqueeze(-1)).squeeze(-1)
+        return _restrict(log_p, inside)
 
     def log_pdf_grad(self, x):
         raise _discrete_grad_error()
 
     def log_pdf_param_grads(self, x):
+        inside, idx = self._support(x)
         if self.logits is not None:
             logits = _as_float(self.logits)
-            onehot = self._one_hot(x, logits)
-            return {self.resolve_name("logits", self.logits): onehot - torch.softmax(logits, dim=-1)}
+            grad = self._one_hot(idx, logits) - torch.softmax(logits, dim=-1)
+            return {self.resolve_name("logits", self.logits): _zero_outside(grad, inside.unsqueeze(-1))}
         p = _as_float(self.probs)
-        onehot = self._one_hot(x, p)
+        onehot = self._one_hot(idx, p)
         grad = torch.where(onehot > 0, 1 / p, torch.zeros_like(p)) - 1 / p.sum(-1, keepdim=True)
-        return {self.resolve_name("probs", self.probs): grad}
+        return {self.resolve_name("probs", self.probs): _zero_outside(grad, inside.unsqueeze(-1))}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1707,24 +1782,33 @@ class Multinomial(Distribution):
         p = _as_float(self.probs)
         return torch.log(p) - torch.log(p.sum(-1, keepdim=True))
 
+    def _support(self, x):
+        """Counts are non-negative integers that sum to ``total_count`` (zeros outside the support)."""
+        x = torch.as_tensor(x)
+        n = torch.as_tensor(resolve(self.total_count), device=x.device)
+        inside = ((x >= 0) & _is_integer(x)).all(-1) & (x.sum(-1) == n)
+        return inside, torch.where(inside.unsqueeze(-1), x, torch.zeros_like(x))
+
     def log_pdf(self, x):
+        inside, x = self._support(x)
         logp = self._log_probs()
         n = resolve(self.total_count).to(logp.dtype)
         log_terms = torch.where(x > 0, x * logp, torch.zeros_like(x * logp))
-        return torch.lgamma(n + 1) - torch.lgamma(x + 1).sum(-1) + log_terms.sum(-1)
+        return _restrict(torch.lgamma(n + 1) - torch.lgamma(x + 1).sum(-1) + log_terms.sum(-1), inside)
 
     def log_pdf_grad(self, x):
         raise _discrete_grad_error()
 
     def log_pdf_param_grads(self, x):
+        inside, x = self._support(x)
+        n = x.sum(-1, keepdim=True)
         if self.logits is not None:
             logits = _as_float(self.logits)
-            n = x.sum(-1, keepdim=True)
-            return {self.resolve_name("logits", self.logits): x - n * torch.softmax(logits, dim=-1)}
+            grad = x - n * torch.softmax(logits, dim=-1)
+            return {self.resolve_name("logits", self.logits): _zero_outside(grad, inside.unsqueeze(-1))}
         p = _as_float(self.probs)
-        n = x.sum(-1, keepdim=True)
         grad = torch.where(x > 0, x / p, torch.zeros_like(x * p)) - n / p.sum(-1, keepdim=True)
-        return {self.resolve_name("probs", self.probs): grad}
+        return {self.resolve_name("probs", self.probs): _zero_outside(grad, inside.unsqueeze(-1))}
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         """Sequential conditional binomial draws."""
@@ -1786,6 +1870,7 @@ class ZeroInflated(Distribution):
         gate, base_lp, log_keep, log_zero, is_zero = self._parts(x)
         b0 = torch.exp(base_lp)
         grad_gate = torch.where(is_zero, (1 - b0) * torch.exp(-log_zero), -1 / (1 - gate))
+        grad_gate = _zero_outside(grad_gate, is_zero | torch.isfinite(base_lp))
         weight = torch.where(is_zero, torch.exp(log_keep - log_zero), torch.ones_like(log_keep))
         grads = {}
         for name, g in self.base.log_pdf_param_grads(x).items():
@@ -1995,6 +2080,84 @@ class TransformedDistribution(Distribution):
         return self.outer.inverse(self.base.icdf(u))
 
 
+class Ordered(Distribution):
+    """Strictly increasing vector of length ``K`` with elementwise density ``base``.
+
+    ``Ordered(base, K)`` is the distribution of a vector ``x`` of shape
+    ``(*batch, K)`` with ``x_0 < x_1 < ... < x_{K-1}`` and (unnormalised)
+    log density ``sum_k base.log_pdf(x_k)``: the density of ``K`` draws of
+    ``base`` restricted to the ordered region. For a base with parameters
+    shared by all elements the normalising constant is ``K!``, which is left
+    out (it does not depend on ``x`` or on the parameters). The parameters of
+    ``base`` broadcast against ``x``, so they may be scalars or have a
+    trailing dimension of size ``K`` (e.g. one prior mean per element).
+
+    The sampler works in an unconstrained space through
+    :class:`OrderedTransform` (``x_0 = y_0``, ``x_k = x_{k-1} + exp(y_k)``).
+    A base with a bounded support (e.g. ``Exponential``) composes its own
+    increasing elementwise transform after the ordering, so the ordered
+    values stay in the base support.
+
+    The typical use is to break the label-switching symmetry of a mixture::
+
+        means = RandomParameter("means", Ordered(Normal(0.0, 5.0), 2))
+    """
+
+    _param_event_ndims = {"base": 1}
+
+    def __init__(self, base, K):
+        if base.event_shape != ():
+            raise ValueError("Ordered needs a univariate base distribution.")
+        if not base.state_space.is_continuous():
+            raise ValueError("Ordered needs a continuous base distribution.")
+        base_transform = base.transform
+        if isinstance(base_transform, IdentityTransform):
+            transform = OrderedTransform()
+        elif isinstance(base_transform, (LogTransform, InverseSoftPlusTransform)) and base_transform.side == "larger" or isinstance(base_transform, LogitTransform):
+            # Increasing elementwise maps keep the order of the ordered vector.
+            transform = ChainTransform(OrderedTransform(), base_transform)
+        else:
+            raise ValueError(f"Ordered does not support a base with the transform {type(base_transform).__name__}.")
+        super().__init__(transform, ContinuousOrdered(base.state_space), ContinuousReal())
+        self.base = base
+        self.K = int(K)
+        if self.K < 1:
+            raise ValueError("K must be positive.")
+        self._add_dependencies_of(base)
+
+    @property
+    def event_shape(self):
+        return (self.K,)
+
+    @property
+    def batch_shape(self):
+        return torch.broadcast_shapes(tuple(self.base.batch_shape), (self.K,))[:-1]
+
+    def log_pdf(self, x):
+        log_p = self.base.log_pdf(x)
+        return log_p.expand(torch.broadcast_shapes(log_p.shape, x.shape)).sum(-1)
+
+    def log_pdf_grad(self, x):
+        grad = self.base.log_pdf_grad(x)
+        return grad.expand(torch.broadcast_shapes(grad.shape, x.shape))
+
+    def log_pdf_param_grads(self, x):
+        # Elementwise in x; the model sums them onto the shapes of the parameters.
+        return self.base.log_pdf_param_grads(x)
+
+    def sample(self, n_samples=1, _reparametrization_trick_grad=False):
+        if _reparametrization_trick_grad:
+            raise self._no_reparam()
+        base_batch = tuple(self.base.batch_shape)
+        if base_batch[-1:] == (self.K,):
+            draws = self.base.sample(n_samples)
+        else:
+            draws = self.base.sample(n_samples * self.K)
+            draws = draws.reshape(n_samples, self.K, *base_batch).movedim(1, -1)
+            draws = draws.expand(n_samples, *self.batch_shape, self.K)
+        return torch.sort(draws, dim=-1).values
+
+
 # ========================= Miscellaneous distributions =========================
 class Mixture(Distribution):
     _param_event_ndims = {"weights": 1}
@@ -2095,6 +2258,6 @@ class Mixture(Distribution):
 
 
 def _logsumexp(log_values, dim=0):
-    max_val, _ = torch.max(log_values, dim=dim, keepdim=True)
+    max_val = torch.amax(log_values, dim=dim, keepdim=True)
     sum_exp = torch.sum(torch.exp(log_values - max_val), dim=dim, keepdim=True)
     return (max_val + torch.log(sum_exp)).squeeze(dim)

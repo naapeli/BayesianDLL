@@ -50,13 +50,19 @@ class NUTS:
     correlated posteriors. ``max_depth`` bounds the number of trajectory
     doublings, i.e. at most ``2**max_depth - 1`` leapfrog steps per iteration.
 
+    ``delta`` is the target mean acceptance statistic of the dual-averaging
+    step-size adaptation (default 0.8, as in Stan, PyMC and NumPyro); raise
+    it (e.g. to 0.9 or 0.95) for smaller steps when there are divergences.
+    ``gamma``, ``t0`` and ``kappa`` are the dual-averaging constants and
+    ``max_delta`` the energy error that counts as a divergence.
+
     After each call of :meth:`step`, ``last_stats`` holds the iteration's
     statistics: ``step_size`` (used for the trajectory), ``accept_stat``,
     ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` (Hamiltonian at
     the selected point) and ``lp`` (log density at the selected point).
     """
 
-    def __init__(self, log_target, gradient, inverse_transformation, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True, metric="diag"):
+    def __init__(self, log_target, gradient, inverse_transformation, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True, metric="diag"):
         if metric not in ("diag", "dense"):
             raise ValueError(f"metric must be 'diag' or 'dense', got {metric!r}.")
         self.log_target = log_target

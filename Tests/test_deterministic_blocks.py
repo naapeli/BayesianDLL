@@ -449,3 +449,71 @@ def test_enumerated_index_and_weighted_reverse_pass():
     actual = model._reverse_pass(["means", "scale"], active_terms={"y"}, term_weights={"y": weights})
     torch.testing.assert_close(actual["means"], expected[0])
     torch.testing.assert_close(actual["scale"], expected[1])
+
+
+# ----------------------------------------------------------------- Linear shapes
+# (n_features, input layout, coefficient shape). A one-element coefficient with
+# a design matrix of shape (N, 1) is a coefficient vector, not a scalar slope.
+LINEAR_CASES = [
+    (1, "vector", ()),       # scalar slope, inputs (N,)
+    (1, "vector", (1,)),     # one-element slope, inputs (N,)
+    (1, "matrix", (1,)),     # design matrix (N, 1), coefficients (1,)
+    (1, "matrix", ()),       # design matrix (N, 1), scalar coefficient
+    (3, "matrix", (3,)),     # design matrix (N, 3), coefficients (3,)
+]
+
+
+def _linear_model(n_features, layout, coefficient_shape, random_inputs):
+    n_obs = 6
+    shape = (n_obs,) if layout == "vector" else (n_obs, n_features)
+    design = torch.randn(shape)
+    with Model() as model:
+        x = normal("x", shape) if random_inputs else Data("x", design)
+        w = normal("w", coefficient_shape)
+        b = normal("b", ())
+        mean = Linear("mean", x, w, intercept=b)
+        ObservedParameter("y", Normal(mean, 0.7), torch.randn(n_obs))
+    return model, mean
+
+
+@pytest.mark.parametrize("random_inputs", [False, True], ids=["data", "random_inputs"])
+@pytest.mark.parametrize("n_features, layout, coefficient_shape", LINEAR_CASES, ids=lambda v: str(v).replace(" ", ""))
+def test_linear_shapes_and_gradients(n_features, layout, coefficient_shape, random_inputs):
+    model, mean = _linear_model(n_features, layout, coefficient_shape, random_inputs)
+    randomize(model)
+    with torch.no_grad():
+        x = (model.params["x"].constrained_value if random_inputs else mean.regression_inputs.constrained_value)
+        w = model.params["w"].constrained_value
+        b = model.params["b"].constrained_value
+        expected = (x * w.reshape(()) if layout == "vector" else x @ w.reshape(-1)) + b
+    assert mean.constrained_value.shape == (6,)
+    torch.testing.assert_close(mean.constrained_value, expected)
+    assert_grads_match(model)
+
+
+@pytest.mark.parametrize("random_inputs", [False, True], ids=["data", "random_inputs"])
+@pytest.mark.parametrize("n_features, layout, coefficient_shape", LINEAR_CASES, ids=lambda v: str(v).replace(" ", ""))
+def test_batched_linear_matches_autograd(n_features, layout, coefficient_shape, random_inputs):
+    model, mean = _linear_model(n_features, layout, coefficient_shape, random_inputs)
+    n_chains = 3
+    values = {name: 0.7 * torch.randn((n_chains, *p.unconstrained_value.shape)) for name, p in model.params.items()}
+    expected_lp, expected_grads, expected_means = [], {name: [] for name in values}, []
+    for chain in range(n_chains):
+        leaves = {name: value[chain].clone().requires_grad_(True) for name, value in values.items()}
+        with model.temporarily_set_many(leaves):
+            lp = model.model_log_prob()
+            grads = torch.autograd.grad(lp, list(leaves.values()))
+            expected_means.append(mean.constrained_value.detach().clone())
+        expected_lp.append(lp.detach())
+        for name, grad in zip(leaves, grads):
+            expected_grads[name].append(grad)
+    with model.batched(n_chains, values=values):
+        assert model._batch_mode == "tensor", model.batch_fallback_reason
+        lp = model.model_log_prob()
+        grads = model.joint_grad_log_prob(list(values))
+        batched_mean = mean.constrained_value.clone()
+    assert batched_mean.shape == (n_chains, 6)
+    torch.testing.assert_close(batched_mean, torch.stack(expected_means))
+    torch.testing.assert_close(lp, torch.stack(expected_lp))
+    for name in values:
+        torch.testing.assert_close(grads[name], torch.stack(expected_grads[name]), msg=f"gradient of {name}")

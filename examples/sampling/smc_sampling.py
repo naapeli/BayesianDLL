@@ -2,24 +2,37 @@
 Sequential Monte Carlo
 ======================
 
-Sequential Monte Carlo (SMC) moves a population of particles from the prior to
-the posterior through the tempered posteriors ``p(theta) p(y | theta)^beta``.
-The inverse temperature ``beta`` grows adaptively from 0 to 1: every stage
-reweights the particles, resamples them and moves them with a few MCMC steps.
+Sequential Monte Carlo (SMC) starts with particles drawn from the prior and
+moves them through the tempered posteriors ``p(theta) p(y | theta)^beta`` as
+the inverse temperature ``beta`` rises from 0 to 1. Each stage picks the next
+``beta`` so that the importance weights keep a target effective sample size,
+resamples the particles and moves them with a few MCMC steps.
 
-Because the particles start from the prior, SMC explores every mode the prior
-covers, which a single MCMC chain cannot do for a multimodal posterior. The
-weights also give an estimate of the marginal likelihood ``p(y)``, which is
-used here to compute a Bayes factor between two models.
+Two properties make SMC useful beside NUTS:
+
+* the particles start spread over the whole prior, so they populate every
+  mode of a multimodal posterior, while one MCMC chain usually stays in the
+  mode where it starts;
+* the weights give an estimate of the marginal likelihood ``p(y)``, from which
+  two models can be compared with a Bayes factor.
+
+The first model observes only ``|theta|``, so ``theta`` has two symmetric
+posterior modes; ``|theta|`` is the deterministic block ``Elementwise``. The
+second part compares a Normal and a Student-t model for data with outliers.
+Both answers are checked against numerical integration on a grid. The figure
+shows the posterior of ``theta`` from SMC and from a single NUTS chain over the
+exact density, the tempering schedule, both fitted models over the data, and
+the log evidences.
 """
 
 import math
 
-import torch
 import matplotlib.pyplot as plt
+import torch
 
-from BayesianDLL import Model, RandomParameter, ObservedParameter, DeterministicParameter, sample, sample_smc
-from BayesianDLL.Distributions import Normal, StudentT, Gamma
+from BayesianDLL import Model, ObservedParameter, RandomParameter, plate, sample, sample_smc
+from BayesianDLL.Deterministic import Elementwise
+from BayesianDLL.Distributions import Gamma, Normal, StudentT
 
 
 torch.manual_seed(0)
@@ -29,65 +42,99 @@ torch.set_default_dtype(torch.float64)
 # %%
 # A bimodal posterior
 # -------------------
-# The observations only depend on ``|theta|``, so the posterior has two
-# symmetric modes at about ``±2.5``.
 y = 2.5 + torch.randn(20)
 with Model() as bimodal:
     theta = RandomParameter("theta", Normal(0.0, 3.0))
-    magnitude = DeterministicParameter("magnitude", lambda t: t.abs(), lambda t: {"theta": torch.sign(t)}, [theta])
-    ObservedParameter("y", Normal(magnitude, 1.0), y)
+    magnitude = Elementwise("magnitude", torch.abs, lambda t: (torch.sign(t),), theta)
+    with plate("observations", len(y)):
+        ObservedParameter("y", Normal(magnitude, 1.0), y)
 
-smc_result = sample_smc(bimodal, n_particles=1000, kernel="metropolis", seed=0, progress_bar=False)
-nuts_result = sample(1000, 300, n_chains=1, model=bimodal, progress_bar=False, check_convergence=False, seed=0)
+smc = sample_smc(bimodal, n_particles=2000, kernel="metropolis", seed=0, progress_bar=False)
+# One chain only: several NUTS chains would land in different modes and
+# disagree, which is the failure this part illustrates.
+nuts = sample(1000, 300, n_chains=1, model=bimodal, seed=0, check_convergence=False, progress_bar=False)
 
-print("inverse temperatures:", [round(beta, 4) for beta in smc_result.beta_schedule])
-print(f"fraction of positive draws: SMC {(smc_result['theta'] > 0).double().mean():.2f}, "
-      f"NUTS {(nuts_result['theta'] > 0).double().mean():.2f}")
+theta_grid = torch.linspace(-4.5, 4.5, 2001)
+log_posterior = (torch.distributions.Normal(0.0, 3.0).log_prob(theta_grid)
+                 + torch.distributions.Normal(theta_grid.abs().unsqueeze(1), 1.0).log_prob(y).sum(1))
+exact_theta = torch.softmax(log_posterior, 0) / (theta_grid[1] - theta_grid[0])
+print(f"share of draws with theta > 0: SMC {(smc['theta'] > 0).double().mean():.2f}, "
+      f"NUTS {(nuts['theta'] > 0).double().mean():.2f}, exact 0.50")
+print(f"{len(smc.beta_schedule) - 1} tempering stages")
 
 
 # %%
-# Bayes factor via the log evidence
-# ---------------------------------
-# Data with a few outliers is described by a Normal and by a Student-t model.
-# The ratio of their marginal likelihoods, the Bayes factor, measures how much
-# more the data supports one model than the other.
+# Bayes factor from the log evidence
+# ----------------------------------
 data = torch.cat([torch.randn(40), torch.tensor([6.0, -5.5, 7.0])])
+likelihoods = {
+    "Normal": (lambda mu, sigma: Normal(mu, sigma), lambda mu, sigma: torch.distributions.Normal(mu, sigma)),
+    "Student-t (3 dof)": (lambda mu, sigma: StudentT(3.0, mu, sigma),
+                          lambda mu, sigma: torch.distributions.StudentT(3.0, mu, sigma)),
+}
+mu_grid = torch.linspace(-3.0, 3.0, 300)
+sigma_grid = torch.linspace(0.02, 8.0, 400)
+M, S = torch.meshgrid(mu_grid, sigma_grid, indexing="ij")
+cell = (mu_grid[1] - mu_grid[0]) * (sigma_grid[1] - sigma_grid[0])
 
-
-def location_scale_model(likelihood):
+fits, exact_evidence = {}, {}
+for k, (name, (model_likelihood, torch_likelihood)) in enumerate(likelihoods.items()):
     with Model() as model:
         mu = RandomParameter("mu", Normal(0.0, 5.0))
         sigma = RandomParameter("sigma", Gamma(2.0, 1.0))
-        ObservedParameter("data", likelihood(mu, sigma), data)
-    return model
+        with plate("data", len(data)):
+            ObservedParameter("data", model_likelihood(mu, sigma), data)
+    fits[name] = sample_smc(model, n_particles=2000, seed=1 + k, progress_bar=False)
+    log_joint = (torch.distributions.Normal(0.0, 5.0).log_prob(M) + torch.distributions.Gamma(2.0, 1.0).log_prob(S)
+                 + torch_likelihood(M.unsqueeze(-1), S.unsqueeze(-1)).log_prob(data).sum(-1))
+    exact_evidence[name] = (torch.logsumexp(log_joint.reshape(-1), 0) + torch.log(cell)).item()
+    print(f"log p(y | {name}): SMC {fits[name].log_marginal_likelihood:.2f}, grid {exact_evidence[name]:.2f}")
 
-
-normal_model = location_scale_model(lambda mu, sigma: Normal(mu, sigma))
-student_model = location_scale_model(lambda mu, sigma: StudentT(3.0, mu, sigma))
-normal_fit = sample_smc(normal_model, n_particles=1000, seed=1, progress_bar=False)
-student_fit = sample_smc(student_model, n_particles=1000, seed=2, progress_bar=False)
-
-log_bayes_factor = student_fit.log_marginal_likelihood - normal_fit.log_marginal_likelihood
-print(f"log p(y | Normal) = {normal_fit.log_marginal_likelihood:.2f}")
-print(f"log p(y | Student-t) = {student_fit.log_marginal_likelihood:.2f}")
+log_bayes_factor = fits["Student-t (3 dof)"].log_marginal_likelihood - fits["Normal"].log_marginal_likelihood
 print(f"Bayes factor Student-t : Normal = {math.exp(log_bayes_factor):.3g}")
 
+fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
 
-fig, axes = plt.subplots(1, 3, figsize=(12, 3.5))
-bins = torch.linspace(-4, 4, 80).numpy()
-axes[0].hist(smc_result["theta"].flatten().numpy(), bins=bins, density=True, alpha=0.6, label="SMC")
-axes[0].hist(nuts_result["theta"].flatten().numpy(), bins=bins, density=True, alpha=0.6, label="NUTS (1 chain)")
-axes[0].set_title("Bimodal posterior of theta")
-axes[0].legend()
+ax = axes[0, 0]
+bins = torch.linspace(-4.5, 4.5, 80).numpy()
+ax.hist(smc["theta"].reshape(-1).numpy(), bins=bins, density=True, alpha=0.5, label="SMC particles")
+ax.hist(nuts["theta"].reshape(-1).numpy(), bins=bins, density=True, histtype="step", linewidth=1.5,
+        label="one NUTS chain")
+ax.plot(theta_grid, exact_theta, color="black", label="exact")
+ax.set_xlabel("theta")
+ax.set_ylabel("density")
+ax.set_title("Bimodal posterior")
+ax.legend(frameon=False, fontsize="small", loc="upper center")
 
-axes[1].plot(smc_result.beta_schedule, marker="o")
-axes[1].set_xlabel("stage")
-axes[1].set_ylabel("inverse temperature")
-axes[1].set_title("Adaptive tempering")
+ax = axes[0, 1]
+ax.plot(smc.beta_schedule, marker="o")
+ax.set_xlabel("stage")
+ax.set_ylabel("inverse temperature beta")
+ax.set_title("Adaptive tempering schedule")
 
-axes[2].hist(normal_fit["mu"].flatten().numpy(), bins=40, density=True, alpha=0.6, label="Normal")
-axes[2].hist(student_fit["mu"].flatten().numpy(), bins=40, density=True, alpha=0.6, label="Student-t")
-axes[2].set_title(f"Posterior of mu (log BF = {log_bayes_factor:.1f})")
-axes[2].legend()
-plt.tight_layout()
+ax = axes[1, 0]
+grid = torch.linspace(-8, 9, 400)
+ax.hist(data.numpy(), bins=30, density=True, color="lightgray", label="data")
+for name, (_, torch_likelihood) in likelihoods.items():
+    mu_draws, sigma_draws = fits[name]["mu"].reshape(-1, 1), fits[name]["sigma"].reshape(-1, 1)
+    density = torch_likelihood(mu_draws, sigma_draws).log_prob(grid).exp().mean(0)
+    ax.plot(grid, density, label=name)
+ax.set_yscale("log")
+ax.set_ylim(1e-4, 1)
+ax.set_xlabel("y")
+ax.set_ylabel("density (log scale)")
+ax.set_title("Posterior predictive densities")
+ax.legend(frameon=False, fontsize="small")
+
+ax = axes[1, 1]
+names = list(likelihoods)
+positions = torch.arange(len(names), dtype=torch.float64)
+ax.plot(positions, [fits[n].log_marginal_likelihood for n in names], "o", markersize=10, label="SMC estimate")
+ax.plot(positions, [exact_evidence[n] for n in names], "kx", markersize=10, label="grid integration")
+ax.set_xticks(positions, names)
+ax.set_xlim(-0.5, len(names) - 0.5)
+ax.set_ylabel("log p(y)")
+ax.set_title(f"Log evidence (log Bayes factor {log_bayes_factor:.1f})")
+ax.margins(y=0.15)
+ax.legend(frameon=False, fontsize="small", loc="center")
 plt.show()

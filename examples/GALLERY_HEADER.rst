@@ -1,11 +1,14 @@
 Examples
 ========
 
-Here are examples showing how to use the library. They cover building models,
-sampling from posteriors with NUTS and Metropolis, predictive distributions,
-variational inference, Gaussian processes and evaluating the results.
+Short, self-contained scripts that show how to build Bayesian models with
+BayesianDLL, sample or approximate their posteriors, and check the results.
+Every script simulates its own data with a fixed seed, so its numbers and
+figures can be reproduced, and most of them compare the fit with the true
+parameters or an exact answer.
 
-Each example is a standalone script that can be run from the project root as a
-module, for example ``uv run python -m examples.bayesian_regression.logistic_regression``.
-The scripts generate their own synthetic data, fit a model and visualise the
-results.
+Run an example from the project root as a module, for example::
+
+    uv run python -m examples.bayesian_regression.logistic_regression
+
+Set ``MPLBACKEND=Agg`` to run the scripts without opening figure windows.

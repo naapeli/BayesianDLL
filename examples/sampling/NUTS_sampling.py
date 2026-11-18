@@ -2,265 +2,103 @@
 NUTS Sampling
 =============
 
-Plots the log densities of the continuous distributions in their unconstrained
-spaces, then draws samples from each distribution with the No-U-Turn Sampler and
-compares the samples to the true densities.
+The No-U-Turn Sampler (NUTS) simulates Hamiltonian dynamics with the gradient
+of the log density and stops a trajectory when it starts to turn back. It
+adapts its step size (towards the acceptance statistic ``delta``) and a
+diagonal mass matrix during warmup, so it needs no hand tuning.
+
+NUTS moves on an unconstrained scale: positive variables are sampled as their
+logarithm, variables on an interval through a logit, and simplex-valued
+variables through a stick-breaking map. The draws are mapped back, so they
+always respect the support, and the log density includes the Jacobian of the
+map.
+
+Nine distributions with bounded, heavy-tailed, skewed, bimodal and simplex
+supports are sampled with four vectorized chains each. The figure overlays
+the draws on the exact densities; for the Dirichlet distribution the draws
+are shown on the probability simplex over its exact density.
 """
 
-import torch
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
-from BayesianDLL.Distributions import Normal, Beta, Exponential, Uniform, InvGamma, HalfCauchy, Dirichlet, Mixture
 from BayesianDLL import Model, RandomParameter, sample
+from BayesianDLL.Distributions import Beta, Dirichlet, Exponential, HalfCauchy, InvGamma, Mixture, Normal, Uniform
+from BayesianDLL.Evaluation import effective_sample_size, gelman_rubin
 
 
-def _eval_pointwise(func, xs):
-    """Evaluate a function that returns a scalar for each 1D input point."""
-    return torch.stack([func(xi.unsqueeze(0)).squeeze() for xi in xs])
+def nuts_draws(name, distribution, seed, n_samples=800):
+    with Model() as model:
+        RandomParameter("x", distribution)
+    result = sample(n_samples, 300, n_chains=4, model=model, seed=seed, delta=0.9, chain_method="vectorized",
+                    progress_bar=False)
+    draws = {"x": result["x"].double()}
+    print(f"{name:24s}: R-hat {gelman_rubin(draws)['x'].max():.3f}, bulk ESS {effective_sample_size(draws)['x'].min():5.0f}, "
+          f"divergences {sum(result.divergences)}")
+    return result["x"].double()
 
 
-# ================== DISTRIBUTIONS IN UNRESTRICTED SPACES ==================
-plt.figure(figsize=(6, 6))
-plt.subplot(3, 3, 1)
-distribution = Beta(2, 2)
-x = torch.linspace(-5, 5, 100)
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_unconstrained, x).numpy(), label='log_pdf')
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_grad_unconstrained, x).numpy(), label='log_pdf_grad')
-plt.legend()
-plt.title("Beta")
+univariate = [
+    ("Normal(5, sd 1.7)", Normal(5.0, 3 ** 0.5), (-1.0, 11.0), "linear"),
+    ("Beta(2, 5)", Beta(2.0, 5.0), (0.0, 1.0), "linear"),
+    ("Beta(0.5, 0.5)", Beta(0.5, 0.5), (0.0, 1.0), "linear"),
+    ("Exponential(rate 0.3)", Exponential(0.3), (0.0, 20.0), "linear"),
+    ("Uniform(2, 5)", Uniform(2.0, 5.0), (1.5, 5.5), "linear"),
+    ("InvGamma(3, 6)", InvGamma(3.0, 6.0), (0.5, 30.0), "log"),
+    ("HalfCauchy(2)", HalfCauchy(2.0), (0.05, 500.0), "log"),
+    ("Mixture of two Normals", Mixture([Normal(-1.0, 0.5), Normal(2.0, 1.0)], [0.3, 0.7]), (-3.5, 5.5), "linear"),
+]
 
-plt.subplot(3, 3, 2)
-distribution = Normal(0, 1)
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_unconstrained, x).numpy(), label='log_pdf')
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_grad_unconstrained, x).numpy(), label='log_pdf_grad')
-plt.legend()
-plt.title("Normal")
+fig, axes = plt.subplots(3, 3, figsize=(13, 11), layout="constrained")
+for k, (ax, (name, distribution, (low, high), scale)) in enumerate(zip(axes.flat, univariate)):
+    # The chains must hop between the two modes of the mixture: give it more draws.
+    draws = nuts_draws(name, distribution, seed=k, n_samples=2500 if isinstance(distribution, Mixture) else 800)
+    draws = draws.reshape(-1)
+    if scale == "log":
+        edges = np.logspace(np.log10(low), np.log10(high), 50)
+        grid = torch.logspace(np.log10(low), np.log10(high), 400, dtype=torch.float64)
+        ax.hist(draws.numpy(), bins=edges, density=True, alpha=0.6, label="NUTS draws")
+        ax.plot(grid, distribution.pdf(grid.unsqueeze(-1)).reshape(-1), color="black", label="exact density")
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+    else:
+        grid = torch.linspace(low, high, 400, dtype=torch.float64)
+        inside = grid.clone()
+        if isinstance(distribution, Beta):
+            inside = grid.clamp(1e-3, 1 - 1e-3)
+        density = distribution.pdf(inside.unsqueeze(-1)).reshape(-1)
+        if isinstance(distribution, Uniform):
+            density = torch.where((grid > 2.0) & (grid < 5.0), density, torch.zeros_like(density))
+        ax.hist(draws.numpy(), bins=50, range=(low, high), density=True, alpha=0.6, label="NUTS draws")
+        ax.plot(inside, density, color="black", label="exact density")
+    ax.set_title(name)
+    ax.set_xlabel("x")
+    ax.set_ylabel("density")
 
-plt.subplot(3, 3, 3)
-distribution = Exponential(0.3)
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_unconstrained, x).numpy(), label='log_pdf')
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_grad_unconstrained, x).numpy(), label='log_pdf_grad')
-plt.legend()
-plt.title("Exponential")
+# %%
+# A Dirichlet distribution on the 3-simplex
+# -----------------------------------------
+alpha = torch.tensor([2.0, 4.0, 8.0], dtype=torch.float64)
+dirichlet = Dirichlet(alpha)
+draws = nuts_draws("Dirichlet(2, 4, 8)", dirichlet, seed=20).reshape(-1, 3)
+corners = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.5, 3 ** 0.5 / 2]], dtype=torch.float64)
 
-plt.subplot(3, 3, 4)
-distribution = Uniform(2, 5)
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_unconstrained, x).numpy(), label='log_pdf')
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_grad_unconstrained, x).numpy(), label='log_pdf_grad')
-plt.legend()
-plt.title("Uniform")
+resolution = 120
+grid = torch.tensor([[i, j, resolution - i - j] for i in range(1, resolution) for j in range(1, resolution - i)],
+                    dtype=torch.float64) / resolution
+plane = grid @ corners
+density = dirichlet.pdf(grid).reshape(-1)
+ax = axes.flat[-1]
+ax.tripcolor(plane[:, 0], plane[:, 1], density, shading="gouraud", cmap="Blues")
+points = draws[:800] @ corners
+ax.scatter(points[:, 0], points[:, 1], s=2, color="C1", alpha=0.6)
+ax.plot(*torch.cat([corners, corners[:1]]).T, color="black")
+ax.set_aspect("equal")
+ax.axis("off")
+ax.set_title("Dirichlet(2, 4, 8): draws on the exact density")
 
-plt.subplot(3, 3, 5)
-distribution = InvGamma(2, 2)
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_unconstrained, x).numpy(), label='log_pdf')
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_grad_unconstrained, x).numpy(), label='log_pdf_grad')
-plt.legend()
-plt.title("Inverse gamma")
-
-plt.subplot(3, 3, 6)
-distribution = HalfCauchy(2)
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_unconstrained, x).numpy(), label='log_pdf')
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_grad_unconstrained, x).numpy(), label='log_pdf_grad')
-plt.legend()
-plt.title("Half Cauchy")
-
-plt.subplot(3, 3, 7)
-means = [-1, 2]
-stds = [0.5, 1.0]
-components = [Normal(mu, std) for mu, std in zip(means, stds)]
-weights = [0.3, 0.7]
-distribution = Mixture(components, weights)
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_unconstrained, x).numpy(), label='log_pdf')
-plt.plot(x.numpy(), _eval_pointwise(distribution._log_prob_grad_unconstrained, x).numpy(), label='log_pdf_grad')
-plt.legend()
-plt.title("Mixture of Gaussians")
-
-plt.tight_layout()
-# plt.savefig("examples/sampling/pdfs.png")
-
-
-# ================== SAMPLING ==================
-n = 500  # 10_000
-n_warmup = 200
-n_chains = 11  # 12
-bins = 30
-
-plt.figure(figsize=(6, 6))
-
-print("Normal")
-plt.subplot(3, 3, 1)
-distribution = Normal(0, 1)
-with Model() as model:
-    RandomParameter("sample", distribution, sampler="nuts")
-    model.find_MAP(verbose=False)
-    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
-x = torch.linspace(-10, 20, 1000)
-y = distribution.pdf(x)
-plt.plot(x, y)
-plt.title("Normal")
-
-distribution = Normal(5, 3 ** 0.5)
-with Model() as model:
-    RandomParameter("sample", distribution, sampler="nuts")
-    model.find_MAP(verbose=False)
-    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
-x = torch.linspace(-10, 20, 1000)
-y = distribution.pdf(x)
-plt.plot(x, y)
-plt.xlim(-5, 15)
-
-print("Beta")
-plt.subplot(3, 3, 2)
-distribution = Beta(2, 5)
-with Model() as model:
-    RandomParameter("sample", distribution, sampler="nuts")
-    model.find_MAP(verbose=False)
-    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
-x = torch.linspace(0, 1, 100)
-y = distribution.pdf(x)
-plt.plot(x, y)
-plt.title("Beta")
-
-distribution = Beta(0.5, 0.5)
-with Model() as model:
-    RandomParameter("sample", distribution, sampler="nuts")
-    model.find_MAP(verbose=False)
-    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
-x = torch.linspace(0.01, 0.99, 100)
-y = distribution.pdf(x)
-plt.plot(x, y)
-plt.xlim(0, 1)
-
-print("Exponential")
-plt.subplot(3, 3, 3)
-distribution = Exponential(0.3)
-with Model() as model:
-    RandomParameter("sample", distribution, sampler="nuts", delta=0.9)
-    model.find_MAP(verbose=False)
-    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
-x = torch.linspace(0, 20, 100)
-y = distribution.pdf(x)
-plt.plot(x, y)
-plt.xlim(0, 20)
-plt.title("Exponential")
-
-print("Uniform")
-plt.subplot(3, 3, 4)
-distribution = Uniform(2, 5)
-with Model() as model:
-    RandomParameter("sample", distribution, sampler="nuts")
-    model.find_MAP(verbose=False)
-    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
-x = torch.linspace(0, 7, 1000)
-y = distribution.pdf(x)
-plt.plot(x, y)
-plt.xlim(0, 7)
-plt.title("Uniform")
-
-print("Inverse gamma")
-plt.subplot(3, 3, 5)
-distribution = InvGamma(3, 6)
-with Model() as model:
-    RandomParameter("sample", distribution, sampler="nuts", delta=0.9)
-    model.find_MAP(verbose=False)
-    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
-plt.xscale("log")
-plt.yscale("log")
-xmin = samples.min().item()
-xmax = samples.max().item()
-bin_edges = np.logspace(np.log10(xmin), np.log10(xmax), bins)
-plt.hist(samples.numpy(), bins=bin_edges, alpha=0.5, density=True)
-x = torch.logspace(torch.log10(torch.tensor(xmin)), torch.log10(torch.tensor(xmax)), 1000)
-y = distribution.pdf(x)
-plt.plot(x.numpy(), y.numpy())
-plt.title("Inverse gamma")
-
-print("Half Cauchy")
-plt.subplot(3, 3, 6)
-distribution = HalfCauchy(2)
-with Model() as model:
-    RandomParameter("sample", distribution, sampler="nuts")
-    model.find_MAP(verbose=False)
-    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
-plt.xscale("log")
-plt.yscale("log")
-xmin = samples.min().item()
-xmax = samples.max().item()
-bin_edges = np.logspace(np.log10(xmin), np.log10(xmax), bins)
-plt.hist(samples.numpy(), bins=bin_edges, alpha=0.5, density=True)
-x = torch.logspace(torch.log10(torch.tensor(xmin)), torch.log10(torch.tensor(xmax)), 1000)
-y = distribution.pdf(x)
-plt.plot(x.numpy(), y.numpy())
-plt.title("Half Cauchy")
-
-print("Dirichlet")
-plt.subplot(3, 3, 7)
-d = 3
-# alpha = 5 * torch.ones(d, dtype=torch.float64)
-alpha = torch.tensor([2, 4, 8], dtype=torch.float64)
-distribution = Dirichlet(alpha)
-with Model() as model:
-    RandomParameter("sample", distribution, sampler="nuts")
-    model.find_MAP(verbose=False)
-    samples = sample(max(n // 20, 100), n_warmup, n_chains=n_chains, progress_bar=False)["sample"].flatten(0, 1)
-def project_to_2d(points):
-    v1 = torch.tensor([0.0, 0.0])
-    v2 = torch.tensor([1.0, 0.0])
-    v3 = torch.tensor([0.5, 3**0.5 / 2])
-    V = torch.stack([v1, v2, v3]).to(points.dtype)
-    return points @ V
-samples_2d = project_to_2d(samples)
-def shade_pdf():
-    resolution = 200
-    v1 = np.array([0.0, 0.0])
-    v2 = np.array([1.0, 0.0])
-    v3 = np.array([0.5, np.sqrt(3) / 2])
-    V = np.stack([v1, v2, v3], axis=0)
-    grid = []
-    for i in range(resolution + 1):
-        for j in range(resolution + 1 - i):
-            k = resolution - i - j
-            x = i / resolution
-            y = j / resolution
-            z = k / resolution
-            grid.append([x, y, z])
-    grid = np.array(grid)
-    projected = grid @ V
-    simplex_points = torch.tensor(grid, dtype=torch.float64)
-    density = distribution.pdf(simplex_points).squeeze().numpy()
-    return projected, density
-projected, density = shade_pdf()
-plt.tripcolor(projected[:, 0], projected[:, 1], density, shading="gouraud", cmap="Blues")
-plt.scatter(samples_2d[:, 0], samples_2d[:, 1], alpha=0.7, s=1)
-plt.title("Dirichlet")
-triangle_vertices = torch.tensor([[0.0, 0.0], [1.0, 0.0], [0.5, 3**0.5 / 2], [0.0, 0.0]])
-plt.plot(triangle_vertices[:, 0], triangle_vertices[:, 1], '-', lw=2, c="black")
-
-print("Mixture")
-plt.subplot(3, 3, 8)
-means = [-1, 2]
-stds = [0.5, 1.0]
-components = [Normal(mu, std) for mu, std in zip(means, stds)]
-weights = [0.3, 0.7]
-distribution = Mixture(components, weights)
-with Model() as model:
-    RandomParameter("sample", distribution, sampler="nuts")
-    model.find_MAP(verbose=False)
-    samples = sample(n, n_warmup, n_chains=n_chains, progress_bar=False)["sample"].reshape(-1)
-plt.hist(samples.numpy(), bins=bins, alpha=0.5, density=True)
-x = torch.linspace(-5, 5, 1000)
-y = distribution.pdf(x)
-plt.plot(x, y)
-plt.xlim(-5, 5)
-plt.title("Mixture of Gaussians")
-
-plt.tight_layout()
-# plt.savefig("examples/sampling/distributions.png")
+handles, labels = axes.flat[0].get_legend_handles_labels()
+fig.legend(handles, labels, loc="outside lower center", ncols=2, frameon=False)
+fig.suptitle("NUTS draws against the exact densities")
 plt.show()

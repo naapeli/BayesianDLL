@@ -1,35 +1,76 @@
 """
-Continuous Posterior
-====================
+Posterior of a Success Probability
+==================================
 
-Samples the posterior of a Beta prior with a Bernoulli (or Binomial) likelihood and
-compares it to the analytic Beta posterior.
+Twenty coin flips ``y_i ~ Bernoulli(p)`` with a uniform ``Beta(1, 1)`` prior on
+``p``. The prior is conjugate, so the posterior is exactly
+``Beta(1 + successes, 1 + failures)``, which makes this a good check of the
+sampler. NUTS moves on ``logit(p)``, where the posterior is unbounded and
+close to Gaussian, and maps the draws back to ``(0, 1)``.
+
+The figure compares the draws with the exact posterior and the prior, and
+shows the posterior predictive distribution of the number of successes in
+twenty new flips against the exact beta-binomial distribution.
 """
 
-import torch
 import matplotlib.pyplot as plt
+import torch
 
-from BayesianDLL.Distributions import Beta, Bernoulli, Binomial
-from BayesianDLL import Model, RandomParameter, ObservedParameter, sample, plate
-from BayesianDLL.Evaluation.Graphics import plot_posterior
+from BayesianDLL import Model, ObservedParameter, RandomParameter, plate
+from BayesianDLL.Distributions import Bernoulli, Beta
+from BayesianDLL.Evaluation import summary
 
 
 torch.manual_seed(0)
-N = 5
-max_val = 1  # choose 1 for bernoulli prior and something else for binomial prior
-data = torch.randint(0, max_val + 1, size=(N,))
-a, b = 1, 1
+
+n_flips, p_true = 20, 0.3
+flips = torch.bernoulli(torch.full((n_flips,), p_true, dtype=torch.float64))
+a_prior, b_prior = 1.0, 1.0
+successes = int(flips.sum())
+print(f"{successes} successes in {n_flips} flips")
+
 with Model() as model:
-    prior = RandomParameter("prior", Beta(a, b))  # , sampler="metropolis"
+    p = RandomParameter("p", Beta(a_prior, b_prior))
+    with plate("flips", n_flips):
+        ObservedParameter("flips", Bernoulli(p), flips)
 
-    likelihood_distribution = Bernoulli(prior) if max_val == 1 else Binomial(max_val, prior)
-    with plate("data", N):
-        likelihood = ObservedParameter("likelihood", likelihood_distribution, data)
-    samples = sample(1000, 500, n_chains=4, start_point_variance=0)
+result = model.sample(1000, 500, n_chains=4, seed=0, delta=0.85, progress_bar=False)
+print(summary(result).to_string())
+a_post, b_post = a_prior + successes, b_prior + n_flips - successes
+print(f"exact posterior mean {a_post / (a_post + b_post):.3f}")
 
-axes = plot_posterior(samples, method="kde")
-x = torch.linspace(0, 1, 1000)
-axes[0, 0].plot(x, Beta(a + data.sum(), b + (max_val - data).sum()).pdf(x), c="black", label="True posterior")
-axes[0, 0].set_xlim(0, 1)
-axes[0, 0].legend()
+predictive = model.posterior_predicative(result, n_samples=1000, samples_per_step=1, progress_bar=False)
+new_successes = predictive["flips"].reshape(-1, n_flips).sum(1).long()
+
+
+def log_beta_function(a, b):
+    return torch.lgamma(a) + torch.lgamma(b) - torch.lgamma(a + b)
+
+
+k = torch.arange(n_flips + 1, dtype=torch.float64)
+log_binomial_coefficient = torch.lgamma(torch.tensor(n_flips + 1.0)) - torch.lgamma(k + 1) - torch.lgamma(n_flips - k + 1)
+beta_binomial = torch.exp(log_binomial_coefficient + log_beta_function(k + a_post, n_flips - k + b_post)
+                          - log_beta_function(torch.tensor(a_post), torch.tensor(b_post)))
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), layout="constrained")
+ax = axes[0]
+grid = torch.linspace(1e-3, 1 - 1e-3, 400, dtype=torch.float64)
+ax.hist(result["p"].reshape(-1).numpy(), bins=50, density=True, alpha=0.5, label="NUTS draws")
+ax.plot(grid, Beta(a_post, b_post).pdf(grid.unsqueeze(-1)).reshape(-1), color="black", label="exact posterior")
+ax.plot(grid, Beta(a_prior, b_prior).pdf(grid.unsqueeze(-1)).reshape(-1), color="gray", linestyle=":", label="prior")
+ax.axvline(p_true, color="C3", linestyle="--", label="true p")
+ax.set_xlabel("p")
+ax.set_ylabel("density")
+ax.set_title("Posterior of the success probability")
+ax.legend(frameon=False, fontsize="small")
+
+ax = axes[1]
+frequency = torch.bincount(new_successes, minlength=n_flips + 1).double() / len(new_successes)
+ax.bar(k, frequency, alpha=0.5, label="posterior predictive draws")
+ax.plot(k, beta_binomial, "ko", markersize=4, label="exact beta-binomial")
+ax.axvline(successes, color="C3", linestyle="--", label="observed successes")
+ax.set_xlabel(f"successes in {n_flips} new flips")
+ax.set_ylabel("probability")
+ax.set_title("Posterior predictive distribution")
+ax.legend(frameon=False, fontsize="small")
 plt.show()

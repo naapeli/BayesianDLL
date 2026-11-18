@@ -39,17 +39,23 @@ class Metropolis(_CachedTarget):
 
     Continuous states take Gaussian proposals with standard deviation
     ``proposal_scale``, adapted during warmup towards the acceptance rate
-    ``delta``. Discrete states are updated one coordinate at a time: each step
+    ``target_accept_rate`` (0.234 by default; about 0.44 suits a single
+    coordinate): after every step the scale is multiplied by
+    ``1 - adaptation_rate`` when the rolling acceptance rate is below the
+    target and by ``1 + adaptation_rate`` when it is above. The names differ
+    from NUTS's ``delta`` and ``kappa`` on purpose, so settings passed to
+    :func:`~BayesianDLL.sample` for NUTS do not reach Metropolis blocks.
+    Discrete states are updated one coordinate at a time: each step
     sweeps over the coordinates in random order and proposes a move of ±1 for
     each, so the acceptance rate does not collapse with the dimension.
     """
 
-    def __init__(self, log_target, state_space, proposal_scale=1.0, kappa=0.05, delta=0.234):
+    def __init__(self, log_target, state_space, proposal_scale=1.0, adaptation_rate=0.05, target_accept_rate=0.234):
         self.log_target = log_target
         self.state_space = state_space
         self.proposal_scale = proposal_scale
-        self.kappa = kappa
-        self.delta = delta
+        self.adaptation_rate = adaptation_rate
+        self.target_accept_rate = target_accept_rate
         self.m = 0
         self.accept_queue = deque([], maxlen=20)
         self.last_stats = {}
@@ -132,10 +138,10 @@ class Metropolis(_CachedTarget):
 
     def adapt_proposal_scale(self):
         acceptance_ratio = sum(self.accept_queue) / len(self.accept_queue)
-        if acceptance_ratio < self.delta:
-            self.proposal_scale *= (1 - self.kappa)
-        elif acceptance_ratio > self.delta:
-            self.proposal_scale *= (1 + self.kappa)
+        if acceptance_ratio < self.target_accept_rate:
+            self.proposal_scale *= (1 - self.adaptation_rate)
+        elif acceptance_ratio > self.target_accept_rate:
+            self.proposal_scale *= (1 + self.adaptation_rate)
 
     def init_sampler(self):
         pass
@@ -245,7 +251,7 @@ class FiniteGibbs(_CachedTarget):
     def _draw(log_probs):
         """Indices drawn from the normalised ``exp(log_probs)`` along the last dim, and which rows are possible."""
         log_probs = torch.nan_to_num(log_probs, nan=-math.inf)
-        maximum = log_probs.max(dim=-1, keepdim=True).values
+        maximum = torch.amax(log_probs, dim=-1, keepdim=True)
         valid = torch.isfinite(maximum).squeeze(-1)
         weights = torch.exp(log_probs - torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum)))
         weights = torch.where(valid.unsqueeze(-1), weights, torch.ones_like(weights))
