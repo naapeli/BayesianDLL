@@ -411,7 +411,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
 
     Remaining keyword arguments are sampler settings for every block (each
     sampler takes the ones it understands), e.g. ``delta=0.9`` or
-    ``metric="dense"`` for NUTS.
+    ``metric="dense"`` for NUTS and ``target_accept_rate=0.44`` for Metropolis.
     """
     model = get_active_model() if model is None else model
     if device is not None:

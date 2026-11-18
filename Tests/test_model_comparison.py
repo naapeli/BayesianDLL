@@ -58,7 +58,7 @@ def test_loo_matches_arviz(outlier):
     assert result.p == pytest.approx(float(expected.p), abs=1e-6)
     assert result.se == pytest.approx(float(expected.se), abs=1e-6)
     np.testing.assert_allclose(result.elpd_i.numpy(), expected.elpd_i.values, atol=1e-6)
-    np.testing.assert_allclose(result.pareto_k.numpy(), expected.pareto_k.values, atol=0.05)
+    np.testing.assert_allclose(result.pareto_k.numpy(), expected.pareto_k.values, rtol=0, atol=1e-6)
     assert result.good_k == pytest.approx(expected.good_k)
     assert result["elpd_loo"] == result.elpd
 
@@ -215,7 +215,7 @@ def regression_results():
             ObservedParameter("y", Normal(mu, sigma), y)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            return model.sample(300, 300, n_chains=2, progress_bar=False, seed=1)
+            return model.sample(450, 300, n_chains=2, progress_bar=False, seed=1)
 
     return x, y, fit(False), fit(True)
 
@@ -223,13 +223,13 @@ def regression_results():
 def test_sampling_records_pointwise_log_likelihood(regression_results):
     x, y, linear, _ = regression_results
     log_lik = linear.log_likelihood["y"]
-    assert log_lik.shape == (2, 300, 30)
+    assert log_lik.shape == (2, 450, 30)
     mu = linear["a"] + linear["b"] * x
     expected = _normal_log_lik(y, mu, linear["sigma"])
     torch.testing.assert_close(log_lik, expected)
 
     thinned = linear.thin(3)
-    assert thinned.log_likelihood["y"].shape == (2, 100, 30)
+    assert thinned.log_likelihood["y"].shape == (2, 150, 30)
     torch.testing.assert_close(thinned.log_likelihood["y"], log_lik[:, ::3])
 
 
@@ -266,9 +266,10 @@ def test_to_arviz_supports_summary_and_loo(regression_results):
         warnings.simplefilter("ignore")
         expected = az.loo(tree, reff=1.0, pointwise=True)
         result = loo(linear, reff=1.0, pointwise=True)
-    # 600 draws: arviz floors 3 * sqrt(600) = 73.48 while loo ceils it.
+    # 900 draws: 3 * sqrt(900) = 90 is an integer, so arviz (which floors it)
+    # and loo (which ceils it) smooth the same tail length and agree exactly.
     assert result.elpd == pytest.approx(float(expected.elpd), abs=1e-2)
-    np.testing.assert_allclose(result.pareto_k.numpy(), expected.pareto_k.values, atol=0.05)
+    np.testing.assert_allclose(result.pareto_k.numpy(), expected.pareto_k.values, rtol=0, atol=1e-6)
 
 
 def _mixture_model(n, data, shared_assignment=False):

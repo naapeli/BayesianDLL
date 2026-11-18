@@ -98,13 +98,13 @@ class VectorizedMetropolis:
     coordinate at a time with ±1 proposals, as :class:`~BayesianDLL.Samplers.Metropolis`.
     """
 
-    def __init__(self, log_target, state_space, n_chains, proposal_scale=1.0, kappa=0.05, delta=0.234):
+    def __init__(self, log_target, state_space, n_chains, proposal_scale=1.0, adaptation_rate=0.05, target_accept_rate=0.234):
         self.log_target = log_target
         self.state_space = state_space
         self.n_chains = n_chains
         self.initial_scale = proposal_scale
-        self.kappa = kappa
-        self.delta = delta
+        self.adaptation_rate = adaptation_rate
+        self.target_accept_rate = target_accept_rate
         self.proposal_scale = None
         self.accept_history = []
         self.last_stats = {}
@@ -127,7 +127,8 @@ class VectorizedMetropolis:
         self.accept_history = (self.accept_history + [accepted.to(theta.dtype)])[-20:]
         rolling = torch.stack(self.accept_history).mean(0)
         if warmup and self.state_space.is_continuous():
-            factor = torch.where(rolling < self.delta, 1 - self.kappa, torch.where(rolling > self.delta, 1 + self.kappa, 1.0))
+            factor = torch.where(rolling < self.target_accept_rate, 1 - self.adaptation_rate,
+                                 torch.where(rolling > self.target_accept_rate, 1 + self.adaptation_rate, 1.0))
             self.proposal_scale = self.proposal_scale * factor
         self._cached_theta, self._cached_lp = theta, current
         self.last_stats = {
@@ -363,9 +364,11 @@ class VectorizedNUTS:
     estimates) and all statistics are per chain. The statistics match those
     of :class:`~BayesianDLL.Samplers.NUTS`: ``step_size``, ``accept_stat``,
     ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` and ``lp``.
+    The settings are those of :class:`~BayesianDLL.Samplers.NUTS`, e.g. the
+    target acceptance statistic ``delta`` (default 0.8).
     """
 
-    def __init__(self, log_target, gradient, n_chains, delta=0.6, gamma=0.05, step_size_bar=1, max_depth=10, t0=10,
+    def __init__(self, log_target, gradient, n_chains, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10,
                  kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0,
                  adapt_mass_matrix=True, metric="diag"):
         from ._NUTS import _adaptation_windows

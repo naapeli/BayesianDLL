@@ -24,13 +24,25 @@ def _as_tensor(value, *, dtype=None, device=None):
     return torch.as_tensor(value, dtype=dtype, device=device)
 
 
+def _is_scalar_slope(input_ndim, n_features, n_coefficients):
+    """Whether a linear predictor multiplies its inputs by a scalar slope.
+
+    A single coefficient is a scalar slope unless the inputs are a design
+    matrix with one feature (shape ``(..., N, 1)``): then it is a coefficient
+    vector of length one and the output drops the feature dimension, exactly
+    as for ``D > 1`` features.
+    """
+    return n_coefficients == 1 and not (input_ndim >= 2 and n_features == 1)
+
+
 def _linear_output(inputs, coefficients, intercept):
     """Evaluate a scalar-output linear predictor."""
     inputs = _as_tensor(inputs)
     coefficients = _as_tensor(coefficients, dtype=inputs.dtype, device=inputs.device)
     intercept = _as_tensor(intercept, dtype=inputs.dtype, device=inputs.device)
 
-    if coefficients.numel() == 1:
+    n_features = inputs.shape[-1] if inputs.ndim else 1
+    if _is_scalar_slope(inputs.ndim, n_features, coefficients.numel()):
         return inputs * coefficients.reshape(()) + intercept
 
     if inputs.ndim < 2:
@@ -53,7 +65,8 @@ class Linear(DeterministicParameter):
     For one-dimensional inputs and a scalar coefficient, this evaluates
     ``inputs * slope + intercept``. For a design matrix with shape ``(N, D)``
     and a coefficient vector with shape ``(D,)``, it evaluates
-    ``inputs @ coefficients + intercept``.
+    ``inputs @ coefficients + intercept`` with shape ``(N,)``; this includes
+    a single feature, ``D = 1``, where the coefficient may also be a scalar.
 
     Parameters may be model nodes or constants. Named parameters are included
     in the model graph and receive analytic derivatives. ``slope`` and
@@ -146,7 +159,8 @@ class Linear(DeterministicParameter):
                 coefficient_value = coefficients
             coefficient_value = _as_tensor(coefficient_value, device=inputs_value.device)
             grads = {}
-            if coefficient_value.numel() == 1:
+            n_features = inputs_value.shape[-1] if inputs_value.ndim else 1
+            if _is_scalar_slope(inputs_value.ndim, n_features, coefficient_value.numel()):
                 if _is_named(coefficients):
                     grads[coefficients.name] = (cotangent * inputs_value).sum().reshape(coefficient_value.shape)
                 if isinstance(inputs, (RandomParameter, DeterministicParameter)):
@@ -188,11 +202,13 @@ class Linear(DeterministicParameter):
             intercept, intercept_batched = _as_tensor(self.intercept, dtype=inputs.dtype, device=inputs.device), False
         n_chains = self.owner_model.n_chains
         per_chain = coefficients[0].numel() if coefficients_batched else coefficients.numel()
+        input_ndim = inputs.ndim - 1 if flags[0] else inputs.ndim
+        scalar = _is_scalar_slope(input_ndim, inputs.shape[-1] if input_ndim else 1, per_chain)
         if coefficients_batched:
-            coefficients = coefficients.reshape(n_chains) if per_chain == 1 else coefficients.reshape(n_chains, per_chain)
+            coefficients = coefficients.reshape(n_chains) if scalar else coefficients.reshape(n_chains, per_chain)
         else:
-            coefficients = coefficients.reshape(()) if per_chain == 1 else coefficients.reshape(per_chain)
-        return (inputs, flags[0]), (coefficients, coefficients_batched), (intercept, intercept_batched), per_chain == 1
+            coefficients = coefficients.reshape(()) if scalar else coefficients.reshape(per_chain)
+        return (inputs, flags[0]), (coefficients, coefficients_batched), (intercept, intercept_batched), scalar
 
     def _batched_terms(self, input_values):
         (x, fx), (w, fw), (b, fb), scalar = self._batched_parts(input_values)
