@@ -10,8 +10,9 @@ between coordinates.
 The test case is a straight-line fit ``y = a + b x`` with a covariate that is
 away from zero (``x`` between 2 and 6) and a known noise level. Without
 centring, the intercept and the slope are strongly anti-correlated a
-posteriori (correlation about -0.97). With the conjugate Normal priors used here the posterior is
-exactly Gaussian, so its density contours can be drawn for reference.
+posteriori (correlation about -0.96). With the conjugate Normal priors used
+here the posterior is exactly Gaussian, so its density contours can be drawn
+for reference.
 
 A diagonal metric leaves a narrow diagonal ridge: NUTS needs a small step and
 longer trajectories. The dense metric turns the ridge into a round target and

@@ -13,7 +13,7 @@ Vectorized Chains
   finished. Step sizes, mass matrices and statistics stay per chain. This is
   also the mode that runs on a GPU (``device="cuda"``).
 
-Both return the same kind of result. Here 16 chains sample the eight schools
+Both return the same kind of result. Here 8 chains sample the eight schools
 model in its non-centred form, ``theta = mu + tau * eta`` with
 ``eta ~ Normal(0, 1)``, written with the deterministic blocks ``Affine`` and
 ``Index``. The centred form has a funnel between ``tau`` and ``theta`` that
@@ -52,7 +52,7 @@ def eight_schools():
     return model
 
 
-n_chains, n_samples, warmup = 16, 250, 250
+n_chains, n_samples, warmup = 8, 500, 300
 settings = {"n_chains": n_chains, "seed": 1, "delta": 0.9, "progress_bar": False}
 
 # %%

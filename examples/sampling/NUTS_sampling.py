@@ -28,10 +28,10 @@ from BayesianDLL.Distributions import Beta, Dirichlet, Exponential, HalfCauchy, 
 from BayesianDLL.Evaluation import effective_sample_size, gelman_rubin
 
 
-def nuts_draws(name, distribution, seed):
+def nuts_draws(name, distribution, seed, n_samples=800):
     with Model() as model:
         RandomParameter("x", distribution)
-    result = sample(2000, 500, n_chains=4, model=model, seed=seed, delta=0.9, chain_method="vectorized",
+    result = sample(n_samples, 300, n_chains=4, model=model, seed=seed, delta=0.9, chain_method="vectorized",
                     progress_bar=False)
     draws = {"x": result["x"].double()}
     print(f"{name:24s}: R-hat {gelman_rubin(draws)['x'].max():.3f}, bulk ESS {effective_sample_size(draws)['x'].min():5.0f}, "
@@ -52,7 +52,9 @@ univariate = [
 
 fig, axes = plt.subplots(3, 3, figsize=(13, 11), layout="constrained")
 for k, (ax, (name, distribution, (low, high), scale)) in enumerate(zip(axes.flat, univariate)):
-    draws = nuts_draws(name, distribution, seed=k).reshape(-1)
+    # The chains must hop between the two modes of the mixture: give it more draws.
+    draws = nuts_draws(name, distribution, seed=k, n_samples=2500 if isinstance(distribution, Mixture) else 800)
+    draws = draws.reshape(-1)
     if scale == "log":
         edges = np.logspace(np.log10(low), np.log10(high), 50)
         grid = torch.logspace(np.log10(low), np.log10(high), 400, dtype=torch.float64)
