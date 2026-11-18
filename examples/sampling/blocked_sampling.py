@@ -54,13 +54,13 @@ def robust_model(samplers):
     with Model() as model:
         z_cov = Data("x_std", (x - x_mean) / x_sd)
         # Sampler settings given to a parameter apply to its block only; a
-        # setting passed to sample() would reach every block (Metropolis also
-        # reads ``delta`` as its target acceptance rate).
+        # setting passed to sample() reaches every block whose sampler knows it
+        # (``delta`` is NUTS-only; Metropolis has ``target_accept_rate``).
         alpha = RandomParameter("alpha", Normal(0.0, 5.0), sampler=choice("alpha"), delta=0.85)
         beta = RandomParameter("beta", Normal(0.0, 5.0), sampler=choice("beta"), delta=0.85)
         sigma = RandomParameter("sigma", HalfNormal(2.0), sampler=choice("sigma"))
         # A one-dimensional random walk mixes best at about 44% acceptance.
-        w_settings = {"delta": 0.44} if choice("w") == "metropolis" else {}
+        w_settings = {"target_accept_rate": 0.44} if choice("w") == "metropolis" else {}
         w = RandomParameter("w", Beta(1.0, 9.0), sampler=choice("w"), **w_settings)
         mu = Linear("mu", z_cov, slope=beta, intercept=alpha)
         with plate("observations", n_obs):

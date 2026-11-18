@@ -52,9 +52,7 @@ features = torch.stack([x, x ** 2 - (x ** 2).mean()], dim=1)
 
 def regression(degree):
     with Model() as model:
-        # A single feature is passed as a vector: Linear treats a one-element
-        # coefficient as a scalar slope.
-        design = Data("design", features[:, 0] if degree == 1 else features[:, :degree])
+        design = Data("design", features[:, :degree])
         intercept = RandomParameter("intercept", Normal(0.0, 5.0))
         coefficients = RandomParameter("coefficients", Normal(0.0, 2.5), shape=degree)
         sigma = RandomParameter("sigma", HalfNormal(2.0))

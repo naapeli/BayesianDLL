@@ -526,3 +526,85 @@ def test_truncated_and_transformed_unconstrained_support():
     assert (trunc.transform.inverse(z) > 0.5).all()
     transformed = TransformedDistribution(Normal(0.0, 1.0), LogTransform())
     torch.testing.assert_close(transformed._log_prob_unconstrained(z), Normal(0.0, 1.0).log_pdf(z).sum())
+
+
+# ------------------------------------------------------------ discrete supports
+# (name, factory(params), params, torch reference(params, x), x inside, x outside)
+_SUPPORT_CASES = [
+    ("geometric", lambda p: Geometric(p), [0.2], lambda p, x: td.Geometric(p).log_prob(x - 1),
+     [1.0, 2.0, 7.0], [0.0, -1.0, 1.5]),
+    ("geometric_logits", lambda l: Geometric(logits=l), [-0.4], lambda l, x: td.Geometric(logits=l).log_prob(x - 1),
+     [1.0, 2.0, 7.0], [0.0, -2.0, 2.5]),
+    ("poisson", lambda r: Poisson(r), [2.3], lambda r, x: td.Poisson(r).log_prob(x),
+     [0.0, 1.0, 6.0], [-1.0, 0.5, -3.0]),
+    ("bernoulli", lambda p: Bernoulli(p), [0.3], lambda p, x: td.Bernoulli(p).log_prob(x),
+     [0.0, 1.0], [-1.0, 2.0, 0.5]),
+    ("bernoulli_logits", lambda l: Bernoulli(logits=l), [0.6], lambda l, x: td.Bernoulli(logits=l).log_prob(x),
+     [0.0, 1.0], [-1.0, 2.0, 0.5]),
+    ("binomial", lambda p: Binomial(5, p), [0.3], lambda p, x: td.Binomial(5, p).log_prob(x),
+     [0.0, 2.0, 5.0], [-1.0, 6.0, 2.5]),
+    ("binomial_logits", lambda l: Binomial(5, logits=l), [0.4], lambda l, x: td.Binomial(5, logits=l).log_prob(x),
+     [0.0, 2.0, 5.0], [-1.0, 6.0, 2.5]),
+    ("negative_binomial", lambda r, p: NegativeBinomial(r, p), [3.5, 0.4],
+     lambda r, p, x: td.NegativeBinomial(r, p).log_prob(x), [0.0, 3.0, 9.0], [-1.0, 1.5, -4.0]),
+    ("negative_binomial_logits", lambda r, l: NegativeBinomial(r, logits=l), [3.5, -0.3],
+     lambda r, l, x: td.NegativeBinomial(r, logits=l).log_prob(x), [0.0, 3.0, 9.0], [-1.0, 1.5, -4.0]),
+    ("categorical", lambda p: Categorical(p), [[0.2, 0.5, 0.3]], lambda p, x: td.Categorical(p).log_prob(x),
+     [0.0, 1.0, 2.0], [-1.0, 3.0, 0.5]),
+    ("categorical_logits", lambda l: Categorical(logits=l), [[0.2, -1.5, 0.3]],
+     lambda l, x: td.Categorical(logits=l).log_prob(x), [0.0, 1.0, 2.0], [-1.0, 3.0, 1.5]),
+    ("discrete_uniform", lambda: DiscreteUniform(2, 5), [], lambda x: torch.full_like(x, -math.log(4.0)),
+     [2.0, 3.0, 5.0], [1.0, 6.0, 2.5]),
+]
+
+
+@pytest.mark.parametrize("name,factory,values,reference,inside,outside", _SUPPORT_CASES, ids=[c[0] for c in _SUPPORT_CASES])
+def test_discrete_log_pdf_is_minus_infinity_outside_the_support(name, factory, values, reference, inside, outside):
+    params = [torch.tensor(v, requires_grad=True) for v in values]
+    dist = factory(*params)
+    x_in, x_out = torch.tensor(inside), torch.tensor(outside)
+    x = torch.cat([x_in, x_out])
+
+    log_p = dist.log_pdf(x)
+    with torch.no_grad():
+        expected = reference(*params, x_in)
+    torch.testing.assert_close(log_p[: len(inside)].detach(), expected)
+    assert torch.isneginf(log_p[len(inside):]).all(), log_p
+    pdf = dist.pdf(x).detach()
+    assert (pdf[len(inside):] == 0).all() and (pdf[: len(inside)] > 0).all()
+
+    if not params:
+        return
+    # Gradients are finite everywhere, match autograd inside the support and
+    # are zero outside it.
+    grads = dist.log_pdf_param_grads(x)
+    keys = list(grads)  # in the order of the parameters
+    expected_grads = torch.autograd.grad(log_p[: len(inside)].sum(), params)
+    for key, param, expected_grad in zip(keys, params, expected_grads):
+        grad = torch.as_tensor(grads[key]).broadcast_to((len(x), *param.shape))
+        assert torch.isfinite(grad).all(), (key, grad)
+        torch.testing.assert_close(grad[: len(inside)].sum(0), expected_grad)
+        assert (grad[len(inside):] == 0).all(), (key, grad)
+
+
+def test_geometric_pdf_at_zero_is_zero():
+    assert Geometric(0.2).pdf(t(0.0)).item() == 0.0
+    assert Geometric(logits=t(0.3)).pdf(t(0.0)).item() == 0.0
+    assert torch.isneginf(Geometric(0.2).log_pdf(t(0.0)))
+
+
+def test_multinomial_log_pdf_outside_the_support():
+    probs = t([0.2, 0.5, 0.3], requires_grad=True)
+    for kind, param in (("probs", probs), ("logits", torch.log(probs.detach()).requires_grad_(True))):
+        dist = Multinomial(4, **{kind: param})
+        inside = t([[1.0, 2.0, 1.0], [0.0, 4.0, 0.0]])
+        outside = t([[-1.0, 3.0, 2.0], [5.0, 0.0, -1.0], [1.0, 1.0, 1.0], [2.0, 2.0, 2.0], [0.5, 1.5, 2.0]])
+        x = torch.cat([inside, outside])
+        log_p = dist.log_pdf(x)
+        torch.testing.assert_close(log_p[:2].detach(), td.Multinomial(4, probs.detach()).log_prob(inside))
+        assert torch.isneginf(log_p[2:]).all(), log_p
+        grads = dist.log_pdf_param_grads(x)[kind]
+        assert torch.isfinite(grads).all()
+        assert (grads[2:] == 0).all()
+        expected, = torch.autograd.grad(log_p[:2].sum(), param)
+        torch.testing.assert_close(grads[:2].sum(0), expected)
