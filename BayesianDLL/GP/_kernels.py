@@ -226,16 +226,24 @@ def _half_integer_matern(p, u):
     for the polynomial ``P`` in front of the exponential.
     """
     leading = math.factorial(p) / math.factorial(2 * p)
-    polynomial = torch.zeros_like(u)
-    polynomial_derivative = torch.zeros_like(u)
+    # coefficients[d] multiplies (2u)^d; P and P' are evaluated with Horner's rule.
+    coefficients = [0.0] * (p + 1)
     for i in range(p + 1):
-        coefficient = leading * math.factorial(p + i) / (math.factorial(i) * math.factorial(p - i))
-        degree = p - i
-        polynomial = polynomial + coefficient * (2.0 * u) ** degree
-        if degree > 0:
-            polynomial_derivative = polynomial_derivative + coefficient * 2.0 * degree * (2.0 * u) ** (degree - 1)
+        coefficients[p - i] = leading * math.factorial(p + i) / (math.factorial(i) * math.factorial(p - i))
     exponential = torch.exp(-u)
-    return exponential * polynomial, exponential * (polynomial_derivative - polynomial)
+    if p == 0:
+        return exponential, -exponential
+    two_u = 2.0 * u
+    polynomial = torch.full_like(u, coefficients[p])
+    for degree in range(p - 1, -1, -1):
+        polynomial.mul_(two_u).add_(coefficients[degree])
+    # P'(u) = Σ_d 2 d c_d (2u)^(d-1).
+    derivative = torch.full_like(u, 2.0 * p * coefficients[p])
+    for degree in range(p - 1, 0, -1):
+        derivative.mul_(two_u).add_(2.0 * degree * coefficients[degree])
+    value = polynomial.mul_(exponential)
+    slope = derivative.mul_(exponential).sub_(value)
+    return value, slope
 
 
 class Kernel(ABC):

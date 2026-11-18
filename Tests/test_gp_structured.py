@@ -271,7 +271,7 @@ def test_learnable_inducing_predictive_reads_inducing_draws():
 def test_learnable_inducing_vectorized_chains_match_chain_by_chain():
     model, _, _, _ = _learnable_inducing_model("vfe", "matern52")
     with model.batched(3):
-        assert model._batch_mode == "loop"
+        assert model._batch_mode == "tensor"
         values = model.joint_grad_log_prob()
         assert values["z"].shape == (3, 5, 2)
     trace = model.sample(5, 5, n_chains=2, chain_method="vectorized", progress_bar=False, check_convergence=False, seed=0)

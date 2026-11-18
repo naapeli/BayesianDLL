@@ -25,6 +25,7 @@ from ._process import (
     sparse_gp_predictive,
     gp_predictive,
     stable_cholesky,
+    batched_stable_cholesky,
 )
 from ._structured import (
     KroneckerGP,
@@ -56,6 +57,7 @@ __all__ = [
     "SparseGP",
     "sparse_gp_predictive",
     "stable_cholesky",
+    "batched_stable_cholesky",
     "KroneckerGP",
     "kronecker_gp_predictive",
     "ToeplitzGP",
