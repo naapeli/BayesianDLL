@@ -135,13 +135,39 @@ class Group:
         with Guide(model, default_family="mean_field") as guide:
             Group(["mu", "beta"], family="full_rank")
 
+    **Structured groups.** Used as a context manager without ``family``, a
+    group holds hand-written guide latents that may depend on each other::
+
+        with Guide(model, default_family="mean_field") as guide:
+            with Group(["mu", "theta"]):
+                mu = RandomParameter("mu", Normal(VariationalParameter("m", 0.0),
+                                                  VariationalParameter("s", 1.0, log_scale=True)))
+                RandomParameter("theta", Normal(Affine("theta_loc", mu, loc=VariationalParameter("b", 0.0),
+                                                       scale=VariationalParameter("a", 1.0)),
+                                                VariationalParameter("t", 1.0, log_scale=True)))
+
+    ``q`` of the group then factorises along the guide graph,
+    ``q(mu) q(theta | mu)``. Distributions and deterministic blocks inside the
+    group may take other latents of the same group, VariationalParameters,
+    constants and Data as arguments, but no latent of another group (groups
+    stay independent). ``params`` must equal the model latents defined inside
+    the block; entries describe unconstrained or constrained values and
+    auxiliary latents give a model latent through a guide deterministic,
+    exactly as for single hand-written entries. Sampling is ancestral and
+    exact; gradients are reparameterised through the chain when every
+    distribution has a reparameterised sampler, and use the score function
+    for the whole group otherwise (see :mod:`BayesianDLL.Variational._structured`).
+    Its ``mean`` and ``covariance`` are Monte Carlo estimates in both spaces.
+
     Args:
         params: the latents of the group, as names or as the model's
             ``RandomParameter`` objects. Every latent belongs to exactly one
             group or hand-written guide entry; unknown, enumerated and
             discrete latents are rejected (sum discrete latents out with
             enumeration, or give them a hand-written guide entry).
-        family: ``"mean_field"``: an independent Normal per unconstrained
+        family: ``None`` (default): ``"mean_field"``, or a structured group
+            when the group is used as a context manager.
+            ``"mean_field"``: an independent Normal per unconstrained
             coordinate, with VariationalParameters ``{prefix}{latent}_loc`` and
             ``{prefix}{latent}_scale`` (optimised on the log scale).
             ``"full_rank"``: one multivariate Normal ``z = loc + L eps`` over
@@ -171,15 +197,52 @@ class Group:
             (full-rank only).
     """
 
-    def __init__(self, params, family="mean_field", init_scale=0.1, name=None):
+    def __init__(self, params, family=None, init_scale=0.1, name=None):
         guide = get_active_model()
         if guide is None or not hasattr(guide, "_register_group"):
             raise RuntimeError("Create a Group inside a `with Guide(model, ...) as guide:` block.")
         names = guide._group_names(params)
         if name is None:
             name = f"group{len(guide._groups)}"
-        self._setup(guide.model, names, family, init_scale, name, prefixed=True)
+        self.guide = guide
+        self._family_given = family is not None
+        self.nodes = []
+        self._setup(guide.model, names, "mean_field" if family is None else family, init_scale, name, prefixed=True)
         guide._register_group(self)
+
+    # --- structured groups ----------------------------------------------------
+    def __enter__(self):
+        if self._family_given:
+            raise ValueError(
+                f"The group '{self.name}' has family={self.family!r}, a Gaussian over its latents. Use "
+                "`with Group([...]):` without a family for a structured group of hand-written guide latents."
+            )
+        if self.nodes:
+            raise ValueError(f"The structured group '{self.name}' was already defined.")
+        self.family = "structured"
+        for attribute in ("locs", "scales", "loc_parameter", "scale_tril_parameter"):
+            self.__dict__.pop(attribute, None)
+        self._before = set(self.guide.params) | set(self.guide.deterministic_params)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None:
+            return False
+        guide, model = self.guide, self.model
+        self.nodes = [
+            name for name in list(guide.params) + list(guide.deterministic_params) if name not in self._before
+        ]
+        described = [name for name in self.nodes if name in model.params]
+        if set(described) != set(self.names):
+            raise ValueError(
+                f"The structured group '{self.name}' lists {sorted(self.names)} but defines the model latents "
+                f"{sorted(described)}; the two must be equal."
+            )
+        return False
+
+    def _structured_piece(self):
+        from ._structured import StructuredPiece
+        return StructuredPiece(self, self.guide, self.guide.model)
 
     @classmethod
     def _default(cls, model, names, family, init_scale, prefixed):
@@ -218,6 +281,8 @@ class Group:
     # --- parameters -----------------------------------------------------------
     def variational_parameters(self):
         """``{key: VariationalParameter}`` of the group (the keys of the ELBO gradient)."""
+        if self.family == "structured":
+            return self._structured_piece().variational_parameters()
         if self.family == "mean_field":
             table = {}
             for latent in self.names:
@@ -336,6 +401,8 @@ class Group:
         """
         if space not in ("unconstrained", "constrained"):
             raise ValueError(f"space must be 'unconstrained' or 'constrained', got {space!r}.")
+        if self.family == "structured":
+            return self.guide._piece_moments(self._structured_piece(), space, n_samples, seed)
         loc = self.loc
         cov = self._unconstrained_covariance()
         if space == "unconstrained":

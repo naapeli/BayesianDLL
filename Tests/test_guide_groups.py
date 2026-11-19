@@ -476,3 +476,146 @@ def test_guides_cannot_be_conditioned_but_models_can():
         RandomParameter("sigma", LogNormal(VariationalParameter("m", 0.0), VariationalParameter("s", 0.5)))
     with pytest.raises(ValueError, match="observed in the model"):
         guide.validate()
+
+
+# ---------------------------------------------------------------------------
+# Structured groups
+# ---------------------------------------------------------------------------
+from BayesianDLL.Deterministic import Affine, Exp
+
+
+def _hierarchical(J=3, noise=0.5):
+    """mu ~ N(0, 1), theta_j ~ N(mu, 1) in a plate, y_j ~ N(theta_j, noise): a Gaussian posterior."""
+    y = torch.tensor([0.8, -0.3, 1.5, 0.4])[:J].reshape(J, 1)  # the plate gives theta the shape (J, 1)
+    with Model() as model:
+        mu = RandomParameter("mu", Normal(0.0, 1.0))
+        with plate("groups", J):
+            theta = RandomParameter("theta", Normal(mu, 1.0))
+            ObservedParameter("y", Normal(theta, noise), y)
+    return model, y
+
+
+def _structured_guide(model, J, m=0.0, s=1.0, b=0.0, a=1.0, t=1.0):
+    def vp(name, value, shape=(1,), **kwargs):
+        return VariationalParameter(name, torch.full(shape, float(value)), **kwargs)
+
+    with Guide(model) as guide:
+        with Group(["mu", "theta"]) as group:
+            mu = RandomParameter("mu", Normal(vp("m", m), vp("s", s, log_scale=True)))
+            loc = Affine("theta_loc", mu, loc=vp("b", b, (J, 1)), scale=vp("a", a, (J, 1)))
+            RandomParameter("theta", Normal(loc, vp("t", t, (J, 1), log_scale=True)), shape=(J, 1))
+    return guide, group
+
+
+def test_structured_group_gradient_matches_autograd():
+    model, _ = _hierarchical()
+    guide, group = _structured_guide(model, 3, m=0.3, s=0.7, b=0.2, a=0.6, t=0.5)
+    assert group.family == "structured" and sorted(group.nodes) == ["mu", "theta", "theta_loc"]
+    table = guide.variational_parameters()
+    assert set(table) == {"mu_m", "mu_s", "theta_loc_b", "theta_loc_a", "theta_t"}
+    table["theta_loc_b"].set_new_value(torch.tensor([0.2, -0.1, 0.4]))
+    for parameter in table.values():
+        parameter.value.requires_grad_(True)
+    value, grads = elbo(model, guide, n_samples=4)
+    expected = torch.autograd.grad(value, [table[key].value for key in grads])
+    for key, reference in zip(grads, expected):
+        torch.testing.assert_close(grads[key], reference, msg=key)
+
+
+def test_structured_group_recovers_the_conditional_posterior():
+    """theta_j | mu, y has slope 1 / (1 + 1/0.25) = 0.2 in mu and sd 1/sqrt(5): q(mu) q(theta | mu) contains it."""
+    J = 4
+    model, y = _hierarchical(J)
+    torch.manual_seed(0)
+    guide, group = _structured_guide(model, J, s=0.5, a=0.0, t=0.5)
+    BBVI(model, guide, n_samples=4, epochs=1500, lr=0.03, lrd=0.999, verbose=False)
+    table = guide.variational_parameters()
+    torch.testing.assert_close(table["theta_loc_a"].value.reshape(-1), torch.full((J,), 0.2), atol=0.06, rtol=0)
+    torch.testing.assert_close(table["theta_t"].value.reshape(-1), torch.full((J,), 5 ** -0.5), atol=0.05, rtol=0)
+    # The exact joint posterior covariance of (mu, theta).
+    precision = torch.zeros(J + 1, J + 1)
+    precision[0, 0] = 1 + J
+    precision[0, 1:] = -1.0
+    precision[1:, 0] = -1.0
+    precision[1:, 1:] = torch.eye(J) * (1 + 4)
+    exact = torch.linalg.inv(precision)
+    fitted = guide.covariance(n_samples=20000)
+    assert fitted.estimated == ["mu", "theta"]
+    torch.testing.assert_close(fitted.block("mu", "theta"), exact[:1, 1:], atol=0.02, rtol=0)
+    # A mean-field guide has no cross-covariance at all.
+    mean_field = Guide(model, default_family="mean_field")
+    assert torch.count_nonzero(mean_field.covariance().block("mu", "theta")) == 0
+
+
+def test_structured_group_errors():
+    model, _ = _hierarchical()
+    with pytest.raises(ValueError, match="must be equal"):
+        with Guide(model, default_family="mean_field"):
+            with Group(["mu", "theta"]):
+                RandomParameter("mu", Normal(VariationalParameter("m", 0.0), VariationalParameter("s", 1.0)))
+    with Guide(model) as guide:
+        with Group(["mu"]):
+            mu = RandomParameter("mu", Normal(VariationalParameter("m", 0.0), VariationalParameter("s", 1.0)))
+        with Group(["theta"]):
+            RandomParameter("theta", Normal(mu, VariationalParameter("t", torch.ones(3, 1))), shape=(3, 1))
+    with pytest.raises(ValueError, match="depends on 'mu', which is not in that group"):
+        guide.validate()
+    with pytest.raises(ValueError, match="without a family"):
+        with Guide(model, default_family="mean_field"):
+            with Group(["mu"], family="full_rank"):
+                pass
+
+
+def test_structured_group_samples_exactly():
+    model, _ = _hierarchical()
+    b, a, t = torch.tensor([0.1, -0.2, 0.3]), torch.tensor([0.3, 1.0, -0.5]), torch.tensor([0.4, 0.2, 0.6])
+    guide, _ = _structured_guide(model, 3, m=0.5, s=0.8)
+    table = guide.variational_parameters()
+    table["theta_loc_b"].set_new_value(b)
+    table["theta_loc_a"].set_new_value(a)
+    table["theta_t"].set_new_value(t)
+    torch.manual_seed(0)
+    trace = guide.sample(8000)
+    draws = torch.cat([trace["mu"].reshape(-1, 1), trace["theta"].reshape(-1, 3)], dim=1)
+    mean = torch.cat([torch.tensor([0.5]), b + a * 0.5])
+    covariance = torch.zeros(4, 4)
+    covariance[0, 0] = 0.64
+    covariance[0, 1:] = a * 0.64
+    covariance[1:, 0] = a * 0.64
+    covariance[1:, 1:] = torch.outer(a, a) * 0.64 + torch.diag(t ** 2)
+    torch.testing.assert_close(draws.mean(0), mean, atol=0.04, rtol=0)
+    torch.testing.assert_close(torch.cov(draws.T), covariance, atol=0.04, rtol=0)
+    for space in ("unconstrained", "constrained"):
+        result = guide.covariance(space, n_samples=2000)
+        assert result.estimated == ["mu", "theta"] and set(result.standard_error) == {"mu", "theta"}
+        torch.testing.assert_close(result.matrix, covariance, atol=0.08, rtol=0)
+
+
+def test_structured_group_score_function_fallback_is_unbiased():
+    """A Gamma node (no reparameterised sampler) in the chain: the whole group uses the score function."""
+    counts = torch.tensor([2.0, 4.0, 3.0])
+    with Model() as model:
+        mu = RandomParameter("mu", Normal(0.0, 1.0))
+        x = RandomParameter("x", Exponential(1.0))
+        ObservedParameter("counts", Poisson(x), counts)
+        ObservedParameter("y", Normal(mu, 1.0), torch.tensor([0.5, 1.5]))
+    with Guide(model) as guide:
+        with Group(["mu", "x"]):
+            q_mu = RandomParameter("mu", Normal(VariationalParameter("m", torch.tensor([0.4])), VariationalParameter("s", torch.tensor([0.5]))))
+            rate = Exp("rate", q_mu)
+            RandomParameter("x", Gamma(VariationalParameter("alpha", torch.tensor([3.0])), rate))
+    assert not guide.validate()[0].reparametrized
+    torch.manual_seed(0)
+    _, grads = elbo(model, guide, n_samples=8000)
+    # Reference: central differences of the ELBO with common random numbers
+    # (the Gamma draws only rescale with the rate, so the draws move smoothly with m).
+    m = guide.params["mu"].distribution.mu
+    h = 1e-3
+    values = []
+    for sign in (1, -1):
+        m.set_new_value(torch.tensor([0.4 + sign * h]))
+        torch.manual_seed(1)
+        values.append(elbo(model, guide, n_samples=8000)[0])
+    m.set_new_value(torch.tensor([0.4]))
+    reference = (values[0] - values[1]) / (2 * h)
+    assert grads["mu_m"].item() == pytest.approx(reference.item(), abs=0.25)

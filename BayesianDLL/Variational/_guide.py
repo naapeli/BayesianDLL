@@ -11,6 +11,7 @@ from ..Distributions._transforms import IdentityTransform
 from ..Samplers._result import SamplingResult
 from ._ELBO import HandWrittenEntries, estimate_elbo
 from ._groups import FAMILIES, Group, _discrete_message
+from ._structured import StructuredPiece
 from ._moments import GuideCovariance, mc_moments, transform_batch
 
 
@@ -85,7 +86,7 @@ class _Plan:
     ``covered`` are the model latents that the guide's groups cover.
     """
 
-    def __init__(self, model, guide, covered=()):
+    def __init__(self, model, guide, covered=(), exclude=()):
         if not model._compiled:
             model.compile()
         if not guide._compiled:
@@ -100,6 +101,8 @@ class _Plan:
 
         self.modes = {}
         for name, parameter in guide.params.items():
+            if name in exclude:
+                continue
             distribution = parameter.distribution
             if set(distribution.parameters) & guide_nodes:
                 raise NotImplementedError(
@@ -144,7 +147,7 @@ class _Plan:
         self.targets = {}
         used_sources = set()
         for name, deterministic in guide.deterministic_params.items():
-            if name not in model.params:
+            if name not in model.params or name in exclude:
                 continue
             sources = [getattr(i, "name", None) for i in deterministic.inputs if getattr(i, "name", None) in guide.params]
             if len(sources) != 1 or self.modes[sources[0]] != "auxiliary" or sources[0] in used_sources:
@@ -212,7 +215,9 @@ class Guide(Model, BaseGuide):
     pieces:
 
     * **Groups** (:class:`Group`): Gaussians over the unconstrained values of
-      their latents, mean-field or full-rank.
+      their latents, mean-field or full-rank, or structured groups
+      (``with Group([...]):``) whose hand-written latents may depend on each
+      other within the group.
     * **Hand-written entries**: a ``RandomParameter`` named like a model
       latent whose distribution has :class:`VariationalParameter` arguments.
       A family on the real line describes the latent's unconstrained value,
@@ -265,6 +270,7 @@ class Guide(Model, BaseGuide):
                                     transform is the       moments, else MC
                                     identity, else MC
     deterministic (auxiliary) entry Monte Carlo            Monte Carlo
+    structured group                Monte Carlo            Monte Carlo
     ==============================  =====================  =====================================
 
     The result lists the Monte Carlo blocks in ``estimated`` and their
@@ -296,8 +302,9 @@ class Guide(Model, BaseGuide):
       result is reproducible.
     * **The draws are exact and independent.** Every group is sampled
       exactly (``z = loc + L eps`` for full-rank, independent Normals for
-      mean-field) and every hand-written entry with its distribution's own
-      ``sample()``; the guide is never sampled with MCMC (an entry without a
+      mean-field), every hand-written entry with its distribution's own
+      ``sample()`` and every structured group by ancestral sampling in
+      topological order; the guide is never sampled with MCMC (an entry without a
       working ``sample()`` raises an error). So ``n`` draws are ``n``
       effective samples, with no autocorrelation and no warm-up. Strong
       correlation inside a full-rank group does not change this, because
@@ -353,8 +360,16 @@ class Guide(Model, BaseGuide):
         self._reinforce_baseline = None
 
     # --- groups -------------------------------------------------------------
+    def _structured_nodes(self):
+        return {name for group in self._groups for name in group.nodes}
+
     def _hand_written_latents(self, model):
-        return {name for name in list(self.params) + list(self.deterministic_params) if name in model.params}
+        """Model latents described by hand-written entries outside structured groups."""
+        owned = self._structured_nodes()
+        return {
+            name for name in list(self.params) + list(self.deterministic_params)
+            if name in model.params and name not in owned
+        }
 
     def _group_names(self, params):
         """Check the latents of a new :class:`Group` and return their names."""
@@ -405,7 +420,10 @@ class Guide(Model, BaseGuide):
         if not model._compiled:
             model.compile()
         for group in self._groups:
-            group.check(model)
+            if group.family != "structured":
+                group.check(model)
+            elif not group.nodes:
+                raise ValueError(f"The structured group '{group.name}' defines no guide latents.")
         in_groups = {name: group for group in self._groups for name in group.names}
         hand_written = self._hand_written_latents(model)
         overlap = sorted(hand_written & set(in_groups))
@@ -429,19 +447,21 @@ class Guide(Model, BaseGuide):
             if (default is None or default.names != uncovered or default.model is not model
                     or default.family != self.default_family or (default.prefix == "") != whole):
                 self._default_group = Group._default(model, uncovered, self.default_family, self.init_scale, prefixed=not whole)
-        pieces = list(self._groups)
+        pieces = [StructuredPiece(group, self, model) if group.family == "structured" else group for group in self._groups]
         if self._default_group is not None:
             pieces.append(self._default_group)
-        if self.params or self.deterministic_params:
-            plan = _Plan(model, self, covered=set(in_groups) | set(uncovered))
+        owned = self._structured_nodes()
+        if any(name not in owned for name in list(self.params) + list(self.deterministic_params)):
+            plan = _Plan(model, self, covered=set(in_groups) | set(uncovered), exclude=owned)
             if plan.active:
                 pieces.append(HandWrittenEntries(self, plan, model))
         return pieces
 
     @property
     def groups(self):
-        """The Gaussian groups: the explicit ones in creation order, then the default group (if any)."""
-        return [piece for piece in self._finalize(self.model) if isinstance(piece, Group)]
+        """The groups: the explicit ones in creation order, then the default group (if any)."""
+        self._finalize(self.model)
+        return list(self._groups) + ([self._default_group] if self._default_group is not None else [])
 
     def validate(self, model=None):
         """Check the guide against ``model`` (default: the bound model), bind it and return its pieces.
@@ -526,6 +546,8 @@ class Guide(Model, BaseGuide):
         for piece in self.validate():
             if isinstance(piece, Group):
                 parts.append(piece.covariance(space, n_samples, seed))
+            elif isinstance(piece, StructuredPiece):
+                parts.append(self._piece_moments(piece, space, n_samples, seed))
             else:
                 parts.append(self._entry_moments(piece, space, n_samples, seed))
         return GuideCovariance.combine(space, parts, list(self.model.params))
@@ -554,26 +576,51 @@ class Guide(Model, BaseGuide):
         if not estimated:
             return result
 
-        # Monte Carlo from exact draws of the entries only, with the global random state restored afterwards.
+        # Monte Carlo from exact draws of the entries only; the entries are
+        # independent, so every latent gets its own block.
         n = int(n_samples)
-        devices = [reference.device] if reference.device.type == "cuda" else []
-        with torch.random.fork_rng(devices=devices):
-            torch.manual_seed(int(seed))
-            piece.draw(n, reparametrized=False)
-        draws = {name: [] for name in estimated}
-        for i in range(n):
-            try:
-                eta = piece.to_model(i, jacobian=False)[0]
-            finally:
-                piece.release(i)
-            for name in estimated:
-                draws[name].append(eta[name])
+        draws = self._mc_draws(piece, estimated, space, n, seed, shapes, dtype, reference.device)
         for name in estimated:
-            values = torch.stack(draws[name]).to(dtype)
-            if space == "constrained":
-                values = transform_batch(model.params[name].distribution.transform.inverse, values, shapes[name])
-            mean, matrix, standard_error = mc_moments(values.reshape(n, -1))
+            mean, matrix, standard_error = mc_moments(draws[name])
             result.set_block([name], mean, matrix)
             result.set_standard_errors([name], standard_error, [name], n)
         result.estimated = estimated
+        return result
+
+    def _mc_draws(self, piece, names, space, n, seed, shapes, dtype, device):
+        """``{latent: (n, k)}`` exact draws of ``piece`` in ``space``, with the global random state restored."""
+        model = self.model
+        devices = [device] if device.type == "cuda" else []
+        draws = {name: [] for name in names}
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(int(seed))
+            piece.draw(n, reparametrized=False)
+            for i in range(n):
+                try:
+                    eta = piece.to_model(i, jacobian=False)[0]
+                finally:
+                    piece.release(i)
+                for name in names:
+                    draws[name].append(eta[name])
+        result = {}
+        for name in names:
+            values = torch.stack(draws[name]).to(dtype)
+            if space == "constrained":
+                values = transform_batch(model.params[name].distribution.transform.inverse, values, shapes[name])
+            result[name] = values.reshape(n, -1)
+        return result
+
+    def _piece_moments(self, piece, space, n_samples, seed):
+        """Monte Carlo mean and covariance of a structured group (its latents are dependent: one joint block)."""
+        model, latents = self.model, piece.latents
+        attribute = "unconstrained_value" if space == "unconstrained" else "constrained_value"
+        shapes = {name: tuple(getattr(model.params[name], attribute).shape) for name in latents}
+        reference = model.params[latents[0]].unconstrained_value
+        dtype = reference.dtype if reference.is_floating_point() else torch.get_default_dtype()
+        n = int(n_samples)
+        draws = self._mc_draws(piece, latents, space, n, seed, shapes, dtype, reference.device)
+        mean, matrix, standard_error = mc_moments(torch.cat([draws[name] for name in latents], dim=1))
+        result = GuideCovariance(space, latents, shapes, mean=mean, matrix=matrix)
+        result.set_standard_errors(latents, standard_error, latents, n)
+        result.estimated = list(latents)
         return result

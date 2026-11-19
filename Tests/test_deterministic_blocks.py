@@ -351,7 +351,7 @@ def test_index_rejects_float_constant_index():
 def test_blocks_reject_unknown_argument_types():
     with Model():
         x = normal("x", (2,))
-        with pytest.raises(TypeError, match="model node, a tensor or a number"):
+        with pytest.raises(TypeError, match="model node, a VariationalParameter, a tensor or a number"):
             Add("bad", x, "not a node")
 
 
