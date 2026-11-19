@@ -9,7 +9,7 @@ scipy_special = pytest.importorskip("scipy.special")
 scipy_fftpack = pytest.importorskip("scipy.fftpack")
 
 from BayesianDLL.Evaluation._information_criteria import _logsumexp
-from BayesianDLL.Evaluation._numerics import autocov, gaussian_kde, next_fast_len, rankdata, z_scale
+from BayesianDLL.Evaluation._numerics import _betainc, _betaincinv, autocov, gaussian_kde, next_fast_len, rankdata, z_scale
 
 
 @pytest.mark.parametrize("values", [
@@ -101,3 +101,27 @@ def test_logsumexp_matches_scipy():
     np.testing.assert_allclose(_logsumexp(values), scipy_special.logsumexp(values), rtol=1e-14)
     np.testing.assert_allclose(_logsumexp(values, axis=0), scipy_special.logsumexp(values, axis=0), rtol=1e-14)
     assert _logsumexp(np.full(3, -np.inf)) == -np.inf
+
+
+_BETA_SHAPES = [0.5, 3.0, 150.0, 5000.0]
+_BETA_POINTS = [1e-6, 0.05, 0.5, 0.95, 1 - 1e-6]
+
+
+@pytest.mark.parametrize("a", _BETA_SHAPES)
+@pytest.mark.parametrize("b", _BETA_SHAPES)
+def test_betainc_and_betaincinv_match_scipy(a, b):
+    for x in _BETA_POINTS:
+        expected = scipy_special.betainc(a, b, x)
+        # Far in the tail, near the double-precision underflow, scipy itself loses digits.
+        if expected > 1e-200:
+            assert _betainc(a, b, x) == pytest.approx(expected, rel=1e-10, abs=0)
+        assert _betaincinv(a, b, x) == pytest.approx(scipy_special.betaincinv(a, b, x), rel=1e-10, abs=0)
+
+
+def test_betainc_edge_values():
+    assert _betainc(2.0, 3.0, 0.0) == 0.0
+    assert _betainc(2.0, 3.0, 1.0) == 1.0
+    assert _betaincinv(2.0, 3.0, 0.0) == 0.0
+    assert _betaincinv(2.0, 3.0, 1.0) == 1.0
+    assert np.isnan(_betainc(-1.0, 3.0, 0.5))
+    assert _betaincinv(4.0, 9.0, _betainc(4.0, 9.0, 0.37)) == pytest.approx(0.37, rel=1e-12)
