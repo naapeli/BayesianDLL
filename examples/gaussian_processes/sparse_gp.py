@@ -80,7 +80,7 @@ def band(f, trace, method):
 
 # %%
 # Type-II MAP estimate for each method
-# -----------------------------------
+# ------------------------------------
 
 fits = {}
 for method in ("exact", "vfe", "dtc", "fitc"):
