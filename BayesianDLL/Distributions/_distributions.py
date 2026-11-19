@@ -522,7 +522,7 @@ class MultivariateNormal(Distribution):
     ``VariationalParameter``.
     """
 
-    _param_event_ndims = {"mu": 1, "covariance": 2, "scale_tril": 2}
+    _param_event_ndims = {"mu": 1, "covariance_matrix": 2, "scale_tril": 2}
 
     def __init__(self, mu, covariance=None, scale_tril=None):
         super().__init__()
