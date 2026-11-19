@@ -15,10 +15,12 @@ nodes use for vectorized MCMC chains (see :mod:`BayesianDLL._batching`):
 The batched methods are :meth:`Kernel.batch_evaluate` (``(B, N, M)``),
 :meth:`Kernel.batch_derivatives` (``(B, *parameter_shape, N, M)``),
 :meth:`Kernel.batch_diag` (``(B, N)``), :meth:`Kernel.batch_diag_derivatives`
-(``(B, *parameter_shape, N)``) and :meth:`Kernel.batch_input_vjp`
-(``(B, N, D)``). The ordinary methods (``kernel(x1, x2)``, ``derivatives``,
-``diag``, ``diag_derivatives``, ``input_vjp``) are the ``B = 1`` case and
-keep their unbatched shapes.
+(``(B, *parameter_shape, N)``), :meth:`Kernel.batch_input_vjp`
+(``(B, N, D)``) and :meth:`Kernel.batch_diag_input_vjp` (``(B, N, D)``, the
+input gradient of ``g · diag K(X, X)``). The ordinary methods
+(``kernel(x1, x2)``, ``derivatives``, ``diag``, ``diag_derivatives``,
+``input_vjp``, ``diag_input_vjp``) are the ``B = 1`` case and keep their
+unbatched shapes.
 
 A user kernel that only overrides the unbatched ``evaluate`` (and
 ``derivatives`` / ``input_vjp``) still works in batched form: the default
@@ -152,6 +154,11 @@ def _differences(x1, x2):
 def _times_matrix(derivative, matrix):
     """Multiply a derivative ``(B, *P, N, M)`` by a matrix ``(B, N, M)`` (broadcasting ``B``)."""
     return derivative * matrix.reshape(matrix.shape[0], *([1] * (derivative.ndim - 3)), *matrix.shape[-2:])
+
+
+def _zero_input_vjp(x, cotangent):
+    """Zero input gradient ``(B, N, D)`` (for kernels whose value does not depend on the inputs)."""
+    return torch.zeros((_batch_size(x, cotangent), *x.shape[1:]), dtype=x.dtype, device=x.device)
 
 
 def _slice_batch(value, index):
@@ -331,6 +338,16 @@ class Kernel(ABC):
         """``∂⟨G, K(x, x)⟩ / ∂x`` with both arguments moving (shape ``(N, D)``)."""
         return self.input_vjp(x, x, cotangent + cotangent.transpose(-2, -1), parameter_values=parameter_values)
 
+    def diag_input_vjp(self, x, cotangent, parameter_values=None):
+        r"""``∂(g · diag K(x, x)) / ∂x``: ``out[i] = g_i d k(x_i, x_i) / d x_i`` (shape ``(N, D)``).
+
+        ``cotangent`` ``g`` has shape ``(N,)``. Stationary kernels have a
+        constant diagonal and give zero; see :meth:`batch_diag_input_vjp`.
+        """
+        return self.batch_diag_input_vjp(
+            _batch_inputs(x), torch.as_tensor(cotangent).unsqueeze(0), self._single_values(parameter_values)
+        )[0]
+
     def __call__(self, x1, x2=None, parameter_values=None):
         """``kernel(x1, x2)`` is :meth:`evaluate`; ``x2`` defaults to ``x1``."""
         if x2 is None:
@@ -394,6 +411,21 @@ class Kernel(ABC):
     def batch_input_vjp_symmetric(self, x, cotangent, parameter_values):
         return self.batch_input_vjp(x, x, cotangent + cotangent.transpose(-2, -1), parameter_values)
 
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        r"""``(B, N, D)``: ``∂(g_b · diag K_b(x_b, x_b)) / ∂x_b`` for a cotangent ``g`` ``(B, N)``.
+
+        Generic fallback: by symmetry, ``d k(x_i, x_i) / d x_i = 2 ∂_1 k(x_i, x_i)``,
+        so the result is :meth:`batch_input_vjp` of square blocks of at most
+        ``chunk_size`` points with the diagonal cotangent ``2 diag(g)`` (no
+        ``N x N`` matrix). The built-in kernels override it with closed forms.
+        """
+        blocks = []
+        for start in range(0, x.shape[1], chunk_size):
+            block = x[:, start:start + chunk_size]
+            weights = 2.0 * torch.diag_embed(cotangent[:, start:start + chunk_size])
+            blocks.append(self.batch_input_vjp(block, block, weights, parameter_values))
+        return torch.cat(blocks, dim=1)
+
     def __add__(self, other):
         return SumKernel(self, other)
 
@@ -427,7 +459,11 @@ class Constant(Kernel):
 
     def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
         """Zero: the kernel does not depend on the input locations."""
-        return torch.zeros((_batch_size(x1, cotangent), *x1.shape[1:]), dtype=x1.dtype, device=x1.device)
+        return _zero_input_vjp(x1, cotangent)
+
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Zero: ``k(x, x) = v``."""
+        return _zero_input_vjp(x, cotangent)
 
 
 class WhiteNoise(Kernel):
@@ -460,7 +496,11 @@ class WhiteNoise(Kernel):
 
     def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
         """Zero: the identity pattern is piecewise constant in the inputs."""
-        return torch.zeros((_batch_size(x1, cotangent), *x1.shape[1:]), dtype=x1.dtype, device=x1.device)
+        return _zero_input_vjp(x1, cotangent)
+
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Zero: ``k(x, x) = v``."""
+        return _zero_input_vjp(x, cotangent)
 
 
 class _StationaryDiagonal:
@@ -482,6 +522,10 @@ class _StationaryDiagonal:
         if _is_named(self.variance):
             derivatives[self.variance.name] = torch.ones((1, 1, x.shape[1]), dtype=x.dtype, device=x.device)
         return derivatives
+
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Zero: the diagonal ``k(x, x) = v`` does not depend on ``x``."""
+        return _zero_input_vjp(x, cotangent)
 
 
 class RBF(_StationaryDiagonal, Kernel):
@@ -834,6 +878,11 @@ class Linear(Kernel):
         variance, _, _, _, right = self._centred(x1, x2, parameter_values)
         return variance.reshape(-1, 1, 1) * (cotangent @ right)
 
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """``k(x, x) = v ‖x - c‖²``, so the VJP is ``2 v (x - c) g``."""
+        variance, _, _, left, _ = self._centred(x, x, parameter_values)
+        return 2.0 * variance.reshape(-1, 1, 1) * left * cotangent.unsqueeze(-1)
+
 
 class SumKernel(Kernel):
     """``k = k_1 + k_2 + ...`` (also built with ``k1 + k2``).
@@ -860,6 +909,10 @@ class SumKernel(Kernel):
 
     def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
         return sum(_batch_kernel_input_vjp(kernel, x1, x2, cotangent, parameter_values) for kernel in self.kernels)
+
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Sum rule: the parts' diagonal input VJPs added up."""
+        return sum(_batch_kernel_diag_input_vjp(kernel, x, cotangent, parameter_values, chunk_size) for kernel in self.kernels)
 
 
 class ProductKernel(Kernel):
@@ -906,6 +959,18 @@ class ProductKernel(Kernel):
             result = result + _batch_kernel_input_vjp(kernel, x1, x2, weighted, parameter_values)
         return result
 
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Product rule on the diagonal: part ``k`` receives the cotangent ``g ⊙ Π_{j≠k} diag K_j``."""
+        diagonals = [_batch_kernel_diag(kernel, x, parameter_values, chunk_size) for kernel in self.kernels]
+        result = 0
+        for index, kernel in enumerate(self.kernels):
+            weighted = cotangent
+            for other_index, diagonal in enumerate(diagonals):
+                if other_index != index:
+                    weighted = weighted * diagonal
+            result = result + _batch_kernel_diag_input_vjp(kernel, x, weighted, parameter_values, chunk_size)
+        return result
+
 
 def _kernel_parameters(kernel):
     if isinstance(kernel, Kernel):
@@ -932,6 +997,24 @@ def _batch_kernel_derivatives(kernel, x1, x2, parameter_values):
     if isinstance(kernel, Kernel):
         return kernel.batch_derivatives(x1, x2, parameter_values)
     return {}
+
+
+def _batch_kernel_diag(kernel, x, parameter_values, chunk_size=256):
+    """``(B, N)`` diagonal of a part of a composite kernel (a kernel, a plain callable or a number)."""
+    if isinstance(kernel, Kernel):
+        return kernel.batch_diag(x, parameter_values, chunk_size=chunk_size)
+    if callable(kernel):
+        a, _ = _shared_inputs(x, x, "evaluate")
+        return torch.diagonal(torch.as_tensor(kernel(a, a))).unsqueeze(0)
+    return torch.as_tensor(kernel, dtype=x.dtype, device=x.device).reshape(1, 1)
+
+
+def _batch_kernel_diag_input_vjp(kernel, x, cotangent, parameter_values, chunk_size=256):
+    if isinstance(kernel, Kernel):
+        return kernel.batch_diag_input_vjp(x, cotangent, parameter_values, chunk_size=chunk_size)
+    if callable(kernel):
+        raise NotImplementedError("Input gradients are not available for plain callables inside a composite kernel.")
+    return _zero_input_vjp(x, cotangent)
 
 
 def _batch_kernel_input_vjp(kernel, x1, x2, cotangent, parameter_values):

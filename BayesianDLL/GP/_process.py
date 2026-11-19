@@ -166,6 +166,11 @@ def _input_value(value):
     return _as_tensor(value)
 
 
+def _is_learnable(node):
+    """Whether ``node`` is a learnable model node (a ``RandomParameter`` or ``DeterministicParameter``, not ``Data``)."""
+    return not isinstance(node, Data) and isinstance(node, (RandomParameter, DeterministicParameter))
+
+
 def _feature_count(x):
     x = _input_value(x)
     return x.shape[0] if x.ndim > 0 else 1
@@ -742,7 +747,8 @@ class SparseGP(_GPDistribution):
     Use :func:`sparse_gp_predictive` for predictions at new inputs.
     """
 
-    def __init__(self, name, inputs, kernel: Kernel, inducing_points, noise_variance=1e-6, mean=None, method="vfe", jitter=1e-6):
+    def __init__(self, name, inputs, kernel: Kernel, inducing_points, noise_variance=1e-6, mean=None, method="vfe", jitter=1e-6,
+                 n_outputs=None):
         super().__init__()
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
@@ -751,6 +757,9 @@ class SparseGP(_GPDistribution):
         method = str(method).lower()
         if method not in _SPARSE_METHODS:
             raise ValueError(f"SparseGP method must be one of {_SPARSE_METHODS}; got {method!r}.")
+        if n_outputs is not None and (isinstance(n_outputs, bool) or not isinstance(n_outputs, int) or n_outputs < 1):
+            raise ValueError(f"SparseGP n_outputs must be None or a positive integer; got {n_outputs!r}.")
+        self.n_outputs = n_outputs
         self.name = name
         self.inputs = inputs
         self.kernel = kernel
@@ -767,7 +776,8 @@ class SparseGP(_GPDistribution):
 
     @property
     def event_shape(self):
-        return (_feature_count(self.inputs),)
+        n = _feature_count(self.inputs)
+        return (n,) if self.n_outputs is None else (self.n_outputs, n)
 
     def _named_parameter_values(self):
         values = {}
@@ -775,6 +785,25 @@ class SparseGP(_GPDistribution):
             if _is_named(parameter):
                 values[parameter.name] = resolve(parameter)
         return values
+
+    def _output_count(self):
+        return 1 if self.n_outputs is None else self.n_outputs
+
+    def _observations(self, observed, n, dtype, device):
+        """Observations as ``(R, n)`` (``R = 1`` without ``n_outputs``)."""
+        observed = torch.as_tensor(observed, dtype=dtype, device=device)
+        if self.n_outputs is None:
+            if observed.numel() != n:
+                raise ValueError(
+                    f"Sparse GP observations must contain one value per input ({n}); got {observed.numel()} values."
+                )
+            return observed.reshape(1, n)
+        if observed.numel() != self.n_outputs * n:
+            raise ValueError(
+                f"Sparse GP observations with n_outputs={self.n_outputs} must have shape ({self.n_outputs}, {n}); "
+                f"got {tuple(observed.shape)}."
+            )
+        return observed.reshape(self.n_outputs, n)
 
     def _training_inputs(self):
         x = torch.as_tensor(_input_value(self.inputs))
@@ -799,11 +828,8 @@ class SparseGP(_GPDistribution):
         x = context.inputs(self.inputs, dtype, device)
         z = context.inputs(self.inducing_points, dtype, device)
         n = x.shape[1]
-        observed = torch.as_tensor(observed, dtype=dtype, device=device).reshape(-1)
-        if observed.numel() != n:
-            raise ValueError(
-                f"Sparse GP observations must contain one value per input ({n}); got {observed.numel()} values."
-            )
+        outputs = self._output_count()
+        observed = self._observations(observed, n, dtype, device)
         noise = context.value(self.noise_variance, dtype, device)
         noise = noise.reshape(noise.shape[0], -1)
         if noise.shape[1] != 1:
@@ -826,19 +852,20 @@ class SparseGP(_GPDistribution):
             lam = (k_diag - q_diag).clamp_min(0.0) + noise[:, None]
         else:
             lam = noise[:, None].expand(size, n)
-        residual = _expand_batch(observed - mean, size)
+        # (B, R, n): one row per independent output (R = 1 without n_outputs).
+        residual = _expand_batch(observed - mean.unsqueeze(-2), size)
         eye_m = torch.eye(v.shape[-2], dtype=dtype, device=device)
         v_scaled = v / lam.unsqueeze(-2)
         # Σ = Vᵀ V + Λ and B = I + V Λ⁻¹ Vᵀ = L_B L_Bᵀ, so |Σ| = |Λ| |B|.
         factor_b = torch.linalg.cholesky(eye_m + v_scaled @ v.transpose(-2, -1))
-        # Woodbury: Σ⁻¹ r = Λ⁻¹ r - Λ⁻¹ Vᵀ L_B⁻ᵀ c with c = L_B⁻¹ V Λ⁻¹ r.
-        c = torch.linalg.solve_triangular(factor_b, (v_scaled @ residual.unsqueeze(-1)), upper=False)
-        correction = torch.linalg.solve_triangular(factor_b.transpose(-2, -1), c, upper=True).squeeze(-1)
-        alpha = (residual - (v.transpose(-2, -1) @ correction.unsqueeze(-1)).squeeze(-1)) / lam
-        log_det = torch.log(lam).sum(-1) + 2 * torch.log(torch.diagonal(factor_b, dim1=-2, dim2=-1)).sum(-1)
-        quadratic = (residual.square() / lam).sum(-1) - c.square().sum(dim=(-2, -1))
-        log_probability = -0.5 * (quadratic + log_det + n * math.log(2 * math.pi))
-        trace_term = (k_diag - q_diag).sum(-1)
+        # Woodbury: Σ⁻¹ r = Λ⁻¹ r - Λ⁻¹ Vᵀ L_B⁻ᵀ c with c = L_B⁻¹ V Λ⁻¹ r (one column per output).
+        c = torch.linalg.solve_triangular(factor_b, v_scaled @ residual.transpose(-2, -1), upper=False)  # (B, m, R)
+        correction = torch.linalg.solve_triangular(factor_b.transpose(-2, -1), c, upper=True)
+        alpha = (residual - (v.transpose(-2, -1) @ correction).transpose(-2, -1)) / lam.unsqueeze(-2)  # (B, R, n)
+        log_det = outputs * (torch.log(lam).sum(-1) + 2 * torch.log(torch.diagonal(factor_b, dim1=-2, dim2=-1)).sum(-1))
+        quadratic = (residual.square() / lam.unsqueeze(-2)).sum(dim=(-2, -1)) - c.square().sum(dim=(-2, -1))
+        log_probability = -0.5 * (quadratic + log_det + outputs * n * math.log(2 * math.pi))
+        trace_term = outputs * (k_diag - q_diag).sum(-1)
         if self.method == "vfe":
             log_probability = log_probability - 0.5 * trace_term / noise
         batched = context.any([self.inputs, self.inducing_points, self.noise_variance, *self.mean.parameters, *self.kernel.parameters])
@@ -854,7 +881,8 @@ class SparseGP(_GPDistribution):
 
     def log_pdf_grad(self, x):
         parts = self._components(x)
-        return _finish(-parts["alpha"], parts["batched"])
+        alpha = parts["alpha"] if self.n_outputs is not None else parts["alpha"][:, 0]
+        return _finish(-alpha, parts["batched"])
 
     def _cotangents(self, parts):
         r"""Cotangents of the log density w.r.t. ``K_mn``, ``K_mm`` and ``diag(K_nn)`` (batched).
@@ -862,7 +890,10 @@ class SparseGP(_GPDistribution):
         Every gradient below is linear in the covariance differentials, so it
         is ``⟨G_mn, dK_mn⟩ + ⟨G_mm, dK_mm⟩ + ⟨g_nn, d diag(K_nn)⟩``. With
         ``Σ = Q_nn + Λ``, ``α = Σ⁻¹ r``, ``W = K_mm⁻¹ K_mn``, ``P = W Σ⁻¹`` and
-        ``ω = ½ (α² - diag(Σ⁻¹))``:
+        ``ω = ½ (α² - diag(Σ⁻¹))``. With ``R`` independent outputs (``n_outputs``)
+        ``α`` has one column ``α_r`` per output, every ``(Wα)(…)ᵀ`` term below
+        sums over the outputs, ``α²`` becomes ``Σ_r α_r²`` and the terms
+        without ``α`` (``P``, ``diag(Σ⁻¹)`` and the VFE trace) are multiplied by ``R``:
 
         * Gaussian term (all methods), from ``dQ = dK_nm W + Wᵀ dK_mn - Wᵀ dK_mm W``
           and ``½ αᵀ dΣ α - ½ tr(Σ⁻¹ dΣ)``:
@@ -877,24 +908,25 @@ class SparseGP(_GPDistribution):
         """
         factor, factor_b, v, lam, alpha = parts["factor"], parts["factor_b"], parts["v"], parts["lam"], parts["alpha"]
         noise = parts["noise"]
+        outputs = alpha.shape[-2]
         w = torch.linalg.solve_triangular(factor.transpose(-2, -1), v, upper=True)  # K_mm⁻¹ K_mn, (B, m, n)
-        w_alpha = (w @ alpha.unsqueeze(-1)).squeeze(-1)
+        w_alpha = w @ alpha.transpose(-2, -1)  # (B, m, R)
         # Σ⁻¹ = Λ⁻¹ - Gᵀ G with G = L_B⁻¹ V Λ⁻¹.
         g = torch.linalg.solve_triangular(factor_b, v / lam.unsqueeze(-2), upper=False)
         sigma_inverse_diag = 1.0 / lam - g.square().sum(dim=-2)
         p = w / lam.unsqueeze(-2) - (w @ g.transpose(-2, -1)) @ g  # W Σ⁻¹, (B, m, n)
-        diag_weight = 0.5 * (alpha.square() - sigma_inverse_diag)
-        g_mn = w_alpha.unsqueeze(-1) * alpha.unsqueeze(-2) - p
-        g_mm = -0.5 * w_alpha.unsqueeze(-1) * w_alpha.unsqueeze(-2) + 0.5 * p @ w.transpose(-2, -1)
+        diag_weight = 0.5 * (alpha.square().sum(-2) - outputs * sigma_inverse_diag)
+        g_mn = w_alpha @ alpha - outputs * p
+        g_mm = -0.5 * w_alpha @ w_alpha.transpose(-2, -1) + 0.5 * outputs * p @ w.transpose(-2, -1)
         g_nn = None
         if self.method == "fitc":
             g_mn = g_mn - 2.0 * w * diag_weight.unsqueeze(-2)
             g_mm = g_mm + (w * diag_weight.unsqueeze(-2)) @ w.transpose(-2, -1)
             g_nn = diag_weight
         elif self.method == "vfe":
-            g_mn = g_mn + w / noise[:, None, None]
-            g_mm = g_mm - 0.5 * (w @ w.transpose(-2, -1)) / noise[:, None, None]
-            g_nn = (-0.5 / noise)[:, None].expand_as(alpha)
+            g_mn = g_mn + outputs * w / noise[:, None, None]
+            g_mm = g_mm - 0.5 * outputs * (w @ w.transpose(-2, -1)) / noise[:, None, None]
+            g_nn = (-0.5 * outputs / noise)[:, None].expand_as(diag_weight)
         g_mm = _jitter_cotangent(parts["jitter_info"], g_mm)
         return g_mn, g_mm, g_nn, diag_weight
 
@@ -912,10 +944,14 @@ class SparseGP(_GPDistribution):
           ``kernel.input_vjp(Z, X, G_mn) + kernel.input_vjp(Z, Z, G_mm + G_mmᵀ)``
           (``K_nn`` does not depend on ``Z``, and the mean is evaluated at
           ``X``, so ``Z`` gets no mean term);
+        * learnable training inputs ``X`` get
+          ``kernel.input_vjp(X, Z, G_mnᵀ)`` (``K_mn = K(Z, X)``), plus
+          ``kernel.diag_input_vjp(X, g_nn)`` for VFE and FITC (zero for
+          stationary kernels, whose diagonal is constant) and the mean's input
+          VJP ``∂⟨α, m(X)⟩/∂X``;
         * a parameter ``θ`` of the mean function gets ``⟨α, ∂m(X)/∂θ⟩``.
 
-        Gradients w.r.t. learnable training inputs ``X`` are not
-        implemented.
+        With ``n_outputs`` the mean terms use ``Σ_r α_r``.
         """
         parts = self._components(x)
         context, x_values, z = parts["context"], parts["x"], parts["z"]
@@ -944,6 +980,15 @@ class SparseGP(_GPDistribution):
             shape = _parameter_shape(context, self.inducing_points)
             gradients[self.inducing_points.name] = z_gradient.reshape(z_gradient.shape[0], *shape)
 
+        learnable_inputs = _is_learnable(self.inputs)
+        input_shape = _parameter_shape(context, self.inputs) if learnable_inputs else None
+        if learnable_inputs:
+            # K_mn = K(Z, X): ⟨G_mn, K(Z, X)⟩ = ⟨G_mnᵀ, K(X, Z)⟩; diag(K_nn) enters VFE and FITC.
+            x_gradient = self.kernel.batch_input_vjp(x_values, z, g_mn.transpose(-2, -1), kernel_values)
+            if g_nn is not None:
+                x_gradient = x_gradient + self.kernel.batch_diag_input_vjp(x_values, g_nn, kernel_values)
+            _accumulate(gradients, self.inputs.name, x_gradient.reshape(x_gradient.shape[0], *input_shape))
+
         if _is_named(self.noise_variance):
             noise_gradient = diag_weight.sum(-1)
             if self.method == "vfe":
@@ -951,10 +996,10 @@ class SparseGP(_GPDistribution):
             _accumulate(gradients, self.noise_variance.name,
                         _to_parameter_shape(noise_gradient.unsqueeze(-1), _parameter_shape(context, self.noise_variance)))
 
-        # The residual is y - m(X) and the trace term does not depend on the mean: ∂/∂m(X) = α.
+        # The residual is y - m(X) and the trace term does not depend on the mean: ∂/∂m(X) = Σ_r α_r.
         _add_mean_gradients(
-            gradients, self.mean, context, x_values, alpha, lambda node: _parameter_shape(context, node),
-            alpha.dtype, alpha.device,
+            gradients, self.mean, context, x_values, alpha.sum(-2), lambda node: _parameter_shape(context, node),
+            alpha.dtype, alpha.device, input_node=self.inputs if learnable_inputs else None, input_shape=input_shape,
         )
 
         return _finish(gradients, parts["batched"])
@@ -963,14 +1008,16 @@ class SparseGP(_GPDistribution):
         """Draw from the approximate prior ``Normal(m(X), Q_nn + Λ)``.
 
         Uses ``Vᵀ ε₁ + sqrt(Λ) ε₂`` with ``V = L⁻¹ K_mn``, so no ``n x n``
-        covariance is formed.
+        covariance is formed. The draws have shape ``(n_samples, n)``, or
+        ``(n_samples, n_outputs, n)`` with independent outputs.
         """
         x = self._training_inputs()
-        parts = self._components(torch.zeros(_feature_count(x), dtype=x.dtype, device=x.device))
+        parts = self._components(torch.zeros(self.event_shape, dtype=x.dtype, device=x.device))
         v, lam = parts["v"][0], parts["lam"][0]
         mean = self._mean_at(x)
-        first = torch.randn((n_samples, v.shape[0]), dtype=x.dtype, device=x.device) @ v
-        second = torch.randn((n_samples, lam.numel()), dtype=x.dtype, device=x.device) * lam.sqrt()
+        shape = (n_samples,) if self.n_outputs is None else (n_samples, self.n_outputs)
+        first = torch.randn((*shape, v.shape[0]), dtype=x.dtype, device=x.device) @ v
+        second = torch.randn((*shape, lam.numel()), dtype=x.dtype, device=x.device) * lam.sqrt()
         return mean + first + second
 
 
@@ -1202,9 +1249,14 @@ def sparse_gp_predictive(
     ``m`` evaluated per draw. All solves use ``m x m`` Cholesky factors, so
     the cost is linear in the number of training points. Kernel parameters,
     the noise variance and the named parameters of the mean function must
-    be in ``trace``; learnable inducing inputs are read from the trace draw
-    by draw. A given ``observation_noise`` variance is added to the
-    diagonal. The result has shape ``(n_parameter_draws, n_samples, n_new)``.
+    be in ``trace``; learnable inducing inputs and learnable training inputs
+    are read from the trace draw by draw (a learnable training-input node
+    missing from the trace keeps its current value). A given
+    ``observation_noise`` variance is added to the diagonal. The result has
+    shape ``(n_parameter_draws, n_samples, n_new)``; with ``n_outputs = R``
+    independent outputs, ``observed_values`` has shape ``(R, n)`` and the
+    result ``(n_parameter_draws, n_samples, R, n_new)`` (the outputs share
+    the predictive covariance and differ in their means).
     """
     if not isinstance(gp, SparseGP):
         raise TypeError("gp must be a SparseGP distribution returned by BayesianDLL.GP.SparseGP.")
@@ -1222,12 +1274,13 @@ def sparse_gp_predictive(
         new_values = new_values.reshape(1)
     n_training = _feature_count(training_values)
     n_new = _feature_count(new_values)
-    observed_values = torch.as_tensor(_input_value(observed_values), dtype=dtype, device=device).reshape(-1)
-    if observed_values.numel() != n_training:
+    observed_values = torch.as_tensor(_input_value(observed_values), dtype=dtype, device=device)
+    if gp.n_outputs is None and observed_values.numel() != n_training:
         raise ValueError(
             f"observed_values must contain one value per training input ({n_training}); "
             f"got {observed_values.numel()} values."
         )
+    observed_values = gp._observations(observed_values, n_training, dtype, device)  # (R, n)
 
     first_value = next(iter(trace.values()))
     n_draws = first_value.shape[0] * first_value.shape[1] if first_value.ndim >= 2 else first_value.shape[0]
@@ -1238,6 +1291,8 @@ def sparse_gp_predictive(
     learnable_inducing = _is_named(gp.inducing_points) and not isinstance(gp.inducing_points, Data)
     if learnable_inducing:
         inducing_draws = _trace_draws(trace, gp.inducing_points, n_draws, dtype, device)
+    training_shape = training_values.shape
+    training_draws = _draws_of(trace, gp.inputs, n_draws, dtype, device) if _is_learnable(gp.inputs) else None
 
     outputs = []
     for draw_index in range(n_draws):
@@ -1245,6 +1300,8 @@ def sparse_gp_predictive(
         mean_values = _draw(mean_draws, draw_index)
         if learnable_inducing:
             inducing_values = inducing_draws[draw_index].reshape(gp._inducing_inputs(dtype, device).shape)
+        if training_draws is not None:
+            training_values = training_draws[draw_index if training_draws.shape[0] > 1 else 0].reshape(training_shape)
         noise = noise_draws[draw_index].reshape(-1)
         if noise.numel() != 1:
             raise ValueError("Sparse GP noise_variance must be scalar.")
@@ -1266,10 +1323,12 @@ def sparse_gp_predictive(
         # Σ_u = L⁻ᵀ B⁻¹ L⁻¹ with B = I + V Λ⁻¹ Vᵀ = L_B L_Bᵀ.
         factor_b = torch.linalg.cholesky(eye_m + (v / lam) @ v.transpose(-2, -1))
         c = torch.linalg.solve_triangular(
-            factor_b, ((v / lam) @ (observed_values - mean_train)).reshape(-1, 1), upper=False
-        )
+            factor_b, (v / lam) @ (observed_values - mean_train).transpose(-2, -1), upper=False
+        )  # (m, R)
         projected = torch.linalg.solve_triangular(factor_b, v_new, upper=False)  # L_B⁻¹ L⁻¹ K_m*
-        predictive_mean = mean_new + (projected.transpose(-2, -1) @ c).reshape(-1)
+        predictive_mean = mean_new + (projected.transpose(-2, -1) @ c).transpose(-2, -1)  # (R, n*)
+        if gp.n_outputs is None:
+            predictive_mean = predictive_mean[0]
         predictive_covariance = (
             k_ss
             - v_new.transpose(-2, -1) @ v_new
@@ -1281,9 +1340,10 @@ def sparse_gp_predictive(
             ).reshape(-1)[0] * torch.eye(n_new, dtype=dtype, device=device)
         predictive_covariance = (predictive_covariance + predictive_covariance.transpose(-2, -1)) / 2
         prediction_factor = stable_cholesky(predictive_covariance, jitter=gp.jitter)
+        shape = (n_samples, n_new) if gp.n_outputs is None else (n_samples, gp.n_outputs, n_new)
         outputs.append(
             predictive_mean
-            + torch.randn((n_samples, n_new), dtype=dtype, device=device) @ prediction_factor.transpose(-2, -1)
+            + torch.randn(shape, dtype=dtype, device=device) @ prediction_factor.transpose(-2, -1)
         )
 
     return torch.stack(outputs)

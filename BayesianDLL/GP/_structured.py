@@ -47,7 +47,9 @@ from ._process import (
     _evaluate_mean,
     _expand_batch,
     _finish,
+    _draws_of,
     _input_value,
+    _is_learnable,
     _parameter_draws,
     _parameter_shape,
     _resolved_value,
@@ -150,6 +152,15 @@ class KroneckerGP(_GPDistribution):
     gets ``½ (αᵀα - Σ 1/(λ + σ²))``; the mean function, evaluated at the
     ``N`` grid points (the factors' features concatenated, in row-major
     order), gets the cotangent ``α`` for its parameters.
+
+    **Learnable grid axes.** Each ``grid_inputs[p]`` may be a
+    ``RandomParameter`` or ``DeterministicParameter`` of shape ``(n_p,)`` or
+    ``(n_p, D_p)`` (the grid stays a Cartesian product, but its points along
+    every axis can move). The axis gets ``kernels[p].input_vjp_symmetric(X_p, G_p)``
+    (the same ``G_p`` as the hyperparameters) plus the mean's input VJP of
+    ``α`` at the grid points, whose columns of factor ``p`` are summed over
+    all other axes. :func:`kronecker_gp_predictive` reads learnable axes from
+    the trace draw by draw.
 
     ``noise_variance`` is the scalar noise variance ``σ²`` (default
     ``1e-6``), ``mean`` a :class:`~BayesianDLL.GP.MeanFunction` (defaults to
@@ -320,6 +331,28 @@ class KroneckerGP(_GPDistribution):
             gradients[name] = _to_parameter_shape(gradients[name], _parameter_shape(context, parameter))
         alpha = parts["alpha"]
         flat_alpha = alpha.reshape(alpha.shape[0], -1)
+        learnable = [_is_learnable(grid) for grid in self.grid_inputs]
+        axis_gradients = [None] * len(self.grid_inputs)
+        for p, (kernel, x_p, values, cotangent) in enumerate(zip(self.kernels, parts["xs"], parts["kernel_values"], cotangents)):
+            if learnable[p]:
+                # ⟨G_p, K_p(X_p, X_p)⟩ with both arguments moving.
+                axis_gradients[p] = kernel.batch_input_vjp_symmetric(x_p, cotangent, values)
+        if parts["points"] is not None and any(learnable):
+            # ∂⟨α, m(points)⟩/∂points, split into the factors' columns and summed over the other axes.
+            mean_values = context.kernel_values(self.mean, alpha.dtype, alpha.device)
+            point_vjp = self.mean.batch_input_vjp(parts["points"], flat_alpha, mean_values)
+            widths = [x_p.shape[-1] for x_p in parts["xs"]]
+            shape = parts["shape"]
+            for p, columns in enumerate(torch.split(point_vjp, widths, dim=-1)):
+                if not learnable[p]:
+                    continue
+                grid = columns.reshape(columns.shape[0], *shape, widths[p])
+                others = tuple(1 + q for q in range(len(shape)) if q != p)
+                axis = grid.sum(dim=others) if others else grid
+                axis_gradients[p] = axis_gradients[p] + axis
+        for grid, gradient in zip(self.grid_inputs, axis_gradients):
+            if gradient is not None:
+                _accumulate(gradients, grid.name, gradient.reshape(gradient.shape[0], *_parameter_shape(context, grid)))
         if _is_named(self.noise_variance):
             inverse = (1.0 / parts["denominator"]).reshape(alpha.shape[0], -1)
             noise_gradient = 0.5 * (flat_alpha.square().sum(-1) - inverse.sum(-1))
@@ -417,11 +450,18 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
     mean_draws = _parameter_draws(trace, gp.mean.parameters, n_draws, dtype, device)
     shape = tuple(x.shape[0] for x in xs)
-    training_points = _grid_points([x.unsqueeze(0) for x in xs])[0]
     new_points = torch.cat(new, dim=1)
+    # Learnable grid axes are read from the trace draw by draw.
+    axis_draws = [_draws_of(trace, grid, n_draws, dtype, device) if _is_learnable(grid) else None for grid in gp.grid_inputs]
+    fixed_xs = xs
 
     outputs = []
     for draw_index in range(n_draws):
+        xs = [
+            fixed if draws is None else draws[draw_index if draws.shape[0] > 1 else 0].reshape(fixed.shape)
+            for fixed, draws in zip(fixed_xs, axis_draws)
+        ]
+        training_points = _grid_points([x.unsqueeze(0) for x in xs])[0]
         values = _draw(parameter_draws, draw_index)
         mean_values = _draw(mean_draws, draw_index)
         noise = noise_draws[draw_index].reshape(-1)[0]
@@ -648,8 +688,13 @@ class ToeplitzGP(_GPDistribution):
     to ``ZeroMean()``; a number or named scalar node is a ``ConstantMean``;
     its parameters get the cotangent ``α`` of ``m(X)``), and
     ``spacing_tolerance`` (default ``1e-6``) the relative tolerance of
-    the equal-spacing check. Gradients w.r.t. learnable inputs are not
-    implemented.
+    the equal-spacing check.
+
+    **Fixed inputs only.** The Toeplitz structure needs fixed, equally
+    spaced inputs, and a learnable spacing would be redundant with the
+    kernel's length-scale. ``inputs`` given as a ``RandomParameter`` or
+    ``DeterministicParameter`` raises a ``TypeError``; use :class:`ExactGP`
+    or :class:`SparseGP` for learnable inputs.
 
     The kernel must be stationary (RBF, Matern, RationalQuadratic,
     Periodic, Constant and their sums/products); ``inputs`` must be equally
@@ -676,6 +721,12 @@ class ToeplitzGP(_GPDistribution):
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
         _check_stationary(kernel)
+        if _is_learnable(inputs):
+            raise TypeError(
+                "ToeplitzGP needs fixed, equally spaced inputs (a Data node or a tensor); a learnable spacing would be "
+                "redundant with the kernel's lengthscale, so inputs cannot be a RandomParameter or "
+                "DeterministicParameter. Use ExactGP or SparseGP for learnable inputs."
+            )
         self.name = name
         self.inputs = inputs
         self.kernel = kernel
