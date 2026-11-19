@@ -16,14 +16,30 @@ def get_active_plates():
     return list(_get_plate_stack())
 
 
-class PlateInfo:
-    """Stores metadata about an active plate context."""
-    __slots__ = ("name", "_size", "dim")
+def _sizing_ndim(size):
+    """Number of batch dimensions of a ``Data`` or tensor plate size (``None`` for an integer)."""
+    if hasattr(size, "batch_shape"):
+        return len(size.batch_shape)
+    if hasattr(size, "shape"):
+        return len(size.shape)
+    return None
 
-    def __init__(self, name, size, dim):
+
+class PlateInfo:
+    """Stores metadata about an active plate context.
+
+    ``dim`` is the dimension of the sizing ``Data`` (its batch shape) or
+    tensor that gives the plate size. ``position`` is where the plate sits in
+    the value shape: the index of its dimension among the leading plate
+    dimensions, 0 for the outermost plate.
+    """
+    __slots__ = ("name", "_size", "dim", "position")
+
+    def __init__(self, name, size, dim, position=0):
         self.name = name
         self._size = size
         self.dim = dim
+        self.position = position
 
     @property
     def size(self):
@@ -51,7 +67,7 @@ class PlateInfo:
         return self._size
 
     def __repr__(self):
-        return f"PlateInfo(name={self.name!r}, size={self.size}, dim={self.dim})"
+        return f"PlateInfo(name={self.name!r}, size={self.size}, dim={self.dim}, position={self.position})"
 
 
 class plate:
@@ -85,16 +101,25 @@ class plate:
             with plate("features", D):
                 ...
 
+    Plates sized by a one-dimensional ``Data`` or tensor can be nested in
+    any order, e.g. ``plate("groups", group_data)`` around
+    ``plate("items", item_data)``.
+
     Args:
         name: Human-readable identifier for this plate.
         size: Number of independent repetitions along this dimension, a
               ``Data`` object whose batch dimension ``dim`` determines the
               size at runtime, or a tensor whose dimension ``dim`` gives the size.
-        dim:  The dimension of a ``Data`` (its batch shape) or tensor ``size``
-              that gives the plate size; ignored for an integer size. It
+        dim:  Which dimension of a ``Data`` (its batch shape) or tensor
+              ``size`` gives the plate size; ignored for an integer size. It
               does not change where the plate's dimension is placed in the
-              value shape (see above). Default: ``-1`` for the outermost plate,
-              ``-2`` for a plate nested in one other plate, and so on.
+              value shape, which is set by the nesting alone (see above; the
+              ``position`` of the plate's ``PlateInfo``). For a
+              one-dimensional ``Data`` or tensor the size is always its only
+              (batch) dimension, so ``dim`` defaults to ``-1`` and must be
+              ``0`` or ``-1``. Otherwise the default is ``-1`` for the
+              outermost plate, ``-2`` for a plate nested in one other plate,
+              and so on.
     """
 
     def __init__(self, name: str, size: int, dim: int | None = None):
@@ -104,12 +129,22 @@ class plate:
 
     def __enter__(self):
         stack = _get_plate_stack()
-        if self._dim is not None:
+        position = len(stack)
+        if _sizing_ndim(self.size) == 1:
+            # A one-dimensional size has a single dimension to read, wherever
+            # the plate sits in the value shape.
+            if self._dim not in (None, 0, -1):
+                raise ValueError(
+                    f"Plate '{self.name}' is sized by a one-dimensional Data or tensor, so its size is that "
+                    f"dimension; dim must be 0, -1 or None, got {self._dim}."
+                )
+            dim = -1
+        elif self._dim is not None:
             dim = self._dim
         else:
             # Auto-assign: rightmost unused dim = -(len(stack) + 1)
             dim = -(len(stack) + 1)
-        self._info = PlateInfo(self.name, self.size, dim)
+        self._info = PlateInfo(self.name, self.size, dim, position)
         stack.append(self._info)
         return self
 

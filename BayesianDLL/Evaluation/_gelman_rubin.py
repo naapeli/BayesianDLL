@@ -1,3 +1,5 @@
+import math
+
 import torch
 import numpy as np
 
@@ -21,8 +23,12 @@ def _rhat_core(chains: torch.Tensor) -> float:
 
     var_hat = ((n_samples - 1) / n_samples) * W + (1.0 / n_samples) * B
 
-    if W == 0 or torch.isnan(W) or torch.isnan(B):
-        return 1.0
+    if torch.isnan(W) or torch.isnan(B):
+        return float("nan")
+    if W == 0:
+        # No within-chain variation: undefined if all chains are the same
+        # constant, infinite if they are stuck at different values.
+        return float("nan") if B == 0 else float("inf")
 
     rhat = torch.sqrt(var_hat / W)
     return float(rhat)
@@ -68,7 +74,10 @@ def _rank_normalized_rhat_core(chains: torch.Tensor) -> float:
     z_tail = _z_scale(folded)
     rhat_tail = _split_rhat_core(z_tail)
 
-    return max(rhat_bulk, rhat_tail)
+    # The larger of the two, ignoring an undefined (NaN) one; NaN only when
+    # both are undefined (all draws equal).
+    finite = [value for value in (rhat_bulk, rhat_tail) if not math.isnan(value)]
+    return max(finite) if finite else float("nan")
 
 
 def gelman_rubin(samples: dict[str, torch.Tensor], method: str = "rank") -> dict[str, torch.Tensor]:
@@ -108,8 +117,12 @@ def gelman_rubin(samples: dict[str, torch.Tensor], method: str = "rank") -> dict
     -------
     dict[str, Tensor]
         Mapping from parameter name to a float64 tensor of shape ``event_shape``.
-        It is 1 when the R-hat is undefined: fewer than two (split) chains,
-        fewer than two draws per (split) chain, or zero within-chain variance.
+        It is 1 with fewer than two (split) chains or fewer than two draws per
+        (split) chain. With zero within-chain variance ``W`` it is ``inf``
+        when the chains differ (``B > 0``, e.g. chains stuck at different
+        constants) and NaN when every chain is the same constant
+        (``W = B = 0``). For ``"rank"`` an undefined (NaN) bulk or tail
+        R-hat is ignored in the maximum.
 
     Raises
     ------

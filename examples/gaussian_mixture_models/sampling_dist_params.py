@@ -26,7 +26,7 @@ Three choices make all chains sample the same, single mode:
   ``Exp`` block maps them back. The sampler moves in ``log sigma``, where the
   posterior is close to normal, and the prior keeps the scales moderate.
 * **Start at the posterior mode.** ``find_MAP`` finds the mode and the chains
-  start close to it (``start_point_variance=0.1`` in the unconstrained space).
+  start close to it (``init_scale=0.1`` in the unconstrained space).
   With the default jitter of one unconstrained unit, a start point now and
   then lands in the basin of a degenerate mode, and that chain never joins the
   others.
@@ -88,7 +88,7 @@ with Model() as model:
 model.find_MAP(lr=5e-2, epochs=400, verbose=False)
 print("Mode:", {name: [round(v, 3) for v in p.constrained_value.flatten().tolist()] for name, p in model.params.items()})
 
-result = model.sample(500, 400, n_chains=4, start_point_variance=0.1, seed=1, progress_bar=False)
+result = model.sample(500, 400, n_chains=4, init_scale=0.1, seed=1, progress_bar=False)
 print(result.summary())
 print("Divergences per chain:", result.divergences)
 

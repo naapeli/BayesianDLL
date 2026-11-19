@@ -107,9 +107,24 @@ class SamplingResult:
     log_likelihood_unavailable : dict[str, str]
         Observed nodes whose pointwise log-likelihood could not be recorded,
         mapped to the reason.
+    log_marginal_likelihood : float or None
+        :func:`~BayesianDLL.sample_smc` only (``None`` otherwise): the
+        estimate of ``log p(y)``.
+    beta_schedule : list of float or None
+        :func:`~BayesianDLL.sample_smc` only: the inverse temperatures,
+        starting with 0.
+    stage_ess : list of float or None
+        :func:`~BayesianDLL.sample_smc` only: the effective sample size of
+        every stage's incremental weights.
+    stage_acceptance : list of float or None
+        :func:`~BayesianDLL.sample_smc` only: the mean acceptance of every
+        stage's mutation.
+    kernel : str or None
+        :func:`~BayesianDLL.sample_smc` only: the mutation kernel.
     """
 
-    def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None, sample_stats=None, enumerated_probs=None, log_likelihood=None, log_likelihood_unavailable=None):
+    def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None, sample_stats=None, enumerated_probs=None, log_likelihood=None, log_likelihood_unavailable=None,
+                 log_marginal_likelihood=None, beta_schedule=None, stage_ess=None, stage_acceptance=None, kernel=None):
         self.trace = trace
         self.divergences = divergences
         self.acceptance_probabilities = acceptance_probabilities
@@ -126,6 +141,12 @@ class SamplingResult:
         # Observed nodes whose pointwise log-likelihood could not be recorded,
         # mapped to the reason.
         self.log_likelihood_unavailable = {} if log_likelihood_unavailable is None else dict(log_likelihood_unavailable)
+        # Sequential Monte Carlo results (None for MCMC).
+        self.log_marginal_likelihood = log_marginal_likelihood
+        self.beta_schedule = beta_schedule
+        self.stage_ess = stage_ess
+        self.stage_acceptance = stage_acceptance
+        self.kernel = kernel
 
     def __getitem__(self, key):
         if key in self.trace:
@@ -150,8 +171,9 @@ class SamplingResult:
         The traces, sample statistics, enumerated probabilities and
         log-likelihoods are thinned along the draw dimension; the
         divergences, acceptance probabilities and step sizes are copied
-        unchanged. Attributes added by :func:`~BayesianDLL.sample_smc`
-        (``log_marginal_likelihood``, ``beta_schedule``, ...) are not carried over.
+        unchanged, as are the attributes of :func:`~BayesianDLL.sample_smc`
+        (``log_marginal_likelihood``, ``beta_schedule``, ``stage_ess``,
+        ``stage_acceptance``, ``kernel``), which describe the run, not the draws.
         """
         s = _normalize_slice(step)
         thinned_trace = {name: val[:, s] for name, val in self.trace.items()}
@@ -166,6 +188,11 @@ class SamplingResult:
             enumerated_probs={name: val[:, s] for name, val in self.enumerated_probs.items()},
             log_likelihood={name: val[:, s] for name, val in self.log_likelihood.items()},
             log_likelihood_unavailable=self.log_likelihood_unavailable,
+            log_marginal_likelihood=self.log_marginal_likelihood,
+            beta_schedule=None if self.beta_schedule is None else list(self.beta_schedule),
+            stage_ess=None if self.stage_ess is None else list(self.stage_ess),
+            stage_acceptance=None if self.stage_acceptance is None else list(self.stage_acceptance),
+            kernel=self.kernel,
         )
 
     def summary(self, hdi_prob=0.94, ci_kind="eti", round_to=3, include_deterministic=False):

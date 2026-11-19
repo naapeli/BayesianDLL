@@ -1,3 +1,4 @@
+import math
 import numpy as np
 import pytest
 import torch
@@ -135,7 +136,8 @@ def test_diagnostics_preserve_multidimensional_feature_shape(function):
 
 def test_constant_chain_diagnostics():
     trace = {"x": torch.ones(4, 100, 1)}
-    assert gelman_rubin(trace)["x"].item() == 1
+    # All chains are the same constant: the R-hat is undefined.
+    assert math.isnan(gelman_rubin(trace)["x"].item())
     assert effective_sample_size(trace, method="mean")["x"].item() == 400
     assert mcse(trace, method="mean")["x"].item() == 0
     assert mcse(trace, method="sd")["x"].item() == 0

@@ -39,7 +39,9 @@ class Metropolis(_CachedTarget):
 
     Continuous states take isotropic Gaussian proposals
     ``theta + proposal_scale * N(0, I)``, accepted with probability
-    ``min(1, p(theta') / p(theta))``. The scale is adapted during warmup
+    ``min(1, p(theta') / p(theta))``; a proposal outside the state space has
+    zero density and is rejected (acceptance probability 0, counted as a
+    rejection by the acceptance statistics and the adaptation). The scale is adapted during warmup
     towards the acceptance rate ``target_accept_rate`` (0.234 by default;
     about 0.44 suits a single coordinate): after every warmup step it is
     multiplied by ``1 - adaptation_rate`` when the rolling acceptance rate
@@ -114,8 +116,13 @@ class Metropolis(_CachedTarget):
     def _continuous_step(self, theta):
         current = self._current_log_prob(theta)
         proposal = self.get_proposal(theta)
-        proposal_log_prob = self.log_target(proposal)
-        accepted, accept_prob = self._accept(proposal_log_prob - current)
+        if proposal is None:
+            # Outside the support: the proposal has zero density (log target
+            # -inf), so it is rejected and counted as a rejection.
+            accepted, accept_prob = False, 0.0
+        else:
+            proposal_log_prob = self.log_target(proposal)
+            accepted, accept_prob = self._accept(proposal_log_prob - current)
         if accepted:
             theta, current = proposal, proposal_log_prob
         self.accept_queue.append(int(accepted))
@@ -152,11 +159,11 @@ class Metropolis(_CachedTarget):
         return None
 
     def get_proposal(self, theta):
-        """Continuous Gaussian proposal (the current state when it leaves the state space)."""
+        """Continuous Gaussian proposal, or ``None`` when it leaves the state space (a rejected proposal)."""
         theta_proposal = theta + self.proposal_scale * torch.randn_like(theta)
         if self.state_space.contains(theta_proposal):
             return theta_proposal
-        return theta
+        return None
 
     def adapt_proposal_scale(self):
         acceptance_ratio = sum(self.accept_queue) / len(self.accept_queue)
@@ -346,7 +353,9 @@ class FiniteGibbs(_CachedTarget):
         log_probs = torch.stack(values, dim=-1)
         choice, valid = self._draw(log_probs)
         new_theta = torch.where(valid, support[choice], theta)
-        self.invalidate_cache()
+        # The full target (which may contain terms beyond the elementwise
+        # ones) at the new state, for ``lp`` and the cache.
+        self._store_cache(new_theta, self.log_target(new_theta.clone()))
         return new_theta
 
     def init_sampler(self):

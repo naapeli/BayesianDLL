@@ -292,13 +292,9 @@ def run_smc_batched(model, n_particles, kernel, n_mutation_steps, target_ess, pr
             "accept_stat": acceptance.detach().to(torch.float64).reshape(1, n_particles),
         },
     }])
-    result = SamplingResult(
+    return SamplingResult(
         trace, [0], [[stage_acceptance[-1] if stage_acceptance else 1.0]], [[mutation.scale]],
         deterministic_trace=deterministic_trace, sample_stats=stats, enumerated_probs=enumerated_probs,
+        log_marginal_likelihood=log_evidence, beta_schedule=betas, stage_ess=stage_ess,
+        stage_acceptance=stage_acceptance, kernel=kernel,
     )
-    result.log_marginal_likelihood = log_evidence
-    result.beta_schedule = betas
-    result.stage_ess = stage_ess
-    result.stage_acceptance = stage_acceptance
-    result.kernel = kernel
-    return result
