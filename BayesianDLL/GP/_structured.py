@@ -35,17 +35,21 @@ from ._kernels import (
     _feature_matrix,
     _is_named,
 )
+from ._means import _is_zero
 from ._process import (
     _BatchContext,
     _GPDistribution,
-    _batched_mean,
+    _accumulate,
+    _add_mean_gradients,
     _contract,
     _contract_diagonal,
+    _draw,
+    _evaluate_mean,
     _expand_batch,
     _finish,
     _input_value,
+    _parameter_draws,
     _parameter_shape,
-    _prediction_means,
     _resolved_value,
     _to_parameter_shape,
     _trace_draws,
@@ -80,6 +84,15 @@ def _batched_mode_product(tensor, matrix, mode):
     return torch.movedim((moved @ view).squeeze(-2), -1, mode + 1)
 
 
+def _grid_points(xs):
+    """All grid points ``(B, N, Σ_p D_p)`` in row-major order from batched factors ``(B_p, n_p, D_p)``."""
+    size = max(x.shape[0] for x in xs)
+    indices = torch.cartesian_prod(*[torch.arange(x.shape[1], device=x.device) for x in xs])
+    if indices.ndim == 1:
+        indices = indices.reshape(-1, 1)
+    return torch.cat([_expand_batch(x, size)[:, indices[:, p]] for p, x in enumerate(xs)], dim=-1)
+
+
 def _batched_kronecker_eigenvalues(eigenvalues):
     """``λ_1 ⊗ … ⊗ λ_P`` per batch element: ``(B, n_1, …, n_P)`` from ``(B_p, n_p)``."""
     result = eigenvalues[0]
@@ -104,7 +117,7 @@ class KroneckerGP(_GPDistribution):
     ``K_p = Q_p Λ_p Q_pᵀ`` (``torch.linalg.eigh`` on each ``n_p x n_p``
     factor) and ``Q = Q_1 ⊗ … ⊗ Q_P``, ``λ = λ_1 ⊗ … ⊗ λ_P``:
 
-    * ``ỹ = Qᵀ (y - mean)`` via sequential mode products,
+    * ``ỹ = Qᵀ (y - m(X))`` via sequential mode products,
     * ``log det(K + σ² I) = Σ log(λ + σ²)``,
     * ``α = Q (ỹ / (λ + σ²))`` and
       ``log p(y) = -½ (Σ ỹ² / (λ + σ²) + log det + N log 2π)``.
@@ -134,18 +147,20 @@ class KroneckerGP(_GPDistribution):
       ``Π_{q≠p} λ_q / (λ + σ²)`` over all modes but ``p``,
 
     so ``G_p = ½ A_(p) B_(p)ᵀ - ½ Q_p diag(s_p) Q_pᵀ``. The noise variance
-    gets ``½ (αᵀα - Σ 1/(λ + σ²))`` and the mean gets ``α``.
+    gets ``½ (αᵀα - Σ 1/(λ + σ²))``; the mean function, evaluated at the
+    ``N`` grid points (the factors' features concatenated, in row-major
+    order), gets the cotangent ``α`` for its parameters.
 
     ``noise_variance`` is the scalar noise variance ``σ²`` (default
-    ``1e-6``), ``mean`` a scalar or one value per grid point (default
-    ``0.0``) and ``jitter`` (default ``1e-8``) a constant added to the noise
-    variance. Use it as the distribution of an ``ObservedParameter``::
+    ``1e-6``), ``mean`` a :class:`~BayesianDLL.GP.MeanFunction` (defaults to
+    ``ZeroMean()``; a number or named scalar node is a ``ConstantMean``) and
+    ``jitter`` (default ``1e-8``) a constant added to the noise variance. Use it as the distribution of an ``ObservedParameter``::
 
         gp = KroneckerGP("f", grid_inputs=[x1, x2], kernels=[RBF(l1, v), RBF(l2)], noise_variance=s2)
         ObservedParameter("y", gp, y_grid)  # y_grid: (len(x1), len(x2))
     """
 
-    def __init__(self, name, grid_inputs, kernels, noise_variance=1e-6, mean=0.0, jitter=1e-8):
+    def __init__(self, name, grid_inputs, kernels, noise_variance=1e-6, mean=None, jitter=1e-8):
         super().__init__()
         grid_inputs = list(grid_inputs)
         kernels = list(kernels)
@@ -158,7 +173,6 @@ class KroneckerGP(_GPDistribution):
         self.grid_inputs = grid_inputs
         self.kernels = kernels
         self.noise_variance = noise_variance
-        self.mean = mean
         self.jitter = jitter
         for grid in grid_inputs:
             self.add_dependency(grid)
@@ -166,7 +180,7 @@ class KroneckerGP(_GPDistribution):
         for parameter in self._kernel_parameter_nodes:
             self.add_dependency(parameter)
         self.add_dependency(noise_variance)
-        self.add_dependency(mean)
+        self._register_mean(mean, "KroneckerGP")
 
     # -- helpers ------------------------------------------------------------
     def _factor_inputs(self):
@@ -202,15 +216,6 @@ class KroneckerGP(_GPDistribution):
             eigenvectors.append(vectors)
         return matrices, eigenvalues, eigenvectors
 
-    def _mean_tensor(self, shape, dtype, device, value=None):
-        mean = _resolved_value(self.mean if value is None else value, dtype, device)
-        n = math.prod(shape)
-        if mean.numel() == 1:
-            return mean.reshape(()).expand(shape)
-        if mean.numel() != n:
-            raise ValueError(f"KroneckerGP mean must be scalar or contain one value per grid point ({n}); got {mean.numel()}.")
-        return mean.reshape(shape)
-
     def _components(self, observed):
         context = _BatchContext()
         reference = self._factor_inputs()[0]
@@ -226,7 +231,9 @@ class KroneckerGP(_GPDistribution):
         if noise.shape[1] != 1:
             raise ValueError("KroneckerGP noise_variance must be scalar.")
         noise = noise[:, 0]
-        mean = _batched_mean(context, self.mean, n, dtype, device, "KroneckerGP")
+        # A ZeroMean needs no grid points (and adds nothing to the gradients).
+        points = None if _is_zero(self.mean) else _grid_points(xs)
+        mean = torch.zeros((1, n), dtype=dtype, device=device) if points is None else _evaluate_mean(context, self.mean, points, dtype, device)
         kernel_values, matrices, eigenvalues, eigenvectors = [], [], [], []
         for kernel, x in zip(self.kernels, xs):
             values = context.kernel_values(kernel, dtype, device)
@@ -254,9 +261,9 @@ class KroneckerGP(_GPDistribution):
         log_probability = -0.5 * (
             (rotated * scaled).sum(reduce) + torch.log(denominator).sum(reduce) + n * math.log(2 * math.pi)
         )
-        batched = context.any([*self.grid_inputs, self.noise_variance, self.mean, *self._kernel_parameter_nodes])
+        batched = context.any([*self.grid_inputs, self.noise_variance, *self.mean.parameters, *self._kernel_parameter_nodes])
         return {
-            "context": context, "xs": xs, "shape": shape, "noise": noise, "matrices": matrices,
+            "context": context, "xs": xs, "points": points, "shape": shape, "noise": noise, "matrices": matrices,
             "eigenvalues": eigenvalues, "eigenvectors": eigenvectors, "denominator": denominator, "alpha": alpha,
             "kernel_values": kernel_values, "log_probability": log_probability, "batched": batched,
         }
@@ -316,15 +323,19 @@ class KroneckerGP(_GPDistribution):
         if _is_named(self.noise_variance):
             inverse = (1.0 / parts["denominator"]).reshape(alpha.shape[0], -1)
             noise_gradient = 0.5 * (flat_alpha.square().sum(-1) - inverse.sum(-1))
-            gradients[self.noise_variance.name] = _to_parameter_shape(
+            _accumulate(gradients, self.noise_variance.name, _to_parameter_shape(
                 noise_gradient.unsqueeze(-1), _parameter_shape(context, self.noise_variance)
+            ))
+        if parts["points"] is not None:
+            # The residual is y - m(X) at the grid points (row-major), so ∂ log p / ∂m(X) = α.
+            _add_mean_gradients(
+                gradients, self.mean, context, parts["points"], flat_alpha,
+                lambda node: _parameter_shape(context, node), alpha.dtype, alpha.device,
             )
-        if _is_named(self.mean):
-            gradients[self.mean.name] = _to_parameter_shape(flat_alpha, _parameter_shape(context, self.mean))
         return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
-        """Draws of shape ``(n_samples, n_1, …, n_P)``: ``mean + Q (sqrt(λ) ⊙ ε₁) + σ ε₂``."""
+        """Draws of shape ``(n_samples, n_1, …, n_P)``: ``m(X) + Q (sqrt(λ) ⊙ ε₁) + σ ε₂``."""
         xs = self._factor_inputs()
         dtype, device = xs[0].dtype, xs[0].device
         shape = tuple(x.shape[0] for x in xs)
@@ -335,7 +346,8 @@ class KroneckerGP(_GPDistribution):
         for mode, vectors in enumerate(eigenvectors):
             draws = _mode_product(draws, vectors, mode + 1)
         draws = draws + (noise + self.jitter).sqrt() * torch.randn_like(draws)
-        return self._mean_tensor(shape, dtype, device) + draws
+        points = _grid_points([x.unsqueeze(0) for x in xs])[0]
+        return self._mean_at(points).reshape(shape) + draws
 
 
 def _split_new_inputs(gp, inputs, xs):
@@ -367,7 +379,7 @@ def _rowwise_contract(rows, tensor):
     return current.reshape(n_new)
 
 
-def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None, diagonal=False, new_mean=None):
+def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None, diagonal=False):
     r"""Sample predictions of a :class:`KroneckerGP` at new points.
 
     ``inputs`` is either a list with one array per grid factor (a new grid,
@@ -376,24 +388,20 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
     hyperparameter draw, with ``U_p = K_p(x*_p, X_p) Q_p`` and the row-wise
     Kronecker product ``U``:
 
-    ``mean = m + K_*X α`` and ``cov = K_** - U diag(1/(λ+σ²)) Uᵀ``,
+    ``mean = m(X*) + K_*X α`` and ``cov = K_** - U diag(1/(λ+σ²)) Uᵀ``,
 
     both evaluated without forming an ``N x N`` matrix (the mean in
     ``O(n* N)``; the full covariance needs an ``n* x N`` matrix ``U``).
     With ``diagonal=True`` only the marginal variances are computed (in
     ``O(n* N)``) and the draws are independent across points, which is
     enough for pointwise credible bands on large prediction grids. Here
-    ``α = (K + σ² I)⁻¹ (y - mean)`` with ``y = observed_values`` (grid
-    shaped or flattened); the kernel parameters, the noise variance and a
-    named mean are read from ``trace``, and a given ``observation_noise``
-    variance is added to the diagonal.
-
-    ``new_mean`` is the mean at the new points (shape ``(n*,)``, or
-    ``(n_parameter_draws, n*)`` for one per draw). A scalar mean is used at
-    the new points when it is omitted; a mean given per grid point cannot
-    be evaluated at new points, so ``new_mean`` is then required
-    (``ValueError`` otherwise). The result has shape
-    ``(n_parameter_draws, n_samples, n*)``.
+    ``α = (K + σ² I)⁻¹ (y - m(X))`` with ``y = observed_values`` (grid
+    shaped or flattened) and the mean function ``m`` evaluated per draw at
+    the training grid points and the new points (the factors' features
+    concatenated); the kernel parameters, the noise variance and the named
+    parameters of the mean function are read from ``trace``, and a given
+    ``observation_noise`` variance is added to the diagonal. The result has
+    shape ``(n_parameter_draws, n_samples, n*)``.
     """
     if not isinstance(gp, KroneckerGP):
         raise TypeError("gp must be a KroneckerGP.")
@@ -405,22 +413,19 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
     n_new = new[0].shape[0]
     observed_values = torch.as_tensor(_input_value(observed_values), dtype=dtype, device=device)
     n_draws = _draw_count(trace)
-    parameter_draws = {
-        parameter.name: _trace_draws(trace, parameter, n_draws, dtype, device)
-        for kernel in gp.kernels for parameter in kernel.parameters
-    }
+    parameter_draws = _parameter_draws(trace, [p for kernel in gp.kernels for p in kernel.parameters], n_draws, dtype, device)
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
+    mean_draws = _parameter_draws(trace, gp.mean.parameters, n_draws, dtype, device)
     shape = tuple(x.shape[0] for x in xs)
-    mean_train_draws, mean_new_draws = _prediction_means(
-        _trace_draws(trace, gp.mean, n_draws, dtype, device), new_mean,
-        math.prod(shape), n_new, n_draws, dtype, device, "KroneckerGP",
-    )
+    training_points = _grid_points([x.unsqueeze(0) for x in xs])[0]
+    new_points = torch.cat(new, dim=1)
 
     outputs = []
     for draw_index in range(n_draws):
-        values = {name: draws[draw_index] for name, draws in parameter_draws.items()}
+        values = _draw(parameter_draws, draw_index)
+        mean_values = _draw(mean_draws, draw_index)
         noise = noise_draws[draw_index].reshape(-1)[0]
-        residual = observed_values.reshape(shape) - mean_train_draws[draw_index].reshape(shape)
+        residual = observed_values.reshape(shape) - gp.mean(training_points, parameter_values=mean_values).reshape(shape)
         _, eigenvalues, eigenvectors = gp._decompose(xs, values)
         inverse = 1.0 / (_kronecker_eigenvalues(eigenvalues).clamp_min(0.0) + noise + gp.jitter)
         rotated = residual
@@ -429,7 +434,7 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
         scaled = rotated * inverse  # Qᵀ α
         cross = [kernel(x_new, x, parameter_values=values) for kernel, x_new, x in zip(gp.kernels, new, xs)]
         projected = [k @ q for k, q in zip(cross, eigenvectors)]  # U_p
-        predictive_mean = mean_new_draws[draw_index] + _rowwise_contract(projected, scaled)
+        predictive_mean = gp.mean(new_points, parameter_values=mean_values) + _rowwise_contract(projected, scaled)
         extra = 0.0
         if observation_noise is not None:
             extra = _resolved_value(observation_noise, dtype, device).reshape(-1)[0]
@@ -619,7 +624,7 @@ class ToeplitzGP(_GPDistribution):
     For a stationary kernel on ``x_i = x_0 + i h`` the covariance
     ``K + σ² I`` is symmetric Toeplitz, determined by its first column
     ``t_k = k(0, k h) + σ² δ_k0``. :func:`levinson_solve` gives
-    ``α = (K + σ² I)⁻¹ (y - mean)`` and the log determinant in ``O(n²)``
+    ``α = (K + σ² I)⁻¹ (y - m(X))`` and the log determinant in ``O(n²)``
     time and ``O(n)`` memory (a dense Cholesky needs ``O(n³)`` and
     ``O(n²)``). With vectorized chains one Levinson recursion of ``n`` steps
     runs on ``(C, …)`` tensors, i.e. all chains in the same Python loop.
@@ -639,8 +644,10 @@ class ToeplitzGP(_GPDistribution):
     the diagonal (including its derivative), per chain; unlike
     :func:`stable_cholesky` it is not increased on failure.
     ``noise_variance`` is the scalar noise variance ``σ²`` (default
-    ``1e-6``), ``mean`` a scalar or one value per input (default ``0.0``),
-    and ``spacing_tolerance`` (default ``1e-6``) the relative tolerance of
+    ``1e-6``), ``mean`` a :class:`~BayesianDLL.GP.MeanFunction` (defaults
+    to ``ZeroMean()``; a number or named scalar node is a ``ConstantMean``;
+    its parameters get the cotangent ``α`` of ``m(X)``), and
+    ``spacing_tolerance`` (default ``1e-6``) the relative tolerance of
     the equal-spacing check. Gradients w.r.t. learnable inputs are not
     implemented.
 
@@ -664,7 +671,7 @@ class ToeplitzGP(_GPDistribution):
     solver, and the recursion raises if it breaks down.
     """
 
-    def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=0.0, jitter=1e-6, spacing_tolerance=1e-6):
+    def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=None, jitter=1e-6, spacing_tolerance=1e-6):
         super().__init__()
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
@@ -673,7 +680,6 @@ class ToeplitzGP(_GPDistribution):
         self.inputs = inputs
         self.kernel = kernel
         self.noise_variance = noise_variance
-        self.mean = mean
         self.jitter = jitter
         x = self._training_inputs()
         if x.shape[1] != 1:
@@ -685,7 +691,7 @@ class ToeplitzGP(_GPDistribution):
         self.add_dependency(inputs)
         self._register_kernel(kernel)
         self.add_dependency(noise_variance)
-        self.add_dependency(mean)
+        self._register_mean(mean, "ToeplitzGP")
 
     def _training_inputs(self):
         x = _feature_matrix(torch.as_tensor(_input_value(self.inputs)))
@@ -720,14 +726,6 @@ class ToeplitzGP(_GPDistribution):
         )
         return column[0], diagonal_scale[0]
 
-    def _mean_vector(self, n, dtype, device):
-        mean = _resolved_value(self.mean, dtype, device)
-        if mean.numel() == 1:
-            return mean.reshape(()).expand(n)
-        if mean.numel() != n:
-            raise ValueError(f"ToeplitzGP mean must be scalar or contain one value per input ({n}).")
-        return mean.reshape(n)
-
     def _components(self, observed, need_inverse=False):
         context = _BatchContext()
         reference = self._training_inputs()
@@ -743,7 +741,7 @@ class ToeplitzGP(_GPDistribution):
             raise ValueError("ToeplitzGP noise_variance must be scalar.")
         kernel_values = context.kernel_values(self.kernel, dtype, device)
         column, diagonal_scale = self._batched_first_column(x, kernel_values, noise[:, 0])
-        mean = _batched_mean(context, self.mean, n, dtype, device, "ToeplitzGP")
+        mean = _evaluate_mean(context, self.mean, x, dtype, device)
         size = max(column.shape[0], mean.shape[0])
         column, diagonal_scale = _expand_batch(column, size), _expand_batch(diagonal_scale, size)
         residual = _expand_batch(observed - mean, size)
@@ -756,7 +754,7 @@ class ToeplitzGP(_GPDistribution):
             solution, log_det = _levinson(column, residual.unsqueeze(-1))
             alpha, inverse_column = solution[..., 0], None
         log_probability = -0.5 * ((residual * alpha).sum(-1) + log_det + n * math.log(2 * math.pi))
-        batched = context.any([self.inputs, self.noise_variance, self.mean, *self.kernel.parameters])
+        batched = context.any([self.inputs, self.noise_variance, *self.mean.parameters, *self.kernel.parameters])
         return {
             "context": context, "x": x, "alpha": alpha, "inverse_column": inverse_column,
             "diagonal_scale": diagonal_scale, "kernel_values": kernel_values,
@@ -795,9 +793,13 @@ class ToeplitzGP(_GPDistribution):
             gradients[name] = _to_parameter_shape(gradient, _parameter_shape(context, parameter))
         if _is_named(self.noise_variance):
             noise_gradient = (cotangent[:, 0] * parts["diagonal_scale"]).unsqueeze(-1)
-            gradients[self.noise_variance.name] = _to_parameter_shape(noise_gradient, _parameter_shape(context, self.noise_variance))
-        if _is_named(self.mean):
-            gradients[self.mean.name] = _to_parameter_shape(parts["alpha"], _parameter_shape(context, self.mean))
+            _accumulate(gradients, self.noise_variance.name,
+                        _to_parameter_shape(noise_gradient, _parameter_shape(context, self.noise_variance)))
+        # The residual is y - m(X), so ∂ log p / ∂m(X) = α.
+        _add_mean_gradients(
+            gradients, self.mean, context, x_values, parts["alpha"], lambda node: _parameter_shape(context, node),
+            x_values.dtype, x_values.device,
+        )
         return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
@@ -808,26 +810,20 @@ class ToeplitzGP(_GPDistribution):
         covariance = covariance + noise * torch.eye(x.shape[0], dtype=x.dtype, device=x.device)
         factor = stable_cholesky(covariance, jitter=self.jitter)
         draws = torch.randn((n_samples, x.shape[0]), dtype=x.dtype, device=x.device) @ factor.transpose(-2, -1)
-        return self._mean_vector(x.shape[0], x.dtype, x.device) + draws
+        return self._mean_at(x) + draws
 
 
-def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None, new_mean=None):
+def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
     r"""Sample predictions of a :class:`ToeplitzGP` at arbitrary new 1-D inputs.
 
-    ``mean = m + K_*X α`` and ``cov = K_** - K_*X T⁻¹ K_X*``, where the solves
-    use :func:`levinson_solve` with ``n*`` right-hand sides
+    ``mean = m(X*) + K_*X α`` and ``cov = K_** - K_*X T⁻¹ K_X*``, where the
+    solves use :func:`levinson_solve` with ``n*`` right-hand sides
     (``O(n² n*)``; no ``n x n`` matrix is formed), ``T = K + σ² I`` plus
-    jitter and ``α = T⁻¹ (y - mean)`` with ``y = observed_values``. The
-    kernel parameters, noise variance and a named mean are read from
+    jitter and ``α = T⁻¹ (y - m(X))`` with ``y = observed_values`` and the
+    mean function ``m`` evaluated per draw. The kernel parameters, noise
+    variance and the named parameters of the mean function are read from
     ``trace``; a given ``observation_noise`` variance is added to the
-    diagonal.
-
-    ``new_mean`` is the mean at the new inputs (shape ``(n*,)``, or
-    ``(n_parameter_draws, n*)`` for one per draw). A scalar mean is used at
-    the new inputs when it is omitted; a mean given per training input
-    cannot be evaluated at new inputs, so ``new_mean`` is then required
-    (``ValueError`` otherwise). The result has shape
-    ``(n_parameter_draws, n_samples, n*)``.
+    diagonal. The result has shape ``(n_parameter_draws, n_samples, n*)``.
     """
     from ._process import stable_cholesky
     if not isinstance(gp, ToeplitzGP):
@@ -841,21 +837,19 @@ def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obse
     n_new = new.shape[0]
     observed_values = torch.as_tensor(_input_value(observed_values), dtype=dtype, device=device).reshape(-1)
     n_draws = _draw_count(trace)
-    parameter_draws = {p.name: _trace_draws(trace, p, n_draws, dtype, device) for p in gp.kernel.parameters}
+    parameter_draws = _parameter_draws(trace, gp.kernel.parameters, n_draws, dtype, device)
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
-    mean_train_draws, mean_new_draws = _prediction_means(
-        _trace_draws(trace, gp.mean, n_draws, dtype, device), new_mean,
-        n, n_new, n_draws, dtype, device, "ToeplitzGP",
-    )
+    mean_draws = _parameter_draws(trace, gp.mean.parameters, n_draws, dtype, device)
     outputs = []
     for draw_index in range(n_draws):
-        values = {name: draws[draw_index] for name, draws in parameter_draws.items()}
+        values = _draw(parameter_draws, draw_index)
+        mean_values = _draw(mean_draws, draw_index)
         noise = noise_draws[draw_index].reshape(-1)[0]
         column, _ = gp._first_column(x, values, noise)
         cross = gp.kernel(x, new, parameter_values=values)  # (n, n*)
-        rhs = torch.cat([(observed_values - mean_train_draws[draw_index]).reshape(n, 1), cross], dim=1)
+        rhs = torch.cat([(observed_values - gp.mean(x, parameter_values=mean_values)).reshape(n, 1), cross], dim=1)
         solution, _ = levinson_solve(column, rhs)
-        predictive_mean = mean_new_draws[draw_index] + cross.transpose(-2, -1) @ solution[:, 0]
+        predictive_mean = gp.mean(new, parameter_values=mean_values) + cross.transpose(-2, -1) @ solution[:, 0]
         covariance = gp.kernel(new, new, parameter_values=values) - cross.transpose(-2, -1) @ solution[:, 1:]
         if observation_noise is not None:
             covariance = covariance + _resolved_value(observation_noise, dtype, device).reshape(-1)[0] * torch.eye(n_new, dtype=dtype, device=device)

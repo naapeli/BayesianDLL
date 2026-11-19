@@ -21,7 +21,8 @@ Here 400 noisy observations of a 1-D function are fitted with ``m = 10``
 fixed, evenly spaced inducing inputs. Each method's hyperparameters are set
 to a type-II MAP estimate (``find_MAP`` maximises the method's marginal
 likelihood times weak log-normal priors), and the four fits are compared
-with the exact GP. Finally NUTS samples the VFE hyperparameter posterior.
+with the exact GP. NUTS then samples the VFE hyperparameter posterior, and
+a last section adds a learned ``LinearMean`` for data with a trend.
 """
 
 import time
@@ -32,7 +33,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import ExactGP, Matern52, SparseGP, exact_gp_predictive, sparse_gp_predictive
+from BayesianDLL.GP import ExactGP, LinearMean, Matern52, SparseGP, exact_gp_predictive, sparse_gp_predictive
 
 
 torch.manual_seed(0)
@@ -152,4 +153,74 @@ ax_hist.hist(trace["noise"].reshape(-1).sqrt(), bins=30, color="tab:green", dens
 ax_hist.axvline(0.2, color="k", linestyle="--", label="true value")
 ax_hist.set(xlabel="noise standard deviation", ylabel="density", title="Noise posterior")
 ax_hist.legend(fontsize="small")
+plt.show()
+
+# %%
+# A learned linear mean
+# ---------------------
+# Every GP takes a mean function ``m(x)`` (``mean=``, default
+# ``ZeroMean()``): the GP then models ``f(x) - m(x)``. Here the data get an
+# upward trend, ``y + 0.35 x``, and the model is fitted twice with VFE: with
+# the default zero mean and with ``LinearMean(slope, intercept)``, whose
+# slope and intercept are ordinary ``RandomParameter`` nodes with weak priors,
+# estimated by ``find_MAP`` together with the kernel hyperparameters (NUTS
+# would sample them in the same way, and the predictive reads them from the
+# trace draw by draw).
+#
+# Away from the data a stationary GP reverts to its mean. With a zero mean
+# the prediction beyond the data (shaded, ``x > 10``) falls back to zero; with the learned
+# linear mean it continues the trend, and the kernel only describes the
+# wiggles around it.
+#
+# **Linear mean vs. linear kernel.** The ExactGP example models a trend with
+# a ``Linear`` *kernel*, ``k(x, x') = v x x'``. That is the covariance of
+# ``f(x) = β x`` with a *random* slope ``β ~ Normal(0, v)`` integrated out of
+# the likelihood: the slope's uncertainty is part of the GP, and the
+# predictive band widens linearly with ``|x|``. A ``LinearMean`` is a fixed
+# trend whose slope is a model parameter: it is learned (a point estimate
+# here, or a posterior with NUTS) rather than integrated out, the kernel
+# stays stationary (so it also works with ``ToeplitzGP``), and the band far
+# from the data is that of the stationary kernel alone.
+
+y_trend = y + 0.35 * x
+grid_far = torch.linspace(-0.5, 15.0, 250, dtype=torch.float64)
+
+
+def build_trend(learned_mean):
+    with Model() as model:
+        log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 1.0))
+        log_variance = RandomParameter("log_variance", Normal(0.0, 1.0))
+        log_noise = RandomParameter("log_noise", Normal(-2.0, 1.0))
+        kernel = Matern52(Exp("lengthscale", log_lengthscale), Exp("variance", log_variance))
+        mean = None
+        if learned_mean:
+            slope = RandomParameter("slope", Normal(0.0, 1.0))
+            intercept = RandomParameter("intercept", Normal(0.0, 2.0))
+            mean = LinearMean(slope, intercept)
+        f = SparseGP("f", Data("inputs", x), kernel, inducing_points=inducing,
+                     noise_variance=Exp("noise", log_noise), mean=mean)
+        ObservedParameter("y", f, y_trend)
+    return model, f
+
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True, layout="constrained")
+for ax, learned_mean in zip(axes, (False, True)):
+    model, f = build_trend(learned_mean)
+    model.find_MAP(lr=0.05, epochs=250, verbose=False)
+    trace = point_trace(model)
+    title = "zero mean"
+    if learned_mean:
+        for name in ("slope", "intercept"):
+            trace[name] = model.params[name].constrained_value.reshape(1, 1, -1)
+        title = f"LinearMean (slope {trace['slope'].item():.2f}, intercept {trace['intercept'].item():.2f})"
+    draws = sparse_gp_predictive(f, trace, y_trend, grid_far, n_samples=300).reshape(-1, grid_far.numel())
+    lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
+    ax.scatter(x, y_trend, s=3, color="0.65", label="observations")
+    ax.fill_between(grid_far, lower, upper, color="tab:purple", alpha=0.3, label="90% band of f")
+    ax.plot(grid_far, median, color="tab:purple", label="median of f")
+    ax.plot(grid_far, true_function(grid_far) + 0.35 * grid_far, "k--", linewidth=1, label="true f")
+    ax.axvspan(10.0, 15.0, color="0.9", zorder=0)
+    ax.set(xlabel="x", title=f"VFE, {title}")
+axes[0].set_ylabel("y")
+fig.legend(*axes[0].get_legend_handles_labels(), loc="outside lower center", ncol=4, fontsize="small")
 plt.show()
