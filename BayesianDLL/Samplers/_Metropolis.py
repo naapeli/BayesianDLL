@@ -37,17 +37,39 @@ class _CachedTarget:
 class Metropolis(_CachedTarget):
     """Random-walk Metropolis sampler.
 
-    Continuous states take Gaussian proposals with standard deviation
-    ``proposal_scale``, adapted during warmup towards the acceptance rate
-    ``target_accept_rate`` (0.234 by default; about 0.44 suits a single
-    coordinate): after every step the scale is multiplied by
-    ``1 - adaptation_rate`` when the rolling acceptance rate is below the
-    target and by ``1 + adaptation_rate`` when it is above. The names differ
-    from NUTS's ``delta`` and ``kappa`` on purpose, so settings passed to
+    Continuous states take isotropic Gaussian proposals
+    ``theta + proposal_scale * N(0, I)``, accepted with probability
+    ``min(1, p(theta') / p(theta))``. The scale is adapted during warmup
+    towards the acceptance rate ``target_accept_rate`` (0.234 by default;
+    about 0.44 suits a single coordinate): after every warmup step it is
+    multiplied by ``1 - adaptation_rate`` when the rolling acceptance rate
+    (over the last 20 steps) is below the target and by
+    ``1 + adaptation_rate`` when it is above. The names differ from NUTS's
+    ``delta`` and ``kappa`` on purpose, so settings passed to
     :func:`~BayesianDLL.sample` for NUTS do not reach Metropolis blocks.
     Discrete states are updated one coordinate at a time: each step
     sweeps over the coordinates in random order and proposes a move of ±1 for
-    each, so the acceptance rate does not collapse with the dimension.
+    each (rejected when it leaves the state space), so the acceptance rate
+    does not collapse with the dimension; their proposals are not adapted.
+
+    Parameters
+    ----------
+    log_target : callable
+        Maps a state tensor to its scalar log density.
+    state_space : StateSpace
+        The space of the state; decides between the continuous and the
+        discrete update.
+    proposal_scale : float, default 1.0
+        Initial standard deviation of the continuous proposal.
+    adaptation_rate : float, default 0.05
+        Relative change of ``proposal_scale`` per warmup step.
+    target_accept_rate : float, default 0.234
+        The acceptance rate the warmup adaptation aims for.
+
+    :meth:`step` returns ``(theta, proposal_scale, rolling_acceptance_rate,
+    False)`` and sets ``last_stats`` (``accept_stat``, the acceptance
+    probability of this step or the mean over the coordinates of a discrete
+    sweep; ``accepted``; ``step_size``, the proposal scale; ``lp``).
     """
 
     def __init__(self, log_target, state_space, proposal_scale=1.0, adaptation_rate=0.05, target_accept_rate=0.234):
@@ -210,8 +232,23 @@ class FiniteGibbs(_CachedTarget):
 
     If ``elementwise_log_target`` is given, it must return a tensor of the
     shape of the state holding independent per-coordinate log probabilities
-    (e.g. a factorised predictive distribution); all coordinates are then
-    sampled jointly with one evaluation per support value.
+    (e.g. a factorised predictive distribution); when all coordinates share
+    one support, they are then sampled jointly with one evaluation per
+    support value (otherwise, or if the returned shape differs from the
+    state's, the sweep is used).
+
+    Parameters
+    ----------
+    log_target : callable
+        Maps a state tensor to its scalar log density.
+    state_space : DiscreteRange or JointStateSpace of DiscreteRange
+        A discrete space with finite support per coordinate; anything else
+        raises a ``RuntimeError``.
+    elementwise_log_target : callable, optional
+        Per-coordinate log probabilities, see above.
+
+    :meth:`step` returns ``(theta, 1.0, 1.0, False)``: every Gibbs update is
+    accepted.
     """
 
     def __init__(self, log_target, state_space, elementwise_log_target=None):

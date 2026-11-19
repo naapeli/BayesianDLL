@@ -265,10 +265,14 @@ class EnumerationGroup:
         """Per-assignment log densities of the group at the current parameter values.
 
         Returns a dict with ``"log_terms"``: for the factorised mode a tensor
-        of shape ``(K, *z_shape)``, for brute force a tensor of shape
-        ``(C,)``; ``"configurations"``: the assignments (support values or
-        lists of tensors); ``"term_shapes"``: elementwise term shapes; and
-        ``"log_marginal"``.
+        of shape ``(K, *z_shape)`` for the ``K`` support values, for brute
+        force a tensor of shape ``(n_configurations,)``, in a batched model
+        with the chain dimension after the first one (``z_shape`` then
+        includes it); ``"configurations"``: the assignments (support values
+        or lists of tensors); ``"term_shapes"``: elementwise term shapes; and
+        ``"log_marginal"``: ``sum logsumexp`` of the log terms over the
+        assignments plus the log-Jacobians of the group's continuous random
+        children (a scalar, or one value per chain).
         """
         self.prepare(model)
         saved = self._saved_values(model)

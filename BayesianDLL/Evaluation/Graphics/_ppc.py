@@ -16,12 +16,31 @@ def plot_ppc_statistic(
 
     Draws a histogram of ``T(y_rep)`` over the replicated datasets, marks the
     observed ``T(y)`` with a vertical line and puts the posterior predictive
-    p-value ``P(T(y_rep) >= T(y))`` in the title. ``predicative_distribution``
-    is a PredicativeResult (then ``data`` is the observed data) or the
-    :class:`~BayesianDLL.Evaluation.PPCResult` of
-    :func:`~BayesianDLL.Evaluation.ppc_pvalue`. ``statistic`` is a callable
-    or the name of a built-in statistic, see
-    :func:`~BayesianDLL.Evaluation.ppc_pvalue`.
+    p-value ``P(T(y_rep) >= T(y))`` in the title.
+
+    Parameters
+    ----------
+    predicative_distribution : PredicativeResult or PPCResult
+        Posterior predictive draws (then ``data`` is required), or the
+        :class:`~BayesianDLL.Evaluation.PPCResult` of
+        :func:`~BayesianDLL.Evaluation.ppc_pvalue`, in which case ``data``,
+        ``statistic`` and ``var_name`` are ignored.
+    data : Tensor or dict, optional
+        The observed data ``y``, passed to :func:`~BayesianDLL.Evaluation.ppc_pvalue`.
+    statistic : str or callable, default "mean"
+        A callable or the name of a built-in statistic, see
+        :func:`~BayesianDLL.Evaluation.ppc_pvalue`.
+    var_name : str, optional
+        The predicted variable; required when there are several.
+    bins : int, default 30
+        Number of histogram bins. Integer valued statistics with at most
+        ``bins`` distinct values get one bar per integer instead.
+    ax : matplotlib.axes.Axes, optional
+        Axes to draw into; a new figure is created when omitted.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
     """
     if isinstance(predicative_distribution, PPCResult):
         result = predicative_distribution

@@ -218,6 +218,33 @@ def _move_tensors(root, device, dtype):
 
 
 class Model:
+    """A probabilistic model: a directed acyclic graph of parameters, data and observations.
+
+    Nodes are registered by creating ``Data``, ``RandomParameter``,
+    ``ObservedParameter`` and ``DeterministicParameter`` objects inside a
+    ``with Model() as model:`` block; leaving the block compiles the model
+    (:meth:`compile`). Log densities are taken in the unconstrained space of
+    every random parameter (with the log-Jacobian of its transform), and
+    enumerated parameters are summed out.
+
+    Attributes
+    ----------
+    params : dict[str, RandomParameter]
+        The sampled random parameters.
+    enumerated_params : dict[str, RandomParameter]
+        Finite discrete parameters that are summed out instead of sampled.
+    observed_params : dict[str, ObservedParameter]
+        The likelihood terms.
+    deterministic_params : dict[str, DeterministicParameter]
+        Deterministic functions of other nodes.
+    data : dict[str, Data]
+        Mutable data inputs.
+    graph : networkx.DiGraph
+        The dependency graph; each node has a ``"type"`` attribute.
+    n_chains : int or None
+        The chain dimension while the model is batched (:meth:`batch`), else ``None``.
+    """
+
     def __init__(self):
         self.data = {}
         self.params: dict[str, RandomParameter] = {}
@@ -253,6 +280,11 @@ class Model:
         return False
 
     def compile(self):
+        """Fix the topological order, the dependants of every parameter and the enumeration groups.
+
+        Called when the ``with`` block ends and after :func:`condition` /
+        :func:`marginalize`; call it again after adding nodes outside a block.
+        """
         self._all_params_list = list(self.params.values())
 
         try:
@@ -441,6 +473,14 @@ class Model:
         return self._log_prob_of_terms(random_terms, list(self.observed_params.values()))
 
     def log_prob(self, name, theta):
+        """Log density terms that change with parameter ``name``, at the unconstrained value ``theta``.
+
+        The parameter is set to ``theta`` temporarily. The result is the sum of
+        the prior terms (with Jacobians) of ``name`` and of the random
+        parameters downstream of it and of the observed terms downstream of
+        it, so it differs from :meth:`model_log_prob` by a constant in
+        ``theta``. With enumerated parameters it is :meth:`block_log_prob`.
+        """
         if not self._compiled:
             self.compile()
 
@@ -460,6 +500,7 @@ class Model:
 
     @contextmanager
     def temporarily_set(self, name, value):
+        """Context manager: set the unconstrained value of parameter ``name`` and restore it afterwards."""
         try:
             old_value = self._random_term(name).unconstrained_value
             self._random_term(name).set_unconstrained_value(value)
@@ -712,11 +753,16 @@ class Model:
         ``mode`` is ``"tensor"`` (one batched tensor computation),
         ``"loop"`` (the model is evaluated chain by chain; always correct but
         slower) or ``"auto"``: ``"tensor"`` unless a node of the model does
-        not support batching. With ``check=True`` the batched evaluation is
-        compared once with chain-by-chain evaluation at random points, and
-        the model falls back to ``"loop"`` (with a warning) when they differ,
-        e.g. for a user ``DeterministicParameter`` whose function does not
-        broadcast over a leading chain dimension.
+        not support batching. With ``check=True`` and ``mode="auto"`` the
+        batched evaluation is compared once with chain-by-chain evaluation (of
+        up to four chains) at randomly perturbed points, and the model falls
+        back to ``"loop"`` (with a warning) when they differ, e.g. for a user
+        ``DeterministicParameter`` whose function does not broadcast over a
+        leading chain dimension. The reason of a fallback is stored in
+        ``batch_fallback_reason``.
+
+        The model is modified in place and returned; raises a
+        ``RuntimeError`` if it is already batched.
         """
         if not self._compiled:
             self.compile()
@@ -1120,6 +1166,12 @@ class Model:
 
 
     def grad_log_prob(self, name, theta):
+        """Gradient of the joint log density w.r.t. the unconstrained parameter ``name`` at ``theta``.
+
+        The parameter is set to ``theta`` temporarily; returns a tensor of its
+        unconstrained shape. Raises a ``RuntimeError`` if ``name`` is not a
+        (sampled) random parameter.
+        """
         if not self._compiled:
             self.compile()
 
@@ -1136,6 +1188,7 @@ class Model:
         return _sample(n_samples, warmup_length, n_chains=n_chains, model=self, progress_bar=progress_bar, start_point_variance=start_point_variance, blocks=blocks, seed=seed, **sampler_params)
 
     def find_MAP(self, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
+        """Maximum a posteriori estimate of this model; see :func:`BayesianDLL.find_MAP`."""
         from .Variational import find_MAP as _find_MAP
         return _find_MAP(self, lr=lr, epochs=epochs, betas=betas, callback_frequency=callback_frequency, verbose=verbose)
     
@@ -1150,13 +1203,35 @@ class Model:
         return _spp(n_samples, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)
 
     def condition(self, random_variable_names_and_values=None, **kwargs):
+        """A conditioned copy of this model; see :func:`BayesianDLL.condition`."""
         return condition(self, random_variable_names_and_values, **kwargs)
 
     def marginalize(self, names):
+        """A copy of this model with ``names`` summed out; see :func:`BayesianDLL.marginalize`."""
         return marginalize(self, names)
 
 
 def condition(model: Model, random_variable_names_and_values: dict = None, **kwargs) -> Model:
+    """Return a copy of ``model`` with some variables fixed to given values.
+
+    Conditions are given as a dict (keys are names or the parameter objects)
+    and/or as keyword arguments. A conditioned random (or enumerated)
+    parameter becomes an ``ObservedParameter`` with that value; a
+    conditioned observed parameter gets new observations; a conditioned
+    ``Data`` node a new value. Values are reshaped (or broadcast) to the
+    node's shape and must lie in its distribution's state space. The
+    original model is not modified.
+
+    Raises
+    ------
+    TypeError
+        If ``model`` is not a :class:`Model` or the conditions are not a dict.
+    ValueError
+        For a deterministic node, a value that cannot be shaped like the node
+        or one outside its state space.
+    KeyError
+        For an unknown name.
+    """
     if not isinstance(model, Model):
         raise TypeError(f"model must be an instance of Model, got {type(model).__name__}.")
 

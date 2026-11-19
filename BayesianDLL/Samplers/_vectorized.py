@@ -195,8 +195,12 @@ def sample_vectorized(n_samples, warmup_length, n_chains, model, progress_bar, s
     """Run ``n_chains`` chains of the batched model in lock step.
 
     Returns the pieces :func:`~BayesianDLL.sample` assembles into a
-    :class:`SamplingResult`: ``(trace, det_trace, enum_trace, enum_probs,
-    log_lik, divergences, acceptance, step_sizes, sample_stats, max_depths)``.
+    :class:`SamplingResult`: ``(trace, det_trace, enum_probs, log_lik,
+    divergences, acceptance, step_sizes, sample_stats, max_depths)``, where
+    ``trace`` also holds the draws of the enumerated parameters, the tensors
+    have shape ``(n_chains, n_samples, ...)``, ``log_lik`` is ``None`` without
+    a plan, and ``divergences``, ``acceptance`` and ``step_sizes`` are lists
+    per chain (the latter two with one entry per block).
     """
     from ..Evaluation._pointwise import pointwise_log_likelihood
 

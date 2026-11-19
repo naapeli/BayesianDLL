@@ -16,6 +16,38 @@ class RandomParameter:
     parameters are then sampled from the marginal posterior and posterior
     draws of the enumerated parameter are added to the sampling result
     afterwards (see :func:`BayesianDLL.marginalize`).
+
+    Parameters
+    ----------
+    name : str
+        Unique node name in the model.
+    distribution : Distribution
+        The prior; its parameters may be other model nodes (referenced by name).
+    initial_value : Tensor, optional
+        Starting value (constrained), reshaped or broadcast to the value shape.
+        By default a continuous parameter starts at the image of zero under
+        the inverse transform (e.g. 1 for a positive parameter) and a
+        discrete one at the first value of its state space.
+    shape : int or tuple of int, optional
+        Event shape of the value; by default the distribution's event shape,
+        and ``(1,)`` for a scalar distribution (values are at least 1-d).
+        The value shape is ``(*plate_sizes, *shape)`` with the sizes of the
+        enclosing plates.
+    sampler : {"auto", "nuts", "metropolis", "slice", "gibbs"}, default "auto"
+        The sampler requested for this parameter's block in
+        :func:`~BayesianDLL.sample`.
+    enumerate : bool, default False
+        Sum the parameter out instead of sampling it, see above.
+    **sampler_params
+        Settings for the sampler of this parameter's block (e.g. ``delta=0.9``).
+
+    Raises
+    ------
+    RuntimeError
+        Outside an active model, or if the distribution refers to a node not
+        in the model.
+    ValueError
+        With ``enumerate=True`` for a distribution without finite support.
     """
 
     def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", enumerate=False, **sampler_params):
@@ -81,12 +113,14 @@ class RandomParameter:
             raise RuntimeError("One should select an active model before creating random variables.")
 
     def set_unconstrained_value(self, unconstrained_value):
+        """Set the value from the unconstrained space (the constrained value follows via the inverse transform)."""
         if not isinstance(unconstrained_value, torch.Tensor):
             raise TypeError("unconstrained_value should be a torch.Tensor.")
         self.unconstrained_value = unconstrained_value
         self.constrained_value = self.distribution.transform.inverse(unconstrained_value)
-    
+
     def set_constrained_value(self, constrained_value):
+        """Set the constrained value (the unconstrained value follows via the forward transform)."""
         if not isinstance(constrained_value, torch.Tensor):
             raise TypeError("constrained_value should be a torch.Tensor.")
         self.constrained_value = constrained_value
@@ -122,6 +156,27 @@ def _check_enumerable(name, distribution):
 
 
 class ObservedParameter:
+    """An observed node of the active model: a likelihood term ``log p(observed_values | parents)``.
+
+    Parameters
+    ----------
+    name : str
+        Unique node name in the model.
+    distribution : Distribution
+        The likelihood; its parameters may be other model nodes.
+    observed_values : Tensor or Data
+        The observations. With a :class:`~BayesianDLL.Data` node the current
+        value of the node is used, so the data can be replaced later.
+    sampler : str, default "auto"
+        Sampler of the MCMC fallback used by the predictive functions when
+        the distribution cannot be sampled directly.
+    **sampler_params
+        Settings for that sampler.
+
+    ``predictive_shape`` is the shape of a generated data set: the shape of
+    the observations with the plate sizes resolved at call time.
+    """
+
     def __init__(self, name, distribution, observed_values, sampler="auto", **sampler_params):
         self.name = name
         self.distribution = distribution
@@ -227,7 +282,28 @@ class DeterministicParameter:
       it is given. Inputs missing from the returned dict get no gradient.
 
     When only ``vjp_func`` is given, :meth:`derivatives` builds dense
-    Jacobians from it (one VJP per output element).
+    Jacobians from it (one VJP per output element). At least one of the two
+    is required (``TypeError`` otherwise).
+
+    In a batched model (vectorized chains) inputs that depend on a latent
+    parameter carry a leading chain dimension and are padded with singleton
+    dimensions after it, so functions built from broadcasting operations
+    work unchanged; others must override :meth:`batched_forward` and
+    :meth:`batched_vjp`, or the model is evaluated chain by chain.
+
+    Parameters
+    ----------
+    name : str
+        Unique node name in the model.
+    forward_func : callable
+        ``forward_func(*input_values) -> Tensor``.
+    derivative_func : callable, optional
+        Local derivatives, see above.
+    inputs : sequence
+        Model nodes (parameters, deterministic nodes, ``Data``) or constant
+        tensors, passed to the functions in order.
+    vjp_func : callable, optional
+        Vector-Jacobian product, see above.
     """
 
     def __init__(self, name, forward_func, derivative_func=None, inputs=(), vjp_func=None):
@@ -414,6 +490,10 @@ class VariationalParameter:
     ``value``. This is recommended for positive parameters such as variances:
     Adam then takes multiplicative steps, so small variances can be reached
     without overshooting the lower bound.
+
+    ``value`` is converted to a tensor (float32 unless it already is a
+    tensor) of at least one dimension; every update is clamped to
+    ``[min, max]``. With ``log_scale=True`` the value must be positive.
     """
 
     def __init__(self, name, value, min=-float("inf"), max=float("inf"), log_scale=False):
