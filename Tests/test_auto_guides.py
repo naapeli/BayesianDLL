@@ -201,3 +201,78 @@ def test_minibatch_scales_likelihood():
             assert model.data["x"].value.shape == (3,)
             estimates.append(scaled_log_joint(model, scales))
     assert torch.stack(estimates).mean().item() == pytest.approx(full.item(), rel=0.02)
+
+
+@pytest.mark.parametrize("outer_sized_by_data", [False, True])
+def test_minibatch_subsamples_inner_nested_plate(outer_sized_by_data):
+    """The subsampled axis is the plate's position in the value shape, not its sizing dim.
+
+    The inner plate of a nested pair sits at position 1 of the observed values
+    (shape (groups, n)), while its sizing Data is 1-d.
+    """
+    from BayesianDLL.Variational._minibatch import Subsampler
+    from BayesianDLL.Variational._ELBO import scaled_log_joint
+
+    n_groups, n = 3, 8
+    torch.manual_seed(0)
+    x = torch.randn(n, dtype=torch.float64)
+    y = torch.randn(n_groups, n, dtype=torch.float64)
+    with Model() as model:
+        a = RandomParameter("a", Normal(0.0, 1.0))
+        group_sizes = Data("groups", torch.zeros(n_groups, dtype=torch.float64))
+        xs = Data("x", x)
+        mu = DeterministicParameter("mu", lambda a, x: a * x, lambda a, x: {"a": x}, [a, xs])
+        with plate("groups", group_sizes if outer_sized_by_data else n_groups):
+            with plate("obs", xs):
+                ObservedParameter("y", Normal(mu, 1.0), y)
+
+    subsampler = Subsampler(model, 4, subsample_plate="obs")
+    a_value = model.params["a"].constrained_value
+    with subsampler.minibatch(generator=torch.Generator().manual_seed(1)) as scales:
+        x_batch = model.data["x"].value
+        y_batch = model.observed_params["y"].observed_values
+        assert x_batch.shape == (4,)
+        assert y_batch.shape == (n_groups, 4)
+        # Every row of the batch is the same subset of columns as x.
+        columns = [int(torch.nonzero(x == value)[0]) for value in x_batch]
+        assert torch.equal(y_batch, y[:, columns])
+        expected = (
+            torch.distributions.Normal(0.0, 1.0).log_prob(a_value).sum()
+            + scales["y"] * torch.distributions.Normal(a_value * x_batch, 1.0).log_prob(y_batch).sum()
+        )
+        assert scaled_log_joint(model, scales).item() == pytest.approx(expected.item(), rel=1e-10)
+    assert torch.equal(model.data["x"].value, x)
+    assert torch.equal(model.observed_params["y"].observed_values, y)
+
+
+def test_minibatch_subsamples_outer_nested_plate():
+    """Subsampling the outer plate of a nested pair slices axis 0 of the observations."""
+    from BayesianDLL.Variational._minibatch import Subsampler
+    from BayesianDLL.Variational._ELBO import scaled_log_joint
+
+    n, n_inner = 8, 3
+    torch.manual_seed(0)
+    x = torch.randn(n, dtype=torch.float64)
+    y = torch.randn(n, n_inner, dtype=torch.float64)
+    with Model() as model:
+        a = RandomParameter("a", Normal(0.0, 1.0))
+        xs = Data("x", x)
+        mu = DeterministicParameter("mu", lambda a, x: (a * x).unsqueeze(-1), lambda a, x: {"a": x.unsqueeze(-1)}, [a, xs])
+        with plate("obs", xs):
+            with plate("repeats", n_inner):
+                ObservedParameter("y", Normal(mu, 1.0), y)
+
+    subsampler = Subsampler(model, 4, subsample_plate="obs")
+    a_value = model.params["a"].constrained_value
+    with subsampler.minibatch(generator=torch.Generator().manual_seed(1)) as scales:
+        x_batch = model.data["x"].value
+        y_batch = model.observed_params["y"].observed_values
+        assert x_batch.shape == (4,)
+        assert y_batch.shape == (4, n_inner)
+        rows = [int(torch.nonzero(x == value)[0]) for value in x_batch]
+        assert torch.equal(y_batch, y[rows])
+        expected = (
+            torch.distributions.Normal(0.0, 1.0).log_prob(a_value).sum()
+            + scales["y"] * torch.distributions.Normal((a_value * x_batch).unsqueeze(-1), 1.0).log_prob(y_batch).sum()
+        )
+        assert scaled_log_joint(model, scales).item() == pytest.approx(expected.item(), rel=1e-10)
