@@ -104,9 +104,10 @@ class ScaleTrilParameter(VariationalParameter):
 class AutoGuide(BaseGuide):
     """Base class of the automatic Gaussian guides over the concatenated unconstrained latents.
 
-    The guide is built from ``model``: every latent gets a Normal family on
-    its unconstrained value. For other variational families write a
-    :class:`Guide` by hand.
+    The guide is built from ``model``: a Gaussian over the concatenation of
+    the latents' unconstrained values, centred at the model's current values.
+    All latents must be continuous. The ELBO uses the reparameterisation
+    trick. For other variational families write a :class:`Guide` by hand.
 
     ``guide.sample(n)`` draws directly from the guide (no MCMC) and returns a
     :class:`SamplingResult` in the constrained space, including the
@@ -155,6 +156,7 @@ class AutoGuide(BaseGuide):
         return total / n_samples, grads
 
     def sample_unconstrained(self, n):
+        """``n`` draws ``(n, D)`` of the flat unconstrained latent vector."""
         return self._transform(self._noise(n))
 
     def sample(self, n_samples=1000, n_chains=1):
@@ -168,7 +170,12 @@ class AutoGuide(BaseGuide):
         return self._transform(torch.zeros(1, self.layout.dim, dtype=self.layout.dtype, device=self.layout.device))[0]
 
     def median(self):
-        """Constrained values at the guide's mean (the median of every latent)."""
+        """Constrained values at the guide's mean, ``{name: value}``.
+
+        For elementwise transforms this is the median of every latent's
+        marginal; for vector transforms (simplex, Cholesky factors) it is the
+        image of the mean only.
+        """
         return self.layout.to_constrained(self.model, self.loc)
 
 
@@ -177,7 +184,9 @@ class AutoNormal(AutoGuide):
 
     For each latent ``name`` the guide has the VariationalParameters
     ``f"{name}_loc"`` and ``f"{name}_scale"`` (optimised on the log scale).
-    The guide starts at the model's current values with scale ``init_scale``.
+    The guide starts at the model's current values with scale ``init_scale``
+    (default ``0.1``). The entropy gradient ``1 / scale`` is added to the
+    reparameterised scale gradient ``g eps``.
     """
 
     def __init__(self, model, init_scale=0.1):
@@ -225,7 +234,10 @@ class AutoMultivariateNormal(AutoGuide):
     diagonal is kept positive (log-diagonal parameterisation). The hand-written
     reparameterisation gradients are ``d/dloc = g`` and
     ``d/dL = tril(g eps^T) + diag(1 / L_ii)``, where the last term is the
-    gradient of the entropy ``sum_i log L_ii``.
+    gradient of the entropy ``sum_i log L_ii`` (``g`` is the gradient of the
+    unconstrained log joint at ``z``). The VariationalParameters are
+    ``"loc"`` (starting at the model's current values) and ``"scale_tril"``
+    (starting at ``init_scale * I``, default ``init_scale=0.1``).
     """
 
     def __init__(self, model, init_scale=0.1):

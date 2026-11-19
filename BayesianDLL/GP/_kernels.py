@@ -261,6 +261,7 @@ class Kernel(ABC):
 
     @property
     def parameters(self):
+        """The named model nodes among the kernel's hyperparameters (each once)."""
         return self._parameters
 
     # ------------------------------------------------------------------
@@ -275,6 +276,11 @@ class Kernel(ABC):
         return values
 
     def evaluate(self, x1, x2, parameter_values=None):
+        """Covariance matrix ``(N, M)`` of inputs ``x1`` ``(N, D)`` / ``(N,)`` and ``x2`` ``(M, D)`` / ``(M,)``.
+
+        ``parameter_values`` optionally maps parameter names to values that
+        replace the nodes' current values (e.g. a posterior draw).
+        """
         if type(self).batch_evaluate is Kernel.batch_evaluate:
             raise NotImplementedError(f"{type(self).__name__} must implement evaluate or batch_evaluate.")
         return self.batch_evaluate(_batch_inputs(x1), _batch_inputs(x2), self._single_values(parameter_values))[0]
@@ -321,6 +327,7 @@ class Kernel(ABC):
         return self.input_vjp(x, x, cotangent + cotangent.transpose(-2, -1), parameter_values=parameter_values)
 
     def __call__(self, x1, x2=None, parameter_values=None):
+        """``kernel(x1, x2)`` is :meth:`evaluate`; ``x2`` defaults to ``x1``."""
         if x2 is None:
             x2 = x1
         return self.evaluate(x1, x2, parameter_values=parameter_values)
@@ -396,6 +403,8 @@ class Kernel(ABC):
 
 
 class Constant(Kernel):
+    """``k(x1, x2) = v`` for all inputs, with a scalar ``variance`` ``v`` (default ``1.0``)."""
+
     def __init__(self, variance=1.0):
         super().__init__(variance)
         self.variance = variance
@@ -417,7 +426,13 @@ class Constant(Kernel):
 
 
 class WhiteNoise(Kernel):
-    """Independent noise on matching input points."""
+    """Independent noise: ``K(X1, X2) = v I`` when ``X1`` and ``X2`` are the same inputs, else ``0``.
+
+    "The same inputs" means equal tensors (same shape and values), so the
+    kernel adds ``v`` to the diagonal of ``K(X, X)`` and nothing to
+    cross-covariances, even at coincident points. ``variance`` ``v`` is a
+    scalar (default ``1e-6``).
+    """
 
     def __init__(self, variance=1e-6):
         super().__init__(variance)
@@ -474,7 +489,8 @@ class RBF(_StationaryDiagonal, Kernel):
     ``lengthscale`` is either a scalar shared by all ``D`` features or a
     vector with one value per feature (automatic relevance determination).
     It may be a constant, a ``RandomParameter`` (e.g. with ``shape=D`` or
-    inside a plate of size ``D``) or a ``DeterministicParameter``. The
+    inside a plate of size ``D``) or a ``DeterministicParameter``.
+    ``lengthscale`` and the scalar ``variance`` ``v`` default to ``1.0``. The
     derivative w.r.t. an ARD length-scale has shape ``(D, N, M)``:
     ``dk/dl_d = k (x_{1d}-x_{2d})^2 / l_d^3``; w.r.t. the inputs,
     ``dk/dx_{1d} = -k (x_{1d}-x_{2d}) / l_d^2``.
@@ -531,7 +547,9 @@ class Periodic(_StationaryDiagonal, Kernel):
             -2\sum_{d=1}^D \sin^2(\pi (x_{1d}-x_{2d}) / p) / l_d^2
         \Bigr).
 
-    Both forms agree for one-dimensional inputs.
+    Both forms agree for one-dimensional inputs. ``lengthscale``,
+    ``variance`` and ``period`` default to ``1.0``; ``variance`` and
+    ``period`` are scalars.
     """
 
     def __init__(self, lengthscale=1.0, variance=1.0, period=1.0):
@@ -604,8 +622,11 @@ class Matern(_StationaryDiagonal, Kernel):
     r"""Matérn kernel for any fixed positive finite smoothness ``nu``.
 
     With ``s = sqrt(sum_d (x_{1d}-x_{2d})^2 / l_d^2)`` and
-    ``a = sqrt(2 nu) s``, ``k = v 2^{1-nu}/Gamma(nu) a^nu K_nu(a)``.
-    ``lengthscale`` may be scalar or hold one value per feature (ARD).
+    ``a = sqrt(2 nu) s``, ``k = v 2^{1-nu}/Gamma(nu) a^nu K_nu(a)``
+    (``K_nu`` the modified Bessel function of the second kind).
+    ``lengthscale`` (default ``1.0``) may be scalar or hold one value per
+    feature (ARD); ``variance`` ``v`` is a scalar (default ``1.0``); ``nu``
+    is a fixed Python number (default ``1.5``) and receives no gradient.
 
     * Half-integer ``nu = p + 1/2`` (0.5, 1.5, 2.5, ...) uses the exact
       closed form ``k = v exp(-a) p!/(2p)! Σ_i (p+i)!/(i!(p-i)!) (2a)^{p-i}``.
@@ -696,11 +717,15 @@ class Matern(_StationaryDiagonal, Kernel):
 
 
 class Matern32(Matern):
+    """Matérn kernel with ``nu = 3/2``: ``k = v (1 + a) exp(-a)``, ``a = sqrt(3) s``."""
+
     def __init__(self, lengthscale=1.0, variance=1.0):
         super().__init__(lengthscale=lengthscale, variance=variance, nu=1.5)
 
 
 class Matern52(Matern):
+    """Matérn kernel with ``nu = 5/2``: ``k = v (1 + a + a²/3) exp(-a)``, ``a = sqrt(5) s``."""
+
     def __init__(self, lengthscale=1.0, variance=1.0):
         super().__init__(lengthscale=lengthscale, variance=variance, nu=2.5)
 
@@ -718,7 +743,9 @@ class RationalQuadratic(_StationaryDiagonal, Kernel):
     ``B = 1 + r^2 / (2 alpha)`` the derivatives are
     ``dk/dl_d = k (x_{1d}-x_{2d})^2 / (l_d^3 B)``,
     ``dk/dalpha = k (r^2 / (2 alpha B) - log B)`` and
-    ``dk/dx_{1d} = -k (x_{1d}-x_{2d}) / (l_d^2 B)``.
+    ``dk/dx_{1d} = -k (x_{1d}-x_{2d}) / (l_d^2 B)``. All three
+    hyperparameters default to ``1.0``; ``variance`` and ``alpha`` are
+    scalars.
     """
 
     def __init__(self, lengthscale=1.0, variance=1.0, alpha=1.0):
@@ -761,7 +788,11 @@ class RationalQuadratic(_StationaryDiagonal, Kernel):
 
 
 class Linear(Kernel):
-    """``k(x1, x2) = v (x1 - c)·(x2 - c)`` with a scalar or per-feature offset ``c``."""
+    """``k(x1, x2) = v (x1 - c)·(x2 - c)`` with a scalar or per-feature offset ``c``.
+
+    ``variance`` ``v`` (scalar, default ``1.0``) and ``offset`` ``c``
+    (default ``0.0``). The kernel is not stationary.
+    """
 
     def __init__(self, variance=1.0, offset=0.0):
         super().__init__(variance, offset)
@@ -798,6 +829,14 @@ class Linear(Kernel):
 
 
 class SumKernel(Kernel):
+    """``k = k_1 + k_2 + ...`` (also built with ``k1 + k2``).
+
+    Parts may be :class:`Kernel` objects, numbers (constant kernels without
+    gradient) or plain callables ``k(x1, x2)`` (no gradients, unbatched
+    inputs only). A parameter shared by several parts gets the sum of their
+    derivatives.
+    """
+
     def __init__(self, *kernels):
         self.kernels = tuple(kernels)
         super().__init__(*(parameter for kernel in self.kernels for parameter in _kernel_parameters(kernel)))
@@ -817,6 +856,11 @@ class SumKernel(Kernel):
 
 
 class ProductKernel(Kernel):
+    """``k = k_1 k_2 ...`` (elementwise product of the covariance matrices; also built with ``k1 * k2``).
+
+    Parts are as for :class:`SumKernel`; derivatives follow the product rule.
+    """
+
     def __init__(self, *kernels):
         self.kernels = tuple(kernels)
         super().__init__(*(parameter for kernel in self.kernels for parameter in _kernel_parameters(kernel)))

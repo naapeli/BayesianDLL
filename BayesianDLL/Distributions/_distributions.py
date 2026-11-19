@@ -149,6 +149,22 @@ def _mvdigamma(a, p):
 
 
 class Distribution(ABC):
+    """Base class of all distributions.
+
+    A distribution's parameters may be Python numbers, tensors, model nodes
+    (``RandomParameter``, ``DeterministicParameter``, ``ObservedParameter``,
+    ``Data``) or ``VariationalParameter`` objects; they are resolved to
+    tensors every time a density is evaluated. Parameters broadcast like
+    ``torch`` tensors to ``batch_shape``. Inside a vectorized (batched)
+    evaluation the values of batched model nodes carry a leading chain
+    dimension, which broadcasts in the same way.
+
+    ``transform`` maps the unconstrained sampling space to the support
+    (``transform.inverse``: unconstrained -> constrained), ``state_space``
+    describes the support and ``transformed_state_space`` the unconstrained
+    space.
+    """
+
     #: ``True`` when ``sample(..., _reparametrization_trick_grad=True)`` is supported.
     has_rsample = False
 
@@ -170,32 +186,55 @@ class Distribution(ABC):
         return ()
 
     def pdf(self, x):
+        """Density (or probability mass) ``exp(log_pdf(x))``."""
         return torch.exp(self.log_pdf(x))
 
     @abstractmethod
     def log_pdf(self, x):
         """
-        Log probability density.  Returns a tensor whose shape equals the
-        broadcast batch dimensions (event dimensions are summed out).
+        Log probability density (or mass) of ``x`` in the constrained space.
+        Returns a tensor with the broadcast shape of ``x`` and the batch
+        dimensions, without the event dimensions (they are summed out).
+        Values outside the support give ``-inf``.
         """
         pass
 
     @abstractmethod
     def log_pdf_grad(self, x):
+        """Gradient of :meth:`log_pdf` w.r.t. ``x`` (same shape as ``x``).
+
+        Discrete distributions raise ``NotImplementedError``.
+        """
         pass
 
     @abstractmethod
     def log_pdf_param_grads(self, x):
+        """Gradients of :meth:`log_pdf` w.r.t. the distribution's parameters.
+
+        Returns a dict keyed by the name of each parameter (the node's name
+        for model nodes and variational parameters, a fixed key such as
+        ``"mean"`` or ``"sigma"`` for constants). Each value has the
+        broadcast shape of ``log_pdf(x)`` (plus the parameter's event
+        dimensions for vector or matrix parameters); the caller sums it onto
+        the parameter's shape.
+        """
         pass
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
-        """Draw ``n_samples`` samples of shape ``(n_samples, *batch_shape, *event_shape)``."""
+        """Draw ``n_samples`` samples of shape ``(n_samples, *batch_shape, *event_shape)``.
+
+        With ``_reparametrization_trick_grad=True`` (only when
+        :attr:`has_rsample`) the result is ``(samples, grads)`` with
+        ``grads[name]`` the derivative of the samples w.r.t. each parameter.
+        """
         raise NotImplementedError(f"{type(self).__name__} does not implement sampling.")
 
     def cdf(self, x):
+        """Cumulative distribution function ``P(X <= x)`` (where available)."""
         raise NotImplementedError(f"{type(self).__name__} has no closed-form cdf.")
 
     def icdf(self, u):
+        """Inverse of :meth:`cdf` for ``u`` in ``(0, 1)`` (where available)."""
         raise NotImplementedError(f"{type(self).__name__} has no closed-form inverse cdf.")
 
     def _no_reparam(self):
@@ -239,7 +278,14 @@ class Distribution(ABC):
 
 # ========================= CONTINUOUS =========================
 class Normal(Distribution):
-    """Normal distribution with mean ``mu`` and **standard deviation** ``sigma``."""
+    """Normal distribution with mean ``mu`` and **standard deviation** ``sigma``.
+
+    ``log p(x) = -(x - mu)^2 / (2 sigma^2) - log sigma - log(2 pi) / 2`` on
+    the real line. ``mu`` and ``sigma > 0`` are numbers, tensors or model
+    nodes and broadcast to ``batch_shape``. Supports ``cdf``, ``icdf``,
+    ``cdf_param_grads`` (used by :class:`Truncated`) and reparameterised
+    sampling.
+    """
 
     has_rsample = True
 
@@ -299,7 +345,12 @@ class Normal(Distribution):
 
 
 class HalfNormal(Distribution):
-    """Half-normal distribution ``|N(0, sigma^2)|`` with scale ``sigma``."""
+    """Half-normal distribution ``|N(0, sigma^2)|`` with scale ``sigma``.
+
+    ``log p(x) = log(2 / pi) / 2 - log sigma - x^2 / (2 sigma^2)`` for
+    ``x > 0``; ``sigma > 0`` is the standard deviation of the underlying
+    normal. Sampled on ``log x`` (:class:`LogTransform`).
+    """
 
     has_rsample = True
 
@@ -351,7 +402,12 @@ class HalfNormal(Distribution):
 
 
 class LogNormal(Distribution):
-    """``exp(N(mu, sigma^2))`` with ``sigma`` the standard deviation of the log."""
+    """Log-normal distribution ``exp(N(mu, sigma^2))``.
+
+    ``mu`` and ``sigma > 0`` are the mean and **standard deviation** of
+    ``log x``: ``log p(x) = -log x - log sigma - log(2 pi) / 2 -
+    (log x - mu)^2 / (2 sigma^2)`` for ``x > 0``. Sampled on ``log x``.
+    """
 
     has_rsample = True
 
@@ -411,11 +467,17 @@ class MultivariateNormal(Distribution):
     """Multivariate normal parameterised by ``covariance`` **or** ``scale_tril``.
 
     ``MultivariateNormal(mu, covariance)`` or
-    ``MultivariateNormal(mu, scale_tril=L)`` with ``L`` lower triangular and
-    ``covariance = L @ L.T``. The covariance gradient returned by
+    ``MultivariateNormal(mu, scale_tril=L)`` with ``L`` lower triangular
+    (positive diagonal) and ``covariance = L @ L.T``; exactly one of the two
+    must be given. ``mu`` has shape ``(..., D)`` (a scalar is broadcast to
+    ``D`` entries) and the matrix ``(..., D, D)``; leading dimensions are
+    batch dimensions. ``log_pdf`` returns one value per batch element. The
+    covariance gradient returned by
     :meth:`log_pdf_param_grads` is the full symmetric matrix
     ``0.5 * (S^-1 d d^T S^-1 - S^-1)``; the ``scale_tril`` gradient is lower
-    triangular.
+    triangular. Reparameterised sampling gives gradients w.r.t. ``mu``
+    only, so ``has_rsample`` is ``False`` when the matrix is a
+    ``VariationalParameter``.
     """
 
     _param_event_ndims = {"mu": 1, "covariance": 2, "scale_tril": 2}
@@ -501,6 +563,12 @@ class MultivariateNormal(Distribution):
 
 
 class Beta(Distribution):
+    """Beta distribution on ``(0, 1)`` with concentrations ``a > 0`` and ``b > 0``.
+
+    ``log p(x) = (a - 1) log x + (b - 1) log(1 - x) - log B(a, b)``; mean
+    ``a / (a + b)``. Sampled on ``logit x`` (:class:`LogitTransform`).
+    """
+
     def __init__(self, a, b):
         super().__init__(LogitTransform(low=0, high=1), ContinuousRange(0, 1), ContinuousReal())
         self.a = a
@@ -549,6 +617,13 @@ class Beta(Distribution):
 
 
 class Exponential(Distribution):
+    """Exponential distribution with **rate** ``rate > 0`` (mean ``1 / rate``).
+
+    ``log p(x) = log rate - rate x`` for ``x > 0``. Sampled on ``log x``;
+    supports ``cdf``, ``icdf``, ``cdf_param_grads`` and reparameterised
+    sampling.
+    """
+
     has_rsample = True
 
     def __init__(self, rate):
@@ -614,7 +689,12 @@ class Exponential(Distribution):
 
 
 class Gamma(Distribution):
-    """Gamma distribution with shape ``alpha`` and **rate** ``beta``."""
+    """Gamma distribution with shape ``alpha > 0`` and **rate** ``beta > 0``.
+
+    ``log p(x) = alpha log beta - log Gamma(alpha) + (alpha - 1) log x -
+    beta x`` for ``x > 0``; mean ``alpha / beta`` (the scale is
+    ``1 / beta``). Sampled on ``log x``; no reparameterised sampler.
+    """
 
     def __init__(self, alpha, beta):
         super().__init__(LogTransform(border=0, side="larger"), ContinuousPositive(), ContinuousReal())
@@ -739,6 +819,13 @@ class Uniform(Distribution):
 
 
 class InvGamma(Distribution):
+    """Inverse-gamma distribution with shape ``alpha > 0`` and **scale** ``beta > 0``.
+
+    ``1 / X ~ Gamma(alpha, rate=beta)``, i.e. ``log p(x) = alpha log beta -
+    log Gamma(alpha) - (alpha + 1) log x - beta / x`` for ``x > 0``; mean
+    ``beta / (alpha - 1)`` for ``alpha > 1``. Sampled on ``log x``.
+    """
+
     def __init__(self, alpha, beta):
         super().__init__(LogTransform(border=0, side="larger"), ContinuousPositive(), ContinuousReal())
         self.alpha = alpha
@@ -790,6 +877,12 @@ class InvGamma(Distribution):
 
 
 class HalfCauchy(Distribution):
+    """Half-Cauchy distribution ``|Cauchy(0, scale)|`` with ``scale > 0``.
+
+    ``log p(x) = log 2 - log pi - log scale - log(1 + (x / scale)^2)`` for
+    ``x > 0``. Sampled on ``log x``.
+    """
+
     has_rsample = True
 
     def __init__(self, scale):
@@ -848,6 +941,11 @@ class HalfCauchy(Distribution):
 
 
 class Cauchy(Distribution):
+    """Cauchy distribution with location ``mu`` and scale ``scale > 0``.
+
+    ``log p(x) = -log pi - log scale - log(1 + ((x - mu) / scale)^2)``.
+    """
+
     has_rsample = True
 
     def __init__(self, mu, scale):
@@ -902,6 +1000,12 @@ class Cauchy(Distribution):
 
 
 class Laplace(Distribution):
+    """Laplace (double-exponential) distribution with location ``mu`` and scale ``scale > 0``.
+
+    ``log p(x) = -log 2 - log scale - |x - mu| / scale``; the variance is
+    ``2 scale^2``.
+    """
+
     has_rsample = True
 
     def __init__(self, mu, scale):
@@ -958,6 +1062,12 @@ class Laplace(Distribution):
 
 class StudentT(Distribution):
     """Student's t with ``nu`` degrees of freedom, location ``mu`` and scale ``sigma``.
+
+    ``mu`` defaults to ``0.0`` and ``sigma`` to ``1.0``. With
+    ``t = (x - mu) / sigma``: ``log p(x) = log Gamma((nu + 1) / 2) -
+    log Gamma(nu / 2) - log(nu pi) / 2 - log sigma - (nu + 1) / 2
+    log(1 + t^2 / nu)``. ``sigma`` is a scale, not the standard deviation
+    (which is ``sigma sqrt(nu / (nu - 2))`` for ``nu > 2``).
 
     Reparameterised sampling gives gradients w.r.t. ``mu`` and ``sigma`` only,
     so ``has_rsample`` is ``False`` when ``nu`` is a VariationalParameter.
@@ -1017,7 +1127,12 @@ class StudentT(Distribution):
 
 
 class Dirichlet(Distribution):
-    """Dirichlet distribution on the simplex.
+    """Dirichlet distribution on the simplex with concentrations ``alpha``.
+
+    ``alpha`` has shape ``(..., K)`` with positive entries (last dimension =
+    number of categories; leading dimensions are batch dimensions) and
+    ``log p(x) = sum_k (alpha_k - 1) log x_k - (sum_k log Gamma(alpha_k) -
+    log Gamma(sum_k alpha_k))``.
 
     Sampled in the ``K-1`` dimensional unconstrained space of a
     :class:`StickBreakingTransform` (the unconstrained value has shape
@@ -1088,7 +1203,12 @@ class LKJCholesky(Distribution):
 
     ``p(L) ∝ prod_{i>=2} L_ii^{dim - i + 2 eta - 2}`` (1-indexed), i.e. the
     correlation matrix ``L L^T`` has density ``∝ det(L L^T)^(eta - 1)``.
-    The unconstrained space is ``R^{dim(dim-1)/2}`` via
+    The density is taken w.r.t. the strictly lower-triangular entries of
+    ``L`` and is normalised (the same convention as
+    ``torch.distributions.LKJCholesky``). ``dim >= 2`` is an integer and
+    ``eta > 0`` (default ``1.0``, uniform over correlation matrices) may be a
+    model node; ``eta > 1`` concentrates mass near the identity. The
+    unconstrained space is ``R^{dim(dim-1)/2}`` via
     :class:`CorrCholeskyTransform` (tanh of canonical partial correlations).
     """
 
@@ -1245,7 +1365,14 @@ class Wishart(_WishartFamily):
     """Wishart distribution over ``D x D`` SPD matrices with ``df`` degrees of freedom.
 
     ``Wishart(df, scale)`` or ``Wishart(df, scale_tril=L)`` with
-    ``scale = L L^T``; ``E[X] = df * scale``. Sampled in the
+    ``scale = L L^T`` (exactly one of the two); ``df > D - 1`` and
+    ``E[X] = df * scale``. The density is
+
+    ``log p(X) = (df - D - 1)/2 log|X| - tr(scale^-1 X)/2 - df D/2 log 2 -
+    df/2 log|scale| - log Gamma_D(df/2)``
+
+    (``Gamma_D`` the multivariate gamma function), w.r.t. the ``D(D+1)/2``
+    unique entries of ``X``. Sampled in the
     ``D(D+1)/2``-dimensional unconstrained space of a
     :class:`PositiveDefiniteTransform`. Matrix gradients are full symmetric
     matrices (entries treated as independent), the ``scale_tril`` gradient is
@@ -1311,9 +1438,14 @@ class Wishart(_WishartFamily):
 class InverseWishart(_WishartFamily):
     """Inverse-Wishart distribution: ``X^-1 ~ Wishart(df, scale^-1)``.
 
-    ``InverseWishart(df, scale)`` or ``InverseWishart(df, scale_tril=L)``;
-    ``E[X] = scale / (df - D - 1)``. Same transform and gradient conventions
-    as :class:`Wishart`.
+    ``InverseWishart(df, scale)`` or ``InverseWishart(df, scale_tril=L)``
+    (``scale = L L^T``); ``df > D - 1`` and ``E[X] = scale / (df - D - 1)``
+    for ``df > D + 1``. The density is
+
+    ``log p(X) = df/2 log|scale| - df D/2 log 2 - log Gamma_D(df/2) -
+    (df + D + 1)/2 log|X| - tr(scale X^-1)/2``.
+
+    Same transform and gradient conventions as :class:`Wishart`.
     """
 
     def log_pdf(self, x):
@@ -1384,7 +1516,13 @@ class _ProbsOrLogits:
 
 
 class Geometric(_ProbsOrLogits, Distribution):
-    """Number of trials up to and including the first success (support 1, 2, ...)."""
+    """Number of trials up to and including the first success (support 1, 2, ...).
+
+    Give exactly one of ``probs`` (success probability ``p`` in ``(0, 1]``)
+    or ``logits`` (``logit p``): ``log p(k) = log p + (k - 1) log(1 - p)``,
+    mean ``1 / p``. Note that ``torch.distributions.Geometric`` counts the
+    failures instead (support 0, 1, ...).
+    """
 
     def __init__(self, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscretePositive(), DiscretePositive())
@@ -1427,6 +1565,12 @@ class Geometric(_ProbsOrLogits, Distribution):
 
 
 class Bernoulli(_ProbsOrLogits, Distribution):
+    """Bernoulli distribution on ``{0, 1}``.
+
+    Give exactly one of ``probs`` (``P(x = 1)``) or ``logits``
+    (``logit P(x = 1)``, numerically more stable).
+    """
+
     def __init__(self, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscreteRange(0, 1), DiscreteRange(0, 1))
         self._init_probs(probs, logits)
@@ -1468,6 +1612,13 @@ class Bernoulli(_ProbsOrLogits, Distribution):
 
 
 class Binomial(_ProbsOrLogits, Distribution):
+    """Number of successes in ``n`` independent trials (support ``0, ..., n``).
+
+    ``n`` is the (integer-valued) number of trials; give exactly one of
+    ``probs`` (success probability ``p``) or ``logits`` (``logit p``):
+    ``log p(k) = log C(n, k) + k log p + (n - k) log(1 - p)``.
+    """
+
     def __init__(self, n, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscreteRange(0, n), DiscreteRange(0, n))
         self.n = n
@@ -1572,6 +1723,11 @@ class DiscreteUniform(Distribution):
 
 
 class Poisson(Distribution):
+    """Poisson distribution with mean ``rate > 0`` (support 0, 1, 2, ...).
+
+    ``log p(k) = k log rate - rate - log k!``.
+    """
+
     def __init__(self, rate):
         super().__init__(IdentityTransform(), DiscreteNonNegative(), DiscreteNonNegative())
         self.rate = rate
@@ -1610,7 +1766,9 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
     """Number of successes before ``total_count`` failures, success probability ``probs``.
 
     ``log p(k) = log C(k + r - 1, k) + r log(1 - p) + k log p`` (the PyTorch /
-    Pyro convention), mean ``r p / (1 - p)``.
+    Pyro convention), mean ``r p / (1 - p)``, with ``r = total_count > 0``
+    (need not be an integer). Give exactly one of ``probs`` (``p``) or
+    ``logits`` (``logit p``).
     """
 
     def __init__(self, total_count, probs=None, logits=None):
@@ -1670,8 +1828,10 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
 class Categorical(Distribution):
     """Categorical distribution over ``{0, ..., K-1}`` given ``probs`` or ``logits`` (last dim = K).
 
-    ``probs`` need not be normalised; the gradients are those of
-    ``log(probs_k / sum(probs))``.
+    Give exactly one of ``probs`` or ``logits``, shape ``(..., K)``; leading
+    dimensions are batch dimensions. ``probs`` need not be normalised; the
+    density and gradients are those of ``log(probs_k / sum(probs))``.
+    Draws are returned as floating-point category indices.
     """
 
     _param_event_ndims = {"probs": 1, "logits": 1}
@@ -1742,6 +1902,11 @@ class Categorical(Distribution):
 
 class Multinomial(Distribution):
     """Multinomial counts over K categories with ``total_count`` trials.
+
+    Give exactly one of ``probs`` (need not be normalised) or ``logits``,
+    shape ``(..., K)``. ``log p(x) = log n! - sum_k log x_k! + sum_k x_k
+    log p_k`` for non-negative integer counts summing to ``n =
+    total_count``.
 
     Supports ``log_pdf``, parameter gradients and ``sample``; it cannot be
     used as a latent variable for MCMC (its support, vectors summing to
@@ -1827,7 +1992,10 @@ class Multinomial(Distribution):
 class ZeroInflated(Distribution):
     """Zero-inflated discrete distribution: ``0`` with probability ``gate``, else ``base``.
 
-    E.g. ``ZeroInflated(Poisson(rate), gate)`` is the zero-inflated Poisson.
+    ``p(0) = gate + (1 - gate) p_base(0)`` and ``p(k) = (1 - gate)
+    p_base(k)`` for ``k != 0``, with ``gate`` in ``(0, 1)``. The support and
+    transform are those of ``base``. E.g. ``ZeroInflated(Poisson(rate),
+    gate)`` is the zero-inflated Poisson.
     """
 
     def __init__(self, base, gate):
@@ -1890,8 +2058,12 @@ class ZeroInflated(Distribution):
 class Truncated(Distribution):
     """A continuous ``base`` distribution truncated to ``[low, high]``.
 
-    Either bound may be ``None`` (no truncation on that side). The base must
-    provide ``cdf`` (and ``icdf`` for sampling). Gradients w.r.t. the base
+    ``log p(x) = log p_base(x) - log(F(high) - F(low))`` inside
+    ``[low, high]`` and ``-inf`` outside (``F`` the base cdf). Either bound
+    may be ``None`` (the default; no truncation on that side) and may be a
+    model node. The sampler works on ``logit`` (two bounds) or ``log`` (one
+    bound) of the value. The base must provide ``cdf`` (and ``icdf`` for
+    sampling, by inversion). Gradients w.r.t. the base
     parameters additionally need ``base.cdf_param_grads`` (Normal,
     Exponential, Cauchy and Laplace provide it).
     """
@@ -2007,7 +2179,8 @@ class TransformedDistribution(Distribution):
     ``log p(y) = log p_base(x) - log|det d inverse/dx|`` with
     ``x = transform.forward(y)``. MCMC runs in the base distribution's
     unconstrained space. ``state_space`` describes the support of ``y``
-    (default: real line).
+    (default ``None``: the real line). ``cdf`` and ``icdf`` assume an
+    increasing elementwise transform.
     """
 
     def __init__(self, base, transform, state_space=None):
@@ -2154,6 +2327,16 @@ class Ordered(Distribution):
 
 # ========================= Miscellaneous distributions =========================
 class Mixture(Distribution):
+    """Finite mixture ``p(x) = sum_k weights_k p_k(x)`` of ``components``.
+
+    ``components`` is a list of distributions with a common event shape;
+    ``weights`` (shape ``(K,)``, last dimension = number of components) are
+    the mixture probabilities and must sum to one (``log_pdf`` does not
+    normalise them). ``log_pdf_param_grads`` returns ``p_k(x) / p(x)`` for
+    the weights and the posterior-responsibility-weighted component
+    gradients for the component parameters.
+    """
+
     _param_event_ndims = {"weights": 1}
 
     def __init__(self, components, weights):

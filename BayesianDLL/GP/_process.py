@@ -300,14 +300,29 @@ class LatentGP(DeterministicParameter):
     r"""An explicit whitened latent GP function node.
 
     The object is a ``DeterministicParameter`` whose value is
-    ``mean(inputs) + L @ z`` with ``L Lᵀ = K``. If ``latent`` is omitted, a
-    standard-normal latent vector named ``<name>_white`` is created
-    automatically. This is a non-centred parameterization intended for NUTS
-    and variational inference.
+    ``mean + L @ z`` with ``L Lᵀ = K(X, X) + jitter I`` (the jitter of
+    :func:`stable_cholesky`). If ``latent`` is omitted, a standard-normal
+    latent vector of ``N`` values named ``latent_name`` (default
+    ``<name>_white``) is created automatically. This is a non-centred
+    parameterization intended for NUTS and variational inference.
 
-    ``inputs`` should normally be a ``Data`` object containing shape ``(N, D)``
-    or ``(N,)``. The likelihood can then use the returned function directly,
-    for example ``ObservedParameter("y", Normal(f, noise), y)``.
+    Arguments:
+
+    * ``inputs``: a named node, normally a ``Data`` object, of shape
+      ``(N, D)`` or ``(N,)``; a learnable ``RandomParameter`` /
+      ``DeterministicParameter`` also gets gradients;
+    * ``kernel``: a :class:`Kernel`;
+    * ``latent``: a named ``RandomParameter`` with ``N`` values and a
+      ``Normal(0, 1)`` prior (default ``None``: created automatically);
+    * ``mean``: a scalar, one value per input, or a named node (default ``0.0``);
+    * ``jitter``: relative diagonal jitter (default ``1e-6``);
+    * ``latent_name``: name of the automatically created latent.
+
+    The node stores them as ``gp_inputs``, ``gp_latent``, ``gp_kernel``,
+    ``gp_mean`` and ``gp_jitter``. The likelihood can use the returned
+    function directly, for example
+    ``ObservedParameter("y", Normal(f, noise), y)``; see
+    :func:`gp_predictive` for predictions at new inputs.
 
     **Gradients** (vector-Jacobian product, hand-derived). For a cotangent
     ``ḡ`` of ``f``: ``z`` gets ``Lᵀ ḡ``; with ``dL = L Φ(L⁻¹ dK L⁻ᵀ)``
@@ -495,8 +510,20 @@ class ExactGP(_GPDistribution):
 
     Unlike :class:`LatentGP`, this does not create a latent random
     variable. Kernel and noise hyperparameters remain ordinary model
-    parameters and can be sampled with MCMC. With vectorized chains the
-    covariance matrices of all chains are factorised as one batch.
+    parameters and can be sampled with MCMC (or optimised with
+    :func:`~BayesianDLL.Variational.find_MAP`, a type-II MAP estimate when
+    they have priors). With vectorized chains the covariance matrices of all
+    chains are factorised as one batch.
+
+    Arguments: ``name`` (a label for the node), ``inputs`` (a named ``Data``
+    or model node of shape ``(N, D)`` or ``(N,)``), ``kernel`` (a
+    :class:`Kernel`), ``noise_variance`` (the scalar noise **variance**
+    ``σ²``, default ``1e-6``), ``mean`` (scalar, one value per input or a
+    named node; default ``0.0``) and ``jitter`` (default ``1e-6``; the
+    relative diagonal jitter of :func:`batched_stable_cholesky`, applied to
+    ``K + σ² I`` and included in the gradients). The observations have
+    shape ``(N,)``; ``sample`` draws ``y`` including the noise. Use
+    :func:`exact_gp_predictive` for predictions at new inputs.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=0.0, jitter=1e-6):
@@ -650,10 +677,17 @@ class SparseGP(_GPDistribution):
     to collapse inducing points and underestimate the noise), so they can
     overfit ``Z``.
 
-    Use it as the distribution of an ``ObservedParameter``::
+    The other arguments are as for :class:`ExactGP`: ``noise_variance`` is
+    the scalar noise variance ``σ²`` (default ``1e-6``), ``mean`` defaults to
+    ``0.0``, ``method`` is ``"vfe"``, ``"dtc"`` or ``"fitc"`` (case
+    insensitive) and ``jitter`` (default ``1e-6``) is the relative jitter of
+    the ``K_mm`` Cholesky factor. Use it as the distribution of an
+    ``ObservedParameter``::
 
         gp = SparseGP("function", inputs, kernel, inducing_points=Z, noise_variance=noise)
         ObservedParameter("observations", gp, y)
+
+    Use :func:`sparse_gp_predictive` for predictions at new inputs.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, inducing_points, noise_variance=1e-6, mean=0.0, method="vfe", jitter=1e-6):
@@ -885,9 +919,16 @@ class SparseGP(_GPDistribution):
 def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
     """Sample latent GP values at new inputs from posterior latent traces.
 
-    ``trace`` may be a ``SamplingResult`` or a mapping containing the GP's
-    deterministic trace and kernel-parameter traces. The result has shape
-    ``(n_parameter_draws, n_samples, n_new)``.
+    ``gp`` is a :class:`LatentGP`. ``trace`` may be a ``SamplingResult`` or
+    a mapping with values of shape ``(n_chains, n_draws, *shape)``
+    containing the GP's deterministic trace (``trace[gp.name]``) and the
+    kernel-parameter traces (a kernel parameter missing from the trace keeps
+    its current value). For every draw ``f`` the function at ``inputs`` is
+    drawn ``n_samples`` times from the noise-free GP conditional
+    ``N(m* + K_*X K⁻¹ (f - m), K_** - K_*X K⁻¹ K_X*)``; a given
+    ``observation_noise`` variance is added to the diagonal. The mean is
+    the node's current ``gp_mean`` value (it is not read from the trace).
+    The result has shape ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not hasattr(gp, "gp_kernel"):
         raise TypeError("gp must be a LatentGP function returned by BayesianDLL.GP.LatentGP.")
@@ -964,9 +1005,16 @@ def exact_gp_predictive(
 ):
     """Sample exact-GP predictions conditional on observed training values.
 
-    ``trace`` contains only hyperparameter draws; the training function is
-    integrated out during inference and is sampled here from its conditional
-    Gaussian distribution. The returned tensor has shape
+    ``gp`` is an :class:`ExactGP`, ``observed_values`` the training
+    observations ``y`` (``(N,)``) and ``inputs`` the new inputs. ``trace``
+    (values of shape ``(n_chains, n_draws, *shape)``) contains only
+    hyperparameter draws; the latent function is integrated out during
+    inference and is sampled here from the GP posterior
+    ``mean = m* + K_*X (K + σ² I)⁻¹ (y - m)`` and
+    ``cov = K_** - K_*X (K + σ² I)⁻¹ K_X*``. Every named kernel parameter,
+    the noise variance and the mean must be in the trace. A given
+    ``observation_noise`` variance is added to the diagonal to predict
+    noisy observations. The returned tensor has shape
     ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not isinstance(gp, ExactGP):
@@ -1092,9 +1140,12 @@ def sparse_gp_predictive(
 
     ``mean = K_*m Σ_u K_mn Λ⁻¹ r`` and ``cov = K_** - Q_** + K_*m Σ_u K_m*``.
 
-    All solves use ``m x m`` Cholesky factors, so the cost is linear in the
-    number of training points. Learnable inducing inputs are read from the
-    trace draw by draw. The result has shape
+    Here ``r = y - mean`` with ``y = observed_values``. All solves use
+    ``m x m`` Cholesky factors, so the cost is linear in the number of
+    training points. Kernel parameters, the noise variance and the (scalar)
+    mean must be in ``trace``; learnable inducing inputs are read from the
+    trace draw by draw. A given ``observation_noise`` variance is added to
+    the diagonal. The result has shape
     ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not isinstance(gp, SparseGP):
@@ -1224,7 +1275,12 @@ class SparseLatentGP(DeterministicParameter):
     * ``whitened_values``: a ``RandomParameter`` with ``m`` values and a
       ``Normal(0, 1)`` prior; ``None`` creates ``<name>_white``;
     * ``mean``: a scalar, a vector with one value per input, or a named
-      parameter.
+      parameter (default ``0.0``);
+    * ``jitter``: relative diagonal jitter of ``K_mm`` (default ``1e-6``).
+
+    The node stores them as ``gp_inputs``, ``gp_inducing_points``,
+    ``gp_latent`` (the whitened values), ``gp_kernel``, ``gp_mean`` and
+    ``gp_jitter``.
 
     **Gradients** (hand-derived VJP). For a cotangent ``g`` of ``f`` let
     ``a = L⁻ᵀ v``, so that ``f = mean + K_nm a``:
@@ -1421,7 +1477,9 @@ def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_
 
     Under the DTC approximation the function is deterministic given the
     whitened values ``v``, the inducing inputs and the hyperparameters:
-    ``f* = mean + K_*m L⁻ᵀ v``. With ``conditional_variance=True``
+    ``f* = mean + K_*m L⁻ᵀ v`` at ``new_inputs``, so the ``n_samples``
+    samples per draw are identical by default. With
+    ``conditional_variance=True`` (default ``False``)
     independent Normal noise with the FITC-style variance
     ``diag(K_** - Q_**)`` (the prior variance that the inducing values do not
     explain) is added to every sample.
@@ -1431,7 +1489,7 @@ def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_
     contain the whitened values; learnable inducing inputs, kernel
     parameters and a named mean are read from it as well (a node missing
     from the trace keeps its current value). Draws are evaluated in batches
-    of ``chunk_size`` with the batched kernel API. The result has shape
+    of ``chunk_size`` (default ``64``) with the batched kernel API. The result has shape
     ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not isinstance(gp, SparseLatentGP):

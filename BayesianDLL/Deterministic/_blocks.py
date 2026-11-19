@@ -7,6 +7,11 @@ pass never builds a dense Jacobian. Inputs may be model nodes
 Python numbers; numbers adopt the floating dtype and device of the tensor
 inputs. Elementwise blocks broadcast their inputs like ``torch`` does, and the
 gradient of a broadcast input is summed back onto its shape.
+
+The first argument of every block is the name of the new deterministic
+node. ``Data`` inputs receive no gradient. With vectorized chains the values
+of batched nodes carry a leading chain dimension; ``dim`` arguments address
+the same axis with and without it (negative dimensions count from the right).
 """
 
 from __future__ import annotations
@@ -286,7 +291,8 @@ class Affine(_ElementwiseBlock):
     ``theta = Affine("theta", z, loc=mu, scale=tau)``. The prior geometry of
     ``z`` no longer depends on ``tau``, which removes the funnel.
 
-    ``loc`` and ``scale`` may be model nodes, tensors or numbers.
+    ``loc`` (default ``0.0``) and ``scale`` (default ``1.0``) may be model
+    nodes, tensors or numbers.
     """
 
     def __init__(self, name, x, loc=0.0, scale=1.0):
@@ -369,7 +375,7 @@ class Tanh(_ElementwiseBlock):
 
 
 class Softmax(_Block):
-    """Softmax along ``dim``: maps real vectors to the probability simplex.
+    """Softmax of ``x`` along ``dim`` (default ``-1``): maps real vectors to the probability simplex.
 
     The VJP is ``s * (g - sum(g * s, dim))`` with ``s`` the output. For a
     categorical likelihood prefer ``Categorical(logits=...)``, which is
@@ -401,7 +407,10 @@ class Softmax(_Block):
 
 # ============================================================ reductions and shapes
 class Sum(_Block):
-    """Sum of ``x`` over ``dim`` (all elements when ``dim`` is ``None``)."""
+    """Sum of ``x`` over ``dim`` (an int or a tuple; all elements when ``dim`` is ``None``, the default).
+
+    ``keepdim`` (default ``False``) keeps the summed dimensions with size one.
+    """
 
     def __init__(self, name, x, dim=None, keepdim=False):
         self.dim = dim
@@ -449,7 +458,10 @@ class Sum(_Block):
 
 
 class Concat(_Block):
-    """Concatenate inputs along ``dim`` (``torch.cat``)."""
+    """Concatenate inputs along ``dim`` (keyword-only, default ``-1``; ``torch.cat``).
+
+    Scalar inputs are treated as vectors of length one.
+    """
 
     def __init__(self, name, *inputs, dim=-1):
         if len(inputs) < 1:
@@ -490,7 +502,10 @@ class Concat(_Block):
 
 
 class Stack(_Block):
-    """Stack equally shaped inputs along a new dimension ``dim`` (``torch.stack``)."""
+    """Stack inputs along a new dimension ``dim`` (keyword-only, default ``0``; ``torch.stack``).
+
+    The inputs are first broadcast to a common shape.
+    """
 
     def __init__(self, name, *inputs, dim=0):
         if len(inputs) < 1:
@@ -588,7 +603,7 @@ class MatMul(_Block):
 
 
 class Index(_Block):
-    """Gather ``x`` along ``dim`` with an integer index, e.g. ``theta[group_idx]``.
+    """Gather ``x`` along ``dim`` (default ``0``) with an integer index, e.g. ``theta[group_idx]``.
 
     ``index`` is an integer tensor (or list), or a model node holding integer
     values: a :class:`~BayesianDLL.Data` object -- which can be replaced with

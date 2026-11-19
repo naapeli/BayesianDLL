@@ -135,8 +135,10 @@ class KroneckerGP(_GPDistribution):
     so ``G_p = ½ A_(p) B_(p)ᵀ - ½ Q_p diag(s_p) Q_pᵀ``. The noise variance
     gets ``½ (αᵀα - Σ 1/(λ + σ²))`` and the mean gets ``α``.
 
-    ``jitter`` is a constant added to the noise variance. Use it as the
-    distribution of an ``ObservedParameter``::
+    ``noise_variance`` is the scalar noise variance ``σ²`` (default
+    ``1e-6``), ``mean`` a scalar or one value per grid point (default
+    ``0.0``) and ``jitter`` (default ``1e-8``) a constant added to the noise
+    variance. Use it as the distribution of an ``ObservedParameter``::
 
         gp = KroneckerGP("f", grid_inputs=[x1, x2], kernels=[RBF(l1, v), RBF(l2)], noise_variance=s2)
         ObservedParameter("y", gp, y_grid)  # y_grid: (len(x1), len(x2))
@@ -373,14 +375,18 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
     hyperparameter draw, with ``U_p = K_p(x*_p, X_p) Q_p`` and the row-wise
     Kronecker product ``U``:
 
-    ``mean = K_*X α`` and ``cov = K_** - U diag(1/(λ+σ²)) Uᵀ``,
+    ``mean = m + K_*X α`` and ``cov = K_** - U diag(1/(λ+σ²)) Uᵀ``,
 
     both evaluated without forming an ``N x N`` matrix (the mean in
     ``O(n* N)``; the full covariance needs an ``n* x N`` matrix ``U``).
     With ``diagonal=True`` only the marginal variances are computed (in
     ``O(n* N)``) and the draws are independent across points, which is
-    enough for pointwise credible bands on large prediction grids. The
-    result has shape ``(n_parameter_draws, n_samples, n*)``.
+    enough for pointwise credible bands on large prediction grids. Here
+    ``α = (K + σ² I)⁻¹ (y - mean)`` with ``y = observed_values`` (grid
+    shaped or flattened); the kernel parameters, the noise variance and the
+    (scalar) mean are read from ``trace``, and a given ``observation_noise``
+    variance is added to the diagonal. The result has shape
+    ``(n_parameter_draws, n_samples, n*)``.
     """
     if not isinstance(gp, KroneckerGP):
         raise TypeError("gp must be a KroneckerGP.")
@@ -611,16 +617,25 @@ class ToeplitzGP(_GPDistribution):
     ``O(n²)``). With vectorized chains one Levinson recursion of ``n`` steps
     runs on ``(C, …)`` tensors, i.e. all chains in the same Python loop.
 
-    **Gradients** (hand-derived, ``O(n log n)`` on top of the solve). A
-    hyperparameter changes the first column by ``dt``; with ``c_k = Σ_i α_i α_{i+k}``
+    **Gradients** (hand-derived). They need ``T⁻¹ e_0`` as a second
+    right-hand side of the same Levinson recursion and then ``O(n log n)``
+    work. A hyperparameter changes the first column by ``dt``; with
+    ``c_k = Σ_i α_i α_{i+k}``
     and the diagonal sums ``D_k`` of ``T⁻¹`` (Gohberg-Semencul formula from
     ``T⁻¹ e_0``, evaluated with FFT correlations)
 
     ``d log p = ½ αᵀ dT α - ½ tr(T⁻¹ dT) = Σ_k w_k dt_k (c_k - D_k) / 2``,
 
     with ``w_0 = 1`` and ``w_k = 2`` for ``k > 0``. The noise variance only
-    changes ``t_0``. ``jitter`` matches :class:`ExactGP`: ``jitter * max(1, t_0)``
-    is added to the diagonal (including its derivative), per chain.
+    changes ``t_0``. ``jitter`` (default ``1e-6``) follows the first attempt
+    of :class:`ExactGP`'s jitter: ``jitter * max(1, k(0) + σ²)`` is added to
+    the diagonal (including its derivative), per chain; unlike
+    :func:`stable_cholesky` it is not increased on failure.
+    ``noise_variance`` is the scalar noise variance ``σ²`` (default
+    ``1e-6``), ``mean`` a scalar or one value per input (default ``0.0``),
+    and ``spacing_tolerance`` (default ``1e-6``) the relative tolerance of
+    the equal-spacing check. Gradients w.r.t. learnable inputs are not
+    implemented.
 
     The kernel must be stationary (RBF, Matern, RationalQuadratic,
     Periodic, Constant and their sums/products); ``inputs`` must be equally
@@ -785,10 +800,13 @@ class ToeplitzGP(_GPDistribution):
 def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
     r"""Sample predictions of a :class:`ToeplitzGP` at arbitrary new 1-D inputs.
 
-    ``mean = K_*X α`` and ``cov = K_** - K_*X T⁻¹ K_X*``, where the solves
+    ``mean = m + K_*X α`` and ``cov = K_** - K_*X T⁻¹ K_X*``, where the solves
     use :func:`levinson_solve` with ``n*`` right-hand sides
-    (``O(n² n*)``; no ``n x n`` matrix is formed). The result has shape
-    ``(n_parameter_draws, n_samples, n*)``.
+    (``O(n² n*)``; no ``n x n`` matrix is formed), ``T = K + σ² I`` plus
+    jitter and ``α = T⁻¹ (y - mean)`` with ``y = observed_values``. The
+    kernel parameters, noise variance and (scalar) mean are read from
+    ``trace``; a given ``observation_noise`` variance is added to the
+    diagonal. The result has shape ``(n_parameter_draws, n_samples, n*)``.
     """
     from ._process import stable_cholesky
     if not isinstance(gp, ToeplitzGP):

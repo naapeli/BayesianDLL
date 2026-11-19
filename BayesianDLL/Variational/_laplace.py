@@ -61,13 +61,23 @@ def _stable_cholesky(matrix, jitter):
 class LaplaceApproximation:
     """Gaussian approximation ``N(mean, cov)`` of the posterior over the unconstrained latents.
 
+    "MAP" here is the mode ``eta*`` of the posterior of the unconstrained
+    latents ``eta`` (the log joint includes the transforms' ``log|det J|``).
+
     Attributes:
-        mean: the MAP estimate (flat unconstrained vector).
-        cov: ``(-H)^-1`` with ``H`` the Hessian of the log joint at the MAP.
+        mean: the mode ``eta*`` (flat unconstrained vector).
+        cov: ``(-H)^-1`` with ``H`` the Hessian of the unconstrained log
+            joint at ``eta*`` (``-H`` plus ``jitter`` I if it was not
+            positive definite).
         scale_tril: Cholesky factor of ``cov``.
         hessian: ``H``.
-        log_marginal_likelihood: the Laplace estimate of ``log p(y)``,
-            ``log p(theta*, y) + d/2 log(2 pi) - 1/2 log det(-H)``.
+        jitter: the diagonal jitter added to ``-H`` (``0.0`` if none).
+        log_joint_at_mode: ``log p(eta*, y)``, the unconstrained log joint at the mode.
+        log_marginal_likelihood: the Laplace estimate of the evidence
+            ``log p(y)``, ``log p(eta*, y) + d/2 log(2 pi) - 1/2 log det(-H)``
+            with ``d`` the number of unconstrained values. Because
+            ``p(eta, y)`` includes the Jacobian, it integrates to ``p(y)``
+            over ``eta``.
         names: latent names, in the order of the flat vector.
     """
 
@@ -93,7 +103,7 @@ class LaplaceApproximation:
         self.log_marginal_likelihood = log_joint + 0.5 * layout.dim * math.log(2 * math.pi) - 0.5 * log_det
 
     def map_estimate(self):
-        """Constrained values at the MAP."""
+        """Constrained values ``{name: value}`` at the unconstrained mode (not the constrained-space mode)."""
         return self.layout.to_constrained(self.model, self.mean)
 
     def std(self):
@@ -101,6 +111,7 @@ class LaplaceApproximation:
         return self.layout.unpack(torch.sqrt(torch.diagonal(self.cov)))
 
     def sample_unconstrained(self, n):
+        """``n`` draws ``(n, d)`` from ``N(mean, cov)``."""
         eps = torch.randn(n, self.layout.dim, dtype=self.mean.dtype, device=self.mean.device)
         return self.mean + eps @ self.scale_tril.T
 
@@ -116,18 +127,23 @@ class LaplaceApproximation:
 def laplace_approximation(model, map_epochs=1000, lr=1e-2, betas=(0.9, 0.999), newton_steps=20, hessian="fd", fd_step=None, jitter=1e-10, tolerance=1e-9, verbose=False):
     """Laplace approximation of the posterior of ``model``.
 
-    1. The MAP is found in the unconstrained space with :func:`find_MAP`
-       (``map_epochs`` Adam steps from the current values) and refined with
-       up to ``newton_steps`` damped Newton steps.
+    1. The mode is found in the unconstrained space with :func:`find_MAP`
+       (``map_epochs`` Adam steps from the current values, learning rate
+       ``lr`` and ``betas``; ``map_epochs=0`` skips it) and refined with up
+       to ``newton_steps`` Newton steps with a backtracking line search.
+       Newton stops when the largest gradient entry or step is below
+       ``tolerance``, or when ``-H`` is not positive definite.
     2. The Hessian ``H`` of the unconstrained log joint is computed by
        central finite differences of the hand-written gradient
-       ``model.joint_grad_log_prob`` (``hessian="fd"``, the only option) and
-       symmetrised.
-    3. The posterior is approximated by ``N(MAP, (-H)^-1)``; a warning is
-       issued (and jitter added) when ``-H`` is not positive definite.
+       ``model.joint_grad_log_prob`` (``hessian="fd"``, the only option;
+       relative step ``fd_step``, default ``eps^(1/3)``) and symmetrised.
+    3. The posterior is approximated by ``N(mode, (-H)^-1)``; a warning is
+       issued (and jitter, at least ``jitter`` times the mean absolute
+       diagonal of ``-H``, added) when ``-H`` is not positive definite.
 
-    The model's parameters are left at the MAP, like :func:`find_MAP`.
-    Returns a :class:`LaplaceApproximation`.
+    ``verbose`` prints the progress of both stages. The model's parameters
+    are left at the mode, like :func:`find_MAP`. Returns a
+    :class:`LaplaceApproximation`.
     """
     if hessian != "fd":
         raise ValueError(f"Unknown hessian method '{hessian}'; only 'fd' (finite differences of the gradient) is available.")

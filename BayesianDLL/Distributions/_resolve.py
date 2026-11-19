@@ -5,6 +5,13 @@ from .._batching import aligned
 
 
 def resolve(parameter):
+    """Current tensor value of a distribution parameter.
+
+    Tensors are returned as they are, model nodes give their constrained
+    value (inside a batched evaluation with the chain dimension aligned),
+    variational parameters their value, and numbers, lists and tuples are
+    converted to tensors.
+    """
     if isinstance(parameter, torch.Tensor):
         return parameter
     elif isinstance(parameter, RandomParameter | DeterministicParameter):

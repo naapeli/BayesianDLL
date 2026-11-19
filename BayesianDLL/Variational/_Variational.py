@@ -20,7 +20,8 @@ def BBVI(model: Model, guide, n_samples=1, epochs=100, lr=1e-2, betas=(0.9, 0.99
         lr: learning rate.
         betas: Adam parameters (beta1, beta2).
         clip_norm: maximum L2 norm of each parameter's gradient.
-        lrd: learning-rate decay factor per epoch.
+        lrd: learning-rate decay factor per epoch (applied before every
+            step, so step ``t`` uses ``lr * lrd**t``).
         callback_frequency: record (and print) the ELBO every this many epochs.
         verbose: print the ELBO.
         batch_size: when given, every epoch uses a random minibatch of
