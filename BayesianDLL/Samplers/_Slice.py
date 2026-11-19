@@ -22,14 +22,31 @@ class Slice(_CachedTarget):
     the slice. Every update is accepted, so the sampler needs no gradient and
     no tuning of an acceptance rate.
 
-    ``width`` is a scalar or a tensor with one initial width per coordinate.
-    With ``adapt_width=True`` the width of every coordinate is adapted during
-    warmup towards twice the running mean of the coordinate's absolute moves,
-    a running estimate of the scale of its conditional distribution.
+    The ``max_steps_out`` extensions are split at random between the two
+    ends (Neal's ``J = floor(m V)`` to the left, the rest to the right). The
+    shrinkage gives up after 200 proposals and keeps the current value.
 
-    After each call of :meth:`step`, ``last_stats`` holds ``n_evals`` (target
-    evaluations of the step), ``accept_stat`` (always 1), ``step_size`` (mean
-    width) and ``lp`` (log target at the new state).
+    Parameters
+    ----------
+    log_target : callable
+        Maps the state tensor to its scalar log density; points outside
+        ``state_space`` count as density zero.
+    state_space : StateSpace
+        A continuous state space (otherwise a ``RuntimeError`` is raised).
+    width : float or Tensor, default 1.0
+        Initial interval width, a scalar or one positive value per coordinate.
+    max_steps_out : int, default 20
+        Total number of stepping-out extensions per coordinate update.
+    adapt_width : bool, default True
+        Adapt the width of every coordinate during warmup to the running mean
+        of ``2 |move|`` of the coordinate (the initial width counting as one
+        observation), a running estimate of the scale of its conditional
+        distribution.
+
+    :meth:`step` returns ``(theta, mean_width, 1.0, False)``. After each call,
+    ``last_stats`` holds ``n_evals`` (target evaluations of the step),
+    ``accept_stat`` (always 1), ``step_size`` (mean width) and ``lp`` (log
+    target at the new state).
     """
 
     def __init__(self, log_target, state_space, width=1.0, max_steps_out=20, adapt_width=True):

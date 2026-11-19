@@ -103,24 +103,58 @@ def _ess_tail(chains: np.ndarray, prob: float = 0.89) -> float:
 
 
 def effective_sample_size(samples: dict[str, torch.Tensor], method: str = "bulk", prob: float = 0.89) -> dict[str, torch.Tensor]:
-    """
-    Compute Effective Sample Size (ESS).
+    r"""Effective sample size (ESS) of every parameter component (Vehtari et al., 2021).
 
-    Parameters:
-    -----------
+    All methods split each chain into two halves (``2 M`` chains of
+    ``N' = N // 2`` draws, the middle draw dropped for odd ``N``) and compute
+
+    .. math::
+
+       \hat\rho_t = 1 - \frac{W - \frac{1}{M'} \sum_m \hat\gamma_{m,t}}{\widehat{\mathrm{var}}^+},
+       \qquad
+       \widehat{\mathrm{var}}^+ = \frac{N' - 1}{N'} W + \frac{B}{N'},
+       \qquad
+       \mathrm{ESS} = \frac{M' N'}{\hat\tau},
+       \quad \hat\tau = -1 + 2 \sum_{t=0}^{2k+1} \hat\rho_t,
+
+    with the biased within-chain autocovariances :math:`\hat\gamma_{m,t}` (FFT),
+    ``W``/``B`` as in :func:`gelman_rubin`, and the sum truncated by Geyer's
+    initial positive sequence and made monotone (initial monotone sequence).
+    :math:`\hat\tau` is bounded below by ``1 / log10(M' N')``, so the ESS can
+    exceed the number of draws for antithetic chains. A constant input has an
+    ESS equal to its number of draws. This matches ArviZ.
+
+    Parameters
+    ----------
     samples : dict[str, Tensor]
-        Mapping from parameter name to tensor of shape (n_chains, n_samples, ...)
-    method : str, default "bulk"
-        - "bulk": Rank-normalized split ESS.
-        - "tail": Tail ESS computed on upper and lower quantile indicators.
-        - "mean": Raw split ESS for posterior mean.
-    prob : float or tuple, default 0.89
-        Coverage probability or quantile pair for tail ESS (only used when method="tail").
+        Mapping from parameter name to a tensor of shape
+        ``(n_chains, n_samples, *event_shape)``.
+    method : {"bulk", "tail", "mean"}, default "bulk"
+        - ``"bulk"``: the ESS of the rank-normalised split chains,
+          :math:`z = \Phi^{-1}((r - 3/8) / (S + 1/4))`.
+        - ``"tail"``: the minimum of the ESS of the indicators
+          :math:`1[x \le \hat q_{p_\mathrm{low}}]` and
+          :math:`1[x \le \hat q_{p_\mathrm{high}}]` of the pooled empirical
+          quantiles.
+        - ``"mean"``: the ESS of the split chains themselves, the one that
+          enters the MCSE of the posterior mean.
+    prob : float or tuple of float, default 0.89
+        Only used by ``method="tail"``. A float ``p`` gives the quantile pair
+        ``sorted((p, 1 - p))`` (so the default uses the 0.11 and 0.89
+        quantiles, matching ArviZ's ``ci_prob``), a pair ``(p_low, p_high)``
+        is used as given.
 
-    Returns:
-    --------
-    dict[str, Tensor]:
-        Mapping from parameter name to tensor of ESS values.
+    Returns
+    -------
+    dict[str, Tensor]
+        Mapping from parameter name to a float64 tensor of shape ``event_shape``.
+
+    Raises
+    ------
+    ValueError
+        For an unknown ``method``.
+    NotImplementedError
+        If a tensor has fewer than two dimensions.
     """
     results = {}
     for name, chains in samples.items():

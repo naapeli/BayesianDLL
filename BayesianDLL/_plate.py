@@ -58,10 +58,13 @@ class plate:
     """
     Context manager that declares a batch dimension as conditionally independent.
 
-    Inspired by pyro.plate. When a RandomParameter or ObservedParameter is
-    created inside a plate context, its value shape is expanded along the
-    plate dimension. The plate tells the model that log-probabilities along
-    this dimension should be summed (the data are conditionally independent).
+    Inspired by pyro.plate. When a RandomParameter is created inside plate
+    contexts, its value shape is ``(*plate_sizes, *event_shape)``, with the
+    sizes of the enclosing plates from the outermost to the innermost as the
+    leading dimensions; an ObservedParameter's generated data
+    (``predictive_shape``) take the plate sizes in its leading dimensions in
+    the same order. The elementwise log-probabilities along these dimensions
+    are summed (the values are conditionally independent).
 
     Usage::
 
@@ -84,13 +87,14 @@ class plate:
 
     Args:
         name: Human-readable identifier for this plate.
-        size: Number of independent repetitions along this dimension, or a
-              ``Data`` object whose corresponding batch dimension determines
-              the size at runtime.
-        dim:  Which batch dimension this plate controls (negative, counting
-              from the right).  When nesting plates without specifying dim,
-              each nested plate automatically takes the next leftward
-              dimension.
+        size: Number of independent repetitions along this dimension, a
+              ``Data`` object whose batch dimension ``dim`` determines the
+              size at runtime, or a tensor whose dimension ``dim`` gives the size.
+        dim:  The dimension of a ``Data`` (its batch shape) or tensor ``size``
+              that gives the plate size; ignored for an integer size. It
+              does not change where the plate's dimension is placed in the
+              value shape (see above). Default: ``-1`` for the outermost plate,
+              ``-2`` for a plate nested in one other plate, and so on.
     """
 
     def __init__(self, name: str, size: int, dim: int | None = None):

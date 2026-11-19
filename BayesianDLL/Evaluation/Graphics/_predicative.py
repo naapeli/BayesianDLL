@@ -14,7 +14,38 @@ def plot_predicative_distribution(
     bins=30,
     ax=None,
 ):
-    """Plot posterior predictive densities or CDFs on one axes."""
+    """Plot predictive densities or CDFs on one axes.
+
+    For every parameter draw ``i`` the ``samples_per_step`` replicated values
+    (all trailing dimensions flattened) give one light curve; their pointwise
+    average is drawn in orange and the observed data in black. The curves are
+    evaluated on a 500-point grid spanning the predictive draws and the data.
+    The variables are assumed univariate.
+
+    Parameters
+    ----------
+    predicative_distribution : PredicativeResult
+        Predictive draws of shape ``(n_samples, samples_per_step, *obs_shape)``
+        per observed node, e.g. from ``posterior_predicative`` or
+        ``sample_prior_predicative``. All its variables are drawn on the same axes.
+    data : Tensor, optional
+        Observed data to overlay (flattened); the same tensor is used for
+        every variable.
+    kind : {"pdf", "cdf"}, default "pdf"
+        Draw densities, or CDFs obtained by cumulatively summing the density
+        values on the grid and normalising the last value to one.
+    method : {"kde", "hist"}, default "kde"
+        Gaussian kernel density estimate (Scott's bandwidth) or a normalised
+        histogram interpolated through the bin centres.
+    bins : int, default 30
+        Number of histogram bins (``method="hist"`` only).
+    ax : matplotlib.axes.Axes, optional
+        Axes to draw into; a new figure is created when omitted.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+    """
     if kind not in ["pdf", "cdf"]:
         raise ValueError('kind should be in ["pdf", "cdf"].')
     if method not in ["kde", "hist"]:

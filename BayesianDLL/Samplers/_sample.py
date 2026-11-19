@@ -185,7 +185,23 @@ class SamplingBlock:
     The block's target is the part of the joint log density that depends on
     its parameters (their priors, the priors of their random children and the
     likelihoods of their observed children); the remaining terms are constant
-    while the block moves and are not evaluated.
+    while the block moves and are not evaluated. Points where the model fails
+    numerically (after its first successful evaluation) get density zero.
+
+    Parameters
+    ----------
+    model : Model
+        The compiled model.
+    param_names : str or list of str
+        The random parameters of the block, all continuous or all discrete.
+        Enumerated parameters cannot be sampled.
+    sampler_type : {"auto", "nuts", "metropolis", "slice", "gibbs"}, default "auto"
+        The block's sampler. ``"auto"`` takes the sampler the parameters
+        request (``"metropolis"`` before ``"slice"``), else NUTS for continuous
+        blocks and the finite Gibbs sampler for discrete blocks with finite
+        support (Metropolis otherwise).
+    sampler_params : dict, optional
+        Sampler settings; they override the parameters' own ``sampler_params``.
     """
 
     def __init__(self, model, param_names, sampler_type="auto", sampler_params=None):
@@ -366,6 +382,64 @@ def _chain_seeds(seed, n_chains):
 def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, check_convergence=True, seed=None, log_likelihood=True, chain_method=None, device=None, trace_device="cpu", **sampler_params):
     """Draw posterior samples from ``n_chains`` MCMC chains.
 
+    The random parameters are updated in Gibbs blocks (by default one NUTS
+    block for the continuous parameters, one finite Gibbs block for the
+    discrete parameters with finite support, and Metropolis or slice blocks
+    for the parameters that request them; see :class:`SamplingBlock`), each
+    block's sampler targeting the part of the log density that depends on it.
+    Every iteration ``m = 1, ..., warmup_length + n_samples`` steps every
+    block once. The iterations ``m < warmup_length`` adapt the samplers, the
+    iterations ``m > warmup_length`` are recorded, and iteration
+    ``m = warmup_length`` is a non-adapting step that is not recorded.
+
+    Parameters
+    ----------
+    n_samples : int
+        Number of recorded draws per chain.
+    warmup_length : int
+        Number of warmup (adaptation) iterations per chain, see above.
+    n_chains : int, default 4
+        Number of chains.
+    model : Model, optional
+        The model; the active model (inside ``with model:``) by default.
+    progress_bar : bool, default True
+        Show progress bars (one per chain in parallel mode).
+    start_point_variance : float, default 1
+        The chains start at the model's current values plus Gaussian noise
+        with this *standard deviation*, in the unconstrained space, for the
+        continuous parameters; discrete parameters start at their current
+        values.
+    blocks : list, optional
+        The Gibbs blocks: each entry is a parameter name, a list of names, or
+        a :class:`SamplingBlock`. Every random parameter must be in exactly
+        one block. Default: the blocks described above.
+    check_convergence : bool, default True
+        Warn when the rank-normalised R-hat of a parameter exceeds 1.01
+        (needs ``n_chains > 1`` and ``n_samples >= 50``).
+    seed : int, optional
+        See below.
+    log_likelihood : bool, default True
+        See below.
+    chain_method : {"parallel", "vectorized"}, optional
+        See below.
+    device : str or torch.device, optional
+        See below.
+    trace_device : str or torch.device or None, default "cpu"
+        See below.
+    **sampler_params
+        Sampler settings for every block, see below.
+
+    Returns
+    -------
+    SamplingResult
+        Traces of shape ``(n_chains, n_samples, *parameter_shape)`` (constrained
+        values) of the random, enumerated and deterministic parameters, the
+        sampler statistics, divergences and the pointwise log-likelihood.
+
+    After sampling, warnings are issued for R-hat above 1.01, for divergences
+    after warmup, for an E-BFMI below 0.3 and when more than 5% of the NUTS
+    iterations reach the maximal tree depth.
+
     ``chain_method`` selects how the chains run (the names follow NumPyro):
 
     * ``"parallel"``: one worker process per chain. Every process evaluates
@@ -409,7 +483,10 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
 
     Remaining keyword arguments are sampler settings for every block (each
     sampler takes the ones it understands), e.g. ``delta=0.9`` or
-    ``metric="dense"`` for NUTS and ``target_accept_rate=0.44`` for Metropolis.
+    ``metric="dense"`` for NUTS, ``target_accept_rate=0.44`` for Metropolis
+    and ``width=0.5`` for the slice sampler; a setting no sampler understands
+    raises a ``TypeError``. Settings given to a parameter
+    (``sampler_params``) apply to its block and are overridden by these.
     """
     model = get_active_model() if model is None else model
     if device is not None:
@@ -744,7 +821,10 @@ def sample_prior_predicative(n_samples=20, samples_per_step=500, warmup_per_samp
     ``summary`` and the posterior plots work on it.
 
     ``warmup_per_sample`` is only used by the MCMC fallback for distributions
-    that cannot be sampled directly.
+    that cannot be sampled directly. ``model`` defaults to the active model;
+    ``progress_bar`` shows a progress bar over the draws. A warning is issued
+    when the prior of a parameter depends on an observed node, because its
+    draws then condition on the observed data.
     """
     model = get_active_model() if model is None else model
     return _ancestral_predictive(model, n_samples, samples_per_step, None, progress_bar, warmup_per_sample)
@@ -752,8 +832,11 @@ def sample_prior_predicative(n_samples=20, samples_per_step=500, warmup_per_samp
 def posterior_predicative(trace, n_samples=None, samples_per_step=20, warmup_per_sample=20, model=None, progress_bar=True):
     """Posterior predictive samples by exact ancestral sampling.
 
-    ``n_samples`` evenly spaced draws are taken from ``trace`` (all draws when
-    ``None``). For each draw the model parameters are set to it, the graph is
+    ``trace`` is a :class:`SamplingResult` (or a dict of constrained traces of
+    shape ``(n_chains, n_samples, ...)``) holding every random parameter of
+    ``model`` (the active model by default). ``n_samples`` evenly spaced
+    draws are taken from the chains concatenated (all draws when ``None``;
+    more than the trace holds raises a ``RuntimeError``). For each draw the model parameters are set to it, the graph is
     walked in topological order and every observed node is sampled
     ``samples_per_step`` times with its distribution's ``sample`` method,
     shaped like the node's ``predictive_shape`` (plate sizes, including

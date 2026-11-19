@@ -62,6 +62,7 @@ class SampleStats:
         return any(key in block["stats"] for block in self.blocks)
 
     def thin(self, step=1):
+        """Statistics of every ``step``-th draw (an int >= 1 or a slice) of every chain."""
         s = _normalize_slice(step)
         return SampleStats([
             {**block, "stats": {name: value[:, s] for name, value in block["stats"].items()}}
@@ -74,6 +75,40 @@ class SampleStats:
 
 
 class SamplingResult:
+    """Draws and diagnostics of :func:`~BayesianDLL.sample` or :func:`~BayesianDLL.sample_smc`.
+
+    Indexing (``result[name]``), ``keys``, ``values`` and ``items`` cover the
+    random (and enumerated) parameters and the deterministic nodes.
+
+    Attributes
+    ----------
+    trace : dict[str, Tensor]
+        Constrained draws of the random and enumerated parameters, of shape
+        ``(n_chains, n_samples, *parameter_shape)``.
+    deterministic_trace : dict[str, Tensor]
+        Draws of the deterministic nodes, of the same layout.
+    divergences : list of int
+        Number of divergent NUTS transitions after warmup, per chain.
+    acceptance_probabilities : list of list of float
+        Per chain and sampling block, the mean acceptance statistic over all
+        iterations (warmup included).
+    step_sizes : list of list of float
+        Per chain and sampling block, the final step size (proposal scale or
+        mean slice width for the other samplers).
+    sample_stats : SampleStats
+        Per-iteration sampler statistics of the recorded draws.
+    enumerated_probs : dict[str, Tensor]
+        For every enumerated (summed out) parameter, the posterior probability
+        of each support value per coordinate and draw, of shape
+        ``(n_chains, n_samples, *value_shape, K)``.
+    log_likelihood : dict[str, Tensor]
+        Elementwise ``log p(y_i | theta)`` of every observed node per draw, of
+        shape ``(n_chains, n_samples, *log_density_shape)``.
+    log_likelihood_unavailable : dict[str, str]
+        Observed nodes whose pointwise log-likelihood could not be recorded,
+        mapped to the reason.
+    """
+
     def __init__(self, trace, divergences, acceptance_probabilities, step_sizes, deterministic_trace=None, sample_stats=None, enumerated_probs=None, log_likelihood=None, log_likelihood_unavailable=None):
         self.trace = trace
         self.divergences = divergences
@@ -110,6 +145,14 @@ class SamplingResult:
         return {**self.trace, **self.deterministic_trace}.items()
 
     def thin(self, step: int | slice = 1) -> "SamplingResult":
+        """A new result keeping every ``step``-th draw (or the draws selected by a slice) of every chain.
+
+        The traces, sample statistics, enumerated probabilities and
+        log-likelihoods are thinned along the draw dimension; the
+        divergences, acceptance probabilities and step sizes are copied
+        unchanged. Attributes added by :func:`~BayesianDLL.sample_smc`
+        (``log_marginal_likelihood``, ``beta_schedule``, ...) are not carried over.
+        """
         s = _normalize_slice(step)
         thinned_trace = {name: val[:, s] for name, val in self.trace.items()}
         thinned_det = {name: val[:, s] for name, val in self.deterministic_trace.items()}
@@ -126,6 +169,7 @@ class SamplingResult:
         )
 
     def summary(self, hdi_prob=0.94, ci_kind="eti", round_to=3, include_deterministic=False):
+        """Summary table of the draws; see :func:`~BayesianDLL.Evaluation.summary`."""
         from ..Evaluation._summary import summary as _summary
         return _summary(self, hdi_prob=hdi_prob, ci_kind=ci_kind, round_to=round_to, include_deterministic=include_deterministic)
 
@@ -168,6 +212,12 @@ class PredicativeResult:
         return len(self.samples)
 
     def thin(self, step: int | slice = 1, dim: int | tuple[int, ...] = 1) -> "PredicativeResult":
+        """Keep every ``step``-th entry (an int >= 1 or a slice) along ``dim``.
+
+        ``dim=1`` thins the replications per parameter draw, ``dim=0`` the
+        parameter draws (and the prior draws in ``prior``), ``(0, 1)`` both
+        with the same step.
+        """
         s = _normalize_slice(step)
         if dim == 1:
             thinned = {name: val[:, s] for name, val in self.samples.items()}

@@ -72,23 +72,51 @@ def _rank_normalized_rhat_core(chains: torch.Tensor) -> float:
 
 
 def gelman_rubin(samples: dict[str, torch.Tensor], method: str = "rank") -> dict[str, torch.Tensor]:
-    """
-    Compute Gelman-Rubin convergence diagnostic R-hat for all parameters.
+    r"""Gelman-Rubin potential scale reduction factor R-hat for every parameter component.
 
-    Parameters:
-    -----------
+    For ``M`` chains of ``N`` draws with chain means :math:`\bar x_m`, grand
+    mean :math:`\bar x` and within-chain sample variances :math:`s_m^2`
+    (``ddof=1``), the classical statistic is
+
+    .. math::
+
+       W = \frac{1}{M} \sum_m s_m^2, \qquad
+       B = \frac{N}{M - 1} \sum_m (\bar x_m - \bar x)^2, \qquad
+       \hat R = \sqrt{\frac{\frac{N - 1}{N} W + \frac{1}{N} B}{W}}.
+
+    Values close to 1 indicate that the chains mix; 1.01 is a common threshold
+    for the rank-normalised version.
+
+    Parameters
+    ----------
     samples : dict[str, Tensor]
-        Mapping from parameter name to tensor of shape (n_chains, n_samples, ...)
-    method : str, default "rank"
-        One of:
-        - "classical": Original Gelman & Rubin (1992)
-        - "split": Split R-hat (Gelman et al., 2013 / BDA3)
-        - "rank": Rank-normalized folded split R-hat (Vehtari et al., 2021; ArviZ default)
+        Mapping from parameter name to a tensor of shape
+        ``(n_chains, n_samples, *event_shape)``.
+    method : {"classical", "split", "rank"}, default "rank"
+        - ``"classical"``: the formula above on the chains as given
+          (Gelman & Rubin, 1992).
+        - ``"split"``: the formula on ``2 M`` half chains of ``N // 2`` draws
+          (Gelman et al., 2013, BDA3); with an odd ``N`` the last draw is dropped.
+          Detects non-stationarity within chains.
+        - ``"rank"``: rank-normalised split R-hat (Vehtari et al., 2021):
+          the maximum of the split R-hat of the rank-normalised draws
+          :math:`z = \Phi^{-1}((r - 3/8) / (S + 1/4))` (bulk) and of the
+          rank-normalised folded draws :math:`|x - \mathrm{median}(x)|` (tail).
+          The ArviZ default.
 
-    Returns:
-    --------
-    dict[str, Tensor]:
-        Mapping from parameter name to tensor of R-hat values.
+    Returns
+    -------
+    dict[str, Tensor]
+        Mapping from parameter name to a float64 tensor of shape ``event_shape``.
+        It is 1 when the R-hat is undefined: fewer than two (split) chains,
+        fewer than two draws per (split) chain, or zero within-chain variance.
+
+    Raises
+    ------
+    ValueError
+        For an unknown ``method``.
+    NotImplementedError
+        If a tensor has fewer than two dimensions.
     """
     results = {}
     for name, chains in samples.items():

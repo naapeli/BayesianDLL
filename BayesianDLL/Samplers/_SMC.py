@@ -345,9 +345,10 @@ def sample_smc(model=None, n_particles=1000, kernel="metropolis", n_mutation_ste
     posteriors ``p(theta) p(y | theta)^beta`` with ``0 = beta_0 < beta_1 <
     ... < beta_K = 1``. At every stage
 
-    1. the next inverse temperature is chosen by bisection, so that the
-       effective sample size of the incremental weights
-       ``exp((beta_{k+1} - beta_k) log p(y | theta))`` equals
+    1. the next inverse temperature is the largest ``beta_{k+1} <= 1``
+       (found by bisection) for which the effective sample size
+       ``(sum w)^2 / sum w^2`` of the incremental weights
+       ``w = exp((beta_{k+1} - beta_k) log p(y | theta))`` is at least
        ``target_ess * n_particles``;
     2. the particles are resampled (systematic resampling) and
     3. moved with ``n_mutation_steps`` MCMC steps that leave the new tempered
@@ -355,38 +356,72 @@ def sample_smc(model=None, n_particles=1000, kernel="metropolis", n_mutation_ste
 
     ``kernel`` selects the MCMC kernel for the continuous parameters:
     ``"metropolis"`` (random walk with the particle covariance as proposal
-    covariance, initially scaled by ``2.38^2 / d`` and adapted between steps
-    towards an acceptance rate of 0.234), ``"nuts"`` (tempered log density and
-    gradient ``grad log p(theta) + beta grad log p(y | theta)``, with the
-    particle variances as diagonal metric) or ``"slice"`` (coordinate-wise
-    slice sampling with widths of twice the particle standard deviations).
-    Discrete parameters are updated with the exact finite Gibbs sampler when
-    their support is finite and with discrete Metropolis otherwise, whatever
-    ``kernel`` is. Enumerated parameters are summed out of the likelihood, and
-    posterior draws of them are added to the result.
+    covariance, initially scaled by ``2.38^2 / d``; after every step the
+    scale ``2.38 / sqrt(d)`` is multiplied by ``exp(rate - 0.234)``, i.e.
+    adapted towards an acceptance rate of 0.234), ``"nuts"`` (tempered log density and gradient
+    ``grad log p(theta) + beta grad log p(y | theta)``, with the particle
+    variances as diagonal metric and a maximal tree depth of 8) or
+    ``"slice"`` (coordinate-wise slice sampling with widths of twice the
+    particle standard deviations). The NUTS step size is adapted across the
+    particles of a stage towards a mean acceptance statistic of 0.8: by dual
+    averaging with ``vectorized=False``, and with ``vectorized=True`` as one
+    pooled step size multiplied by ``exp(2 (mean accept_stat - 0.8))`` after
+    every step. Discrete parameters are updated with the exact finite Gibbs
+    sampler when their support is finite and with discrete Metropolis
+    otherwise, whatever ``kernel`` is. Enumerated parameters are summed out
+    of the likelihood, and posterior draws of them are added to the result.
 
     The particles explore all modes the prior covers, so SMC can sample
-    multimodal posteriors that trap a single MCMC chain. The product of the
-    mean incremental weights is an unbiased estimate of the marginal
-    likelihood ``p(y)``.
+    multimodal posteriors that trap a single MCMC chain. The marginal
+    likelihood is estimated as the product over the stages of the mean
+    incremental weights, ``log p(y) ~= sum_k log mean_i w_i^(k)``. For a fixed
+    temperature schedule this estimate of ``p(y)`` is unbiased; with the
+    adaptive schedule it is consistent but slightly biased.
 
-    Returns a :class:`SamplingResult` with one chain of ``n_particles`` draws.
-    It also holds ``log_marginal_likelihood`` (the estimate of ``log p(y)``),
-    ``beta_schedule`` (the inverse temperatures, starting with 0),
-    ``stage_ess`` (the effective sample size of every stage's incremental
-    weights) and ``stage_acceptance`` (the mean acceptance statistic of every
-    stage's mutation).
+    Parameters
+    ----------
+    model : Model, optional
+        The model; the active model (inside ``with model:``) by default.
+    n_particles : int, default 1000
+        Number of particles (at least 2).
+    kernel : {"metropolis", "nuts", "slice"}, default "metropolis"
+        Mutation kernel for the continuous parameters, see above.
+    n_mutation_steps : int, optional
+        MCMC steps per stage; 10 for ``"metropolis"`` and 2 for ``"nuts"`` and
+        ``"slice"`` by default.
+    target_ess : float, default 0.5
+        Fraction of ``n_particles``, in ``(0, 1)``, that the ESS of the
+        incremental weights must keep at each stage; larger values give more,
+        smaller temperature steps.
+    seed : int, optional
+        Makes the run reproducible without changing torch's global random
+        state; with ``seed=None`` the global generator is used.
+    progress_bar : bool, default True
+        Show a progress bar over the inverse temperature.
+    vectorized : bool, default True
+        Use the particles as the chain dimension of the batched model (see
+        :meth:`~BayesianDLL.Model.batch`): the weights of all particles are
+        computed with one evaluation and the mutation kernels move all
+        particles at once, also on a GPU. Models with nodes that cannot be
+        batched are evaluated particle by particle inside the same scheme.
+        ``False`` uses the particle-by-particle implementation.
 
-    ``seed`` makes the run reproducible without changing torch's global
-    random state; with ``seed=None`` the global generator is used.
+    Returns
+    -------
+    SamplingResult
+        One chain of ``n_particles`` draws (trace tensors of shape
+        ``(1, n_particles, *event_shape)``), with ``lp`` and ``accept_stat``
+        sample statistics. It also holds ``log_marginal_likelihood`` (the
+        estimate of ``log p(y)``), ``beta_schedule`` (the inverse
+        temperatures, starting with 0), ``stage_ess`` (the effective sample
+        size of every stage's incremental weights), ``stage_acceptance`` (the
+        mean acceptance statistic of every stage's mutation) and ``kernel``.
 
-    With ``vectorized=True`` (default) the particles are the chain dimension
-    of the batched model (see :meth:`~BayesianDLL.Model.batch`): the
-    weights of all particles are computed with one evaluation and the
-    mutation kernels move all particles at once, also on a GPU. Models with
-    nodes that cannot be batched are evaluated particle by particle inside
-    the same scheme. ``vectorized=False`` uses the particle-by-particle
-    implementation.
+    Raises
+    ------
+    NotImplementedError
+        If the prior of a random parameter depends on an enumerated
+        parameter, or a prior cannot be sampled.
     """
     model = get_active_model() if model is None else model
     if kernel not in _KERNELS:
