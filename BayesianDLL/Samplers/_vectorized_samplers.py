@@ -417,6 +417,8 @@ class VectorizedNUTS:
         self._reset_welford()
         self._cached_theta = None
         self.last_stats = {}
+        # Whether the step size has been adapted since the last non-warmup step.
+        self._adapting = False
         # Optional ``theta -> (log_target, gradient)`` that shares work between the two.
         self.value_and_gradient = None
 
@@ -564,6 +566,11 @@ class VectorizedNUTS:
             self._lp, self._grad = self._evaluate(theta)
             self._cached_theta = theta
 
+        if not warmup and self._adapting:
+            # First draw after warmup: switch to the averaged step size before
+            # building the trajectory, so every post-warmup draw uses it.
+            self.step_size = self.step_size_bar
+            self._adapting = False
         n_chains = theta.shape[0]
         device, dtype = theta.device, theta.dtype
         step_size = self.step_size
@@ -657,8 +664,7 @@ class VectorizedNUTS:
             self.step_size = torch.exp(log_step).clamp(self.min_step_size, self.max_step_size)
             weight = self.m ** -self.kappa
             self.step_size_bar = torch.exp((1 - weight) * torch.log(self.step_size_bar) + weight * torch.log(self.step_size))
-        else:
-            self.step_size = self.step_size_bar
+            self._adapting = True
         self.m += 1
 
         self._lp, self._grad = new_lp, new_grad

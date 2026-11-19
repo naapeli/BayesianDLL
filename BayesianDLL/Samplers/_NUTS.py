@@ -66,8 +66,10 @@ class NUTS:
     ``mu = log(10 eps_0)`` and, at warmup iteration ``m``,
     ``H_bar <- (1 - 1/(m + t0)) H_bar + (delta - alpha)/(m + t0)``,
     ``log eps = mu - sqrt(m)/gamma * H_bar``,
-    ``log eps_bar <- m^-kappa log eps + (1 - m^-kappa) log eps_bar``. After
-    warmup the averaged step size ``eps_bar`` is used. ``eps_0`` comes from
+    ``log eps_bar <- m^-kappa log eps + (1 - m^-kappa) log eps_bar``. Every
+    iteration after warmup (from the first call with ``warmup=False`` on,
+    including that one) uses the averaged step size ``eps_bar``; without any
+    warmup the heuristic initial step size is kept. ``eps_0`` comes from
     the doubling/halving heuristic of Hoffman and Gelman (Algorithm 4).
 
     Metric: Stan's windowed adaptation (see :func:`_adaptation_windows`):
@@ -153,6 +155,8 @@ class NUTS:
         self._reset_welford()
         self._cached_theta = None
         self.last_stats = {}
+        # Whether the step size has been adapted since the last non-warmup step.
+        self._adapting = False
 
         # save in case of resetting
         self._H_bar = H_bar
@@ -165,6 +169,7 @@ class NUTS:
         self.inv_metric = None
         self._inv_metric_chol = None
         self._warmup_iteration = 0
+        self._adapting = False
         self._reset_welford()
         self.invalidate_cache()
 
@@ -359,7 +364,9 @@ class NUTS:
 
         Returns ``(new_theta, step_size, accept_stat, diverging)``, where
         ``step_size`` is the step size for the *next* iteration (the one used
-        here is in ``last_stats["step_size"]``).
+        here is in ``last_stats["step_size"]``). The first call with
+        ``warmup=False`` after warmup calls switches to ``eps_bar`` before
+        building its trajectory.
         """
         if not hasattr(self, "step_size"):
             log_prob = self.log_target(theta)
@@ -377,6 +384,11 @@ class NUTS:
             self.gradient_cache = self.gradient(theta)
             self._cached_theta = theta
 
+        if not warmup and self._adapting:
+            # First draw after warmup: switch to the averaged step size before
+            # building the trajectory, so every post-warmup draw uses it.
+            self.step_size = self.step_size_bar
+            self._adapting = False
         step_size = self.step_size
         r0 = self._sample_momentum(theta)
         joint = self.log_prob_cache - self._kinetic(r0)
@@ -435,8 +447,7 @@ class NUTS:
             self.step_size = min(max(self.step_size, self.min_step_size), self.max_step_size)
             eta = self.m ** -self.kappa
             self.step_size_bar = math.exp((1 - eta) * math.log(self.step_size_bar) + eta * math.log(self.step_size))
-        else:
-            self.step_size = self.step_size_bar
+            self._adapting = True
 
         # Only update cache if new state is finite and valid
         if not torch.isnan(new_log_prob) and not torch.isinf(new_log_prob) and not torch.isnan(new_gradient).any():

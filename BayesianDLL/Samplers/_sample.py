@@ -379,7 +379,7 @@ def _chain_seeds(seed, n_chains):
     return [int(sequence.generate_state(1, dtype=np.uint64)[0] % (2 ** 63)) for sequence in sequences]
 
 
-def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, check_convergence=True, seed=None, log_likelihood=True, chain_method=None, device=None, trace_device="cpu", **sampler_params):
+def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, init_scale=1, blocks=None, check_convergence=True, seed=None, log_likelihood=True, chain_method=None, device=None, trace_device="cpu", **sampler_params):
     """Draw posterior samples from ``n_chains`` MCMC chains.
 
     The random parameters are updated in Gibbs blocks (by default one NUTS
@@ -388,9 +388,10 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     for the parameters that request them; see :class:`SamplingBlock`), each
     block's sampler targeting the part of the log density that depends on it.
     Every iteration ``m = 1, ..., warmup_length + n_samples`` steps every
-    block once. The iterations ``m < warmup_length`` adapt the samplers, the
-    iterations ``m > warmup_length`` are recorded, and iteration
-    ``m = warmup_length`` is a non-adapting step that is not recorded.
+    block once. The ``warmup_length`` iterations ``m <= warmup_length`` adapt
+    the samplers and are not recorded; the ``n_samples`` iterations
+    ``m > warmup_length`` do not adapt and are recorded. Divergences and the
+    sample statistics cover exactly the recorded iterations.
 
     Parameters
     ----------
@@ -404,11 +405,15 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
         The model; the active model (inside ``with model:``) by default.
     progress_bar : bool, default True
         Show progress bars (one per chain in parallel mode).
-    start_point_variance : float, default 1
-        The chains start at the model's current values plus Gaussian noise
-        with this *standard deviation*, in the unconstrained space, for the
-        continuous parameters; discrete parameters start at their current
-        values.
+    init_scale : float, default 1
+        Standard deviation of the Gaussian jitter added to the initial
+        unconstrained values of each chain (the model's current values), for
+        the continuous parameters; discrete parameters start at their current
+        values. The auto guides' ``init_scale``
+        (:class:`~BayesianDLL.AutoNormal`,
+        :class:`~BayesianDLL.AutoMultivariateNormal`) is likewise a standard
+        deviation around the current unconstrained values: the initial scale
+        of the variational distribution.
     blocks : list, optional
         The Gibbs blocks: each entry is a parameter name, a list of names, or
         a :class:`SamplingBlock`. Every random parameter must be in exactly
@@ -513,7 +518,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
         from ._vectorized import sample_vectorized
         (trace, det_trace, enumerated_probs, log_lik, divergences, acceptance_probabilities, step_sizes,
          sample_stats, max_depths) = sample_vectorized(
-            n_samples, warmup_length, n_chains, model, progress_bar, start_point_variance, blocks, seed,
+            n_samples, warmup_length, n_chains, model, progress_bar, init_scale, blocks, seed,
             log_likelihood_plan, sampler_params, trace_device=trace_device,
         )
         return _finish_sampling(model, n_samples, n_chains, check_convergence, trace, det_trace, enumerated_probs,
@@ -546,7 +551,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
                 leave=True,
                 bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}"
             )
-            bar.set_description(f"Chain {chain + 1}/{n_chains} warmup", refresh=False)
+            bar.set_description(f"Chain {chain + 1}/{n_chains} {'warmup' if warmup_length > 0 else 'sample'}", refresh=False)
             bars.append(bar)
 
         def _updater():
@@ -582,7 +587,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
             [n_chains]*n_chains,
             [model]*n_chains,
             [initial_values]*n_chains,
-            [start_point_variance]*n_chains,
+            [init_scale]*n_chains,
             [n_samples]*n_chains,
             [warmup_length]*n_chains,
             [progress_bar]*n_chains,
@@ -648,8 +653,11 @@ def _finish_sampling(model, n_samples, n_chains, check_convergence, trace, det_t
         if n_samples >= 50:
             r_hats = gelman_rubin({name: trace[name] for name in model.params})
             for name, statistics in r_hats.items():
+                # NaN (every chain the same constant) is not a convergence
+                # failure; inf (chains stuck at different values) is.
                 if torch.any(statistics > 1.01):
-                    warn(f"The gelman-Ruben statistic of {name} is above 1.01 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
+                    stuck = " An infinite R-hat means that chains are stuck at different values." if torch.any(torch.isinf(statistics)) else ""
+                    warn(f"The Gelman–Rubin R-hat of {name} is above 1.01 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence.{stuck} Consider increasing the amount of warmup steps or reparametrizing the model.")
     elif check_convergence and n_chains == 1:
         warn(f"The convergence of the chain is not checked when n_chains == 1. Increase it to at least 2 to enable convergence diagnostics.")
 
@@ -690,7 +698,7 @@ def _check_hamiltonian_diagnostics(sample_stats, max_depths, n_samples, bfmi_thr
                 warn(f"{100 * saturated:.1f}% of the NUTS iterations for the parameters {block['params']} reached the maximum tree depth ({max_depth}). Consider increasing max_depth or reparametrizing the model.")
 
 
-def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar, blocks_spec=None, shm_name=None, sampler_params=None, seed=None, log_likelihood_plan=None):
+def _sample_single_chain(chain, n_chains, model, initial_values, init_scale, n_samples, warmup_length, progress_bar, blocks_spec=None, shm_name=None, sampler_params=None, seed=None, log_likelihood_plan=None):
     torch.set_num_threads(1)
     if seed is not None:
         # Worker processes may be fresh or reused; seeding here makes each chain
@@ -699,14 +707,14 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     for name, parameter in model.params.items():
         value = initial_values[name].clone()
         if parameter.distribution.state_space.is_continuous():
-            value = value + start_point_variance * torch.randn_like(value)
+            value = value + init_scale * torch.randn_like(value)
         parameter.set_unconstrained_value(value)
 
     blocks = _build_blocks(model, blocks_spec, sampler_params)
     for block in blocks:
         if hasattr(block.sampler, "set_warmup_length"):
-            # Warmup steps are the iterations m < warmup_length (m starts at 1).
-            block.sampler.set_warmup_length(max(warmup_length - 1, 0))
+            # Warmup steps are the iterations m <= warmup_length (m starts at 1).
+            block.sampler.set_warmup_length(warmup_length)
 
     # Attach to shared memory if multi-chain
     shm = None
@@ -721,7 +729,7 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
             bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}"
         )
 
-    acceptance_probabilities = [1.0 for _ in range(len(blocks))]
+    acceptance_probabilities = [0.0 for _ in range(len(blocks))]
     step_sizes = [1.0 for _ in range(len(blocks))]
     divergences_count = 0
     block_stats = [{} for _ in blocks]
@@ -752,18 +760,20 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
 
     loop_range = _progress_bar if _progress_bar is not None else range(1, n_samples + warmup_length + 1)
     for m in loop_range:
+        warmup = m <= warmup_length
         if _progress_bar is not None:
-            if m < warmup_length: _progress_bar.set_description(f"Chain warmup", refresh=False)
+            if warmup: _progress_bar.set_description(f"Chain warmup", refresh=False)
             else: _progress_bar.set_description(f"Chain sample", refresh=False)
+            # The accumulators hold the m - 1 iterations done so far.
             _progress_bar.set_postfix({
-                "avg. acc. probs": [f"{prob / m:.3f}" for prob in acceptance_probabilities],
+                "avg. acc. probs": [f"{prob / max(m - 1, 1):.3f}" for prob in acceptance_probabilities],
                 "step sizes": [f"{step_size:.3f}" for step_size in step_sizes],
                 "divs": divergences_count
             }, refresh=False)
 
         for i, block in enumerate(blocks):
-            step_size, acceptance_probability, diverging = block.step(warmup=(m < warmup_length))
-            if diverging and m >= warmup_length:
+            step_size, acceptance_probability, diverging = block.step(warmup=warmup)
+            if diverging and not warmup:
                 divergences_count += 1
             step_sizes[i] = step_size
             acceptance_probabilities[i] += acceptance_probability

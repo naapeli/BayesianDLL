@@ -89,7 +89,7 @@ with Model() as model:
 
 model.find_MAP(lr=0.05, epochs=300, verbose=False)
 start = time.perf_counter()
-trace = model.sample(500, 300, n_chains=4, start_point_variance=0.1, seed=0, progress_bar=False)
+trace = model.sample(500, 300, n_chains=4, init_scale=0.1, seed=0, progress_bar=False)
 elapsed = time.perf_counter() - start
 summary = trace.summary(include_deterministic=True)
 print(summary)
