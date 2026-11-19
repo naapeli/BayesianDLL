@@ -324,11 +324,11 @@ def test_predictive_conditional_variance_vanishes_at_the_inducing_inputs():
 
 
 def test_predictive_with_guide_samples():
-    from BayesianDLL import AutoNormal
+    from BayesianDLL import Guide
     from BayesianDLL.Variational import BBVI
 
     model, f, x = _model("rbf", m=4)
-    guide = AutoNormal(model)
+    guide = Guide(model, default_family="mean_field")
     BBVI(model, guide, epochs=5, lr=0.01, verbose=False)
     trace = guide.sample(10, n_chains=2)
     grid = torch.rand(7, 2, dtype=DTYPE)

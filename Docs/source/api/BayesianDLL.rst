@@ -2,8 +2,8 @@ BayesianDLL
 ===========
 
 The core modelling building blocks are importable directly from ``BayesianDLL``.
-``Guide`` (also importable from here) is documented with the other guides in
-:class:`BayesianDLL.Variational.Guide`.
+``Guide`` and ``Group`` (also importable from here) are documented in
+:class:`BayesianDLL.Variational.Guide` and :class:`BayesianDLL.Variational.Group`.
 
 .. automodule:: BayesianDLL
    :members: Model, condition, Data, RandomParameter, ObservedParameter, DeterministicParameter, VariationalParameter, plate

@@ -36,7 +36,7 @@ goes through the kernel's ``input_vjp``. The workflow is
 1. **learn Z** (and a first estimate of everything else) with a MAP
    estimate, ``find_MAP``;
 2. **compare Z** by the evidence lower bound of a full-rank variational
-   posterior (``AutoMultivariateNormal`` with ``BBVI``) over ``v`` and the
+   posterior (``Guide(model, default_family="full_rank")`` with ``BBVI``) over ``v`` and the
    hyperparameters, once with the learned and once with the random initial
    ``Z``;
 3. **sample** ``v`` and the hyperparameters with NUTS, with ``Z`` fixed at
@@ -62,7 +62,7 @@ import time
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import AutoMultivariateNormal, Data, Model, ObservedParameter, RandomParameter
+from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Bernoulli, Normal
 from BayesianDLL.GP import RBF, SparseLatentGP, sparse_latent_gp_predictive
@@ -172,7 +172,7 @@ plt.show()
 guides, histories, models, functions = {}, {}, {}, {}
 for label, inducing in (("random Z", z_start), ("learned Z", z_learned)):
     models[label], functions[label] = build(inducing)
-    guides[label] = AutoMultivariateNormal(models[label], init_scale=0.05)
+    guides[label] = Guide(models[label], default_family="full_rank", init_scale=0.05)
     histories[label] = BBVI(models[label], guides[label], n_samples=1, epochs=800, lr=0.02, lrd=0.998,
                             callback_frequency=1, verbose=False)
     print(f"{label}: final ELBO {sum(histories[label][-200:]) / 200:.1f}")

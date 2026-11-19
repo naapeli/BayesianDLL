@@ -366,7 +366,7 @@ def test_exact_gp_mcmc_and_predictive_samples():
 
 def test_whitened_gp_is_usable_in_variational_inference():
     model, _, _ = build_gp_model(n=3)
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter(
             "function_white",
             Normal(

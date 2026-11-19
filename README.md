@@ -122,7 +122,7 @@ with Model() as model:
 
 Graphics.plot_model(model)
 
-with Guide() as guide:
+with Guide(model) as guide:
     def q_normal(name):
         return RandomParameter(
             name,
@@ -140,7 +140,7 @@ with Guide() as guide:
     Exp("noise_variance", q_log_noise)
 
 BBVI(model, guide, n_samples=4, epochs=200, lr=5e-3)
-trace = guide.sample(200, 200, n_chains=2)
+trace = guide.sample(200, n_chains=2)
 print(summary(trace, include_deterministic=True))
 Graphics.plot_posterior(trace, vars="random")
 Graphics.plot_posterior(trace, vars="deterministic")

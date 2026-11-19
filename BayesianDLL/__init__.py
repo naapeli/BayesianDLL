@@ -5,4 +5,4 @@ from ._plate import plate
 from .Samplers import (
     sample, sample_prior_predicative, posterior_predicative, SamplingResult, PredicativeResult, sample_smc,
 )
-from .Variational import find_MAP, Guide, AutoNormal, AutoMultivariateNormal, laplace_approximation
+from .Variational import find_MAP, Guide, Group, laplace_approximation

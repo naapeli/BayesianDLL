@@ -19,7 +19,7 @@ observations and a standardised covariate,
 
 Its posterior is Gaussian and known exactly, and with a standardised
 covariate the two coefficients are nearly independent, so the mean-field
-``AutoNormal`` guide can match it. The same guide is fitted twice, with
+guide ``Guide(model, default_family="mean_field")`` can match it. The same guide is fitted twice, with
 minibatches of 1000 and with the full data, and both are compared with the
 exact posterior. The figures show the ELBO traces against the amount of data
 processed,
@@ -32,7 +32,7 @@ import time
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import AutoNormal, Data, Model, ObservedParameter, RandomParameter, plate
+from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Deterministic import Linear
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.Variational import BBVI
@@ -69,14 +69,15 @@ exact_mean = exact_cov @ (design.T @ y / noise ** 2)
 runs = {}
 for label, size in (("minibatch (B = 1000)", batch_size), ("full batch", None)):
     torch.manual_seed(1)
-    guide = AutoNormal(model)
+    guide = Guide(model, default_family="mean_field")
     start = time.perf_counter()
     history = BBVI(model, guide, n_samples=4, epochs=2500, lr=0.02, lrd=0.998, batch_size=size,
                    callback_frequency=10, verbose=False)
     seconds = time.perf_counter() - start
     runs[label] = (guide, history, seconds)
-    means = [guide.locs[name].value.item() for name in ("intercept", "slope")]
-    sds = [guide.scales[name].value.item() for name in ("intercept", "slope")]
+    group = guide.groups[0]
+    means = [group.locs[name].value.item() for name in ("intercept", "slope")]
+    sds = [group.scales[name].value.item() for name in ("intercept", "slope")]
     print(f"{label:>20}: {seconds:5.1f} s, mean {[round(v, 4) for v in means]}, sd {[round(v, 4) for v in sds]}")
 print(f"{'exact':>20}:          mean {[round(v, 4) for v in exact_mean.tolist()]}, "
       f"sd {[round(v, 4) for v in exact_cov.diagonal().sqrt().tolist()]}")
@@ -111,7 +112,8 @@ for ax, index, name in ((axes[0, 1], 0, "intercept"), (axes[1, 0], 1, "slope")):
     grid = torch.linspace(exact_mean[index] - 5 * sd, exact_mean[index] + 5 * sd, 300, dtype=torch.float64)
     ax.plot(grid, Normal(exact_mean[index], sd).pdf(grid).flatten(), color="black", lw=3, alpha=0.4, label="exact")
     for label, (guide, history, seconds) in runs.items():
-        density = Normal(guide.locs[name].value, guide.scales[name].value).pdf(grid).flatten()
+        group = guide.groups[0]
+        density = Normal(group.locs[name].value, group.scales[name].value).pdf(grid).flatten()
         ax.plot(grid, density, color=colors[label], linestyle="--", label=label)
     ax.set_xlabel(name)
     ax.set_ylabel("density")

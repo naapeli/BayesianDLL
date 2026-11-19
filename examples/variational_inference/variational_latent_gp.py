@@ -17,7 +17,7 @@ compared:
 * a **hand-written mean-field guide** (a ``Guide``): an independent Normal
   for every coordinate of ``z`` with log-scale standard deviations;
   ``guide.sample`` maps its draws through the model's ``LatentGP`` node;
-* ``AutoMultivariateNormal``, a full-rank Normal over ``z``, which contains
+* ``Guide(model, default_family="full_rank")``, a full-rank Normal over ``z``, which contains
   the exact posterior.
 
 The figures show the ELBO of both guides, the posterior standard deviation
@@ -33,7 +33,7 @@ is about 8 nats lower.
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import AutoMultivariateNormal, Data, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
+from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.GP import RBF, LatentGP, gp_predictive
 from BayesianDLL.Variational import BBVI
@@ -52,7 +52,7 @@ with Model() as model:
     with plate("observations", x):
         ObservedParameter("y", Normal(f, noise_std), y)
 
-with Guide() as guide:
+with Guide(model) as guide:
     z_loc = VariationalParameter("z_loc", torch.zeros(n_observations, dtype=torch.float64))
     z_scale = VariationalParameter("z_scale", torch.ones(n_observations, dtype=torch.float64), log_scale=True)
     RandomParameter("f_white", Normal(z_loc, z_scale), shape=(n_observations,))
@@ -64,7 +64,7 @@ with Guide() as guide:
 history_mean_field = BBVI(model, guide, n_samples=4, epochs=2000, lr=0.02, lrd=0.999, callback_frequency=10, verbose=False)
 mean_field = guide.sample(1000)
 
-full_rank_guide = AutoMultivariateNormal(model)
+full_rank_guide = Guide(model, default_family="full_rank")
 history_full_rank = BBVI(model, full_rank_guide, n_samples=4, epochs=2000, lr=0.02, lrd=0.999, callback_frequency=10, verbose=False)
 full_rank = full_rank_guide.sample(1000)
 

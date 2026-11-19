@@ -13,8 +13,8 @@ def BBVI(model: Model, guide, n_samples=1, epochs=100, lr=1e-2, betas=(0.9, 0.99
 
     Args:
         model: the model.
-        guide: a :class:`Guide` (hand-written), :class:`AutoNormal` or
-            :class:`AutoMultivariateNormal`.
+        guide: a :class:`Guide` bound to ``model`` (Gaussian groups and/or
+            hand-written entries).
         n_samples: Monte Carlo samples per ELBO estimate.
         epochs: number of optimisation steps.
         lr: learning rate.
@@ -41,7 +41,8 @@ def BBVI(model: Model, guide, n_samples=1, epochs=100, lr=1e-2, betas=(0.9, 0.99
     Returns the list of recorded ELBO values.
     """
     if not isinstance(guide, BaseGuide):
-        raise TypeError(f"guide must be a Guide, AutoNormal or AutoMultivariateNormal, got {type(guide).__name__}.")
+        raise TypeError(f"guide must be a Guide, got {type(guide).__name__}.")
+    guide.validate(model)
     table = guide.variational_parameters()
     m = {key: torch.zeros_like(parameter.unconstrained_value) for key, parameter in table.items()}
     v = {key: torch.zeros_like(parameter.unconstrained_value) for key, parameter in table.items()}

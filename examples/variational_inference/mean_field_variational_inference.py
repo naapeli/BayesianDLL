@@ -42,7 +42,7 @@ with Model() as model:
 
 
 def normal_guide(initial_mean):
-    with Guide() as guide:
+    with Guide(model) as guide:
         m = VariationalParameter("m", torch.tensor([initial_mean], dtype=torch.float64))
         s = VariationalParameter("s", torch.tensor([1.0], dtype=torch.float64), log_scale=True)
         RandomParameter("x", Normal(m, s))

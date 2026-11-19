@@ -31,16 +31,16 @@ def test_map_records_history_when_silent(normal_model, capsys):
     assert capsys.readouterr().out == ""
 
 
-def make_guide(mean_value=0.3, std_value=1.1, requires_grad=False):
+def make_guide(model, mean_value=0.3, std_value=1.1, requires_grad=False):
     mean = torch.tensor([mean_value], requires_grad=requires_grad)
     std = torch.tensor([std_value], requires_grad=requires_grad)
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter("mean", Normal(VariationalParameter("loc", mean), VariationalParameter("std", std, min=0.1)))
     return guide, mean, std
 
 
 def test_elbo_reparameterization_gradients_match_autograd(normal_model):
-    guide, mean, std = make_guide(requires_grad=True)
+    guide, mean, std = make_guide(normal_model, requires_grad=True)
     model_before = normal_model.params["mean"].unconstrained_value.clone()
     guide_before = guide.params["mean"].unconstrained_value.clone()
     value, grads = elbo(normal_model, guide, n_samples=10)
@@ -63,7 +63,7 @@ def test_elbo_preserves_vector_reparameterization_gradients():
 
     mean = torch.tensor([0.3, -0.4, 0.8], requires_grad=True)
     std = torch.tensor([1.1, 0.8, 1.2], requires_grad=True)
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter(
             "z",
             Normal(
@@ -82,14 +82,14 @@ def test_elbo_preserves_vector_reparameterization_gradients():
 def test_elbo_is_zero_for_identical_model_and_guide():
     with Model() as model:
         RandomParameter("mean", Normal(torch.tensor([0.3]), torch.tensor([1.1])))
-    guide, _, _ = make_guide()
+    guide, _, _ = make_guide(model)
     value, _ = elbo(model, guide, n_samples=8)
     assert value.item() == pytest.approx(0, abs=1e-12)
 
 
 @pytest.mark.integration
 def test_bbvi_approaches_analytic_normal_posterior(normal_model):
-    guide, _, _ = make_guide(mean_value=-1.0, std_value=1.0)
+    guide, _, _ = make_guide(normal_model, mean_value=-1.0, std_value=1.0)
     BBVI(normal_model, guide, epochs=200, n_samples=12, lr=0.05, verbose=False)
     dist = guide.params["mean"].distribution
     assert dist.mu.value.item() == pytest.approx(1.6, abs=0.18)
@@ -98,7 +98,7 @@ def test_bbvi_approaches_analytic_normal_posterior(normal_model):
 
 
 def test_bbvi_reports_history(normal_model, capsys):
-    guide, _, _ = make_guide()
+    guide, _, _ = make_guide(normal_model)
     history = BBVI(normal_model, guide, epochs=4, n_samples=2, callback_frequency=2)
     assert len(history) == 2
     assert all(torch.isfinite(torch.tensor(history)))
@@ -125,7 +125,7 @@ def test_lognormal_guide_describes_constrained_value_and_matches_autograd():
     model = _exponential_model(counts=torch.tensor([2.0, 4.0, 3.0]))
     mean = torch.tensor([0.4], requires_grad=True)
     std = torch.tensor([0.6], requires_grad=True)
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter("x", LogNormal(VariationalParameter("m", mean), VariationalParameter("s", std)))
     value, grads = elbo(model, guide, n_samples=7)
     expected = torch.autograd.grad(value, (mean, std))
@@ -136,7 +136,7 @@ def test_lognormal_guide_describes_constrained_value_and_matches_autograd():
 def test_lognormal_guide_elbo_is_zero_for_the_exact_posterior():
     with Model() as model:
         RandomParameter("x", LogNormal(0.3, 0.7))
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter("x", LogNormal(VariationalParameter("m", torch.tensor([0.3])), VariationalParameter("s", torch.tensor([0.7]))))
     value, _ = elbo(model, guide, n_samples=5)
     assert value.item() == pytest.approx(0.0, abs=1e-10)
@@ -146,7 +146,7 @@ def test_lognormal_guide_elbo_is_zero_for_the_exact_posterior():
 def test_bbvi_lognormal_guide_reaches_known_optimum():
     """For p = Exp(1) the best LogNormal(m, s) has s = 1 and m = -1/2."""
     model = _exponential_model()
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter("x", LogNormal(VariationalParameter("m", torch.tensor([1.0])), VariationalParameter("s", torch.tensor([0.4]), log_scale=True)))
     BBVI(model, guide, n_samples=16, epochs=1500, lr=0.02, verbose=False)
     distribution = guide.params["x"].distribution
@@ -158,7 +158,7 @@ def test_deterministic_guide_gradient_matches_autograd():
     model = _exponential_model(counts=torch.tensor([1.0, 2.0]))
     mean = torch.tensor([0.1], requires_grad=True)
     std = torch.tensor([0.5], requires_grad=True)
-    with Guide() as guide:
+    with Guide(model) as guide:
         u = RandomParameter("u", Normal(VariationalParameter("m", mean), VariationalParameter("s", std)))
         # x = exp(2 u): the Jacobian terms do not cancel.
         DeterministicParameter("x", lambda u: torch.exp(2 * u), lambda u: {"u": 2 * torch.exp(2 * u)}, [u])
@@ -170,9 +170,9 @@ def test_deterministic_guide_gradient_matches_autograd():
 
 def test_exp_deterministic_guide_equals_normal_guide_on_log_scale():
     model = _exponential_model(counts=torch.tensor([1.0, 2.0]))
-    with Guide() as direct:
+    with Guide(model) as direct:
         RandomParameter("x", Normal(VariationalParameter("m", torch.tensor([0.2])), VariationalParameter("s", torch.tensor([0.3]))))
-    with Guide() as indirect:
+    with Guide(model) as indirect:
         log_x = RandomParameter("log_x", Normal(VariationalParameter("m", torch.tensor([0.2])), VariationalParameter("s", torch.tensor([0.3]))))
         Exp("x", log_x)
     torch.manual_seed(1)
@@ -199,7 +199,7 @@ def test_reinforce_gradient_matches_exact_gradient_without_mcmc():
     assert not hasattr(module, "sample")  # draws come from distribution.sample, not MCMC
     counts = torch.tensor([2.0, 4.0, 3.0])
     model = _exponential_model(counts=counts)
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter("x", Gamma(VariationalParameter("a", torch.tensor([3.0])), VariationalParameter("b", torch.tensor([1.5]))))
     value, grads = elbo(model, guide, n_samples=20000)
     h = 1e-4
@@ -212,14 +212,14 @@ def test_reinforce_gradient_matches_exact_gradient_without_mcmc():
 
 def test_guide_support_must_match_model_support():
     model = _exponential_model()
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter("x", Beta(VariationalParameter("a", torch.tensor([2.0])), VariationalParameter("b", torch.tensor([2.0]))))
     with pytest.raises(ValueError, match="support"):
         elbo(model, guide)
 
 
 def test_guide_must_cover_every_model_latent(normal_model):
-    with Guide() as guide:
+    with Guide(normal_model) as guide:
         RandomParameter("other", Normal(VariationalParameter("loc", torch.zeros(1)), VariationalParameter("scale", torch.ones(1))))
     with pytest.raises(ValueError, match="no distribution"):
         elbo(normal_model, guide)
@@ -234,7 +234,7 @@ def test_bbvi_float32_variational_parameters_with_float64_model():
     torch.manual_seed(0)
     with Model() as model:
         RandomParameter("x", Mixture([Normal(-1, 0.5), Normal(2, 1.0)], [0.3, 0.7]))
-    with Guide() as guide:
+    with Guide(model) as guide:
         mean = VariationalParameter("mean", 0)
         std = VariationalParameter("std", 2, min=1e-3)
         RandomParameter("x", Normal(mean, std))
@@ -245,18 +245,18 @@ def test_bbvi_float32_variational_parameters_with_float64_model():
 
 
 # ---------------------------------------------------------------------------
-# Guide: sampling, validation and agreement with AutoNormal
+# Guide: sampling, validation and agreement with a mean-field Gaussian group
 # ---------------------------------------------------------------------------
 import math
 
 from BayesianDLL.Distributions import Bernoulli
-from BayesianDLL.Variational import AutoNormal, BaseGuide
+from BayesianDLL.Variational import BaseGuide
 
 
-def test_guide_and_auto_guides_share_the_guide_interface(normal_model):
-    guide, _, _ = make_guide()
+def test_guide_interface(normal_model):
+    guide, _, _ = make_guide(normal_model)
     assert isinstance(guide, BaseGuide) and isinstance(guide, Model)
-    assert isinstance(AutoNormal(normal_model), BaseGuide)
+    assert isinstance(Guide(normal_model, default_family="mean_field"), BaseGuide)
     assert set(guide.variational_parameters()) == {"mean_loc", "mean_std"}
 
 
@@ -279,7 +279,7 @@ def test_guide_sample_lognormal_moments_without_mcmc(monkeypatch):
 
 
 def test_guide_sample_normal_moments(normal_model):
-    guide, _, _ = make_guide(mean_value=0.3, std_value=1.1)
+    guide, _, _ = make_guide(normal_model, mean_value=0.3, std_value=1.1)
     guide.validate(normal_model)
     draws = guide.sample(40000)["mean"].reshape(-1)
     assert draws.mean().item() == pytest.approx(0.3, abs=0.03)
@@ -296,15 +296,15 @@ def test_real_line_guide_samples_the_unconstrained_value():
     assert torch.log(draws).std().item() == pytest.approx(0.4, rel=0.02)
 
 
-def test_guide_sample_needs_a_model():
-    with Guide() as guide:
-        RandomParameter("x", Normal(VariationalParameter("m", torch.zeros(1)), VariationalParameter("s", torch.ones(1))))
-    with pytest.raises(ValueError, match="not bound to a model"):
-        guide.sample(10)
+def test_guide_needs_a_model():
+    with pytest.raises(TypeError, match="needs the model"):
+        Guide()
+    with pytest.raises(TypeError, match="needs the model"):
+        Guide("mean_field")
 
 
 def test_guide_must_be_mean_field(normal_model):
-    with Guide() as guide:
+    with Guide(normal_model) as guide:
         loc = RandomParameter("loc", Normal(VariationalParameter("m", torch.zeros(1)), VariationalParameter("s", torch.ones(1))))
         RandomParameter("mean", Normal(loc, VariationalParameter("std", torch.ones(1))))
     with pytest.raises(NotImplementedError, match="mean-field"):
@@ -315,12 +315,12 @@ def test_guide_rejects_enumerated_latents():
     with Model() as model:
         RandomParameter("z", Bernoulli(0.3), enumerate=True)
         RandomParameter("x", Normal(0.0, 1.0))
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter("z", Bernoulli(VariationalParameter("p", torch.tensor([0.5]))), enumerate=True)
         RandomParameter("x", Normal(VariationalParameter("m", torch.zeros(1)), VariationalParameter("s", torch.ones(1))))
     with pytest.raises(ValueError, match="enumerated"):
         guide.validate(model)
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter("z", Bernoulli(VariationalParameter("p", torch.tensor([0.5]))))
         RandomParameter("x", Normal(VariationalParameter("m", torch.zeros(1)), VariationalParameter("s", torch.ones(1))))
     with pytest.raises(ValueError, match="enumerated"):
@@ -335,17 +335,17 @@ def test_bbvi_rejects_objects_that_are_not_guides(normal_model):
 
 
 @pytest.mark.integration
-def test_bbvi_guide_and_auto_normal_reach_the_same_optimum(normal_model):
+def test_bbvi_guide_and_mean_field_group_reach_the_same_optimum(normal_model):
     """For a conjugate Normal model both Normal families contain the exact posterior N(1.6, 4/13)."""
     torch.manual_seed(0)
-    guide, _, _ = make_guide(mean_value=-1.0, std_value=1.0)
+    guide, _, _ = make_guide(normal_model, mean_value=-1.0, std_value=1.0)
     BBVI(normal_model, guide, epochs=1500, n_samples=16, lr=0.02, lrd=0.999, verbose=False)
     torch.manual_seed(0)
-    auto = AutoNormal(normal_model, init_scale=1.0)
+    auto = Guide(normal_model, default_family="mean_field", init_scale=1.0)
     BBVI(normal_model, auto, epochs=1500, n_samples=16, lr=0.02, lrd=0.999, verbose=False)
     distribution = guide.params["mean"].distribution
     hand_loc, hand_scale = distribution.mu.value.item(), distribution.sigma.value.item()
-    auto_loc, auto_scale = auto.locs["mean"].value.item(), auto.scales["mean"].value.item()
+    auto_loc, auto_scale = auto.groups[0].locs["mean"].value.item(), auto.groups[0].scales["mean"].value.item()
     assert hand_loc == pytest.approx(1.6, abs=0.05)
     assert hand_scale == pytest.approx(math.sqrt(4 / 13), abs=0.05)
     assert hand_loc == pytest.approx(auto_loc, abs=0.05)
@@ -360,7 +360,7 @@ def test_guide_mixture_registers_component_variational_parameters():
         RandomParameter("x", Normal(0.0, 1.0))
     m1 = VariationalParameter("m1", torch.tensor(-1.0, dtype=torch.float64))
     m2 = VariationalParameter("m2", torch.tensor(1.5, dtype=torch.float64))
-    with Guide() as guide:
+    with Guide(model) as guide:
         RandomParameter("x", Mixture([Normal(m1, 1.0), Normal(m2, 1.0)], torch.tensor([0.4, 0.6], dtype=torch.float64)))
     assert set(guide.variational_parameters()) == {"x_m1", "x_m2"}
     assert not Mixture.has_rsample  # score-function path

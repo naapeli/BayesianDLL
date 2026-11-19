@@ -100,6 +100,11 @@ def _uniform(shape, dtype, device):
     return u.clamp(min=tiny)
 
 
+def _expand(value, shape):
+    """``value`` broadcast to ``shape`` (a contiguous copy)."""
+    return value.expand(torch.broadcast_shapes(value.shape, tuple(shape))).clone()
+
+
 def _discrete_grad_error():
     return NotImplementedError("Gradient w.r.t. x is undefined for discrete distributions.")
 
@@ -237,6 +242,18 @@ class Distribution(ABC):
         """Inverse of :meth:`cdf` for ``u`` in ``(0, 1)`` (where available)."""
         raise NotImplementedError(f"{type(self).__name__} has no closed-form inverse cdf.")
 
+    def mean(self):
+        """Closed-form mean, broadcast to ``batch_shape + event_shape``.
+
+        Raises ``NotImplementedError`` when the distribution has no closed
+        form, and ``ValueError`` when the mean does not exist (Cauchy).
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no closed-form mean.")
+
+    def variance(self):
+        """Closed-form elementwise variance (see :meth:`mean`)."""
+        raise NotImplementedError(f"{type(self).__name__} has no closed-form variance.")
+
     def _no_reparam(self):
         return NotImplementedError(f"{type(self).__name__} has no reparameterised sampler; call sample() without _reparametrization_trick_grad.")
 
@@ -334,6 +351,15 @@ class Normal(Distribution):
         phi = torch.exp(-0.5 * t ** 2 - 0.5 * _LOG_2PI)
         return {self.resolve_name("mean", self.mu): -phi / sigma, self.resolve_name("sigma", self.sigma): -phi * t / sigma}
 
+
+    def mean(self):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        return _expand(mu, self.batch_shape)
+
+    def variance(self):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        return _expand(sigma ** 2, self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         mu, sigma = _as_float(self.mu, self.sigma)
         shape = _sample_shape(n_samples, self.batch_shape)
@@ -391,6 +417,13 @@ class HalfNormal(Distribution):
     def icdf(self, u):
         sigma = _as_float(self.sigma)
         return sigma * torch.special.ndtri((1 + u) / 2)
+
+
+    def mean(self):
+        return _as_float(self.sigma) * math.sqrt(2 / math.pi)
+
+    def variance(self):
+        return _as_float(self.sigma) ** 2 * (1 - 2 / math.pi)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         sigma = _as_float(self.sigma)
@@ -454,6 +487,15 @@ class LogNormal(Distribution):
         mu, sigma = _as_float(self.mu, self.sigma)
         return torch.exp(mu + sigma * torch.special.ndtri(u))
 
+
+    def mean(self):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        return _expand(torch.exp(mu + sigma ** 2 / 2), self.batch_shape)
+
+    def variance(self):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        return _expand(torch.expm1(sigma ** 2) * torch.exp(2 * mu + sigma ** 2), self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         mu, sigma = _as_float(self.mu, self.sigma)
         eps = torch.randn(_sample_shape(n_samples, self.batch_shape), dtype=mu.dtype, device=mu.device)
@@ -486,18 +528,18 @@ class MultivariateNormal(Distribution):
         super().__init__()
         _check_exactly_one(["covariance", "scale_tril"], [covariance, scale_tril])
         self.mu = mu
-        self.covariance = covariance
+        self.covariance_matrix = covariance
         self.scale_tril = scale_tril
         self.add_dependency(mu)
         self.add_dependency(covariance if covariance is not None else scale_tril)
 
     @property
     def has_rsample(self):
-        return not isinstance(self.covariance if self.covariance is not None else self.scale_tril, VariationalParameter)
+        return not isinstance(self.covariance_matrix if self.covariance_matrix is not None else self.scale_tril, VariationalParameter)
 
     def _params(self):
-        if self.covariance is not None:
-            mu, cov = _as_float(self.mu, self.covariance)
+        if self.covariance_matrix is not None:
+            mu, cov = _as_float(self.mu, self.covariance_matrix)
             L = torch.linalg.cholesky(cov)
         else:
             mu, L = _as_float(self.mu, self.scale_tril)
@@ -506,7 +548,7 @@ class MultivariateNormal(Distribution):
         return mu, L
 
     def _matrix(self):
-        return resolve(self.covariance if self.covariance is not None else self.scale_tril)
+        return resolve(self.covariance_matrix if self.covariance_matrix is not None else self.scale_tril)
 
     @property
     def event_shape(self):
@@ -542,13 +584,27 @@ class MultivariateNormal(Distribution):
     def log_pdf_param_grads(self, x):
         y, a, L = self._whiten(x)
         grads = {self.resolve_name("mean", self.mu): a}
-        if self.covariance is not None:
+        if self.covariance_matrix is not None:
             precision = torch.cholesky_inverse(L)
-            grads[self.resolve_name("covariance", self.covariance)] = 0.5 * (a.unsqueeze(-1) * a.unsqueeze(-2) - precision)
+            grads[self.resolve_name("covariance", self.covariance_matrix)] = 0.5 * (a.unsqueeze(-1) * a.unsqueeze(-2) - precision)
         else:
             diag = torch.diagonal(L, dim1=-2, dim2=-1)
             grads[self.resolve_name("scale_tril", self.scale_tril)] = torch.tril(a.unsqueeze(-1) * y.unsqueeze(-2)) - torch.diag_embed(1 / diag)
         return grads
+
+
+    def mean(self):
+        mu, L = self._params()
+        return _expand(mu, (*self.batch_shape, *self.event_shape))
+
+    def covariance(self):
+        """The covariance matrix ``L L^T``, shape ``(*batch_shape, D, D)``."""
+        mu, L = self._params()
+        D = self.event_shape[0]
+        return _expand(L @ L.transpose(-2, -1), (*self.batch_shape, D, D))
+
+    def variance(self):
+        return torch.diagonal(self.covariance(), dim1=-2, dim2=-1)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad and not self.has_rsample:
@@ -608,6 +664,16 @@ class Beta(Distribution):
     def _log_prob_grad_unconstrained(self, x_unconstrained):
         a, b = _as_float(self.a, self.b)
         return a * torch.sigmoid(-x_unconstrained) - b * torch.sigmoid(x_unconstrained)
+
+
+    def mean(self):
+        a, b = _as_float(self.a, self.b)
+        return _expand(a / (a + b), self.batch_shape)
+
+    def variance(self):
+        a, b = _as_float(self.a, self.b)
+        total = a + b
+        return _expand(a * b / (total ** 2 * (total + 1)), self.batch_shape)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -677,6 +743,13 @@ class Exponential(Distribution):
         rate = _as_float(self.rate)
         return {self.resolve_name("rate", self.rate): x * torch.exp(-rate * x)}
 
+
+    def mean(self):
+        return 1 / _as_float(self.rate)
+
+    def variance(self):
+        return 1 / _as_float(self.rate) ** 2
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         rate = _as_float(self.rate)
         eps = _uniform(_sample_shape(n_samples, self.batch_shape), rate.dtype, rate.device)
@@ -732,6 +805,15 @@ class Gamma(Distribution):
     def cdf(self, x):
         alpha, beta = _as_float(self.alpha, self.beta)
         return torch.special.gammainc(alpha, beta * x)
+
+
+    def mean(self):
+        alpha, beta = _as_float(self.alpha, self.beta)
+        return _expand(alpha / beta, self.batch_shape)
+
+    def variance(self):
+        alpha, beta = _as_float(self.alpha, self.beta)
+        return _expand(alpha / beta ** 2, self.batch_shape)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -809,6 +891,15 @@ class Uniform(Distribution):
         low, high = _as_float(self.low, self.high)
         return low + (high - low) * u
 
+
+    def mean(self):
+        low, high = _as_float(self.low, self.high)
+        return _expand((low + high) / 2, self.batch_shape)
+
+    def variance(self):
+        low, high = _as_float(self.low, self.high)
+        return _expand((high - low) ** 2 / 12, self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         low, high = _as_float(self.low, self.high)
         u = torch.rand(_sample_shape(n_samples, self.batch_shape), dtype=low.dtype, device=low.device)
@@ -867,6 +958,21 @@ class InvGamma(Distribution):
     def cdf(self, x):
         alpha, beta = _as_float(self.alpha, self.beta)
         return torch.special.gammaincc(alpha, beta / x)
+
+
+    def mean(self):
+        """``beta / (alpha - 1)`` for ``alpha > 1``, ``inf`` otherwise."""
+        alpha, beta = _as_float(self.alpha, self.beta)
+        safe = torch.where(alpha > 1, alpha - 1, torch.ones_like(alpha))
+        mean = torch.where(alpha > 1, beta / safe, torch.full_like(alpha * beta, math.inf))
+        return _expand(mean, self.batch_shape)
+
+    def variance(self):
+        """``beta^2 / ((alpha - 1)^2 (alpha - 2))`` for ``alpha > 2``, ``inf`` otherwise."""
+        alpha, beta = _as_float(self.alpha, self.beta)
+        safe = torch.where(alpha > 2, alpha, torch.full_like(alpha, 3.0))
+        variance = torch.where(alpha > 2, beta ** 2 / ((safe - 1) ** 2 * (safe - 2)), torch.full_like(alpha * beta, math.inf))
+        return _expand(variance, self.batch_shape)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -930,6 +1036,13 @@ class HalfCauchy(Distribution):
         scale = _as_float(self.scale)
         return scale * torch.tan(math.pi / 2 * u)
 
+
+    def mean(self):
+        raise ValueError("The half-Cauchy distribution has no finite mean.")
+
+    def variance(self):
+        raise ValueError("The half-Cauchy distribution has no finite variance.")
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         scale = _as_float(self.scale)
         u = torch.rand(_sample_shape(n_samples, self.batch_shape), dtype=scale.dtype, device=scale.device)
@@ -988,6 +1101,13 @@ class Cauchy(Distribution):
         t = (x - mu) / scale
         dens = 1 / (math.pi * (1 + t ** 2))
         return {self.resolve_name("mean", self.mu): -dens / scale, self.resolve_name("scale", self.scale): -dens * t / scale}
+
+
+    def mean(self):
+        raise ValueError("The Cauchy distribution has no mean.")
+
+    def variance(self):
+        raise ValueError("The Cauchy distribution has no variance.")
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         mu, scale = _as_float(self.mu, self.scale)
@@ -1048,6 +1168,15 @@ class Laplace(Distribution):
         t = (x - mu) / scale
         dens = 0.5 * torch.exp(-t.abs())
         return {self.resolve_name("mean", self.mu): -dens / scale, self.resolve_name("scale", self.scale): -dens * t / scale}
+
+
+    def mean(self):
+        mu, scale = _as_float(self.mu, self.scale)
+        return _expand(mu, self.batch_shape)
+
+    def variance(self):
+        mu, scale = _as_float(self.mu, self.scale)
+        return _expand(2 * scale ** 2, self.batch_shape)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         mu, scale = _as_float(self.mu, self.scale)
@@ -1111,6 +1240,20 @@ class StudentT(Distribution):
         grad_sigma = -1 / sigma + (nu + 1) * t2 / (sigma * (nu + t2))
         return {self.resolve_name("nu", self.nu): grad_nu, self.resolve_name("mean", self.mu): grad_mu,
                 self.resolve_name("sigma", self.sigma): grad_sigma}
+
+
+    def mean(self):
+        """``mu`` for ``nu > 1``, ``nan`` otherwise (the mean does not exist)."""
+        nu, mu, sigma = _as_float(self.nu, self.mu, self.sigma)
+        mu = _expand(mu, self.batch_shape)
+        return torch.where(_expand(nu, self.batch_shape) > 1, mu, torch.full_like(mu, math.nan))
+
+    def variance(self):
+        """``sigma^2 nu / (nu - 2)`` for ``nu > 2``, ``inf`` for ``1 < nu <= 2`` and ``nan`` for ``nu <= 1``."""
+        nu, mu, sigma = _as_float(self.nu, self.mu, self.sigma)
+        nu, sigma = _expand(nu, self.batch_shape), _expand(sigma, self.batch_shape)
+        finite = sigma ** 2 * nu / torch.where(nu > 2, nu - 2, torch.ones_like(nu))
+        return torch.where(nu > 2, finite, torch.where(nu > 1, torch.full_like(nu, math.inf), torch.full_like(nu, math.nan)))
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad and not self.has_rsample:
@@ -1189,6 +1332,21 @@ class Dirichlet(Distribution):
         tail = torch.flip(torch.cumsum(torch.flip(a1, dims=[-1]), dim=-1), dims=[-1])[..., 1:]
         grad = a1[..., :-1] * (1 - y) - y * tail
         return grad + self.transform.grad_log_abs_det_jacobian(z)
+
+
+    def mean(self):
+        alpha = _as_float(self.alpha)
+        return alpha / alpha.sum(-1, keepdim=True)
+
+    def variance(self):
+        return torch.diagonal(self.covariance(), dim1=-2, dim2=-1)
+
+    def covariance(self):
+        """``(diag(m) - m m^T) / (alpha_0 + 1)`` with ``m = alpha / alpha_0``, shape ``(*batch_shape, K, K)``."""
+        alpha = _as_float(self.alpha)
+        total = alpha.sum(-1, keepdim=True)
+        m = alpha / total
+        return (torch.diag_embed(m) - m.unsqueeze(-1) * m.unsqueeze(-2)) / (total.unsqueeze(-1) + 1)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1425,6 +1583,21 @@ class Wishart(_WishartFamily):
         diag = torch.where(rows == cols, torch.ones((), dtype=z.dtype, device=z.device), torch.zeros((), dtype=z.dtype, device=z.device))
         return grad + (df - self.dim - 1)[..., None] * diag + T.grad_log_abs_det_jacobian(z)
 
+
+    def mean(self):
+        """``df * scale``."""
+        df, L, _, _ = self._params()
+        df = df[..., None, None] if df.ndim else df
+        return df * (L @ L.transpose(-2, -1))
+
+    def variance(self):
+        """Elementwise variances ``df (S_ij^2 + S_ii S_jj)``."""
+        df, L, _, _ = self._params()
+        S = L @ L.transpose(-2, -1)
+        diagonal = torch.diagonal(S, dim1=-2, dim2=-1)
+        df = df[..., None, None] if df.ndim else df
+        return df * (S ** 2 + diagonal.unsqueeze(-1) * diagonal.unsqueeze(-2))
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         """Bartlett decomposition: ``X = L_S A A^T L_S^T``."""
         self._no_rsample(_reparametrization_trick_grad)
@@ -1475,6 +1648,15 @@ class InverseWishart(_WishartFamily):
         grads = {self.resolve_name("df", self.df): grad_df}
         grads.update(self._matrix_grads(grad_scale, L))
         return grads
+
+
+    def mean(self):
+        """``scale / (df - D - 1)`` for ``df > D + 1``, ``inf`` otherwise."""
+        df, _, S, _ = self._scale_params()
+        df = df[..., None, None] if df.ndim else df
+        denominator = df - self.dim - 1
+        safe = torch.where(denominator > 0, denominator, torch.ones_like(denominator))
+        return torch.where(denominator > 0, S / safe, torch.full_like(S, math.inf))
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         """``X = L_S A^-T A^-1 L_S^T`` with a Bartlett factor ``A``."""
@@ -1556,6 +1738,15 @@ class Geometric(_ProbsOrLogits, Distribution):
         p = _as_float(self.probs)
         return {self.resolve_name("probs", self.probs): _zero_outside(1 / p - (x - 1) / (1 - p), inside)}
 
+
+    def mean(self):
+        """``1 / p`` (number of trials, support 1, 2, ...)."""
+        return 1 / self._probs_float()
+
+    def variance(self):
+        p = self._probs_float()
+        return (1 - p) / p ** 2
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -1602,6 +1793,14 @@ class Bernoulli(_ProbsOrLogits, Distribution):
             return {self.resolve_name("logits", self.logits): _zero_outside(grad, inside)}
         p = _as_float(self.probs)
         return {self.resolve_name("probs", self.probs): _zero_outside(x / p - (1 - x) / (1 - p), inside)}
+
+
+    def mean(self):
+        return self._probs_float()
+
+    def variance(self):
+        p = self._probs_float()
+        return p * (1 - p)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1665,6 +1864,15 @@ class Binomial(_ProbsOrLogits, Distribution):
         p = _as_float(self.probs)
         return {self.resolve_name("probs", self.probs): _zero_outside(x / p - (n - x) / (1 - p), inside)}
 
+
+    def mean(self):
+        p = self._probs_float()
+        return self._count(p) * p
+
+    def variance(self):
+        p = self._probs_float()
+        return self._count(p) * p * (1 - p)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -1714,6 +1922,15 @@ class DiscreteUniform(Distribution):
         inv = torch.where(inside, 1 / (high - low + 1), torch.zeros_like(x))
         return {self.resolve_name("low", self.low): inv, self.resolve_name("high", self.high): -inv}
 
+
+    def mean(self):
+        low, high = self._bounds(torch.empty(0))
+        return _expand((low + high) / 2, self.batch_shape)
+
+    def variance(self):
+        low, high = self._bounds(torch.empty(0))
+        return _expand(((high - low + 1) ** 2 - 1) / 12, self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -1754,6 +1971,13 @@ class Poisson(Distribution):
         inside, x = self._support(x)
         rate = _as_float(self.rate)
         return {self.resolve_name("rate", self.rate): _zero_outside(x / rate - 1, inside)}
+
+
+    def mean(self):
+        return _as_float(self.rate)
+
+    def variance(self):
+        return _as_float(self.rate)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1810,6 +2034,22 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
             p = _as_float(self.probs)
             grads[self.resolve_name("probs", self.probs)] = x / p - r / (1 - p)
         return {name: _zero_outside(grad, inside) for name, grad in grads.items()}
+
+
+    def _odds(self):
+        if self.logits is not None:
+            return torch.exp(_as_float(self.logits))
+        p = _as_float(self.probs)
+        return p / (1 - p)
+
+    def mean(self):
+        """``r p / (1 - p)`` (number of successes before ``total_count`` failures)."""
+        odds = self._odds()
+        return _as_float(self.total_count).to(odds.dtype) * odds
+
+    def variance(self):
+        odds = self._odds()
+        return _as_float(self.total_count).to(odds.dtype) * odds * (1 + odds)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1890,6 +2130,19 @@ class Categorical(Distribution):
         grad = torch.where(onehot > 0, 1 / p, torch.zeros_like(p)) - 1 / p.sum(-1, keepdim=True)
         return {self.resolve_name("probs", self.probs): _zero_outside(grad, inside.unsqueeze(-1))}
 
+
+    def mean(self):
+        """Mean of the category index ``sum_k k p_k``."""
+        p = torch.exp(self._log_probs())
+        k = torch.arange(self.n_categories, dtype=p.dtype, device=p.device)
+        return (p * k).sum(-1)
+
+    def variance(self):
+        p = torch.exp(self._log_probs())
+        k = torch.arange(self.n_categories, dtype=p.dtype, device=p.device)
+        mean = (p * k).sum(-1)
+        return (p * k ** 2).sum(-1) - mean ** 2
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -1969,6 +2222,22 @@ class Multinomial(Distribution):
         grad = torch.where(x > 0, x / p, torch.zeros_like(x * p)) - n / p.sum(-1, keepdim=True)
         return {self.resolve_name("probs", self.probs): _zero_outside(grad, inside.unsqueeze(-1))}
 
+
+    def mean(self):
+        p = torch.exp(self._log_probs())
+        return _as_float(self.total_count).to(p.dtype) * p
+
+    def variance(self):
+        p = torch.exp(self._log_probs())
+        return _as_float(self.total_count).to(p.dtype) * p * (1 - p)
+
+    def covariance(self):
+        """``n (diag(p) - p p^T)``, shape ``(*batch_shape, K, K)``."""
+        p = torch.exp(self._log_probs())
+        n = _as_float(self.total_count).to(p.dtype)
+        n = n[..., None, None] if n.ndim else n
+        return n * (torch.diag_embed(p) - p.unsqueeze(-1) * p.unsqueeze(-2))
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         """Sequential conditional binomial draws."""
         if _reparametrization_trick_grad:
@@ -2043,6 +2312,16 @@ class ZeroInflated(Distribution):
         gate_name = self.resolve_name("gate", self.gate)
         grads[gate_name] = grads.get(gate_name, 0) + grad_gate
         return grads
+
+
+    def mean(self):
+        gate = _as_float(self.gate)
+        return (1 - gate) * self.base.mean()
+
+    def variance(self):
+        gate = _as_float(self.gate)
+        mean = self.base.mean()
+        return (1 - gate) * (self.base.variance() + mean ** 2) - ((1 - gate) * mean) ** 2
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -2422,6 +2701,25 @@ class Mixture(Distribution):
                     coeff = coeff.reshape(*coeff.shape, *([1] * (gradient.ndim - coefficient.ndim)))
                 grads[name] = grads.get(name, 0) + coeff * gradient
         return grads
+
+
+    def _component_weight(self, k, like):
+        weight = self._weights()[..., k].to(dtype=like.dtype, device=like.device)
+        return weight.reshape(tuple(weight.shape) + (1,) * len(self.event_shape))
+
+    def mean(self):
+        """``sum_k w_k mean_k``."""
+        means = [component.mean() for component in self.components]
+        return sum(self._component_weight(k, m) * m for k, m in enumerate(means))
+
+    def variance(self):
+        """Law of total variance: ``sum_k w_k (var_k + mean_k^2) - mean^2``."""
+        means = [component.mean() for component in self.components]
+        second = sum(
+            self._component_weight(k, m) * (component.variance() + m ** 2)
+            for k, (component, m) in enumerate(zip(self.components, means))
+        )
+        return second - self.mean() ** 2
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:

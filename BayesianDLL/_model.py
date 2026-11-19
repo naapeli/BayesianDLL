@@ -1215,6 +1215,19 @@ class Model:
         return marginalize(self, names)
 
 
+_GUIDE_CONDITION_MESSAGE = (
+    "A Guide cannot be conditioned or marginalised. To fix a latent to a known value, condition the MODEL "
+    "instead, e.g. `condition(model, tau=0.5)`, and build the guide on the conditioned model, which then no "
+    "longer needs to cover that latent. A guide must stay exactly sampleable, and conditioning it on a "
+    "non-root latent would need MCMC."
+)
+
+
+def _refuse_guide(model):
+    if getattr(model, "_is_guide", False):
+        raise TypeError(_GUIDE_CONDITION_MESSAGE)
+
+
 def condition(model: Model, random_variable_names_and_values: dict = None, **kwargs) -> Model:
     """Return a copy of ``model`` with some variables fixed to given values.
 
@@ -1238,6 +1251,7 @@ def condition(model: Model, random_variable_names_and_values: dict = None, **kwa
     """
     if not isinstance(model, Model):
         raise TypeError(f"model must be an instance of Model, got {type(model).__name__}.")
+    _refuse_guide(model)
 
     conditions = {}
     if random_variable_names_and_values is not None:
@@ -1342,6 +1356,7 @@ def marginalize(model: Model, names) -> Model:
     from ._parameters import _check_enumerable
     if not isinstance(model, Model):
         raise TypeError(f"model must be an instance of Model, got {type(model).__name__}.")
+    _refuse_guide(model)
     names = [names] if isinstance(names, str) or hasattr(names, "name") else list(names)
     names = [n.name if hasattr(n, "name") else str(n) for n in names]
     for name in names:

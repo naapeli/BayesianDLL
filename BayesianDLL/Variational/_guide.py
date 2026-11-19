@@ -1,23 +1,17 @@
-"""Variational guides: the shared guide interface and hand-written guides.
-
-A guide is the variational family ``q`` that :func:`BBVI` fits to a model's
-posterior. There are two kinds, with the same interface (:class:`BaseGuide`):
-
-* :class:`Guide`, written by hand: you choose each latent's variational
-  family (``Normal``, ``LogNormal``, ``Gamma``, ``Beta``, ...).
-* the automatic Gaussian guides :class:`AutoNormal` and
-  :class:`AutoMultivariateNormal`, built from the model.
-"""
+"""Variational guides: :class:`Guide`, a product of Gaussian groups and hand-written entries."""
 
 from abc import ABC, abstractmethod
 
 import torch
 
-from .._model import Model
+from .._model import _GUIDE_CONDITION_MESSAGE, Model
+from .._parameters import RandomParameter
 from ..Distributions._state_space import ContinuousReal
-from ..Samplers._ancestral import draw_shaped
+from ..Distributions._transforms import IdentityTransform
 from ..Samplers._result import SamplingResult
-from ._ELBO import _guide_elbo, _restore_guide_values, _set_guide_values
+from ._ELBO import HandWrittenEntries, estimate_elbo
+from ._groups import FAMILIES, Group, _discrete_message
+from ._moments import GuideCovariance, mc_moments, transform_batch
 
 
 class BaseGuide(ABC):
@@ -86,9 +80,12 @@ def _bounds_are_constant(transform):
 
 
 class _Plan:
-    """How each guide latent maps onto the model (built and checked by :meth:`Guide.validate`)."""
+    """How each hand-written guide entry maps onto the model (built and checked by :meth:`Guide.validate`).
 
-    def __init__(self, model, guide):
+    ``covered`` are the model latents that the guide's groups cover.
+    """
+
+    def __init__(self, model, guide, covered=()):
         if not model._compiled:
             model.compile()
         if not guide._compiled:
@@ -111,6 +108,11 @@ class _Plan:
                 )
             if name in enumerated:
                 raise ValueError(f"'{name}' is enumerated (summed out) in the model and must not appear in the guide.")
+            if name in model.observed_params:
+                raise ValueError(
+                    f"'{name}' is observed in the model (e.g. fixed by condition()); the guide must not cover it. "
+                    "Remove its guide entry."
+                )
             if name not in model.params:
                 self.modes[name] = "auxiliary"
                 continue
@@ -154,10 +156,12 @@ class _Plan:
             self.targets[name] = (deterministic, sources[0])
         self.sources = {source: target for target, (_, source) in self.targets.items()}
 
-        covered = {n for n, mode in self.modes.items() if mode != "auxiliary"} | set(self.targets)
-        missing = [name for name in model.params if name not in covered]
+        mine = {n for n, mode in self.modes.items() if mode != "auxiliary"} | set(self.targets)
+        missing = [name for name in model.params if name not in mine and name not in covered]
         if missing:
             raise ValueError(f"The guide has no distribution for the model latent(s) {missing}.")
+        # The model latents described by the entries, in model order.
+        self.latents = [name for name in model.params if name in mine]
 
         # Auxiliary latents that feed no model latent do not enter the ELBO.
         self.active = [n for n, mode in self.modes.items() if mode != "auxiliary" or n in self.sources]
@@ -168,88 +172,408 @@ class _Plan:
         }
 
 
+def _distribution_moments(distribution, shape):
+    """Closed-form ``(flat mean, covariance matrix)`` of a guide distribution whose draws have ``shape``.
+
+    Raises ``NotImplementedError`` or ``ValueError`` when there is no closed form.
+    """
+    shape = tuple(shape)
+    mean = torch.as_tensor(distribution.mean())
+    covariance = getattr(distribution, "covariance", None)
+    if callable(covariance) and len(distribution.event_shape) == 1:
+        matrix = covariance()
+        k = matrix.shape[-1]
+        mean = mean.expand(shape)
+        blocks = matrix.expand(*shape[:-1], k, k).reshape(-1, k, k)
+        return mean.reshape(-1), torch.block_diag(*blocks)
+    variance = torch.as_tensor(distribution.variance())
+    mean = mean.expand(shape).reshape(-1)
+    variance = variance.to(mean.dtype).expand(shape).reshape(-1)
+    return mean, torch.diag(variance)
+
+
 class Guide(Model, BaseGuide):
-    """A hand-written mean-field guide: you choose each latent's variational family.
+    """The variational family ``q`` for :func:`BBVI`: independent Gaussian groups and hand-written entries.
 
-    Build it like a model, with one ``RandomParameter`` per model latent (same
-    name) whose distribution takes :class:`VariationalParameter` arguments::
+    A guide is bound to the model it approximates::
 
-        with Guide() as guide:
-            RandomParameter("sigma", LogNormal(VariationalParameter("m", 0.0), VariationalParameter("s", 1.0, min=1e-3)))
+        guide = Guide(model, default_family="full_rank")    # one full-rank MVN over the whole model
+        guide = Guide(model, default_family="mean_field")   # an independent Normal per coordinate
 
-    Any family with the support of the latent describes its constrained value
-    (``LogNormal``, ``Gamma``, ``Exponential`` or ``Beta`` guides, which
-    :class:`AutoNormal` cannot express); a family on the real line describes
-    its unconstrained value. A guide ``DeterministicParameter`` named like a
-    model latent gives that latent's constrained value as an elementwise
-    function of one auxiliary guide latent, e.g. ``Exp("sigma", log_sigma)``.
-    The guide must be mean-field (no guide distribution depends on another
-    guide node) and must not contain enumerated latents.
+        with Guide(model, default_family="mean_field") as guide:
+            Group(["mu", "beta"], family="full_rank")         # dependent latents share a group
+            RandomParameter("sigma", LogNormal(VariationalParameter("sigma_loc", 0.0),
+                                               VariationalParameter("sigma_scale", 0.5, log_scale=True)))
+        BBVI(model, guide, ...)
+        trace = guide.sample(1000)
 
-    ``model`` is the model the guide approximates. It can be omitted: the
-    guide is bound to the model it is checked against by :meth:`validate`,
-    which :func:`BBVI` and :func:`elbo` call.
+    The ``with`` block is only needed to add :class:`Group` objects or
+    hand-written entries. The joint ``q`` is the product of independent
+    pieces:
+
+    * **Groups** (:class:`Group`): Gaussians over the unconstrained values of
+      their latents, mean-field or full-rank.
+    * **Hand-written entries**: a ``RandomParameter`` named like a model
+      latent whose distribution has :class:`VariationalParameter` arguments.
+      A family on the real line describes the latent's unconstrained value,
+      a family with the latent's support (``LogNormal``, ``Gamma``,
+      ``Beta``, a discrete family, ...) its constrained value. A guide
+      ``DeterministicParameter`` named like a model latent gives that
+      latent's constrained value as an elementwise function of one
+      auxiliary entry, e.g. ``Exp("sigma", log_sigma)``. Entries without a
+      reparameterised sampler (discrete or ``Gamma`` entries, mixtures) are
+      fitted with score-function gradients. Entries must not depend on other
+      guide nodes and must not be enumerated.
+    * **The default group**: with ``default_family="mean_field"`` or
+      ``"full_rank"``, every latent that no group or entry covers is
+      collected into one group of that family (created at the first
+      :meth:`validate`, and on :attr:`groups`). When it covers the whole
+      model its VariationalParameters are unprefixed (``{latent}_loc`` /
+      ``{latent}_scale``, or ``loc`` / ``scale_tril``); otherwise they are
+      prefixed with ``default_``. With ``default_family=None`` (the default)
+      an uncovered latent is an error.
+
+    Every latent belongs to exactly one group or entry. ``init_scale`` is
+    the initial standard deviation of the default group's coordinates.
+
+    A guide cannot be conditioned or marginalised (``condition(guide, ...)``
+    raises ``TypeError``): to fix a latent to a known value, condition the
+    model, ``Guide(condition(model, tau=0.5), ...)``; the conditioned latent
+    is then observed and the guide must not cover it.
+
+    Moments
+    -------
+    :meth:`mean` and :meth:`covariance` (and the same methods of every
+    group) give the moments of ``q`` in the ``"unconstrained"`` or the
+    ``"constrained"`` space. Pieces of the guide are independent, so the
+    covariance is block diagonal: every block between two groups or entries
+    is exactly zero. Within a block:
+
+    ==============================  =====================  =====================================
+    piece                           unconstrained space    constrained space
+    ==============================  =====================  =====================================
+    Gaussian group                  exact: ``loc``,        identity transform: exact;
+                                    ``diag(scale^2)`` or   elementwise ``log``: exact log-normal
+                                    ``L L^T``              moments (full-rank: exact
+                                                           cross-covariances too); any other
+                                                           transform (logit, stick-breaking,
+                                                           ...): Monte Carlo
+    real-line entry                 exact if the family    exact if the latent's transform is
+                                    has closed-form        the identity and the moments are
+                                    moments, else MC       closed-form, else MC
+    support-matched entry           exact if the           exact if the family has closed-form
+                                    transform is the       moments, else MC
+                                    identity, else MC
+    deterministic (auxiliary) entry Monte Carlo            Monte Carlo
+    ==============================  =====================  =====================================
+
+    The result lists the Monte Carlo blocks in ``estimated`` and their
+    standard errors in ``standard_error``.
+
+    Accuracy and cost
+    -----------------
+    * **Exact Gaussian moments, unconstrained space.** No sampling error.
+      The cost is ``O(d)`` for a mean-field group and ``O(d^2)`` for a
+      full-rank group (forming ``L L^T``): essentially free.
+    * **Exact closed forms, constrained space** (log-normal moments
+      ``exp(mu + s^2/2)``, ``(exp(s^2) - 1) exp(2 mu + s^2)`` and
+      ``cov(e^x_i, e^x_j) = exp(mu_i + mu_j + (S_ii + S_jj)/2) (exp(S_ij) - 1)``,
+      and the closed-form moments of hand-written distributions). No
+      sampling error, ``O(d)`` or ``O(d^2)``: also essentially free. They
+      are exact moments of the approximating distribution ``q``, not of the
+      true posterior; how close ``q`` is to the posterior is a separate
+      question, which the ELBO and a comparison with MCMC answer.
+    * **Monte Carlo.** The error of an estimated mean is ``O(sd / sqrt(n))``
+      per coordinate (reported as ``standard_error``); the relative error
+      of an estimated variance is about ``sqrt(2 / n)`` for Gaussian-like
+      draws and larger for heavy-tailed transforms (e.g. ``exp`` of a wide
+      Normal). The cost is ``n`` draws times (the transform cost plus
+      ``O(d^2)`` for accumulating the covariance), linear in ``n``. The
+      default ``n = 4000`` gives about 1.6% relative standard error on a
+      mean in units of its sd (``1 / sqrt(4000)``) and about 2.2% on a
+      variance (``sqrt(2 / 4000)``). The draws come from a local generator
+      seeded with ``seed``, so the global random state is untouched and the
+      result is reproducible.
+    * **The draws are exact and independent.** Every group is sampled
+      exactly (``z = loc + L eps`` for full-rank, independent Normals for
+      mean-field) and every hand-written entry with its distribution's own
+      ``sample()``; the guide is never sampled with MCMC (an entry without a
+      working ``sample()`` raises an error). So ``n`` draws are ``n``
+      effective samples, with no autocorrelation and no warm-up. Strong
+      correlation inside a full-rank group does not change this, because
+      it lives in ``L``; its only consequence is that covariance estimates
+      along near-singular directions are noisier. This is unlike
+      :func:`~BayesianDLL.sample` on the posterior, which runs MCMC and
+      gives autocorrelated draws whose effective sample size is smaller
+      than their number.
+    * **Constrained vs unconstrained.** The unconstrained moments describe
+      ``q`` directly. Constrained moments are moments of the transformed
+      variable and generally cannot be obtained by transforming the
+      unconstrained mean: ``exp(E[x]) != E[exp(x)]``. For a log transform
+      ``exp(E[x])`` is the median of the log-normal, and it underestimates
+      the mean by the factor ``exp(-s^2/2)`` (Jensen's inequality); a logit
+      transform pulls ``sigmoid(E[x])`` away from the mean towards the
+      nearer boundary.
+    * **When to use which.** Use the unconstrained moments to diagnose the
+      optimisation (the scales and correlations that BBVI actually fits,
+      e.g. to see whether a full-rank group is needed). Use the
+      constrained moments to report the approximation in the model's own
+      units. For anything else (quantiles, intervals, functions of several
+      latents, deterministic nodes) draw ``guide.sample(n)`` and use
+      :func:`~BayesianDLL.Evaluation.summary`: it covers every case with the
+      same exact, independent draws.
     """
 
-    def __init__(self, model=None):
-        super().__init__()
-        self.model = model
+    _is_guide = True
 
-    def variational_parameters(self):
-        """``{f"{latent}_{name}": VariationalParameter}`` of every guide distribution."""
-        table = {}
-        for name, parameter in self.params.items():
-            for parameter_name, variational_parameter in parameter.distribution.variational_parameters.items():
-                table[f"{name}_{parameter_name}"] = variational_parameter
-        return table
+    def condition(self, *args, **kwargs):
+        """Guides cannot be conditioned: condition the model instead (raises ``TypeError``)."""
+        raise TypeError(_GUIDE_CONDITION_MESSAGE)
+
+    def marginalize(self, *args, **kwargs):
+        """Guides cannot be marginalised (raises ``TypeError``)."""
+        raise TypeError(_GUIDE_CONDITION_MESSAGE)
+
+    def __init__(self, model=None, default_family=None, init_scale=0.1):
+        if not isinstance(model, Model) or isinstance(model, Guide):
+            raise TypeError(
+                "Guide(model, default_family=...) needs the model it approximates as its first argument, "
+                f"got {type(model).__name__}."
+            )
+        if default_family is not None and default_family not in FAMILIES:
+            raise ValueError(f"default_family must be None, 'mean_field' or 'full_rank', got {default_family!r}.")
+        super().__init__()
+        if not model._compiled:
+            model.compile()
+        self.model = model
+        self.default_family = default_family
+        self.init_scale = float(init_scale)
+        self._groups = []
+        self._default_group = None
+        self._reinforce_baseline = None
+
+    # --- groups -------------------------------------------------------------
+    def _hand_written_latents(self, model):
+        return {name for name in list(self.params) + list(self.deterministic_params) if name in model.params}
+
+    def _group_names(self, params):
+        """Check the latents of a new :class:`Group` and return their names."""
+        if isinstance(params, str | RandomParameter):
+            params = [params]
+        names = []
+        for parameter in params:
+            if isinstance(parameter, RandomParameter):
+                name = parameter.name
+            elif isinstance(parameter, str):
+                name = parameter
+            else:
+                raise TypeError(f"Group params must be latent names or RandomParameter objects, got {type(parameter).__name__}.")
+            if name in names:
+                raise ValueError(f"'{name}' appears twice in the Group.")
+            names.append(name)
+        if not names:
+            raise ValueError("A Group needs at least one latent.")
+        model = self.model
+        for name in names:
+            if name in model.enumerated_params:
+                raise ValueError(f"'{name}' is enumerated (summed out) in the model and must not be in a Group.")
+            if name in model.observed_params:
+                raise ValueError(
+                    f"'{name}' is observed in the model (e.g. fixed by condition()); the guide must not cover it."
+                )
+            if name not in model.params:
+                raise ValueError(f"'{name}' is not a latent of the model; its latents are {list(model.params)}.")
+            if not model.params[name].distribution.transformed_state_space.is_continuous():
+                raise ValueError(_discrete_message(name, "Groups"))
+            for group in self._groups:
+                if name in group.names:
+                    raise ValueError(
+                        f"'{name}' is already in the group '{group.name}'; every latent belongs to exactly one group "
+                        "or hand-written entry."
+                    )
+            if name in self._hand_written_latents(model):
+                raise ValueError(f"'{name}' already has a hand-written guide entry; it cannot also be in a Group.")
+        return names
+
+    def _register_group(self, group):
+        if any(other.name == group.name for other in self._groups):
+            raise ValueError(f"A group named '{group.name}' already exists in this guide.")
+        self._groups.append(group)
+
+    def _finalize(self, model):
+        """Check the coverage of ``model``'s latents and (re)build the default group; returns the pieces."""
+        if not model._compiled:
+            model.compile()
+        for group in self._groups:
+            group.check(model)
+        in_groups = {name: group for group in self._groups for name in group.names}
+        hand_written = self._hand_written_latents(model)
+        overlap = sorted(hand_written & set(in_groups))
+        if overlap:
+            raise ValueError(
+                f"The latent(s) {overlap} have a hand-written guide entry and are also in a Group; every latent "
+                "belongs to exactly one group or hand-written entry."
+            )
+        uncovered = [name for name in model.params if name not in in_groups and name not in hand_written]
+        if uncovered and self.default_family is None:
+            raise ValueError(
+                f"The guide has no distribution for the model latent(s) {uncovered}. Put them in a Group, write "
+                "hand-written entries for them inside `with Guide(model) as guide:`, or pass "
+                "default_family='mean_field' or 'full_rank' to collect them into one default group."
+            )
+        if not uncovered:
+            self._default_group = None
+        else:
+            default = self._default_group
+            whole = len(uncovered) == len(model.params)
+            if (default is None or default.names != uncovered or default.model is not model
+                    or default.family != self.default_family or (default.prefix == "") != whole):
+                self._default_group = Group._default(model, uncovered, self.default_family, self.init_scale, prefixed=not whole)
+        pieces = list(self._groups)
+        if self._default_group is not None:
+            pieces.append(self._default_group)
+        if self.params or self.deterministic_params:
+            plan = _Plan(model, self, covered=set(in_groups) | set(uncovered))
+            if plan.active:
+                pieces.append(HandWrittenEntries(self, plan, model))
+        return pieces
+
+    @property
+    def groups(self):
+        """The Gaussian groups: the explicit ones in creation order, then the default group (if any)."""
+        return [piece for piece in self._finalize(self.model) if isinstance(piece, Group)]
 
     def validate(self, model=None):
-        """Check the guide against ``model`` (default: the bound model), bind it and return the plan.
+        """Check the guide against ``model`` (default: the bound model), bind it and return its pieces.
 
-        Raises ``ValueError`` when a model latent has no guide distribution,
-        when a guide support matches neither the latent's support nor the
+        Raises ``ValueError`` when a model latent has no group or entry (and
+        ``default_family`` is ``None``), when a latent is in two pieces, when
+        a hand-written support matches neither the latent's support nor the
         real line, or when the guide contains enumerated latents, and
-        ``NotImplementedError`` for a guide that is not mean-field.
+        ``NotImplementedError`` for a hand-written entry that depends on other
+        guide nodes. :func:`BBVI` calls it.
         """
         model = self.model if model is None else model
-        if model is None:
-            raise ValueError("The guide is not bound to a model: pass it as Guide(model) or to validate(model).")
-        plan = _Plan(model, self)
+        pieces = self._finalize(model)
         self.model = model
-        return plan
+        return pieces
+
+    def variational_parameters(self):
+        """``{key: VariationalParameter}`` of every group and hand-written entry."""
+        table = {}
+        for piece in self.validate():
+            for key, parameter in piece.variational_parameters().items():
+                if key in table:
+                    raise ValueError(f"Two parts of the guide use the variational parameter name '{key}'.")
+                table[key] = parameter
+        return table
 
     def _elbo(self, model, n_samples, scales=None):
-        return _guide_elbo(model, self, self.validate(model), n_samples, scales=scales)
+        return estimate_elbo(model, self.validate(model), n_samples, scales=scales, baseline_owner=self)
 
+    # --- sampling -------------------------------------------------------------
     def sample(self, n_samples=1000, n_chains=1):
-        """Draw ``n_chains * n_samples`` independent draws from the guide (no MCMC).
+        """Draw ``n_chains * n_samples`` exact, independent draws from the guide (never MCMC).
 
-        Every guide latent is drawn from its distribution's ``sample`` and
-        mapped onto the model; the result is a :class:`SamplingResult` in the
-        model's constrained space, including the model's deterministic nodes.
+        Every group is sampled exactly (``z = loc + L eps`` for a full-rank
+        group, independent Normals for a mean-field group; one
+        ``randn(n, d)`` block per group, in group order) and every
+        hand-written entry with its distribution's ``sample()``; an entry
+        without a working ``sample()`` raises an error instead of falling
+        back to MCMC. The draws are independent, so ``n`` draws are ``n``
+        effective samples, however strongly a full-rank group correlates its
+        latents (that correlation lives in ``L``). Contrast
+        :func:`~BayesianDLL.sample` on the posterior, whose MCMC draws are
+        autocorrelated.
+
+        Returns a :class:`SamplingResult` in the model's constrained space,
+        including the model's deterministic nodes.
         """
-        plan = self.validate()
-        model = self.model
+        pieces = self.validate()
         total = n_chains * n_samples
-        draws = {
-            name: draw_shaped(self.params[name].distribution, total, self.params[name].constrained_value.shape)
-            for name in plan.active
-        }
+        for piece in pieces:
+            piece.draw(total, reparametrized=False)
         values = []
         for i in range(total):
-            u = {name: draws[name][i] for name in plan.active}
             eta = {}
-            for name in plan.active:
-                if plan.modes[name] == "unconstrained":
-                    eta[name] = u[name]
-                elif plan.modes[name] == "constrained":
-                    eta[name] = model.params[name].distribution.transform.forward(u[name])
-            if plan.targets:
-                saved = _set_guide_values(self, u)
-                try:
-                    for target, (deterministic, _) in plan.targets.items():
-                        eta[target] = model.params[target].distribution.transform.forward(deterministic.constrained_value)
-                finally:
-                    _restore_guide_values(self, saved)
+            try:
+                for piece in pieces:
+                    eta.update(piece.to_model(i, jacobian=False)[0])
+            finally:
+                for piece in pieces:
+                    piece.release(i)
             values.append(eta)
-        return trace_from_values(model, values, n_chains, n_samples)
+        return trace_from_values(self.model, values, n_chains, n_samples)
+
+    # --- moments --------------------------------------------------------------
+    def mean(self, space="unconstrained", n_samples=4000, seed=0):
+        """``{latent: mean}`` of the guide in ``space`` (see :meth:`covariance` and "Accuracy and cost")."""
+        return self.covariance(space, n_samples, seed).means()
+
+    def covariance(self, space="unconstrained", n_samples=4000, seed=0):
+        """Mean and block-diagonal covariance of the guide over the concatenated flattened latents.
+
+        Returns a :class:`GuideCovariance` with the latents in model order.
+        Blocks between different groups or entries are exactly zero; see the
+        table in the class docstring for which blocks are exact and which
+        are Monte Carlo estimates (listed in ``estimated``, with standard
+        errors, from ``n_samples`` independent draws of that piece only,
+        seeded with ``seed``).
+        """
+        if space not in ("unconstrained", "constrained"):
+            raise ValueError(f"space must be 'unconstrained' or 'constrained', got {space!r}.")
+        parts = []
+        for piece in self.validate():
+            if isinstance(piece, Group):
+                parts.append(piece.covariance(space, n_samples, seed))
+            else:
+                parts.append(self._entry_moments(piece, space, n_samples, seed))
+        return GuideCovariance.combine(space, parts, list(self.model.params))
+
+    def _entry_moments(self, piece, space, n_samples, seed):
+        model, plan = self.model, piece.plan
+        latents = plan.latents
+        attribute = "unconstrained_value" if space == "unconstrained" else "constrained_value"
+        shapes = {name: tuple(getattr(model.params[name], attribute).shape) for name in latents}
+        reference = model.params[latents[0]].unconstrained_value
+        dtype = reference.dtype if reference.is_floating_point() else torch.get_default_dtype()
+        result = GuideCovariance(space, latents, shapes, dtype=dtype, device=reference.device)
+
+        estimated = []
+        for name in latents:
+            mode = plan.modes.get(name)
+            identity = isinstance(model.params[name].distribution.transform, IdentityTransform)
+            if mode is not None and (identity or mode == space):
+                try:
+                    mean, matrix = _distribution_moments(self.params[name].distribution, shapes[name])
+                    result.set_block([name], mean, matrix)
+                    continue
+                except (NotImplementedError, ValueError):
+                    pass
+            estimated.append(name)
+        if not estimated:
+            return result
+
+        # Monte Carlo from exact draws of the entries only, with the global random state restored afterwards.
+        n = int(n_samples)
+        devices = [reference.device] if reference.device.type == "cuda" else []
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(int(seed))
+            piece.draw(n, reparametrized=False)
+        draws = {name: [] for name in estimated}
+        for i in range(n):
+            try:
+                eta = piece.to_model(i, jacobian=False)[0]
+            finally:
+                piece.release(i)
+            for name in estimated:
+                draws[name].append(eta[name])
+        for name in estimated:
+            values = torch.stack(draws[name]).to(dtype)
+            if space == "constrained":
+                values = transform_batch(model.params[name].distribution.transform.inverse, values, shapes[name])
+            mean, matrix, standard_error = mc_moments(values.reshape(n, -1))
+            result.set_block([name], mean, matrix)
+            result.set_standard_errors([name], standard_error, [name], n)
+        result.estimated = estimated
+        return result

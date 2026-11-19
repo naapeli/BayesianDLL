@@ -6,7 +6,7 @@ from warnings import warn
 import torch
 
 from ._MAP import find_MAP
-from ._auto_guides import LatentLayout
+from ._groups import LatentLayout
 from ._guide import trace_from_unconstrained
 
 

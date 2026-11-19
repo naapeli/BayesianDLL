@@ -1,4 +1,4 @@
-"""Automatic guides, the Laplace approximation and minibatch variational inference."""
+"""Default-family Gaussian guides, the Laplace approximation and minibatch variational inference."""
 
 import math
 
@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from BayesianDLL import (
-    AutoMultivariateNormal, AutoNormal, Data, DeterministicParameter, Model, ObservedParameter,
+    Data, DeterministicParameter, Guide, Model, ObservedParameter,
     RandomParameter, laplace_approximation, plate,
 )
 from BayesianDLL.Distributions import Bernoulli, Beta, HalfNormal, Normal
@@ -24,10 +24,10 @@ def _two_latent_model():
     return model
 
 
-@pytest.mark.parametrize("guide_class", [AutoNormal, AutoMultivariateNormal])
-def test_auto_guide_gradients_match_autograd(guide_class):
+@pytest.mark.parametrize("family", ["mean_field", "full_rank"])
+def test_default_group_gradients_match_autograd(family):
     model = _two_latent_model()
-    guide = guide_class(model, init_scale=0.4)
+    guide = Guide(model, default_family=family, init_scale=0.4)
     table = guide.variational_parameters()
     # Move away from the symmetric initialisation so every gradient entry matters.
     for parameter in table.values():
@@ -41,11 +41,12 @@ def test_auto_guide_gradients_match_autograd(guide_class):
         torch.testing.assert_close(grads[key], reference, msg=key)
 
 
-def test_auto_normal_recovers_conjugate_posterior(normal_model):
-    guide = AutoNormal(normal_model)
+def test_mean_field_guide_recovers_conjugate_posterior(normal_model):
+    guide = Guide(normal_model, default_family="mean_field")
     BBVI(normal_model, guide, n_samples=8, epochs=800, lr=0.03, verbose=False)
-    assert guide.locs["mean"].value.item() == pytest.approx(1.6, abs=0.05)
-    assert guide.scales["mean"].value.item() == pytest.approx(math.sqrt(4 / 13), rel=0.15)
+    group = guide.groups[0]
+    assert group.locs["mean"].value.item() == pytest.approx(1.6, abs=0.05)
+    assert group.scales["mean"].value.item() == pytest.approx(math.sqrt(4 / 13), rel=0.15)
     trace = guide.sample(500, n_chains=2)
     assert isinstance(trace, SamplingResult)
     assert trace["mean"].shape == (2, 500, 1)
@@ -54,7 +55,7 @@ def test_auto_normal_recovers_conjugate_posterior(normal_model):
 
 
 @pytest.mark.integration
-def test_auto_multivariate_normal_captures_posterior_correlation():
+def test_full_rank_guide_captures_posterior_correlation():
     """Linear regression with known noise: the posterior is Gaussian with correlated coefficients."""
     x = torch.linspace(0.5, 1.5, 12)
     y = 1.0 + 2.0 * x + 0.3 * torch.randn(12)
@@ -73,25 +74,27 @@ def test_auto_multivariate_normal_captures_posterior_correlation():
     covariance = torch.linalg.inv(precision)
     mean = covariance @ design.T @ y / 0.09
 
-    guide = AutoMultivariateNormal(model)
+    guide = Guide(model, default_family="full_rank")
     BBVI(model, guide, n_samples=8, epochs=2500, lr=0.02, verbose=False)
-    torch.testing.assert_close(guide.loc, mean, atol=0.05, rtol=0)
-    torch.testing.assert_close(guide.covariance, covariance, atol=0.25 * covariance.abs().max().item(), rtol=0)
-    correlation = guide.covariance[0, 1] / guide.covariance.diagonal().prod().sqrt()
+    group = guide.groups[0]
+    fitted = guide.covariance().matrix
+    torch.testing.assert_close(group.loc, mean, atol=0.05, rtol=0)
+    torch.testing.assert_close(fitted, covariance, atol=0.25 * covariance.abs().max().item(), rtol=0)
+    correlation = fitted[0, 1] / fitted.diagonal().prod().sqrt()
     assert correlation.item() < -0.8  # strongly negatively correlated intercept and slope
     # The triangular structure is preserved and the diagonal stays positive.
-    assert torch.equal(guide.scale_tril, torch.tril(guide.scale_tril))
-    assert (torch.diagonal(guide.scale_tril) > 0).all()
+    assert torch.equal(group.scale_tril, torch.tril(group.scale_tril))
+    assert (torch.diagonal(group.scale_tril) > 0).all()
     trace = guide.sample(300)
     assert trace["mu"].shape == (1, 300, 12)
 
 
-def test_auto_guides_reject_discrete_latents():
+def test_default_groups_reject_discrete_latents():
     with Model() as model:
         RandomParameter("z", Bernoulli(0.3))
-    for guide_class in (AutoNormal, AutoMultivariateNormal):
+    for family in ("mean_field", "full_rank"):
         with pytest.raises(ValueError, match="enumerat"):
-            guide_class(model)
+            Guide(model, default_family=family).validate()
     with pytest.raises(ValueError, match="enumerat"):
         laplace_approximation(model)
 
@@ -166,17 +169,17 @@ def test_minibatch_bbvi_matches_full_batch_optimum():
     scales = precision.diagonal().rsqrt()
 
     model = build()
-    guide = AutoNormal(model)
+    guide = Guide(model, default_family="mean_field")
     BBVI(model, guide, n_samples=4, epochs=1500, lr=0.01, lrd=0.999, batch_size=batch, verbose=False)
-    torch.testing.assert_close(guide.loc, mean, atol=0.03, rtol=0)
-    torch.testing.assert_close(guide.scale, scales, atol=0.01, rtol=0)
+    torch.testing.assert_close(guide.groups[0].loc, mean, atol=0.03, rtol=0)
+    torch.testing.assert_close(guide.groups[0].scale, scales, atol=0.01, rtol=0)
     # The data are restored after every minibatch.
     assert model.data["x"].value.shape == (n,)
     assert model.observed_params["y"].observed_values.shape == (n,)
 
 
 def test_minibatch_requires_data_plate(normal_model):
-    guide = AutoNormal(normal_model)
+    guide = Guide(normal_model, default_family="mean_field")
     with pytest.raises(ValueError, match="plate"):
         BBVI(normal_model, guide, epochs=1, batch_size=2, verbose=False)
 

@@ -409,11 +409,10 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
         Standard deviation of the Gaussian jitter added to the initial
         unconstrained values of each chain (the model's current values), for
         the continuous parameters; discrete parameters start at their current
-        values. The auto guides' ``init_scale``
-        (:class:`~BayesianDLL.AutoNormal`,
-        :class:`~BayesianDLL.AutoMultivariateNormal`) is likewise a standard
-        deviation around the current unconstrained values: the initial scale
-        of the variational distribution.
+        values. The ``init_scale`` of a Gaussian guide group
+        (:class:`~BayesianDLL.Guide`, :class:`~BayesianDLL.Group`) is likewise
+        a standard deviation around the current unconstrained values: the
+        initial scale of the variational distribution.
     blocks : list, optional
         The Gibbs blocks: each entry is a parameter name, a list of names, or
         a :class:`SamplingBlock`. Every random parameter must be in exactly
