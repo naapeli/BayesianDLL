@@ -185,7 +185,10 @@ class AutoNormal(AutoGuide):
     For each latent ``name`` the guide has the VariationalParameters
     ``f"{name}_loc"`` and ``f"{name}_scale"`` (optimised on the log scale).
     The guide starts at the model's current values with scale ``init_scale``
-    (default ``0.1``). The entropy gradient ``1 / scale`` is added to the
+    (default ``0.1``), the initial standard deviation of every unconstrained
+    coordinate (as for :func:`~BayesianDLL.sample`, whose ``init_scale`` is the
+    standard deviation of the jitter of the chains' initial unconstrained
+    values). The entropy gradient ``1 / scale`` is added to the
     reparameterised scale gradient ``g eps``.
     """
 
@@ -237,7 +240,9 @@ class AutoMultivariateNormal(AutoGuide):
     gradient of the entropy ``sum_i log L_ii`` (``g`` is the gradient of the
     unconstrained log joint at ``z``). The VariationalParameters are
     ``"loc"`` (starting at the model's current values) and ``"scale_tril"``
-    (starting at ``init_scale * I``, default ``init_scale=0.1``).
+    (starting at ``init_scale * I``, default ``init_scale=0.1``, i.e. an
+    initial standard deviation ``init_scale`` of every unconstrained
+    coordinate, as in :class:`AutoNormal`).
     """
 
     def __init__(self, model, init_scale=0.1):

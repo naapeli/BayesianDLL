@@ -349,7 +349,7 @@ def test_exact_gp_mcmc_and_predictive_samples():
         n_chains=1,
         progress_bar=False,
         check_convergence=False,
-        start_point_variance=0.2,
+        init_scale=0.2,
         max_depth=4,
         delta=0.8,
     )

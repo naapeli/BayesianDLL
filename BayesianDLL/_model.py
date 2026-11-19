@@ -1182,10 +1182,14 @@ class Model:
             return grads[name]
 
 
-    def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, start_point_variance=1, blocks=None, seed=None, **sampler_params):
-        """Sample the posterior; see :func:`BayesianDLL.sample` (e.g. ``chain_method="vectorized"``, ``device="cuda"``)."""
+    def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, init_scale=1, blocks=None, seed=None, **sampler_params):
+        """Sample the posterior; see :func:`BayesianDLL.sample` (e.g. ``chain_method="vectorized"``, ``device="cuda"``).
+
+        ``init_scale`` is the standard deviation of the Gaussian jitter added to the initial
+        unconstrained values of each chain.
+        """
         from .Samplers import sample as _sample
-        return _sample(n_samples, warmup_length, n_chains=n_chains, model=self, progress_bar=progress_bar, start_point_variance=start_point_variance, blocks=blocks, seed=seed, **sampler_params)
+        return _sample(n_samples, warmup_length, n_chains=n_chains, model=self, progress_bar=progress_bar, init_scale=init_scale, blocks=blocks, seed=seed, **sampler_params)
 
     def find_MAP(self, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
         """Maximum a posteriori estimate of this model; see :func:`BayesianDLL.find_MAP`."""

@@ -69,7 +69,7 @@ with Model() as model:
 # The chains start next to the posterior mode of the continuous parameters.
 
 model.find_MAP(lr=5e-2, epochs=300, verbose=False)
-result = model.sample(400, 300, n_chains=4, start_point_variance=0.1, seed=0, progress_bar=False)
+result = model.sample(400, 300, n_chains=4, init_scale=0.1, seed=0, progress_bar=False)
 print(summary({name: result[name] for name in ("weight", "means", "stds")}))
 print("Divergences per chain:", result.divergences)
 
