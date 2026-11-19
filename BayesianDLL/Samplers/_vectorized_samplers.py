@@ -95,7 +95,11 @@ class VectorizedMetropolis:
     """Random-walk Metropolis for ``C`` chains (per-chain proposal scales and adaptation).
 
     Continuous states take Gaussian proposals; discrete states are swept one
-    coordinate at a time with ±1 proposals, as :class:`~BayesianDLL.Samplers.Metropolis`.
+    coordinate at a time with ±1 proposals, as :class:`~BayesianDLL.Samplers.Metropolis`,
+    whose settings (``proposal_scale``, ``adaptation_rate``,
+    ``target_accept_rate``) it takes. Proposals outside the state space are
+    rejected. :meth:`step` returns ``(theta, proposal_scale,
+    rolling_acceptance_rate, diverging=False)`` with per-chain tensors.
     """
 
     def __init__(self, log_target, state_space, n_chains, proposal_scale=1.0, adaptation_rate=0.05, target_accept_rate=0.234):
@@ -180,8 +184,9 @@ class VectorizedFiniteGibbs:
     """Exact Gibbs sweeps for finite discrete states, all chains at once.
 
     For every coordinate (in random order) the log target is evaluated at
-    every support value for all chains with one batched call per value, and
-    each chain draws its new value from its own conditional distribution.
+    every support value for all chains with one batched call per value (``K``
+    calls for ``K`` values), and each chain draws its new value from its own
+    conditional distribution. The supports must be the same for every chain.
     """
 
     def __init__(self, log_target, state_space, n_chains):
@@ -246,7 +251,8 @@ class VectorizedSlice:
 
     Every chain has its own slice level, interval and (adapted) widths; the
     stepping-out and shrinkage loops run until every chain is done, with
-    finished chains masked.
+    finished chains masked. The settings (``width``, ``max_steps_out``,
+    ``adapt_width``) are those of :class:`~BayesianDLL.Samplers.Slice`.
     """
 
     def __init__(self, log_target, state_space, n_chains, width=1.0, max_steps_out=20, adapt_width=True):
@@ -354,18 +360,30 @@ class VectorizedNUTS:
     once; the recursion of the original algorithm is unrolled: the U-turn
     criterion of every sub-subtree is checked against checkpoints of its
     first state, and the subtree's proposal is drawn by progressive
-    (multinomial) sampling. The subtree replaces the current proposal with
-    probability ``min(1, W_subtree / W_tree)`` (biased progressive sampling).
-    A chain whose trajectory terminated is masked: it stops updating while
-    the other chains continue.
+    (multinomial) sampling: each leaf has the weight ``W = exp(H_0 - H)``
+    and replaces the subtree's proposal with probability
+    ``W_leaf / W_subtree``. The subtree replaces the current proposal with
+    probability ``min(1, W_subtree / W_tree)`` (biased progressive sampling);
+    a subtree that diverges or contains a U-turn is discarded. A chain whose
+    trajectory terminated is masked: it stops updating while the other
+    chains continue.
+
+    This is the multinomial NUTS of Betancourt (2017) and current Stan; the
+    single-chain :class:`~BayesianDLL.Samplers.NUTS` used by
+    ``chain_method="parallel"`` is the slice-sampling variant of Hoffman and
+    Gelman (2014). Both leave the posterior invariant.
 
     Step sizes (dual averaging), the inverse metric (``"diag"`` or
     ``"dense"``, Stan's windowed adaptation with per-chain Welford
     estimates) and all statistics are per chain. The statistics match those
     of :class:`~BayesianDLL.Samplers.NUTS`: ``step_size``, ``accept_stat``,
-    ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` and ``lp``.
-    The settings are those of :class:`~BayesianDLL.Samplers.NUTS`, e.g. the
-    target acceptance statistic ``delta`` (default 0.8).
+    ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` and ``lp``,
+    each of shape ``(C,)``. ``log_target`` and ``gradient`` map ``(C, d)`` to
+    ``(C,)`` and ``(C, d)``; ``n_chains`` is ``C``. The other settings and
+    their defaults are those of :class:`~BayesianDLL.Samplers.NUTS`, e.g. the
+    target acceptance statistic ``delta`` (default 0.8). :meth:`step`
+    returns ``(theta, step_size, accept_stat, diverging)`` with per-chain
+    tensors, ``step_size`` being the one for the next iteration.
     """
 
     def __init__(self, log_target, gradient, n_chains, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10,
@@ -399,6 +417,8 @@ class VectorizedNUTS:
         self._reset_welford()
         self._cached_theta = None
         self.last_stats = {}
+        # Whether the step size has been adapted since the last non-warmup step.
+        self._adapting = False
         # Optional ``theta -> (log_target, gradient)`` that shares work between the two.
         self.value_and_gradient = None
 
@@ -546,6 +566,11 @@ class VectorizedNUTS:
             self._lp, self._grad = self._evaluate(theta)
             self._cached_theta = theta
 
+        if not warmup and self._adapting:
+            # First draw after warmup: switch to the averaged step size before
+            # building the trajectory, so every post-warmup draw uses it.
+            self.step_size = self.step_size_bar
+            self._adapting = False
         n_chains = theta.shape[0]
         device, dtype = theta.device, theta.dtype
         step_size = self.step_size
@@ -639,8 +664,7 @@ class VectorizedNUTS:
             self.step_size = torch.exp(log_step).clamp(self.min_step_size, self.max_step_size)
             weight = self.m ** -self.kappa
             self.step_size_bar = torch.exp((1 - weight) * torch.log(self.step_size_bar) + weight * torch.log(self.step_size))
-        else:
-            self.step_size = self.step_size_bar
+            self._adapting = True
         self.m += 1
 
         self._lp, self._grad = new_lp, new_grad

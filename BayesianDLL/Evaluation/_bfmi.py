@@ -20,18 +20,20 @@ def bfmi(result, block=None):
 
     Following Betancourt (2016), with ``E_n`` the Hamiltonian at draw ``n``::
 
-        E-BFMI = sum_n (E_n - E_{n-1})^2 / sum_n (E_n - mean(E))^2
+        E-BFMI = mean_{n>=2} (E_n - E_{n-1})^2 / mean_n (E_n - mean(E))^2
 
-    (both sums normalised by their number of terms). Values below about 0.3
+    (the numerator averages the ``N - 1`` differences, the denominator is the
+    biased variance over the ``N`` draws). Values below about 0.3
     indicate that the momentum resampling explores the energy distribution
     poorly, which usually points to heavy tails or a poor parametrisation.
 
     Args:
         result: A :class:`SamplingResult` (or its ``sample_stats``) of a run
             with a NUTS block, or an energy tensor of shape
-            ``(n_chains, n_draws)``.
-        block: Index of the sampling block to use when several blocks
-            record energies.
+            ``(n_chains, n_draws)`` (a 1-d tensor is read as a single chain).
+        block: Index of the sampling block whose ``"energy"`` statistics to
+            use. Default ``None`` picks the only block that records energies
+            and raises a ``ValueError`` if there are none or several.
 
     Returns:
         A tensor of shape ``(n_chains,)``.

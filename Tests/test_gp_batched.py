@@ -11,7 +11,7 @@ import warnings
 import pytest
 import torch
 
-from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, RandomParameter
+from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Bernoulli, Normal
 from BayesianDLL.GP import (

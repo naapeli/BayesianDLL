@@ -23,7 +23,6 @@ from ..Distributions._state_space import JointStateSpace
 
 
 _SAMPLER_CLASSES = {"nuts": NUTS, "metropolis": Metropolis, "gibbs": FiniteGibbs, "slice": Slice}
-_SAMPLER_ALIASES = {"finite_gibbs": "gibbs", "finitegibbs": "gibbs"}
 # Constructor arguments supplied by the library itself, not by sampler_params.
 _INTERNAL_ARGUMENTS = {"self", "log_target", "gradient", "inverse_transformation", "state_space", "elementwise_log_target"}
 
@@ -56,7 +55,6 @@ def _select_sampler(log_target, state_space, gradient=None, sampler="auto", samp
 
     is_continuous = state_space.is_continuous()
     is_discrete = state_space.is_discrete()
-    sampler = _SAMPLER_ALIASES.get(sampler, sampler)
 
     if sampler == "auto":
         if is_continuous and gradient is not None:
@@ -106,8 +104,8 @@ def _sampler_name(sampler):
 def _block_sampler_type(model, param_names, sampler_type, state_space, is_continuous):
     """The sampler of a block: ``sampler_type`` or, for ``"auto"``, the one its parameters request."""
     if sampler_type != "auto":
-        return _SAMPLER_ALIASES.get(sampler_type, sampler_type)
-    requested = [_SAMPLER_ALIASES.get(model.params[name].sampler, model.params[name].sampler) for name in param_names]
+        return sampler_type
+    requested = [model.params[name].sampler for name in param_names]
     if is_continuous:
         if "metropolis" in requested:
             return "metropolis"
@@ -160,7 +158,7 @@ def _default_block_specs(model):
     discrete_metropolis_names = []
     for name, p in model.params.items():
         space = p.distribution.transformed_state_space
-        requested = _SAMPLER_ALIASES.get(p.sampler, p.sampler)
+        requested = p.sampler
         if space.is_continuous():
             if requested in ("auto", "nuts"):
                 nuts_names.append(name)
@@ -187,7 +185,23 @@ class SamplingBlock:
     The block's target is the part of the joint log density that depends on
     its parameters (their priors, the priors of their random children and the
     likelihoods of their observed children); the remaining terms are constant
-    while the block moves and are not evaluated.
+    while the block moves and are not evaluated. Points where the model fails
+    numerically (after its first successful evaluation) get density zero.
+
+    Parameters
+    ----------
+    model : Model
+        The compiled model.
+    param_names : str or list of str
+        The random parameters of the block, all continuous or all discrete.
+        Enumerated parameters cannot be sampled.
+    sampler_type : {"auto", "nuts", "metropolis", "slice", "gibbs"}, default "auto"
+        The block's sampler. ``"auto"`` takes the sampler the parameters
+        request (``"metropolis"`` before ``"slice"``), else NUTS for continuous
+        blocks and the finite Gibbs sampler for discrete blocks with finite
+        support (Metropolis otherwise).
+    sampler_params : dict, optional
+        Sampler settings; they override the parameters' own ``sampler_params``.
     """
 
     def __init__(self, model, param_names, sampler_type="auto", sampler_params=None):
@@ -365,8 +379,70 @@ def _chain_seeds(seed, n_chains):
     return [int(sequence.generate_state(1, dtype=np.uint64)[0] % (2 ** 63)) for sequence in sequences]
 
 
-def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, start_point_variance=1, blocks=None, check_convergence=True, seed=None, log_likelihood=True, chain_method=None, device=None, trace_device="cpu", **sampler_params):
+def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, init_scale=1, blocks=None, check_convergence=True, seed=None, log_likelihood=True, chain_method=None, device=None, trace_device="cpu", **sampler_params):
     """Draw posterior samples from ``n_chains`` MCMC chains.
+
+    The random parameters are updated in Gibbs blocks (by default one NUTS
+    block for the continuous parameters, one finite Gibbs block for the
+    discrete parameters with finite support, and Metropolis or slice blocks
+    for the parameters that request them; see :class:`SamplingBlock`), each
+    block's sampler targeting the part of the log density that depends on it.
+    Every iteration ``m = 1, ..., warmup_length + n_samples`` steps every
+    block once. The ``warmup_length`` iterations ``m <= warmup_length`` adapt
+    the samplers and are not recorded; the ``n_samples`` iterations
+    ``m > warmup_length`` do not adapt and are recorded. Divergences and the
+    sample statistics cover exactly the recorded iterations.
+
+    Parameters
+    ----------
+    n_samples : int
+        Number of recorded draws per chain.
+    warmup_length : int
+        Number of warmup (adaptation) iterations per chain, see above.
+    n_chains : int, default 4
+        Number of chains.
+    model : Model, optional
+        The model; the active model (inside ``with model:``) by default.
+    progress_bar : bool, default True
+        Show progress bars (one per chain in parallel mode).
+    init_scale : float, default 1
+        Standard deviation of the Gaussian jitter added to the initial
+        unconstrained values of each chain (the model's current values), for
+        the continuous parameters; discrete parameters start at their current
+        values. The ``init_scale`` of a Gaussian guide group
+        (:class:`~BayesianDLL.Guide`, :class:`~BayesianDLL.Group`) is likewise
+        a standard deviation around the current unconstrained values: the
+        initial scale of the variational distribution.
+    blocks : list, optional
+        The Gibbs blocks: each entry is a parameter name, a list of names, or
+        a :class:`SamplingBlock`. Every random parameter must be in exactly
+        one block. Default: the blocks described above.
+    check_convergence : bool, default True
+        Warn when the rank-normalised R-hat of a parameter exceeds 1.01
+        (needs ``n_chains > 1`` and ``n_samples >= 50``).
+    seed : int, optional
+        See below.
+    log_likelihood : bool, default True
+        See below.
+    chain_method : {"parallel", "vectorized"}, optional
+        See below.
+    device : str or torch.device, optional
+        See below.
+    trace_device : str or torch.device or None, default "cpu"
+        See below.
+    **sampler_params
+        Sampler settings for every block, see below.
+
+    Returns
+    -------
+    SamplingResult
+        Traces of shape ``(n_chains, n_samples, *parameter_shape)`` (constrained
+        values) of the random, enumerated and deterministic parameters, the
+        sampler statistics, divergences and the pointwise log-likelihood.
+
+    After sampling, warnings are issued for R-hat above 1.01, for divergences
+    after warmup, for an E-BFMI below 0.3 and when more than 5% of the NUTS
+    iterations reach the maximal tree depth.
 
     ``chain_method`` selects how the chains run (the names follow NumPyro):
 
@@ -411,7 +487,10 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
 
     Remaining keyword arguments are sampler settings for every block (each
     sampler takes the ones it understands), e.g. ``delta=0.9`` or
-    ``metric="dense"`` for NUTS and ``target_accept_rate=0.44`` for Metropolis.
+    ``metric="dense"`` for NUTS, ``target_accept_rate=0.44`` for Metropolis
+    and ``width=0.5`` for the slice sampler; a setting no sampler understands
+    raises a ``TypeError``. Settings given to a parameter
+    (``sampler_params``) apply to its block and are overridden by these.
     """
     model = get_active_model() if model is None else model
     if device is not None:
@@ -438,7 +517,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
         from ._vectorized import sample_vectorized
         (trace, det_trace, enumerated_probs, log_lik, divergences, acceptance_probabilities, step_sizes,
          sample_stats, max_depths) = sample_vectorized(
-            n_samples, warmup_length, n_chains, model, progress_bar, start_point_variance, blocks, seed,
+            n_samples, warmup_length, n_chains, model, progress_bar, init_scale, blocks, seed,
             log_likelihood_plan, sampler_params, trace_device=trace_device,
         )
         return _finish_sampling(model, n_samples, n_chains, check_convergence, trace, det_trace, enumerated_probs,
@@ -471,7 +550,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
                 leave=True,
                 bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}"
             )
-            bar.set_description(f"Chain {chain + 1}/{n_chains} warmup", refresh=False)
+            bar.set_description(f"Chain {chain + 1}/{n_chains} {'warmup' if warmup_length > 0 else 'sample'}", refresh=False)
             bars.append(bar)
 
         def _updater():
@@ -507,7 +586,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
             [n_chains]*n_chains,
             [model]*n_chains,
             [initial_values]*n_chains,
-            [start_point_variance]*n_chains,
+            [init_scale]*n_chains,
             [n_samples]*n_chains,
             [warmup_length]*n_chains,
             [progress_bar]*n_chains,
@@ -573,8 +652,11 @@ def _finish_sampling(model, n_samples, n_chains, check_convergence, trace, det_t
         if n_samples >= 50:
             r_hats = gelman_rubin({name: trace[name] for name in model.params})
             for name, statistics in r_hats.items():
+                # NaN (every chain the same constant) is not a convergence
+                # failure; inf (chains stuck at different values) is.
                 if torch.any(statistics > 1.01):
-                    warn(f"The gelman-Ruben statistic of {name} is above 1.01 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence. Consider increasing the amount of warmup steps or reparametrizing the model.")
+                    stuck = " An infinite R-hat means that chains are stuck at different values." if torch.any(torch.isinf(statistics)) else ""
+                    warn(f"The Gelman–Rubin R-hat of {name} is above 1.01 ({torch.round(statistics, decimals=3).tolist()}) and indicates poor convergence.{stuck} Consider increasing the amount of warmup steps or reparametrizing the model.")
     elif check_convergence and n_chains == 1:
         warn(f"The convergence of the chain is not checked when n_chains == 1. Increase it to at least 2 to enable convergence diagnostics.")
 
@@ -615,7 +697,7 @@ def _check_hamiltonian_diagnostics(sample_stats, max_depths, n_samples, bfmi_thr
                 warn(f"{100 * saturated:.1f}% of the NUTS iterations for the parameters {block['params']} reached the maximum tree depth ({max_depth}). Consider increasing max_depth or reparametrizing the model.")
 
 
-def _sample_single_chain(chain, n_chains, model, initial_values, start_point_variance, n_samples, warmup_length, progress_bar, blocks_spec=None, shm_name=None, sampler_params=None, seed=None, log_likelihood_plan=None):
+def _sample_single_chain(chain, n_chains, model, initial_values, init_scale, n_samples, warmup_length, progress_bar, blocks_spec=None, shm_name=None, sampler_params=None, seed=None, log_likelihood_plan=None):
     torch.set_num_threads(1)
     if seed is not None:
         # Worker processes may be fresh or reused; seeding here makes each chain
@@ -624,14 +706,14 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     for name, parameter in model.params.items():
         value = initial_values[name].clone()
         if parameter.distribution.state_space.is_continuous():
-            value = value + start_point_variance * torch.randn_like(value)
+            value = value + init_scale * torch.randn_like(value)
         parameter.set_unconstrained_value(value)
 
     blocks = _build_blocks(model, blocks_spec, sampler_params)
     for block in blocks:
         if hasattr(block.sampler, "set_warmup_length"):
-            # Warmup steps are the iterations m < warmup_length (m starts at 1).
-            block.sampler.set_warmup_length(max(warmup_length - 1, 0))
+            # Warmup steps are the iterations m <= warmup_length (m starts at 1).
+            block.sampler.set_warmup_length(warmup_length)
 
     # Attach to shared memory if multi-chain
     shm = None
@@ -646,7 +728,7 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
             bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}"
         )
 
-    acceptance_probabilities = [1.0 for _ in range(len(blocks))]
+    acceptance_probabilities = [0.0 for _ in range(len(blocks))]
     step_sizes = [1.0 for _ in range(len(blocks))]
     divergences_count = 0
     block_stats = [{} for _ in blocks]
@@ -677,18 +759,20 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
 
     loop_range = _progress_bar if _progress_bar is not None else range(1, n_samples + warmup_length + 1)
     for m in loop_range:
+        warmup = m <= warmup_length
         if _progress_bar is not None:
-            if m < warmup_length: _progress_bar.set_description(f"Chain warmup", refresh=False)
+            if warmup: _progress_bar.set_description(f"Chain warmup", refresh=False)
             else: _progress_bar.set_description(f"Chain sample", refresh=False)
+            # The accumulators hold the m - 1 iterations done so far.
             _progress_bar.set_postfix({
-                "avg. acc. probs": [f"{prob / m:.3f}" for prob in acceptance_probabilities],
+                "avg. acc. probs": [f"{prob / max(m - 1, 1):.3f}" for prob in acceptance_probabilities],
                 "step sizes": [f"{step_size:.3f}" for step_size in step_sizes],
                 "divs": divergences_count
             }, refresh=False)
 
         for i, block in enumerate(blocks):
-            step_size, acceptance_probability, diverging = block.step(warmup=(m < warmup_length))
-            if diverging and m >= warmup_length:
+            step_size, acceptance_probability, diverging = block.step(warmup=warmup)
+            if diverging and not warmup:
                 divergences_count += 1
             step_sizes[i] = step_size
             acceptance_probabilities[i] += acceptance_probability
@@ -731,25 +815,7 @@ def _sample_single_chain(chain, n_chains, model, initial_values, start_point_var
     max_depths = [getattr(block.sampler, "max_depth", None) for block in blocks]
     return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes, stats, max_depths, chain_enum_trace, chain_enum_probs, chain_log_lik
 
-def sample_posterior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
-    """Sample the posterior with MCMC and draw from its predictive distribution.
-
-    The posterior is sampled with :func:`sample` (``warmup_length`` warmup
-    steps, four chains); the predictive draws are then generated exactly with
-    :func:`sample_predicative`. ``samples_per_step`` is the number of
-    replicated data sets per posterior draw and ``warmup_per_sample`` is only
-    used by the MCMC fallback for likelihoods without a sampler.
-    """
-    model = get_active_model() if model is None else model
-    trace = sample(n_samples, warmup_length, 4, model, progress_bar, check_convergence=False)
-    return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
-
-def posterior_predicative(trace, n_samples=20, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
-    """Posterior predictive draws for an existing ``trace``; see :func:`sample_predicative`."""
-    model = get_active_model() if model is None else model
-    return sample_predicative(trace, n_samples, samples_per_step, model, progress_bar, warmup_per_sample)
-
-def sample_prior_predicative(n_samples=20, warmup_length=100, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
+def sample_prior_predicative(n_samples=20, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
     """Draw from the prior predictive distribution by ancestral sampling.
 
     For each of the ``n_samples`` prior draws, the random parameters are
@@ -763,18 +829,23 @@ def sample_prior_predicative(n_samples=20, warmup_length=100, samples_per_step=5
     with the prior draws of the random and deterministic parameters, so
     ``summary`` and the posterior plots work on it.
 
-    ``warmup_length`` is ignored and only kept for backward compatibility;
     ``warmup_per_sample`` is only used by the MCMC fallback for distributions
-    that cannot be sampled directly.
+    that cannot be sampled directly. ``model`` defaults to the active model;
+    ``progress_bar`` shows a progress bar over the draws. A warning is issued
+    when the prior of a parameter depends on an observed node, because its
+    draws then condition on the observed data.
     """
     model = get_active_model() if model is None else model
     return _ancestral_predictive(model, n_samples, samples_per_step, None, progress_bar, warmup_per_sample)
 
-def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, warmup_per_sample=20):
+def posterior_predicative(trace, n_samples=None, samples_per_step=20, warmup_per_sample=20, model=None, progress_bar=True):
     """Posterior predictive samples by exact ancestral sampling.
 
-    ``n_samples`` evenly spaced draws are taken from ``trace`` (all draws when
-    ``None``). For each draw the model parameters are set to it, the graph is
+    ``trace`` is a :class:`SamplingResult` (or a dict of constrained traces of
+    shape ``(n_chains, n_samples, ...)``) holding every random parameter of
+    ``model`` (the active model by default). ``n_samples`` evenly spaced
+    draws are taken from the chains concatenated (all draws when ``None``;
+    more than the trace holds raises a ``RuntimeError``). For each draw the model parameters are set to it, the graph is
     walked in topological order and every observed node is sampled
     ``samples_per_step`` times with its distribution's ``sample`` method,
     shaped like the node's ``predictive_shape`` (plate sizes, including
@@ -784,8 +855,7 @@ def sample_predicative(trace, n_samples=None, samples_per_step=20, model=None, p
 
     A likelihood without a sampler (``sample`` raising ``NotImplementedError``
     or missing) falls back to MCMC for that node only, with a warning; the
-    fallback uses ``warmup_per_sample`` warmup steps. Otherwise
-    ``warmup_per_sample`` is ignored.
+    fallback uses ``warmup_per_sample`` warmup steps.
 
     Returns a :class:`PredicativeResult` of tensors with shape
     ``(n_samples, samples_per_step, *predictive_shape)``.

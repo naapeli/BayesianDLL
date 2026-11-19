@@ -73,6 +73,18 @@ def lkj_mvn():
     return model
 
 
+def lkj_mvn_covariance():
+    """MVN given a random covariance matrix (event dims of ``covariance_matrix``)."""
+    data = torch.tensor([[0.5, -0.2, 1.0], [1.3, 0.4, -0.3], [-0.7, 0.2, 0.1], [0.1, -1.1, 0.8]])
+    with Model() as model:
+        mu = RandomParameter("mu", Normal(0.0, 1.0), shape=3)
+        L_corr = RandomParameter("L_corr", LKJCholesky(3, eta=2.0))
+        sigma = RandomParameter("sigma", HalfNormal(1.0), shape=3)
+        covariance = CovarianceFromCholesky("covariance", CholeskyCovariance("scale_tril", L_corr, sigma))
+        ObservedParameter("y", MultivariateNormal(mu, covariance), data)
+    return model
+
+
 def enumerated_mixture():
     y = torch.tensor([-2.1, -1.7, 0.2, 1.9, 2.4, 2.2])
     with Model() as model:
@@ -113,7 +125,7 @@ def scalar_slope_regression():
         x = Data("x", torch.tensor([0.0, 0.5, 1.0, 1.5]))
         a = RandomParameter("a", Normal(0.0, 1.0))
         b = RandomParameter("b", Normal(0.0, 1.0))
-        mean = Linear("mean", x, slope=b, intercept=a)
+        mean = Linear("mean", x, coefficients=b, intercept=a)
         ObservedParameter("y", Normal(mean, 0.5), torch.tensor([0.1, 0.4, 1.2, 1.4]))
     return model
 
@@ -240,6 +252,7 @@ ZOO = {
     "beta_bernoulli": beta_bernoulli,
     "eight_schools": eight_schools,
     "dirichlet_categorical": dirichlet_categorical,
+    "lkj_mvn_covariance": lkj_mvn_covariance,
     "lkj_mvn": lkj_mvn,
     "enumerated_mixture": enumerated_mixture,
     "matrix_data_scalar_params": matrix_data_scalar_params,

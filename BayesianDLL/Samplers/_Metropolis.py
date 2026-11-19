@@ -37,17 +37,41 @@ class _CachedTarget:
 class Metropolis(_CachedTarget):
     """Random-walk Metropolis sampler.
 
-    Continuous states take Gaussian proposals with standard deviation
-    ``proposal_scale``, adapted during warmup towards the acceptance rate
-    ``target_accept_rate`` (0.234 by default; about 0.44 suits a single
-    coordinate): after every step the scale is multiplied by
-    ``1 - adaptation_rate`` when the rolling acceptance rate is below the
-    target and by ``1 + adaptation_rate`` when it is above. The names differ
-    from NUTS's ``delta`` and ``kappa`` on purpose, so settings passed to
+    Continuous states take isotropic Gaussian proposals
+    ``theta + proposal_scale * N(0, I)``, accepted with probability
+    ``min(1, p(theta') / p(theta))``; a proposal outside the state space has
+    zero density and is rejected (acceptance probability 0, counted as a
+    rejection by the acceptance statistics and the adaptation). The scale is adapted during warmup
+    towards the acceptance rate ``target_accept_rate`` (0.234 by default;
+    about 0.44 suits a single coordinate): after every warmup step it is
+    multiplied by ``1 - adaptation_rate`` when the rolling acceptance rate
+    (over the last 20 steps) is below the target and by
+    ``1 + adaptation_rate`` when it is above. The names differ from NUTS's
+    ``delta`` and ``kappa`` on purpose, so settings passed to
     :func:`~BayesianDLL.sample` for NUTS do not reach Metropolis blocks.
     Discrete states are updated one coordinate at a time: each step
     sweeps over the coordinates in random order and proposes a move of ±1 for
-    each, so the acceptance rate does not collapse with the dimension.
+    each (rejected when it leaves the state space), so the acceptance rate
+    does not collapse with the dimension; their proposals are not adapted.
+
+    Parameters
+    ----------
+    log_target : callable
+        Maps a state tensor to its scalar log density.
+    state_space : StateSpace
+        The space of the state; decides between the continuous and the
+        discrete update.
+    proposal_scale : float, default 1.0
+        Initial standard deviation of the continuous proposal.
+    adaptation_rate : float, default 0.05
+        Relative change of ``proposal_scale`` per warmup step.
+    target_accept_rate : float, default 0.234
+        The acceptance rate the warmup adaptation aims for.
+
+    :meth:`step` returns ``(theta, proposal_scale, rolling_acceptance_rate,
+    False)`` and sets ``last_stats`` (``accept_stat``, the acceptance
+    probability of this step or the mean over the coordinates of a discrete
+    sweep; ``accepted``; ``step_size``, the proposal scale; ``lp``).
     """
 
     def __init__(self, log_target, state_space, proposal_scale=1.0, adaptation_rate=0.05, target_accept_rate=0.234):
@@ -92,8 +116,13 @@ class Metropolis(_CachedTarget):
     def _continuous_step(self, theta):
         current = self._current_log_prob(theta)
         proposal = self.get_proposal(theta)
-        proposal_log_prob = self.log_target(proposal)
-        accepted, accept_prob = self._accept(proposal_log_prob - current)
+        if proposal is None:
+            # Outside the support: the proposal has zero density (log target
+            # -inf), so it is rejected and counted as a rejection.
+            accepted, accept_prob = False, 0.0
+        else:
+            proposal_log_prob = self.log_target(proposal)
+            accepted, accept_prob = self._accept(proposal_log_prob - current)
         if accepted:
             theta, current = proposal, proposal_log_prob
         self.accept_queue.append(int(accepted))
@@ -130,11 +159,11 @@ class Metropolis(_CachedTarget):
         return None
 
     def get_proposal(self, theta):
-        """Continuous Gaussian proposal (the current state when it leaves the state space)."""
+        """Continuous Gaussian proposal, or ``None`` when it leaves the state space (a rejected proposal)."""
         theta_proposal = theta + self.proposal_scale * torch.randn_like(theta)
         if self.state_space.contains(theta_proposal):
             return theta_proposal
-        return theta
+        return None
 
     def adapt_proposal_scale(self):
         acceptance_ratio = sum(self.accept_queue) / len(self.accept_queue)
@@ -210,8 +239,23 @@ class FiniteGibbs(_CachedTarget):
 
     If ``elementwise_log_target`` is given, it must return a tensor of the
     shape of the state holding independent per-coordinate log probabilities
-    (e.g. a factorised predictive distribution); all coordinates are then
-    sampled jointly with one evaluation per support value.
+    (e.g. a factorised predictive distribution); when all coordinates share
+    one support, they are then sampled jointly with one evaluation per
+    support value (otherwise, or if the returned shape differs from the
+    state's, the sweep is used).
+
+    Parameters
+    ----------
+    log_target : callable
+        Maps a state tensor to its scalar log density.
+    state_space : DiscreteRange or JointStateSpace of DiscreteRange
+        A discrete space with finite support per coordinate; anything else
+        raises a ``RuntimeError``.
+    elementwise_log_target : callable, optional
+        Per-coordinate log probabilities, see above.
+
+    :meth:`step` returns ``(theta, 1.0, 1.0, False)``: every Gibbs update is
+    accepted.
     """
 
     def __init__(self, log_target, state_space, elementwise_log_target=None):
@@ -309,7 +353,9 @@ class FiniteGibbs(_CachedTarget):
         log_probs = torch.stack(values, dim=-1)
         choice, valid = self._draw(log_probs)
         new_theta = torch.where(valid, support[choice], theta)
-        self.invalidate_cache()
+        # The full target (which may contain terms beyond the elementwise
+        # ones) at the new state, for ``lp`` and the cache.
+        self._store_cache(new_theta, self.log_target(new_theta.clone()))
         return new_theta
 
     def init_sampler(self):

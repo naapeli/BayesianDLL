@@ -48,7 +48,11 @@ class Subsampler:
         if len(candidates) > 1:
             raise ValueError(f"Several plates can be subsampled ({sorted(candidates)}); choose one with subsample_plate.")
         self.plate_name, plate = next(iter(candidates.items()))
+        # ``plate.dim`` is the dimension of the sizing Data that gives the plate
+        # size; ``plate.position`` is where the plate sits among the leading
+        # plate dimensions of the values (0 for the outermost plate).
         self.dim = plate.dim
+        self.position = plate.position
         self.size_data = _plate_data(plate)
         self.n = int(plate.size)
         self.batch_size = int(batch_size)
@@ -64,38 +68,42 @@ class Subsampler:
         ancestors = set()
         for observed in self.observed:
             ancestors |= nx.ancestors(model.graph, observed.name)
-        self.data = [self.size_data]
+        # Each Data node is sliced along one axis of its value: the sizing Data
+        # along the dimension that gives the plate size, the other Data (the
+        # covariates of the observations) along the plate's position when that
+        # dimension has the plate size.
+        self.data = [(self.size_data, self._data_axis(self.size_data, self.dim))]
         for name in ancestors:
             data = model.data.get(name)
             if data is None or data is self.size_data:
                 continue
             batch_shape = data.batch_shape
-            if len(batch_shape) >= -self.dim and batch_shape[self.dim] == self.n:
-                self.data.append(data)
+            if len(batch_shape) > self.position and batch_shape[self.position] == self.n:
+                self.data.append((data, self.position))
         self.scales = {o.name: self.n / self.batch_size for o in self.observed}
 
-    def _axis(self, tensor, event_ndim):
-        return tensor.ndim - event_ndim + self.dim
+    @staticmethod
+    def _data_axis(data, dim):
+        """Non-negative axis of ``data.value`` for a dimension of its batch shape."""
+        return dim % len(data.batch_shape)
 
     @contextmanager
     def minibatch(self, generator=None):
         """Slice the model to a random minibatch; yields the likelihood scales."""
         index = torch.randperm(self.n, generator=generator)[: self.batch_size]
-        saved_data = [(data, data.value) for data in self.data]
+        saved_data = [(data, axis, data.value) for data, axis in self.data]
         saved_observed = [(observed, observed._observed_values) for observed in self.observed]
         try:
-            for data, value in saved_data:
-                axis = value.ndim - len(data.event_shape) + self.dim
+            for data, axis, value in saved_data:
                 data.set_value(value.index_select(axis, index.to(value.device)))
             for observed, value in saved_observed:
                 if isinstance(value, Data):
                     continue
-                event_ndim = len(getattr(observed.distribution, "event_shape", ()))
-                axis = self._axis(value, event_ndim)
-                observed.observed_values = value.index_select(axis, index.to(value.device))
+                # Plate dimensions lead the observed values, outermost first.
+                observed.observed_values = value.index_select(self.position, index.to(value.device))
             yield self.scales
         finally:
-            for data, value in saved_data:
+            for data, _, value in saved_data:
                 data._value = value
             for observed, value in saved_observed:
                 observed._observed_values = value

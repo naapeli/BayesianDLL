@@ -28,8 +28,9 @@ four-chain NUTS run needed several minutes and still had R-hat of 1.04 for
 the predicted function. Variational inference fits one mode in well under
 a minute instead, so it is the method of this example.
 
-Two automatic guides are compared: the mean-field ``AutoNormal`` and the
-full-rank ``AutoMultivariateNormal`` (26 latents, so the covariance is
+Two automatic guides are compared: the mean-field
+``Guide(model, default_family="mean_field")`` and the full-rank
+``Guide(model, default_family="full_rank")`` (26 latents, so the covariance is
 cheap), warm-started from the mean-field solution. The figures show the ELBO,
 and for each guide the data, the true function, the predictive mean of ``f``
 with 50% and 90% bands, and five individual networks drawn from the guide.
@@ -44,7 +45,7 @@ import math
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import AutoMultivariateNormal, AutoNormal, Data, Model, ObservedParameter, RandomParameter, plate
+from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Deterministic import Add, Exp, MatMul, Tanh
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.Variational import BBVI
@@ -90,17 +91,17 @@ def build_model():
 
 torch.manual_seed(0)
 model = build_model()
-mean_field = AutoNormal(model, init_scale=0.05)
+mean_field = Guide(model, default_family="mean_field", init_scale=0.05)
 history_mean_field = BBVI(model, mean_field, n_samples=4, epochs=3000, lr=0.02, lrd=0.999, callback_frequency=10, verbose=False)
 
-full_rank = AutoMultivariateNormal(model)
-full_rank.loc_parameter.set_new_value(mean_field.loc)
-full_rank.scale_tril_parameter.set_new_value(torch.diag(mean_field.scale))
+full_rank = Guide(model, default_family="full_rank")
+full_rank.groups[0].loc_parameter.set_new_value(mean_field.groups[0].loc)
+full_rank.groups[0].scale_tril_parameter.set_new_value(torch.diag(mean_field.groups[0].scale))
 history_full_rank = BBVI(model, full_rank, n_samples=4, epochs=1500, lr=0.005, lrd=0.999, callback_frequency=10, verbose=False)
 
 fits = {
-    "AutoNormal": (mean_field.sample(2000), history_mean_field),
-    "AutoMultivariateNormal": (full_rank.sample(2000), history_mean_field + history_full_rank),
+    "mean-field": (mean_field.sample(2000), history_mean_field),
+    "full-rank": (full_rank.sample(2000), history_mean_field + history_full_rank),
 }
 for label, (trace, history) in fits.items():
     print(f"{label:>22}: final ELBO estimate {sum(history[-20:]) / 20:.2f}, "
@@ -123,12 +124,12 @@ def networks(trace):
     return y_mean + y_std * f
 
 
-colors = {"AutoNormal": "C1", "AutoMultivariateNormal": "C0"}
+colors = {"mean-field": "C1", "full-rank": "C0"}
 fig, axes = plt.subplots(1, 3, figsize=(16, 4.8), layout="constrained", gridspec_kw={"width_ratios": [0.8, 1, 1]})
-steps = range(10, 10 * len(fits["AutoMultivariateNormal"][1]) + 1, 10)
-axes[0].plot(steps[:len(history_mean_field)], history_mean_field, color=colors["AutoNormal"], alpha=0.8, label="AutoNormal")
-axes[0].plot(steps[len(history_mean_field):], history_full_rank, color=colors["AutoMultivariateNormal"], alpha=0.8,
-             label="AutoMultivariateNormal (warm start)")
+steps = range(10, 10 * len(fits["full-rank"][1]) + 1, 10)
+axes[0].plot(steps[:len(history_mean_field)], history_mean_field, color=colors["mean-field"], alpha=0.8, label="mean-field")
+axes[0].plot(steps[len(history_mean_field):], history_full_rank, color=colors["full-rank"], alpha=0.8,
+             label="full-rank (warm start)")
 axes[0].set_ylim(history_full_rank[-1] - 120, max(history_full_rank) + 10)
 axes[0].set_xlabel("epoch")
 axes[0].set_ylabel("ELBO estimate")

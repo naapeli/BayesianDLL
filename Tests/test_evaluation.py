@@ -1,10 +1,10 @@
+import math
 import numpy as np
 import pytest
 import torch
 
 from BayesianDLL.Evaluation import (
-    effective_sample_size, ess_bulk, ess_mean, ess_tail, gelman_rubin,
-    mcse, mcse_mean, mcse_sd, summary,
+    effective_sample_size, gelman_rubin, mcse, summary,
 )
 from BayesianDLL.Samplers import PredicativeResult, SamplingResult
 
@@ -44,24 +44,23 @@ def test_ess_detects_autocorrelation(trace, method):
     assert (actual < independent / 2).all()
 
 
-@pytest.mark.parametrize("wrapper,method", [(ess_mean, "mean"), (ess_bulk, "bulk"), (ess_tail, "tail")])
-def test_ess_convenience_functions(trace, wrapper, method):
-    torch.testing.assert_close(wrapper(trace)["x"], effective_sample_size(trace, method=method)["x"])
-
-
 def test_tail_probability_pair_matches_scalar(trace):
-    torch.testing.assert_close(ess_tail(trace, prob=0.9)["x"], ess_tail(trace, prob=(0.1, 0.9))["x"])
+    torch.testing.assert_close(
+        effective_sample_size(trace, method="tail", prob=0.9)["x"],
+        effective_sample_size(trace, method="tail", prob=(0.1, 0.9))["x"],
+    )
 
 
 def test_mcse_matches_moment_formulas(trace):
     x = trace["x"]
-    ess = ess_mean(trace)["x"]
+    ess = effective_sample_size(trace, method="mean")["x"]
     flat = x.flatten(0, 1)
-    torch.testing.assert_close(mcse_mean(trace)["x"], flat.std(0) / ess.sqrt())
+    torch.testing.assert_close(mcse(trace, method="mean")["x"], flat.std(0) / ess.sqrt())
     squared = (flat - flat.mean(0)).square()
     variance = squared.mean(0)
-    expected_sd = ((squared.square().mean(0) - variance.square()) / ess / variance / 4).sqrt()
-    torch.testing.assert_close(mcse_sd(trace)["x"], expected_sd)
+    # The ESS of the delta-method formula is that of the squared deviations, whose mean is the variance.
+    ess_squared = effective_sample_size({"c": (x - flat.mean(0)).square()}, method="mean")["c"]
+    expected_sd = ((squared.square().mean(0) - variance.square()) / ess_squared / variance / 4).sqrt()
     torch.testing.assert_close(mcse(trace, method="sd")["x"], expected_sd)
 
 
@@ -73,6 +72,63 @@ def test_diagnostics_validate_inputs(function, trace):
         function({"x": torch.ones(5)})
 
 
+def _ar1_chains(n_chains, n_draws, phi, seed):
+    rng = np.random.default_rng(seed)
+    noise = rng.standard_normal((n_chains, n_draws))
+    draws = np.zeros_like(noise)
+    draws[:, 0] = noise[:, 0] / np.sqrt(1 - phi**2)
+    for t in range(1, n_draws):
+        draws[:, t] = phi * draws[:, t - 1] + noise[:, t]
+    return draws
+
+
+@pytest.mark.parametrize("phi, seed", [(0.0, 0), (0.9, 1)])
+@pytest.mark.parametrize("prob", [0.025, 0.3, 0.77, 0.975])
+def test_mcse_quantile_matches_arviz(phi, seed, prob):
+    az = pytest.importorskip("arviz")
+    draws = _ar1_chains(4, 400, phi, seed)
+    actual = mcse({"x": torch.from_numpy(draws)}, method="quantile", prob=prob)["x"].item()
+    expected = float(az.mcse(draws, method="quantile", prob=prob, chain_axis=0, draw_axis=1))
+    assert actual == pytest.approx(expected, rel=1e-8, abs=1e-12)
+
+
+@pytest.mark.parametrize("phi, seed", [(0.0, 3), (0.8, 4)])
+def test_mcse_median_matches_arviz(phi, seed):
+    az = pytest.importorskip("arviz")
+    draws = _ar1_chains(3, 401, phi, seed)
+    tensor = {"x": torch.from_numpy(draws)}
+    expected = float(az.mcse(draws, method="median", chain_axis=0, draw_axis=1))
+    assert mcse(tensor, method="median")["x"].item() == pytest.approx(expected, rel=1e-8)
+    assert mcse(tensor, method="median")["x"].item() == mcse(tensor, method="quantile", prob=0.5)["x"].item()
+
+
+@pytest.mark.parametrize("phi, seed", [(0.0, 5), (0.9, 6)])
+def test_mcse_mean_and_sd_match_arviz(phi, seed):
+    az = pytest.importorskip("arviz")
+    draws = _ar1_chains(4, 400, phi, seed)
+    tensor = {"x": torch.from_numpy(draws)}
+    kwargs = dict(chain_axis=0, draw_axis=1)
+    assert mcse(tensor, method="mean")["x"].item() == pytest.approx(float(az.mcse(draws, method="mean", **kwargs)), rel=1e-8)
+    # ArviZ 1.x divides by the ESS of x in the sd formula; Vehtari et al. (2021), followed here, by the
+    # ESS of the squared deviations (arviz's ``ess(method="sd")``). The formulas coincide up to that factor.
+    ess_x = float(az.ess(draws, method="mean", **kwargs))
+    ess_sq = float(az.ess(draws, method="sd", **kwargs))
+    expected = float(az.mcse(draws, method="sd", **kwargs)) * np.sqrt(ess_x / ess_sq)
+    assert mcse(tensor, method="sd")["x"].item() == pytest.approx(expected, rel=1e-8)
+
+
+def test_mcse_validates_prob(trace):
+    with pytest.raises(ValueError, match="requires prob"):
+        mcse(trace, method="quantile")
+    for prob in (0.0, 1.0, -0.1, 1.5):
+        with pytest.raises(ValueError, match="strictly between"):
+            mcse(trace, method="quantile", prob=prob)
+    for method in ("mean", "sd", "median"):
+        with pytest.raises(ValueError, match="only used by"):
+            mcse(trace, method=method, prob=0.3)
+    assert mcse(trace, method="quantile", prob=0.3)["x"].shape == (2,)
+
+
 @pytest.mark.parametrize("function", [gelman_rubin, effective_sample_size, mcse])
 def test_diagnostics_preserve_multidimensional_feature_shape(function):
     assert function({"x": torch.randn(3, 60, 2, 3)})["x"].shape == (2, 3)
@@ -80,10 +136,12 @@ def test_diagnostics_preserve_multidimensional_feature_shape(function):
 
 def test_constant_chain_diagnostics():
     trace = {"x": torch.ones(4, 100, 1)}
-    assert gelman_rubin(trace)["x"].item() == 1
-    assert ess_mean(trace)["x"].item() == 400
-    assert mcse_mean(trace)["x"].item() == 0
-    assert mcse_sd(trace)["x"].item() == 0
+    # All chains are the same constant: the R-hat is undefined.
+    assert math.isnan(gelman_rubin(trace)["x"].item())
+    assert effective_sample_size(trace, method="mean")["x"].item() == 400
+    assert mcse(trace, method="mean")["x"].item() == 0
+    assert mcse(trace, method="sd")["x"].item() == 0
+    assert mcse(trace, method="median")["x"].item() == 0
 
 
 def test_sampling_result_mapping(trace):

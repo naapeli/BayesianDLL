@@ -1,3 +1,5 @@
+import math
+
 import torch
 import numpy as np
 
@@ -21,8 +23,12 @@ def _rhat_core(chains: torch.Tensor) -> float:
 
     var_hat = ((n_samples - 1) / n_samples) * W + (1.0 / n_samples) * B
 
-    if W == 0 or torch.isnan(W) or torch.isnan(B):
-        return 1.0
+    if torch.isnan(W) or torch.isnan(B):
+        return float("nan")
+    if W == 0:
+        # No within-chain variation: undefined if all chains are the same
+        # constant, infinite if they are stuck at different values.
+        return float("nan") if B == 0 else float("inf")
 
     rhat = torch.sqrt(var_hat / W)
     return float(rhat)
@@ -68,27 +74,62 @@ def _rank_normalized_rhat_core(chains: torch.Tensor) -> float:
     z_tail = _z_scale(folded)
     rhat_tail = _split_rhat_core(z_tail)
 
-    return max(rhat_bulk, rhat_tail)
+    # The larger of the two, ignoring an undefined (NaN) one; NaN only when
+    # both are undefined (all draws equal).
+    finite = [value for value in (rhat_bulk, rhat_tail) if not math.isnan(value)]
+    return max(finite) if finite else float("nan")
 
 
 def gelman_rubin(samples: dict[str, torch.Tensor], method: str = "rank") -> dict[str, torch.Tensor]:
-    """
-    Compute Gelman-Rubin convergence diagnostic R-hat for all parameters.
+    r"""Gelman-Rubin potential scale reduction factor R-hat for every parameter component.
 
-    Parameters:
-    -----------
+    For ``M`` chains of ``N`` draws with chain means :math:`\bar x_m`, grand
+    mean :math:`\bar x` and within-chain sample variances :math:`s_m^2`
+    (``ddof=1``), the classical statistic is
+
+    .. math::
+
+       W = \frac{1}{M} \sum_m s_m^2, \qquad
+       B = \frac{N}{M - 1} \sum_m (\bar x_m - \bar x)^2, \qquad
+       \hat R = \sqrt{\frac{\frac{N - 1}{N} W + \frac{1}{N} B}{W}}.
+
+    Values close to 1 indicate that the chains mix; 1.01 is a common threshold
+    for the rank-normalised version.
+
+    Parameters
+    ----------
     samples : dict[str, Tensor]
-        Mapping from parameter name to tensor of shape (n_chains, n_samples, ...)
-    method : str, default "rank"
-        One of:
-        - "classical": Original Gelman & Rubin (1992)
-        - "split": Split R-hat (Gelman et al., 2013 / BDA3)
-        - "rank": Rank-normalized folded split R-hat (Vehtari et al., 2021; ArviZ default)
+        Mapping from parameter name to a tensor of shape
+        ``(n_chains, n_samples, *event_shape)``.
+    method : {"classical", "split", "rank"}, default "rank"
+        - ``"classical"``: the formula above on the chains as given
+          (Gelman & Rubin, 1992).
+        - ``"split"``: the formula on ``2 M`` half chains of ``N // 2`` draws
+          (Gelman et al., 2013, BDA3); with an odd ``N`` the last draw is dropped.
+          Detects non-stationarity within chains.
+        - ``"rank"``: rank-normalised split R-hat (Vehtari et al., 2021):
+          the maximum of the split R-hat of the rank-normalised draws
+          :math:`z = \Phi^{-1}((r - 3/8) / (S + 1/4))` (bulk) and of the
+          rank-normalised folded draws :math:`|x - \mathrm{median}(x)|` (tail).
+          The ArviZ default.
 
-    Returns:
-    --------
-    dict[str, Tensor]:
-        Mapping from parameter name to tensor of R-hat values.
+    Returns
+    -------
+    dict[str, Tensor]
+        Mapping from parameter name to a float64 tensor of shape ``event_shape``.
+        It is 1 with fewer than two (split) chains or fewer than two draws per
+        (split) chain. With zero within-chain variance ``W`` it is ``inf``
+        when the chains differ (``B > 0``, e.g. chains stuck at different
+        constants) and NaN when every chain is the same constant
+        (``W = B = 0``). For ``"rank"`` an undefined (NaN) bulk or tail
+        R-hat is ignored in the maximum.
+
+    Raises
+    ------
+    ValueError
+        For an unknown ``method``.
+    NotImplementedError
+        If a tensor has fewer than two dimensions.
     """
     results = {}
     for name, chains in samples.items():

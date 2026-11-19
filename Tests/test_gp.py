@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from BayesianDLL import (
     Data,
     DeterministicParameter,
-    MeanFieldGuide,
+    Guide,
     Model,
     ObservedParameter,
     RandomParameter,
@@ -18,8 +18,6 @@ from BayesianDLL.Distributions import Exponential, Normal, Uniform
 from BayesianDLL.GP import (
     Constant,
     ExactGP,
-    GaussianProcess,
-    ExactGaussianProcess,
     Linear,
     LatentGP,
     Matern,
@@ -204,11 +202,6 @@ def test_gp_adds_whitened_latent_and_has_finite_gradients():
     assert all(torch.isfinite(value).all() for value in gradients.values())
 
 
-def test_gp_legacy_names_are_compatible_aliases():
-    assert GaussianProcess is LatentGP
-    assert ExactGaussianProcess is ExactGP
-
-
 def test_condition_can_fix_latent_gp_hyperparameters():
     x = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
     y = torch.sin(2 * torch.pi * x)
@@ -240,11 +233,10 @@ def test_gp_accepts_an_explicit_latent_variable():
     with Model() as model:
         inputs = Data("inputs", x)
         z = RandomParameter("z", Normal(0.0, 1.0), shape=x.numel())
-        function = GaussianProcess("function", inputs, RBF(0.5, 1.0), latent=z)
+        function = LatentGP("function", inputs, RBF(0.5, 1.0), latent=z)
 
     assert model.params["z"] is z
     assert "function_white" not in model.params
-    assert function.latent is z
     assert function.gp_latent is z
 
 
@@ -279,7 +271,7 @@ def test_gp_variance_gradient_matches_full_model_finite_difference():
             Exponential(1.0),
             initial_value=torch.tensor([1.2], dtype=torch.float64),
         )
-        function = GaussianProcess("function", inputs, RBF(0.5, variance), latent=z)
+        function = LatentGP("function", inputs, RBF(0.5, variance), latent=z)
         # The literal likelihood variance must not be confused with the GP
         # hyperparameter named "variance".
         ObservedParameter("observations", Normal(function, 0.1 ** 0.5), y)
@@ -312,7 +304,7 @@ def test_gp_mcmc_promotes_float32_inputs_to_inference_dtype():
         inputs = Data("inputs", x)
         lengthscale = RandomParameter("lengthscale", Exponential(1.0))
         variance = RandomParameter("variance", Exponential(1.0))
-        function = GaussianProcess("function", inputs, RBF(lengthscale, variance))
+        function = LatentGP("function", inputs, RBF(lengthscale, variance))
         ObservedParameter("observations", Normal(function, 0.1 ** 0.5), y)
     # A two-step warmup leaves the step size untuned (every post-warmup step
     # diverged); ten warmup steps are still cheap.
@@ -357,7 +349,7 @@ def test_exact_gp_mcmc_and_predictive_samples():
         n_chains=1,
         progress_bar=False,
         check_convergence=False,
-        start_point_variance=0.2,
+        init_scale=0.2,
         max_depth=4,
         delta=0.8,
     )
@@ -374,7 +366,7 @@ def test_exact_gp_mcmc_and_predictive_samples():
 
 def test_whitened_gp_is_usable_in_variational_inference():
     model, _, _ = build_gp_model(n=3)
-    with MeanFieldGuide() as guide:
+    with Guide(model) as guide:
         RandomParameter(
             "function_white",
             Normal(
@@ -782,7 +774,7 @@ def test_sparse_gp_nuts_and_predictive():
 # ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("nu", [0.3, 0.8, 1.0, 2.0, 3.7])
+@pytest.mark.parametrize("nu", [0.3, 0.8, 1.0, 1.7, 2.0, 3.2, 3.7])
 def test_power_bessel_k_matches_scipy(nu):
     from scipy.special import kv
 
@@ -792,7 +784,7 @@ def test_power_bessel_k_matches_scipy(nu):
     for order in (nu, nu - 1.0):
         expected = a ** nu * torch.as_tensor(kv(order, a.numpy()), dtype=torch.float64)
         actual = _power_bessel_k(nu, order, a)
-        torch.testing.assert_close(actual, expected, rtol=1e-8, atol=0.0)
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=0.0)  # measured: <= 1.2e-13
 
 
 def _scipy_matern(x1, x2, lengthscale, variance, nu):
@@ -881,3 +873,69 @@ def test_exact_gp_with_rational_quadratic_matches_finite_differences():
         kernel = RationalQuadratic(lengthscale, 1.2, alpha)
         ObservedParameter("observations", ExactGP("function", inputs, kernel, noise_variance=noise), y)
     _finite_difference_check(model)
+
+
+def test_gp_predictive_reads_learned_mean_and_inputs_from_the_trace():
+    """Per-draw gp_mean and learnable inputs come from the trace, not the nodes' current values."""
+    dtype = torch.float64
+    x0 = torch.linspace(0.0, 1.0, 4, dtype=dtype)
+    with Model() as model:
+        inputs = RandomParameter("x_in", Normal(x0, 0.1), shape=4, initial_value=x0.clone())
+        offset = RandomParameter("offset", Normal(0.0, 1.0), initial_value=torch.tensor([0.0], dtype=dtype))
+        latent = LatentGP("function", inputs, RBF(0.4, 1.0), mean=offset, jitter=1e-10)
+        ObservedParameter("observations", Normal(latent, 0.3), torch.sin(6 * x0))
+    generator = torch.Generator().manual_seed(0)
+    traced_inputs = x0 + 0.3  # one set of inputs, different from the nodes' current value
+    draws = {"function": [], "x_in": [], "offset": []}
+    for mean in (-2.0, 0.5, 3.0):
+        inputs.set_constrained_value(traced_inputs.clone())
+        offset.set_constrained_value(torch.tensor([mean], dtype=dtype))
+        white = model.params["function_white"]
+        white.set_unconstrained_value(torch.randn(white.unconstrained_value.shape, generator=generator, dtype=dtype))
+        for name, node in (("function", latent), ("x_in", inputs), ("offset", offset)):
+            draws[name].append(node.constrained_value.clone())
+    trace = {name: torch.stack(values).unsqueeze(0) for name, values in draws.items()}
+    inputs.set_constrained_value(x0.clone())
+    offset.set_constrained_value(torch.tensor([0.0], dtype=dtype))
+
+    torch.manual_seed(0)
+    predictions = gp_predictive(latent, trace, traced_inputs, n_samples=2)
+    assert predictions.shape == (3, 2, 4)
+    for sample in range(2):
+        torch.testing.assert_close(predictions[:, sample], trace["function"][0], atol=1e-4, rtol=0)
+
+
+def _exact_gp_with_mean(mean):
+    x = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    with Model():
+        noise = RandomParameter("noise", Uniform(0.01, 0.5), initial_value=torch.tensor([0.1], dtype=torch.float64))
+        gp = ExactGP("function", Data("inputs", x), RBF(0.4, 1.3), noise_variance=noise, mean=mean)
+    return gp
+
+
+def test_exact_gp_predictive_scalar_mean_is_used_at_the_new_inputs():
+    y = torch.tensor([0.3, -0.2, 0.8, 1.1], dtype=torch.float64)
+    new_inputs = torch.linspace(0.1, 1.3, 4, dtype=torch.float64)
+    trace = {"noise": torch.tensor([[[0.1], [0.2]]], dtype=torch.float64)}
+    zero = _exact_gp_with_mean(0.0)
+    scalar = _exact_gp_with_mean(2.5)
+    torch.manual_seed(1)
+    actual = exact_gp_predictive(scalar, trace, y, new_inputs, n_samples=3)
+    torch.manual_seed(1)
+    expected = exact_gp_predictive(zero, trace, y - 2.5, new_inputs, n_samples=3) + 2.5
+    torch.testing.assert_close(actual, expected)
+
+
+def test_gp_classes_reject_a_per_input_vector_mean():
+    """A per-input constant vector cannot be evaluated at new inputs: a mean function is required."""
+    x = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    train_mean = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
+    with pytest.raises(ValueError, match="mean function"):
+        _exact_gp_with_mean(train_mean)
+    with Model():
+        inputs = Data("inputs", x)
+        vector_node = RandomParameter("vector_mean", Normal(0.0, 1.0), shape=4)
+        with pytest.raises(ValueError, match="LinearMean"):
+            SparseGP("sparse", inputs, RBF(0.4, 1.3), x[:2].clone(), noise_variance=0.1, mean=train_mean)
+        with pytest.raises(ValueError, match="MeanFunction"):
+            LatentGP("latent", inputs, RBF(0.4, 1.3), mean=vector_node)

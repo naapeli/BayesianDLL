@@ -24,8 +24,36 @@ def plot_posterior(
     ``aggregate`` is true, all components of each parameter are drawn in the
     same row instead. ``vars`` selects random variables, deterministic
     variables, or both. If ``axes`` is supplied, it must contain exactly two
-    axes per plotted row. The returned axes array always has shape
-    ``(n_rows, 2)``.
+    axes per plotted row. Each chain is drawn as its own curve.
+
+    Parameters
+    ----------
+    trace : SamplingResult
+        The sampling result; its ``trace`` and ``deterministic_trace`` tensors
+        have shape ``(n_chains, n_samples, *event_shape)``.
+    method : {"kde", "hist"}, default "kde"
+        Density estimate per chain: a Gaussian kernel density estimate
+        (Scott's bandwidth) or a normalised histogram, linearly interpolated
+        through the bin centres, on a 500-point grid spanning the draws.
+    bins : int or dict[str, int], default 30
+        Number of histogram bins (``method="hist"`` only), either one value
+        for all parameters or one per parameter name.
+    parameters : list of str, optional
+        Names of the parameters to plot; all selected by ``vars`` by default.
+    axes : array-like of matplotlib.axes.Axes, optional
+        ``2 * n_rows`` axes to draw into, read row by row. A new figure is
+        created when omitted.
+    aggregate : bool, default False
+        Draw all components of a parameter in one row (coloured by component)
+        instead of one row per component.
+    vars : {"random", "deterministic", "all"}, default "random"
+        Whether to plot random parameters (``trace``), deterministic nodes
+        (``deterministic_trace``), or both.
+
+    Returns
+    -------
+    numpy.ndarray
+        The axes, of shape ``(n_rows, 2)``: density in column 0, trace in column 1.
     """
     if method not in ["kde", "hist"]:
         raise ValueError('method should be in ["kde", "hist"].')

@@ -31,30 +31,49 @@ def summary(
     round_to: int = 3,
     include_deterministic: bool = False,
 ):
-    """
-    Create a summary DataFrame of MCMC sampling results.
+    """Summary table of MCMC sampling results, one row per scalar parameter component.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     result : SamplingResult or dict[str, Tensor]
-        MCMC sampling output from Model.sample().
+        MCMC sampling output from ``Model.sample()``, or a mapping from name to
+        a tensor of shape ``(n_chains, n_samples, *event_shape)``. Entries with
+        fewer than two dimensions are skipped.
     hdi_prob : float, default 0.94
-        Probability mass for credible interval (e.g. 0.94 or 0.95).
+        Probability mass of the credible interval (e.g. 0.94 or 0.95), used for
+        both interval kinds.
     ci_kind : {"eti", "hdi"}, default "eti"
-        Type of credible interval to compute ("eti" = equal-tail interval, "hdi" = highest density interval).
+        Kind of credible interval: ``"eti"`` is the equal-tailed interval from
+        the ``(1 - hdi_prob)/2`` and ``(1 + hdi_prob)/2`` quantiles (numpy's
+        linear interpolation), ``"hdi"`` the narrowest interval holding
+        ``floor(hdi_prob * S)`` + 1 of the ``S`` sorted draws. Any value other
+        than ``"hdi"`` gives the equal-tailed interval.
     round_to : int or None, default 3
-        Decimal places for display rounding (use None for raw numbers).
+        Decimal places for display rounding: ``mean``, ``sd`` and the interval
+        to ``round_to``, ``r_hat`` to ``max(2, round_to)``, the MCSEs to
+        ``round_to + 1``, and the ESS columns are floored to integers. ``None``
+        keeps the raw numbers.
     include_deterministic : bool, default False
-        Whether to include deterministic parameter traces in the summary table.
-        Deterministic parameters are omitted by default because they can be
-        numerous and are derived from the sampled parameters. Set this to True
-        to inspect their summaries explicitly.
+        Whether to include deterministic parameter traces (``result.deterministic_trace``)
+        in the summary table. They are omitted by default because they can be
+        numerous and are derived from the sampled parameters. Ignored when
+        ``result`` is a dict.
 
-    Returns:
-    --------
+    Returns
+    -------
     pandas.DataFrame
-        Summary statistics table:
-        mean, sd, ci_lower, ci_upper, ess_bulk, ess_tail, r_hat, mcse_mean, mcse_sd.
+        Indexed by ``name`` or ``name[i,j,...]``, with the columns
+
+        - ``mean``, ``sd``: posterior mean and sample standard deviation
+          (``ddof=1``) of the pooled draws;
+        - ``eti_<low>%``, ``eti_<high>%`` (or ``hdi_...``): the credible interval;
+        - ``ess_bulk``, ``ess_tail``: bulk and tail effective sample size
+          (:func:`effective_sample_size`, tail with ``prob=0.89``);
+        - ``r_hat``: rank-normalised split R-hat (:func:`gelman_rubin`, ``method="rank"``);
+        - ``mcse_mean``: the Monte Carlo standard error *of the posterior mean*
+          estimate, and ``mcse_sd`` the Monte Carlo standard error *of the
+          posterior standard deviation* estimate (:func:`mcse` with
+          ``method="mean"`` and ``method="sd"``).
     """
     # Extract parameter trace dictionary
     traces = {}

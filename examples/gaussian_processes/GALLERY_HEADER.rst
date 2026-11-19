@@ -12,6 +12,8 @@ NUTS:
   (e.g. classification).
 * ``SparseGP`` scales to many observations with inducing inputs (VFE, DTC,
   FITC), which can themselves be learned.
+* The training inputs can be learned too (every class but ``ToeplitzGP``):
+  a GP latent variable model infers the inputs of high-dimensional data.
 * ``KroneckerGP`` and ``ToeplitzGP`` stay exact but exploit grid and
   regular-spacing structure to avoid the cubic cost of a dense Cholesky
   factorisation.

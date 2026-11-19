@@ -4,6 +4,24 @@ from .. import Model
 
 
 def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
+    """Maximise the model's log joint density with Adam, in place.
+
+    Every latent takes ``epochs`` Adam ascent steps (learning rate ``lr``,
+    moment decay rates ``betas``) on its unconstrained value, using the
+    hand-written gradient ``model.joint_grad_log_prob``. The objective is
+    the log joint in the unconstrained space, which includes the
+    ``log|det J|`` of every transform: the result is the mode of the
+    posterior of the unconstrained values, which in general differs from
+    the mode of the constrained parameters (e.g. for a ``HalfNormal``
+    scale). For a GP likelihood (:class:`~BayesianDLL.GP.ExactGP`, ...)
+    with priors on the hyperparameters this is a type-II MAP estimate; it
+    is a type-II maximum-likelihood estimate only with flat priors in the
+    unconstrained space.
+
+    The model's latents are left at the final values. Every
+    ``callback_frequency`` epochs the log joint is recorded (and printed if
+    ``verbose``). Returns the list of recorded log joint values.
+    """
     history = []
 
     m = {}

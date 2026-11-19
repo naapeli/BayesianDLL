@@ -65,6 +65,14 @@ def to_arviz(result, predictive=None, observed=None):
         tensor when the model has a single observed variable; stored as
         ``observed_data``.
 
+    Returns
+    -------
+    xarray.DataTree or arviz.InferenceData
+        With the groups above; arrays have the dimensions ``(chain, draw,
+        <name>_dim_0, ...)``. A statistic recorded by several sampling blocks
+        is stored once per block with a ``_block<i>`` suffix, except
+        ``diverging``, which is true when any block diverged.
+
     ArviZ is imported here only; it is not a dependency of BayesianDLL.
     """
     try:

@@ -13,11 +13,15 @@ def _adaptation_windows(warmup_length, init_buffer=75, term_buffer=50, base_wind
     """Return the iterations that end a metric-adaptation window.
 
     Follows Stan's windowed adaptation: a fast initial buffer that only adapts
-    the step size, a sequence of doubling slow windows in which the diagonal
-    metric is estimated, and a terminal buffer where only the step size is
-    adapted to the final metric. Returns ``(start, ends)``, where ``start`` is
-    the first iteration of the first slow window and ``ends`` contains the
-    last iteration of each slow window.
+    the step size, a sequence of doubling slow windows in which the (diagonal
+    or dense) metric is estimated, and a terminal buffer where only the step
+    size is adapted to the final metric. The defaults are Stan's 75 / 25 / 50
+    iterations; when they do not fit, the buffers become 15% and 10% of the
+    warmup and the first window the remaining 75%. A window is stretched to
+    the terminal buffer when the next, doubled, window would not fit.
+    Returns ``(start, ends)``, where ``start`` is the first iteration of the
+    first slow window and ``ends`` contains the last iteration of each slow
+    window; ``(None, [])`` for fewer than 20 warmup iterations.
     """
     if warmup_length < 20:
         return None, []
@@ -44,22 +48,79 @@ def _adaptation_windows(warmup_length, init_buffer=75, term_buffer=50, base_wind
 class NUTS:
     """No-U-Turn sampler with dual-averaging step size and windowed metric adaptation.
 
-    ``metric`` selects the inverse metric (posterior covariance estimate)
-    adapted during warmup: ``"diag"`` (default) estimates the marginal
-    variances and ``"dense"`` the full covariance, which helps with strongly
-    correlated posteriors. ``max_depth`` bounds the number of trajectory
-    doublings, i.e. at most ``2**max_depth - 1`` leapfrog steps per iteration.
+    This is the slice-sampling NUTS of Hoffman and Gelman (2014, Algorithm 3
+    with the adaptation of Algorithm 6), not the multinomial variant of
+    current Stan: a slice level ``log u = H_0 + log U(0, 1)`` is drawn (with
+    the log joint ``H = log p(theta) - r^T M^{-1} r / 2``), the trajectory is
+    doubled forwards or backwards at random, a point is chosen uniformly
+    among the slice-admissible leaves inside each subtree and, when a subtree
+    is merged into the trajectory, accepted with probability
+    ``min(1, n_subtree / n_trajectory)`` (biased progressive sampling).
+    Doubling stops at a U-turn, ``(theta_+ - theta_-) . M^{-1} r_± < 0``, at a
+    divergence, or after ``max_depth`` doublings, i.e. at most
+    ``2**max_depth - 1`` leapfrog steps per iteration.
 
-    ``delta`` is the target mean acceptance statistic of the dual-averaging
-    step-size adaptation (default 0.8, as in Stan, PyMC and NumPyro); raise
-    it (e.g. to 0.9 or 0.95) for smaller steps when there are divergences.
-    ``gamma``, ``t0`` and ``kappa`` are the dual-averaging constants and
-    ``max_delta`` the energy error that counts as a divergence.
+    Step size: dual averaging (Hoffman and Gelman, 2014, Section 3.2) of the
+    acceptance statistic ``alpha``, the mean of ``min(1, exp(H' - H_0))`` over
+    all leapfrog states of the trajectory (as in Stan), with
+    ``mu = log(10 eps_0)`` and, at warmup iteration ``m``,
+    ``H_bar <- (1 - 1/(m + t0)) H_bar + (delta - alpha)/(m + t0)``,
+    ``log eps = mu - sqrt(m)/gamma * H_bar``,
+    ``log eps_bar <- m^-kappa log eps + (1 - m^-kappa) log eps_bar``. Every
+    iteration after warmup (from the first call with ``warmup=False`` on,
+    including that one) uses the averaged step size ``eps_bar``; without any
+    warmup the heuristic initial step size is kept. ``eps_0`` comes from
+    the doubling/halving heuristic of Hoffman and Gelman (Algorithm 4).
+
+    Metric: Stan's windowed adaptation (see :func:`_adaptation_windows`):
+    within each slow window the draws are accumulated with Welford's online
+    algorithm (running mean and sum of squared deviations ``M2``, covariance
+    ``M2 / (n - 1)``), and at the window's end the inverse metric becomes the
+    regularised estimate ``n/(n + 5) * Sigma + 1e-3 * 5/(n + 5) * I`` and the
+    step size adaptation restarts. Until the first window ends the identity
+    is used. ``metric="dense"`` keeps the full covariance (momenta are drawn
+    as ``L^{-T} z`` with ``M^{-1} = L L^T``); if its Cholesky factorisation
+    fails, the previous metric is kept.
+
+    Parameters
+    ----------
+    log_target : callable
+        Maps the unconstrained position ``theta`` to a scalar log density tensor.
+    gradient : callable
+        Maps ``theta`` to the gradient of ``log_target``, a tensor of ``theta``'s shape.
+    inverse_transformation : callable
+        Map from the unconstrained to the constrained space. Stored for the
+        caller; the sampler does not use it.
+    delta : float, default 0.8
+        Target mean acceptance statistic of the step-size adaptation (as in
+        Stan, PyMC and NumPyro); raise it (e.g. to 0.9 or 0.95) for smaller
+        steps when there are divergences.
+    gamma, t0, kappa : float, default 0.05, 10, 0.75
+        Dual-averaging constants (shrinkage, iteration offset, and the decay
+        exponent of the averaging weights).
+    step_size_bar, H_bar : float, default 1, 0
+        Initial values of the averaged step size and of the running mean of
+        ``delta - alpha``; restored at every restart of the adaptation.
+    max_depth : int, default 10
+        Maximal number of trajectory doublings.
+    min_step_size, max_step_size : float, default 1e-4, 100
+        Bounds on the step size.
+    max_delta : float, default 1000.0
+        Energy error ``H_0 - H'`` beyond which a leapfrog step counts as a
+        divergence (non-finite values always do).
+    adapt_mass_matrix : bool, default True
+        Whether to adapt the metric during warmup; it is only adapted after
+        :meth:`set_warmup_length` and for at least 20 warmup steps.
+    metric : {"diag", "dense"}, default "diag"
+        The adapted inverse metric (posterior covariance estimate): the
+        marginal variances, or the full covariance, which helps with strongly
+        correlated posteriors.
 
     After each call of :meth:`step`, ``last_stats`` holds the iteration's
-    statistics: ``step_size`` (used for the trajectory), ``accept_stat``,
-    ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` (Hamiltonian at
-    the selected point) and ``lp`` (log density at the selected point).
+    statistics: ``step_size`` (used for the trajectory), ``accept_stat``
+    (``alpha``), ``tree_depth`` (number of doublings), ``n_leapfrog``,
+    ``diverging``, ``energy`` (Hamiltonian ``-log p + kinetic energy`` at the
+    selected point) and ``lp`` (log density at the selected point).
     """
 
     def __init__(self, log_target, gradient, inverse_transformation, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True, metric="diag"):
@@ -94,6 +155,8 @@ class NUTS:
         self._reset_welford()
         self._cached_theta = None
         self.last_stats = {}
+        # Whether the step size has been adapted since the last non-warmup step.
+        self._adapting = False
 
         # save in case of resetting
         self._H_bar = H_bar
@@ -106,6 +169,7 @@ class NUTS:
         self.inv_metric = None
         self._inv_metric_chol = None
         self._warmup_iteration = 0
+        self._adapting = False
         self._reset_welford()
         self.invalidate_cache()
 
@@ -296,6 +360,14 @@ class NUTS:
         return _dot(delta_theta, self._velocity(r_minus)) >= 0 and _dot(delta_theta, self._velocity(r_plus)) >= 0
 
     def step(self, theta, warmup=False):
+        """One NUTS iteration from ``theta``; adapts the step size and metric when ``warmup``.
+
+        Returns ``(new_theta, step_size, accept_stat, diverging)``, where
+        ``step_size`` is the step size for the *next* iteration (the one used
+        here is in ``last_stats["step_size"]``). The first call with
+        ``warmup=False`` after warmup calls switches to ``eps_bar`` before
+        building its trajectory.
+        """
         if not hasattr(self, "step_size"):
             log_prob = self.log_target(theta)
             gradient = self.gradient(theta)
@@ -312,6 +384,11 @@ class NUTS:
             self.gradient_cache = self.gradient(theta)
             self._cached_theta = theta
 
+        if not warmup and self._adapting:
+            # First draw after warmup: switch to the averaged step size before
+            # building the trajectory, so every post-warmup draw uses it.
+            self.step_size = self.step_size_bar
+            self._adapting = False
         step_size = self.step_size
         r0 = self._sample_momentum(theta)
         joint = self.log_prob_cache - self._kinetic(r0)
@@ -370,8 +447,7 @@ class NUTS:
             self.step_size = min(max(self.step_size, self.min_step_size), self.max_step_size)
             eta = self.m ** -self.kappa
             self.step_size_bar = math.exp((1 - eta) * math.log(self.step_size_bar) + eta * math.log(self.step_size))
-        else:
-            self.step_size = self.step_size_bar
+            self._adapting = True
 
         # Only update cache if new state is finite and valid
         if not torch.isnan(new_log_prob) and not torch.isinf(new_log_prob) and not torch.isnan(new_gradient).any():

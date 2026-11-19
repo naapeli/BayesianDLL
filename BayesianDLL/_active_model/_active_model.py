@@ -4,17 +4,9 @@ The innermost open model is the *active* model: new parameters register
 themselves with it. Each thread has its own stack, like the plate stack, so
 models built concurrently in different threads do not interfere, and nested
 ``with Model()`` blocks restore the enclosing model on exit.
-
-For backward compatibility the active model is still readable (and writable)
-as the module attribute ``_active_model``::
-
-    from BayesianDLL._active_model import _active_model
-    _active_model._active_model  # innermost open model or None
 """
 
-import sys
 import threading
-import types
 
 
 _context = threading.local()
@@ -49,24 +41,3 @@ def pop_model(model=None):
             return stack.pop(index)
     return None
 
-
-class _ActiveModelModule(types.ModuleType):
-    @property
-    def _active_model(self):
-        return get_active_model()
-
-    @_active_model.setter
-    def _active_model(self, model):
-        # Legacy assignment API: ``None`` deactivates the innermost model and
-        # any other value replaces it.
-        stack = _model_stack()
-        if model is None:
-            if stack:
-                stack.pop()
-        elif stack:
-            stack[-1] = model
-        else:
-            stack.append(model)
-
-
-sys.modules[__name__].__class__ = _ActiveModelModule

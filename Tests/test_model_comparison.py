@@ -11,7 +11,7 @@ from scipy.special import logsumexp
 from BayesianDLL import DeterministicParameter, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Distributions import Bernoulli, Beta, HalfCauchy, Normal
 from BayesianDLL.Evaluation import (
-    ELPDResult, Graphics, compare, effective_sample_size, loo, ppc_pvalue, psis, to_arviz, waic,
+    Graphics, compare, effective_sample_size, loo, ppc_pvalue, psis, to_arviz, waic,
 )
 from BayesianDLL.Evaluation._information_criteria import psis_tail_length, relative_efficiency, stacking_weights
 from BayesianDLL.Samplers import PredicativeResult
@@ -60,7 +60,6 @@ def test_loo_matches_arviz(outlier):
     np.testing.assert_allclose(result.elpd_i.numpy(), expected.elpd_i.values, atol=1e-6)
     np.testing.assert_allclose(result.pareto_k.numpy(), expected.pareto_k.values, rtol=0, atol=1e-6)
     assert result.good_k == pytest.approx(expected.good_k)
-    assert result["elpd_loo"] == result.elpd
 
 
 def test_loo_with_estimated_reff_is_close_to_arviz():

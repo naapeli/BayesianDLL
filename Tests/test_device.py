@@ -28,7 +28,7 @@ from BayesianDLL.Distributions import Bernoulli, HalfCauchy, HalfNormal, Normal,
 from BayesianDLL.Evaluation import loo
 from BayesianDLL.GP import ExactGP, RBF
 from BayesianDLL.Variational import BBVI
-from BayesianDLL import AutoNormal
+from BayesianDLL import Guide
 
 
 CUDA = torch.cuda.is_available()
@@ -134,7 +134,7 @@ def scenario_smc(device, dtype):
 
 def scenario_bbvi(device, dtype):
     model = regression_model().to(device, dtype)
-    guide = AutoNormal(model)
+    guide = Guide(model, default_family="mean_field")
     BBVI(model, guide, n_samples=2, epochs=20, lr=0.03, verbose=False)
     return [guide.sample(20)["b"]]
 

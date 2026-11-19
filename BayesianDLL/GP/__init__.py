@@ -1,5 +1,6 @@
 """Gaussian processes: latent, exact, sparse (inducing-point) and structured
-(Kronecker grid and Toeplitz) models with hand-derived gradients."""
+(Kronecker grid and Toeplitz) models with hand-derived gradients, composable
+kernels and mean functions."""
 
 from ._kernels import (
     Kernel,
@@ -15,11 +16,18 @@ from ._kernels import (
     SumKernel,
     ProductKernel,
 )
+from ._means import (
+    MeanFunction,
+    ZeroMean,
+    ConstantMean,
+    LinearMean,
+    SumMean,
+)
 from ._process import (
     ExactGP,
-    ExactGaussianProcess,
-    GaussianProcess,
     LatentGP,
+    SparseLatentGP,
+    sparse_latent_gp_predictive,
     exact_gp_predictive,
     SparseGP,
     sparse_gp_predictive,
@@ -48,10 +56,15 @@ __all__ = [
     "WhiteNoise",
     "SumKernel",
     "ProductKernel",
+    "MeanFunction",
+    "ZeroMean",
+    "ConstantMean",
+    "LinearMean",
+    "SumMean",
     "LatentGP",
-    "GaussianProcess",
+    "SparseLatentGP",
+    "sparse_latent_gp_predictive",
     "ExactGP",
-    "ExactGaussianProcess",
     "gp_predictive",
     "exact_gp_predictive",
     "SparseGP",

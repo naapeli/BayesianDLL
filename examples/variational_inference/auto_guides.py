@@ -6,10 +6,11 @@ A straight-line regression ``y ~ N(a + b x, sigma)`` is fitted with
 black-box variational inference (``BBVI``) using two guides that are built
 automatically from the model:
 
-* ``AutoNormal``: an independent Normal for every latent in the unconstrained
-  space (``sigma`` enters through its logarithm), i.e. a mean-field guide;
-* ``AutoMultivariateNormal``: one Normal with a full covariance matrix over all
-  unconstrained latents.
+* ``Guide(model, default_family="mean_field")``: an independent Normal for
+  every latent in the unconstrained space (``sigma`` enters through its
+  logarithm), i.e. a mean-field guide;
+* ``Guide(model, default_family="full_rank")``: one Normal with a full
+  covariance matrix over all unconstrained latents.
 
 The covariate lies between 2 and 4, far from zero, so the intercept and the
 slope are strongly negatively correlated in the posterior: a steeper line
@@ -26,7 +27,7 @@ and the regression line with its 90% band under each approximation.
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import AutoMultivariateNormal, AutoNormal, Data, Model, ObservedParameter, RandomParameter, plate
+from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Deterministic import Linear
 from BayesianDLL.Distributions import HalfNormal, Normal
 from BayesianDLL.Variational import BBVI
@@ -44,7 +45,7 @@ with Model() as model:
     sigma = RandomParameter("sigma", HalfNormal(1.0))
     x_data = Data("x", x)
     with plate("observations", x_data):
-        line = Linear("line", x_data, slope=slope, intercept=intercept)
+        line = Linear("line", x_data, coefficients=slope, intercept=intercept)
         ObservedParameter("y", Normal(line, sigma), y)
 
 # %%
@@ -55,7 +56,7 @@ with Model() as model:
 # independent samples directly from the fitted Normal and maps them back to
 # the constrained space.
 
-guides = {"AutoNormal": AutoNormal(model), "AutoMultivariateNormal": AutoMultivariateNormal(model)}
+guides = {"mean-field": Guide(model, default_family="mean_field"), "full-rank": Guide(model, default_family="full_rank")}
 histories = {}
 posteriors = {}
 for label, guide in guides.items():
@@ -90,7 +91,7 @@ for label, trace in posteriors.items():
 # most visibly at the ends of the data range, while the full-rank band
 # matches the NUTS band.
 
-colors = {"AutoNormal": "C1", "AutoMultivariateNormal": "C2", "NUTS": "black"}
+colors = {"mean-field": "C1", "full-rank": "C2", "NUTS": "black"}
 angles = torch.linspace(0, 2 * torch.pi, 200, dtype=torch.float64)
 circle = torch.stack([angles.cos(), angles.sin()]) * 2.448  # radius of the 95% region in 2-D
 

@@ -10,7 +10,7 @@ from ._vectorized_samplers import VectorizedFiniteGibbs, VectorizedMetropolis, V
 from ._NUTS import NUTS
 from ._Metropolis import Metropolis, FiniteGibbs
 from ._Slice import Slice
-from ._result import SamplingResult, SampleStats
+from ._result import SampleStats
 
 
 _NUMERICAL_ERRORS = (ValueError, RuntimeError, OverflowError, ZeroDivisionError)
@@ -190,13 +190,17 @@ def _chain_value(value, n_chains):
     return value
 
 
-def sample_vectorized(n_samples, warmup_length, n_chains, model, progress_bar, start_point_variance, blocks, seed,
+def sample_vectorized(n_samples, warmup_length, n_chains, model, progress_bar, init_scale, blocks, seed,
                       log_likelihood_plan, sampler_params, trace_device="cpu"):
     """Run ``n_chains`` chains of the batched model in lock step.
 
     Returns the pieces :func:`~BayesianDLL.sample` assembles into a
-    :class:`SamplingResult`: ``(trace, det_trace, enum_trace, enum_probs,
-    log_lik, divergences, acceptance, step_sizes, sample_stats, max_depths)``.
+    :class:`SamplingResult`: ``(trace, det_trace, enum_probs, log_lik,
+    divergences, acceptance, step_sizes, sample_stats, max_depths)``, where
+    ``trace`` also holds the draws of the enumerated parameters, the tensors
+    have shape ``(n_chains, n_samples, ...)``, ``log_lik`` is ``None`` without
+    a plan, and ``divergences``, ``acceptance`` and ``step_sizes`` are lists
+    per chain (the latter two with one entry per block).
     """
     from ..Evaluation._pointwise import pointwise_log_likelihood
 
@@ -208,14 +212,14 @@ def sample_vectorized(n_samples, warmup_length, n_chains, model, progress_bar, s
         for name, parameter in model.params.items():
             value = parameter.unconstrained_value.unsqueeze(0).expand(n_chains, *parameter.unconstrained_value.shape).clone()
             if parameter.distribution.state_space.is_continuous():
-                value = value + start_point_variance * torch.randn_like(value)
+                value = value + init_scale * torch.randn_like(value)
             initial[name] = value
 
         with model.batched(n_chains, values=initial):
             blocks = _build_vectorized_blocks(model, blocks, sampler_params)
             for block in blocks:
                 if hasattr(block.sampler, "set_warmup_length"):
-                    block.sampler.set_warmup_length(max(warmup_length - 1, 0))
+                    block.sampler.set_warmup_length(warmup_length)
             return _run(model, blocks, n_samples, warmup_length, n_chains, progress_bar, log_likelihood_plan,
                         trace_device, pointwise_log_likelihood)
 
@@ -229,7 +233,7 @@ def _run(model, blocks, n_samples, warmup_length, n_chains, progress_bar, log_li
         for name, p in model.params.items()
     }
     det_trace, enum_trace, enum_probs, log_lik = {}, {}, {}, {}
-    acceptance = torch.ones((n_chains, len(blocks)), dtype=dtype, device=device)
+    acceptance = torch.zeros((n_chains, len(blocks)), dtype=dtype, device=device)
     step_sizes = torch.ones((n_chains, len(blocks)), dtype=dtype, device=device)
     divergences = torch.zeros(n_chains, dtype=torch.long, device=device)
     stats = [{} for _ in blocks]
@@ -240,14 +244,14 @@ def _run(model, blocks, n_samples, warmup_length, n_chains, progress_bar, log_li
             target[name] = torch.empty((n_chains, n_samples, *value.shape[1:]), dtype=value.dtype, device=value.device)
         target[name][:, index] = value
 
-    bar = tqdm(total=total, disable=not progress_bar, desc=f"{n_chains} chains (vectorized) warmup",
+    bar = tqdm(total=total, disable=not progress_bar, desc=f"{n_chains} chains (vectorized) {'warmup' if warmup_length > 0 else 'sample'}",
                bar_format=r"{desc}{percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}{postfix}")
     try:
         for m in range(1, total + 1):
-            warmup = m < warmup_length
+            warmup = m <= warmup_length
             for i, block in enumerate(blocks):
                 step_size, accept, diverging = block.step(warmup=warmup)
-                if m >= warmup_length:
+                if not warmup:
                     divergences = divergences + torch.as_tensor(diverging, device=device).to(torch.long)
                 step_sizes[:, i] = torch.as_tensor(step_size, dtype=dtype, device=device)
                 acceptance[:, i] = acceptance[:, i] + torch.as_tensor(accept, dtype=dtype, device=device)

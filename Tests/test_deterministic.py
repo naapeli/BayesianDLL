@@ -1,4 +1,3 @@
-import pytest
 import torch
 
 from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, RandomParameter
@@ -12,7 +11,7 @@ def test_linear_regression_is_a_deterministic_parameter():
         inputs = Data("inputs", x)
         slope = RandomParameter("slope", Normal(0.0, 1.0))
         intercept = RandomParameter("intercept", Normal(0.0, 1.0))
-        mean = Linear("mean", inputs, slope=slope, intercept=intercept)
+        mean = Linear("mean", inputs, coefficients=slope, intercept=intercept)
         ObservedParameter("observations", Normal(mean, 0.1 ** 0.5), torch.zeros(4))
 
     assert isinstance(mean, DeterministicParameter)
@@ -30,6 +29,9 @@ def test_linear_regression_supports_design_matrices_and_weights():
 
     torch.testing.assert_close(mean.constrained_value, design @ weights + 1.0)
     assert mean.derivatives() == {}
+    # The coefficients are only exposed as ``coefficients`` (no ``weights``/``slope`` aliases).
+    assert mean.coefficients is weights
+    assert not hasattr(mean, "weights") and not hasattr(mean, "slope")
 
 
 def test_exponential_transform_has_matching_derivative():
@@ -62,7 +64,7 @@ def test_sigmoid_transform_has_matching_derivative_and_finite_logistic_gradient(
         inputs = Data("inputs", x)
         slope = RandomParameter("slope", Normal(0.0, 1.0))
         intercept = RandomParameter("intercept", Normal(0.0, 1.0))
-        logits = Linear("logits", inputs, slope=slope, intercept=intercept)
+        logits = Linear("logits", inputs, coefficients=slope, intercept=intercept)
         probability = Sigmoid("probability", logits)
         ObservedParameter("observations", Bernoulli(probability), y)
 
@@ -73,9 +75,3 @@ def test_sigmoid_transform_has_matching_derivative_and_finite_logistic_gradient(
     )
     assert all(torch.isfinite(value).all() for value in model.joint_grad_log_prob().values())
 
-
-def test_linear_regression_rejects_ambiguous_coefficient_arguments():
-    with Model() as model:
-        inputs = Data("inputs", torch.ones(2))
-        with pytest.raises(TypeError, match="exactly one"):
-            Linear("mean", inputs, coefficients=1.0, slope=1.0)

@@ -7,13 +7,13 @@ from BayesianDLL import (
 )
 from BayesianDLL.Distributions import Bernoulli, Dirichlet, Exponential, Normal
 from BayesianDLL.Distributions._resolve import resolve
-from BayesianDLL._active_model import _active_model
+from BayesianDLL._active_model._active_model import get_active_model
 from BayesianDLL._plate import get_active_plates
 
 
 def test_model_registration_and_log_probability(normal_model):
     model = normal_model
-    assert _active_model._active_model is None
+    assert get_active_model() is None
     assert set(model.params) == {"mean"}
     assert set(model.observed_params) == {"data"}
     assert set(model.graph.edges) == {("mean", "data")}
@@ -90,7 +90,7 @@ def test_contexts_cleanup_on_exception():
             with plate("data", 2, dim=-3):
                 assert get_active_plates()[0].dim == -3
                 raise ValueError("stop")
-    assert _active_model._active_model is None
+    assert get_active_model() is None
     assert get_active_plates() == []
 
 
@@ -155,7 +155,7 @@ def test_condition_basic_and_immutability():
     # Original model is untouched
     assert "x" in model.params
     assert "x" not in model.observed_params
-    assert _active_model._active_model is None
+    assert get_active_model() is None
     assert conditioned is not model
 
     # Conditioned model has x as observed

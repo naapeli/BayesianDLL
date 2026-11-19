@@ -5,7 +5,7 @@ from functools import reduce
 from abc import ABC, abstractmethod
 
 from ._transforms import (
-    IdentityTransform, LogitTransform, LogTransform, SoftMaxTransform, InverseSoftPlusTransform,
+    IdentityTransform, LogitTransform, LogTransform, InverseSoftPlusTransform,
     StickBreakingTransform, CorrCholeskyTransform, ChainTransform, _apply_jacobian_transpose, _log1m_tanh_sq,
     PositiveDefiniteTransform, OrderedTransform, log_sigmoid,
 )
@@ -100,6 +100,11 @@ def _uniform(shape, dtype, device):
     return u.clamp(min=tiny)
 
 
+def _expand(value, shape):
+    """``value`` broadcast to ``shape`` (a contiguous copy)."""
+    return value.expand(torch.broadcast_shapes(value.shape, tuple(shape))).clone()
+
+
 def _discrete_grad_error():
     return NotImplementedError("Gradient w.r.t. x is undefined for discrete distributions.")
 
@@ -149,6 +154,22 @@ def _mvdigamma(a, p):
 
 
 class Distribution(ABC):
+    """Base class of all distributions.
+
+    A distribution's parameters may be Python numbers, tensors, model nodes
+    (``RandomParameter``, ``DeterministicParameter``, ``ObservedParameter``,
+    ``Data``) or ``VariationalParameter`` objects; they are resolved to
+    tensors every time a density is evaluated. Parameters broadcast like
+    ``torch`` tensors to ``batch_shape``. Inside a vectorized (batched)
+    evaluation the values of batched model nodes carry a leading chain
+    dimension, which broadcasts in the same way.
+
+    ``transform`` maps the unconstrained sampling space to the support
+    (``transform.inverse``: unconstrained -> constrained), ``state_space``
+    describes the support and ``transformed_state_space`` the unconstrained
+    space.
+    """
+
     #: ``True`` when ``sample(..., _reparametrization_trick_grad=True)`` is supported.
     has_rsample = False
 
@@ -170,33 +191,68 @@ class Distribution(ABC):
         return ()
 
     def pdf(self, x):
+        """Density (or probability mass) ``exp(log_pdf(x))``."""
         return torch.exp(self.log_pdf(x))
 
     @abstractmethod
     def log_pdf(self, x):
         """
-        Log probability density.  Returns a tensor whose shape equals the
-        broadcast batch dimensions (event dimensions are summed out).
+        Log probability density (or mass) of ``x`` in the constrained space.
+        Returns a tensor with the broadcast shape of ``x`` and the batch
+        dimensions, without the event dimensions (they are summed out).
+        Values outside the support give ``-inf``.
         """
         pass
 
     @abstractmethod
     def log_pdf_grad(self, x):
+        """Gradient of :meth:`log_pdf` w.r.t. ``x`` (same shape as ``x``).
+
+        Discrete distributions raise ``NotImplementedError``.
+        """
         pass
 
     @abstractmethod
     def log_pdf_param_grads(self, x):
+        """Gradients of :meth:`log_pdf` w.r.t. the distribution's parameters.
+
+        Returns a dict keyed by the name of each parameter (the node's name
+        for model nodes and variational parameters, a fixed key such as
+        ``"mean"`` or ``"sigma"`` for constants). Each value has the
+        broadcast shape of ``log_pdf(x)`` (plus the parameter's event
+        dimensions for vector or matrix parameters); the caller sums it onto
+        the parameter's shape.
+        """
         pass
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
-        """Draw ``n_samples`` samples of shape ``(n_samples, *batch_shape, *event_shape)``."""
+        """Draw ``n_samples`` samples of shape ``(n_samples, *batch_shape, *event_shape)``.
+
+        With ``_reparametrization_trick_grad=True`` (only when
+        :attr:`has_rsample`) the result is ``(samples, grads)`` with
+        ``grads[name]`` the derivative of the samples w.r.t. each parameter.
+        """
         raise NotImplementedError(f"{type(self).__name__} does not implement sampling.")
 
     def cdf(self, x):
+        """Cumulative distribution function ``P(X <= x)`` (where available)."""
         raise NotImplementedError(f"{type(self).__name__} has no closed-form cdf.")
 
     def icdf(self, u):
+        """Inverse of :meth:`cdf` for ``u`` in ``(0, 1)`` (where available)."""
         raise NotImplementedError(f"{type(self).__name__} has no closed-form inverse cdf.")
+
+    def mean(self):
+        """Closed-form mean, broadcast to ``batch_shape + event_shape``.
+
+        Raises ``NotImplementedError`` when the distribution has no closed
+        form, and ``ValueError`` when the mean does not exist (Cauchy).
+        """
+        raise NotImplementedError(f"{type(self).__name__} has no closed-form mean.")
+
+    def variance(self):
+        """Closed-form elementwise variance (see :meth:`mean`)."""
+        raise NotImplementedError(f"{type(self).__name__} has no closed-form variance.")
 
     def _no_reparam(self):
         return NotImplementedError(f"{type(self).__name__} has no reparameterised sampler; call sample() without _reparametrization_trick_grad.")
@@ -239,7 +295,14 @@ class Distribution(ABC):
 
 # ========================= CONTINUOUS =========================
 class Normal(Distribution):
-    """Normal distribution with mean ``mu`` and **standard deviation** ``sigma``."""
+    """Normal distribution with mean ``mu`` and **standard deviation** ``sigma``.
+
+    ``log p(x) = -(x - mu)^2 / (2 sigma^2) - log sigma - log(2 pi) / 2`` on
+    the real line. ``mu`` and ``sigma > 0`` are numbers, tensors or model
+    nodes and broadcast to ``batch_shape``. Supports ``cdf``, ``icdf``,
+    ``cdf_param_grads`` (used by :class:`Truncated`) and reparameterised
+    sampling.
+    """
 
     has_rsample = True
 
@@ -288,6 +351,15 @@ class Normal(Distribution):
         phi = torch.exp(-0.5 * t ** 2 - 0.5 * _LOG_2PI)
         return {self.resolve_name("mean", self.mu): -phi / sigma, self.resolve_name("sigma", self.sigma): -phi * t / sigma}
 
+
+    def mean(self):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        return _expand(mu, self.batch_shape)
+
+    def variance(self):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        return _expand(sigma ** 2, self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         mu, sigma = _as_float(self.mu, self.sigma)
         shape = _sample_shape(n_samples, self.batch_shape)
@@ -299,7 +371,12 @@ class Normal(Distribution):
 
 
 class HalfNormal(Distribution):
-    """Half-normal distribution ``|N(0, sigma^2)|`` with scale ``sigma``."""
+    """Half-normal distribution ``|N(0, sigma^2)|`` with scale ``sigma``.
+
+    ``log p(x) = log(2 / pi) / 2 - log sigma - x^2 / (2 sigma^2)`` for
+    ``x > 0``; ``sigma > 0`` is the standard deviation of the underlying
+    normal. Sampled on ``log x`` (:class:`LogTransform`).
+    """
 
     has_rsample = True
 
@@ -341,6 +418,13 @@ class HalfNormal(Distribution):
         sigma = _as_float(self.sigma)
         return sigma * torch.special.ndtri((1 + u) / 2)
 
+
+    def mean(self):
+        return _as_float(self.sigma) * math.sqrt(2 / math.pi)
+
+    def variance(self):
+        return _as_float(self.sigma) ** 2 * (1 - 2 / math.pi)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         sigma = _as_float(self.sigma)
         eps = torch.randn(_sample_shape(n_samples, self.batch_shape), dtype=sigma.dtype, device=sigma.device).abs()
@@ -351,7 +435,12 @@ class HalfNormal(Distribution):
 
 
 class LogNormal(Distribution):
-    """``exp(N(mu, sigma^2))`` with ``sigma`` the standard deviation of the log."""
+    """Log-normal distribution ``exp(N(mu, sigma^2))``.
+
+    ``mu`` and ``sigma > 0`` are the mean and **standard deviation** of
+    ``log x``: ``log p(x) = -log x - log sigma - log(2 pi) / 2 -
+    (log x - mu)^2 / (2 sigma^2)`` for ``x > 0``. Sampled on ``log x``.
+    """
 
     has_rsample = True
 
@@ -398,6 +487,15 @@ class LogNormal(Distribution):
         mu, sigma = _as_float(self.mu, self.sigma)
         return torch.exp(mu + sigma * torch.special.ndtri(u))
 
+
+    def mean(self):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        return _expand(torch.exp(mu + sigma ** 2 / 2), self.batch_shape)
+
+    def variance(self):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        return _expand(torch.expm1(sigma ** 2) * torch.exp(2 * mu + sigma ** 2), self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         mu, sigma = _as_float(self.mu, self.sigma)
         eps = torch.randn(_sample_shape(n_samples, self.batch_shape), dtype=mu.dtype, device=mu.device)
@@ -411,31 +509,37 @@ class MultivariateNormal(Distribution):
     """Multivariate normal parameterised by ``covariance`` **or** ``scale_tril``.
 
     ``MultivariateNormal(mu, covariance)`` or
-    ``MultivariateNormal(mu, scale_tril=L)`` with ``L`` lower triangular and
-    ``covariance = L @ L.T``. The covariance gradient returned by
+    ``MultivariateNormal(mu, scale_tril=L)`` with ``L`` lower triangular
+    (positive diagonal) and ``covariance = L @ L.T``; exactly one of the two
+    must be given. ``mu`` has shape ``(..., D)`` (a scalar is broadcast to
+    ``D`` entries) and the matrix ``(..., D, D)``; leading dimensions are
+    batch dimensions. ``log_pdf`` returns one value per batch element. The
+    covariance gradient returned by
     :meth:`log_pdf_param_grads` is the full symmetric matrix
     ``0.5 * (S^-1 d d^T S^-1 - S^-1)``; the ``scale_tril`` gradient is lower
-    triangular.
+    triangular. Reparameterised sampling gives gradients w.r.t. ``mu``
+    only, so ``has_rsample`` is ``False`` when the matrix is a
+    ``VariationalParameter``.
     """
 
-    _param_event_ndims = {"mu": 1, "covariance": 2, "scale_tril": 2}
+    _param_event_ndims = {"mu": 1, "covariance_matrix": 2, "scale_tril": 2}
 
     def __init__(self, mu, covariance=None, scale_tril=None):
         super().__init__()
         _check_exactly_one(["covariance", "scale_tril"], [covariance, scale_tril])
         self.mu = mu
-        self.covariance = covariance
+        self.covariance_matrix = covariance
         self.scale_tril = scale_tril
         self.add_dependency(mu)
         self.add_dependency(covariance if covariance is not None else scale_tril)
 
     @property
     def has_rsample(self):
-        return not isinstance(self.covariance if self.covariance is not None else self.scale_tril, VariationalParameter)
+        return not isinstance(self.covariance_matrix if self.covariance_matrix is not None else self.scale_tril, VariationalParameter)
 
     def _params(self):
-        if self.covariance is not None:
-            mu, cov = _as_float(self.mu, self.covariance)
+        if self.covariance_matrix is not None:
+            mu, cov = _as_float(self.mu, self.covariance_matrix)
             L = torch.linalg.cholesky(cov)
         else:
             mu, L = _as_float(self.mu, self.scale_tril)
@@ -444,7 +548,7 @@ class MultivariateNormal(Distribution):
         return mu, L
 
     def _matrix(self):
-        return resolve(self.covariance if self.covariance is not None else self.scale_tril)
+        return resolve(self.covariance_matrix if self.covariance_matrix is not None else self.scale_tril)
 
     @property
     def event_shape(self):
@@ -480,13 +584,27 @@ class MultivariateNormal(Distribution):
     def log_pdf_param_grads(self, x):
         y, a, L = self._whiten(x)
         grads = {self.resolve_name("mean", self.mu): a}
-        if self.covariance is not None:
+        if self.covariance_matrix is not None:
             precision = torch.cholesky_inverse(L)
-            grads[self.resolve_name("covariance", self.covariance)] = 0.5 * (a.unsqueeze(-1) * a.unsqueeze(-2) - precision)
+            grads[self.resolve_name("covariance", self.covariance_matrix)] = 0.5 * (a.unsqueeze(-1) * a.unsqueeze(-2) - precision)
         else:
             diag = torch.diagonal(L, dim1=-2, dim2=-1)
             grads[self.resolve_name("scale_tril", self.scale_tril)] = torch.tril(a.unsqueeze(-1) * y.unsqueeze(-2)) - torch.diag_embed(1 / diag)
         return grads
+
+
+    def mean(self):
+        mu, L = self._params()
+        return _expand(mu, (*self.batch_shape, *self.event_shape))
+
+    def covariance(self):
+        """The covariance matrix ``L L^T``, shape ``(*batch_shape, D, D)``."""
+        mu, L = self._params()
+        D = self.event_shape[0]
+        return _expand(L @ L.transpose(-2, -1), (*self.batch_shape, D, D))
+
+    def variance(self):
+        return torch.diagonal(self.covariance(), dim1=-2, dim2=-1)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad and not self.has_rsample:
@@ -501,6 +619,12 @@ class MultivariateNormal(Distribution):
 
 
 class Beta(Distribution):
+    """Beta distribution on ``(0, 1)`` with concentrations ``a > 0`` and ``b > 0``.
+
+    ``log p(x) = (a - 1) log x + (b - 1) log(1 - x) - log B(a, b)``; mean
+    ``a / (a + b)``. Sampled on ``logit x`` (:class:`LogitTransform`).
+    """
+
     def __init__(self, a, b):
         super().__init__(LogitTransform(low=0, high=1), ContinuousRange(0, 1), ContinuousReal())
         self.a = a
@@ -541,6 +665,16 @@ class Beta(Distribution):
         a, b = _as_float(self.a, self.b)
         return a * torch.sigmoid(-x_unconstrained) - b * torch.sigmoid(x_unconstrained)
 
+
+    def mean(self):
+        a, b = _as_float(self.a, self.b)
+        return _expand(a / (a + b), self.batch_shape)
+
+    def variance(self):
+        a, b = _as_float(self.a, self.b)
+        total = a + b
+        return _expand(a * b / (total ** 2 * (total + 1)), self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -549,6 +683,13 @@ class Beta(Distribution):
 
 
 class Exponential(Distribution):
+    """Exponential distribution with **rate** ``rate > 0`` (mean ``1 / rate``).
+
+    ``log p(x) = log rate - rate x`` for ``x > 0``. Sampled on ``log x``;
+    supports ``cdf``, ``icdf``, ``cdf_param_grads`` and reparameterised
+    sampling.
+    """
+
     has_rsample = True
 
     def __init__(self, rate):
@@ -602,6 +743,13 @@ class Exponential(Distribution):
         rate = _as_float(self.rate)
         return {self.resolve_name("rate", self.rate): x * torch.exp(-rate * x)}
 
+
+    def mean(self):
+        return 1 / _as_float(self.rate)
+
+    def variance(self):
+        return 1 / _as_float(self.rate) ** 2
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         rate = _as_float(self.rate)
         eps = _uniform(_sample_shape(n_samples, self.batch_shape), rate.dtype, rate.device)
@@ -614,7 +762,12 @@ class Exponential(Distribution):
 
 
 class Gamma(Distribution):
-    """Gamma distribution with shape ``alpha`` and **rate** ``beta``."""
+    """Gamma distribution with shape ``alpha > 0`` and **rate** ``beta > 0``.
+
+    ``log p(x) = alpha log beta - log Gamma(alpha) + (alpha - 1) log x -
+    beta x`` for ``x > 0``; mean ``alpha / beta`` (the scale is
+    ``1 / beta``). Sampled on ``log x``; no reparameterised sampler.
+    """
 
     def __init__(self, alpha, beta):
         super().__init__(LogTransform(border=0, side="larger"), ContinuousPositive(), ContinuousReal())
@@ -652,6 +805,15 @@ class Gamma(Distribution):
     def cdf(self, x):
         alpha, beta = _as_float(self.alpha, self.beta)
         return torch.special.gammainc(alpha, beta * x)
+
+
+    def mean(self):
+        alpha, beta = _as_float(self.alpha, self.beta)
+        return _expand(alpha / beta, self.batch_shape)
+
+    def variance(self):
+        alpha, beta = _as_float(self.alpha, self.beta)
+        return _expand(alpha / beta ** 2, self.batch_shape)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -729,6 +891,15 @@ class Uniform(Distribution):
         low, high = _as_float(self.low, self.high)
         return low + (high - low) * u
 
+
+    def mean(self):
+        low, high = _as_float(self.low, self.high)
+        return _expand((low + high) / 2, self.batch_shape)
+
+    def variance(self):
+        low, high = _as_float(self.low, self.high)
+        return _expand((high - low) ** 2 / 12, self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         low, high = _as_float(self.low, self.high)
         u = torch.rand(_sample_shape(n_samples, self.batch_shape), dtype=low.dtype, device=low.device)
@@ -739,6 +910,13 @@ class Uniform(Distribution):
 
 
 class InvGamma(Distribution):
+    """Inverse-gamma distribution with shape ``alpha > 0`` and **scale** ``beta > 0``.
+
+    ``1 / X ~ Gamma(alpha, rate=beta)``, i.e. ``log p(x) = alpha log beta -
+    log Gamma(alpha) - (alpha + 1) log x - beta / x`` for ``x > 0``; mean
+    ``beta / (alpha - 1)`` for ``alpha > 1``. Sampled on ``log x``.
+    """
+
     def __init__(self, alpha, beta):
         super().__init__(LogTransform(border=0, side="larger"), ContinuousPositive(), ContinuousReal())
         self.alpha = alpha
@@ -781,6 +959,21 @@ class InvGamma(Distribution):
         alpha, beta = _as_float(self.alpha, self.beta)
         return torch.special.gammaincc(alpha, beta / x)
 
+
+    def mean(self):
+        """``beta / (alpha - 1)`` for ``alpha > 1``, ``inf`` otherwise."""
+        alpha, beta = _as_float(self.alpha, self.beta)
+        safe = torch.where(alpha > 1, alpha - 1, torch.ones_like(alpha))
+        mean = torch.where(alpha > 1, beta / safe, torch.full_like(alpha * beta, math.inf))
+        return _expand(mean, self.batch_shape)
+
+    def variance(self):
+        """``beta^2 / ((alpha - 1)^2 (alpha - 2))`` for ``alpha > 2``, ``inf`` otherwise."""
+        alpha, beta = _as_float(self.alpha, self.beta)
+        safe = torch.where(alpha > 2, alpha, torch.full_like(alpha, 3.0))
+        variance = torch.where(alpha > 2, beta ** 2 / ((safe - 1) ** 2 * (safe - 2)), torch.full_like(alpha * beta, math.inf))
+        return _expand(variance, self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -790,6 +983,12 @@ class InvGamma(Distribution):
 
 
 class HalfCauchy(Distribution):
+    """Half-Cauchy distribution ``|Cauchy(0, scale)|`` with ``scale > 0``.
+
+    ``log p(x) = log 2 - log pi - log scale - log(1 + (x / scale)^2)`` for
+    ``x > 0``. Sampled on ``log x``.
+    """
+
     has_rsample = True
 
     def __init__(self, scale):
@@ -837,6 +1036,13 @@ class HalfCauchy(Distribution):
         scale = _as_float(self.scale)
         return scale * torch.tan(math.pi / 2 * u)
 
+
+    def mean(self):
+        raise ValueError("The half-Cauchy distribution has no finite mean.")
+
+    def variance(self):
+        raise ValueError("The half-Cauchy distribution has no finite variance.")
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         scale = _as_float(self.scale)
         u = torch.rand(_sample_shape(n_samples, self.batch_shape), dtype=scale.dtype, device=scale.device)
@@ -848,6 +1054,11 @@ class HalfCauchy(Distribution):
 
 
 class Cauchy(Distribution):
+    """Cauchy distribution with location ``mu`` and scale ``scale > 0``.
+
+    ``log p(x) = -log pi - log scale - log(1 + ((x - mu) / scale)^2)``.
+    """
+
     has_rsample = True
 
     def __init__(self, mu, scale):
@@ -891,6 +1102,13 @@ class Cauchy(Distribution):
         dens = 1 / (math.pi * (1 + t ** 2))
         return {self.resolve_name("mean", self.mu): -dens / scale, self.resolve_name("scale", self.scale): -dens * t / scale}
 
+
+    def mean(self):
+        raise ValueError("The Cauchy distribution has no mean.")
+
+    def variance(self):
+        raise ValueError("The Cauchy distribution has no variance.")
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         mu, scale = _as_float(self.mu, self.scale)
         u = _uniform(_sample_shape(n_samples, self.batch_shape), mu.dtype, mu.device)
@@ -902,6 +1120,12 @@ class Cauchy(Distribution):
 
 
 class Laplace(Distribution):
+    """Laplace (double-exponential) distribution with location ``mu`` and scale ``scale > 0``.
+
+    ``log p(x) = -log 2 - log scale - |x - mu| / scale``; the variance is
+    ``2 scale^2``.
+    """
+
     has_rsample = True
 
     def __init__(self, mu, scale):
@@ -945,6 +1169,15 @@ class Laplace(Distribution):
         dens = 0.5 * torch.exp(-t.abs())
         return {self.resolve_name("mean", self.mu): -dens / scale, self.resolve_name("scale", self.scale): -dens * t / scale}
 
+
+    def mean(self):
+        mu, scale = _as_float(self.mu, self.scale)
+        return _expand(mu, self.batch_shape)
+
+    def variance(self):
+        mu, scale = _as_float(self.mu, self.scale)
+        return _expand(2 * scale ** 2, self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         mu, scale = _as_float(self.mu, self.scale)
         u = _uniform(_sample_shape(n_samples, self.batch_shape), mu.dtype, mu.device)
@@ -958,6 +1191,12 @@ class Laplace(Distribution):
 
 class StudentT(Distribution):
     """Student's t with ``nu`` degrees of freedom, location ``mu`` and scale ``sigma``.
+
+    ``mu`` defaults to ``0.0`` and ``sigma`` to ``1.0``. With
+    ``t = (x - mu) / sigma``: ``log p(x) = log Gamma((nu + 1) / 2) -
+    log Gamma(nu / 2) - log(nu pi) / 2 - log sigma - (nu + 1) / 2
+    log(1 + t^2 / nu)``. ``sigma`` is a scale, not the standard deviation
+    (which is ``sigma sqrt(nu / (nu - 2))`` for ``nu > 2``).
 
     Reparameterised sampling gives gradients w.r.t. ``mu`` and ``sigma`` only,
     so ``has_rsample`` is ``False`` when ``nu`` is a VariationalParameter.
@@ -1002,6 +1241,20 @@ class StudentT(Distribution):
         return {self.resolve_name("nu", self.nu): grad_nu, self.resolve_name("mean", self.mu): grad_mu,
                 self.resolve_name("sigma", self.sigma): grad_sigma}
 
+
+    def mean(self):
+        """``mu`` for ``nu > 1``, ``nan`` otherwise (the mean does not exist)."""
+        nu, mu, sigma = _as_float(self.nu, self.mu, self.sigma)
+        mu = _expand(mu, self.batch_shape)
+        return torch.where(_expand(nu, self.batch_shape) > 1, mu, torch.full_like(mu, math.nan))
+
+    def variance(self):
+        """``sigma^2 nu / (nu - 2)`` for ``nu > 2``, ``inf`` for ``1 < nu <= 2`` and ``nan`` for ``nu <= 1``."""
+        nu, mu, sigma = _as_float(self.nu, self.mu, self.sigma)
+        nu, sigma = _expand(nu, self.batch_shape), _expand(sigma, self.batch_shape)
+        finite = sigma ** 2 * nu / torch.where(nu > 2, nu - 2, torch.ones_like(nu))
+        return torch.where(nu > 2, finite, torch.where(nu > 1, torch.full_like(nu, math.inf), torch.full_like(nu, math.nan)))
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad and not self.has_rsample:
             raise self._no_reparam()
@@ -1017,7 +1270,12 @@ class StudentT(Distribution):
 
 
 class Dirichlet(Distribution):
-    """Dirichlet distribution on the simplex.
+    """Dirichlet distribution on the simplex with concentrations ``alpha``.
+
+    ``alpha`` has shape ``(..., K)`` with positive entries (last dimension =
+    number of categories; leading dimensions are batch dimensions) and
+    ``log p(x) = sum_k (alpha_k - 1) log x_k - (sum_k log Gamma(alpha_k) -
+    log Gamma(sum_k alpha_k))``.
 
     Sampled in the ``K-1`` dimensional unconstrained space of a
     :class:`StickBreakingTransform` (the unconstrained value has shape
@@ -1075,6 +1333,21 @@ class Dirichlet(Distribution):
         grad = a1[..., :-1] * (1 - y) - y * tail
         return grad + self.transform.grad_log_abs_det_jacobian(z)
 
+
+    def mean(self):
+        alpha = _as_float(self.alpha)
+        return alpha / alpha.sum(-1, keepdim=True)
+
+    def variance(self):
+        return torch.diagonal(self.covariance(), dim1=-2, dim2=-1)
+
+    def covariance(self):
+        """``(diag(m) - m m^T) / (alpha_0 + 1)`` with ``m = alpha / alpha_0``, shape ``(*batch_shape, K, K)``."""
+        alpha = _as_float(self.alpha)
+        total = alpha.sum(-1, keepdim=True)
+        m = alpha / total
+        return (torch.diag_embed(m) - m.unsqueeze(-1) * m.unsqueeze(-2)) / (total.unsqueeze(-1) + 1)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -1088,7 +1361,12 @@ class LKJCholesky(Distribution):
 
     ``p(L) ∝ prod_{i>=2} L_ii^{dim - i + 2 eta - 2}`` (1-indexed), i.e. the
     correlation matrix ``L L^T`` has density ``∝ det(L L^T)^(eta - 1)``.
-    The unconstrained space is ``R^{dim(dim-1)/2}`` via
+    The density is taken w.r.t. the strictly lower-triangular entries of
+    ``L`` and is normalised (the same convention as
+    ``torch.distributions.LKJCholesky``). ``dim >= 2`` is an integer and
+    ``eta > 0`` (default ``1.0``, uniform over correlation matrices) may be a
+    model node; ``eta > 1`` concentrates mass near the identity. The
+    unconstrained space is ``R^{dim(dim-1)/2}`` via
     :class:`CorrCholeskyTransform` (tanh of canonical partial correlations).
     """
 
@@ -1245,7 +1523,14 @@ class Wishart(_WishartFamily):
     """Wishart distribution over ``D x D`` SPD matrices with ``df`` degrees of freedom.
 
     ``Wishart(df, scale)`` or ``Wishart(df, scale_tril=L)`` with
-    ``scale = L L^T``; ``E[X] = df * scale``. Sampled in the
+    ``scale = L L^T`` (exactly one of the two); ``df > D - 1`` and
+    ``E[X] = df * scale``. The density is
+
+    ``log p(X) = (df - D - 1)/2 log|X| - tr(scale^-1 X)/2 - df D/2 log 2 -
+    df/2 log|scale| - log Gamma_D(df/2)``
+
+    (``Gamma_D`` the multivariate gamma function), w.r.t. the ``D(D+1)/2``
+    unique entries of ``X``. Sampled in the
     ``D(D+1)/2``-dimensional unconstrained space of a
     :class:`PositiveDefiniteTransform`. Matrix gradients are full symmetric
     matrices (entries treated as independent), the ``scale_tril`` gradient is
@@ -1298,6 +1583,21 @@ class Wishart(_WishartFamily):
         diag = torch.where(rows == cols, torch.ones((), dtype=z.dtype, device=z.device), torch.zeros((), dtype=z.dtype, device=z.device))
         return grad + (df - self.dim - 1)[..., None] * diag + T.grad_log_abs_det_jacobian(z)
 
+
+    def mean(self):
+        """``df * scale``."""
+        df, L, _, _ = self._params()
+        df = df[..., None, None] if df.ndim else df
+        return df * (L @ L.transpose(-2, -1))
+
+    def variance(self):
+        """Elementwise variances ``df (S_ij^2 + S_ii S_jj)``."""
+        df, L, _, _ = self._params()
+        S = L @ L.transpose(-2, -1)
+        diagonal = torch.diagonal(S, dim1=-2, dim2=-1)
+        df = df[..., None, None] if df.ndim else df
+        return df * (S ** 2 + diagonal.unsqueeze(-1) * diagonal.unsqueeze(-2))
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         """Bartlett decomposition: ``X = L_S A A^T L_S^T``."""
         self._no_rsample(_reparametrization_trick_grad)
@@ -1311,9 +1611,14 @@ class Wishart(_WishartFamily):
 class InverseWishart(_WishartFamily):
     """Inverse-Wishart distribution: ``X^-1 ~ Wishart(df, scale^-1)``.
 
-    ``InverseWishart(df, scale)`` or ``InverseWishart(df, scale_tril=L)``;
-    ``E[X] = scale / (df - D - 1)``. Same transform and gradient conventions
-    as :class:`Wishart`.
+    ``InverseWishart(df, scale)`` or ``InverseWishart(df, scale_tril=L)``
+    (``scale = L L^T``); ``df > D - 1`` and ``E[X] = scale / (df - D - 1)``
+    for ``df > D + 1``. The density is
+
+    ``log p(X) = df/2 log|scale| - df D/2 log 2 - log Gamma_D(df/2) -
+    (df + D + 1)/2 log|X| - tr(scale X^-1)/2``.
+
+    Same transform and gradient conventions as :class:`Wishart`.
     """
 
     def log_pdf(self, x):
@@ -1344,6 +1649,15 @@ class InverseWishart(_WishartFamily):
         grads.update(self._matrix_grads(grad_scale, L))
         return grads
 
+
+    def mean(self):
+        """``scale / (df - D - 1)`` for ``df > D + 1``, ``inf`` otherwise."""
+        df, _, S, _ = self._scale_params()
+        df = df[..., None, None] if df.ndim else df
+        denominator = df - self.dim - 1
+        safe = torch.where(denominator > 0, denominator, torch.ones_like(denominator))
+        return torch.where(denominator > 0, S / safe, torch.full_like(S, math.inf))
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         """``X = L_S A^-T A^-1 L_S^T`` with a Bartlett factor ``A``."""
         self._no_rsample(_reparametrization_trick_grad)
@@ -1357,44 +1671,44 @@ class InverseWishart(_WishartFamily):
 
 # ========================= DISCRETE =========================
 class _ProbsOrLogits:
-    """Mixin for distributions parameterised by a probability ``p`` or by ``logits``."""
+    """Mixin for distributions parameterised by a probability ``probs`` or by ``logits``."""
 
-    def _init_probs(self, p, logits):
-        _check_exactly_one(["p", "logits"], [p, logits])
-        self.p = p
+    def _init_probs(self, probs, logits):
+        _check_exactly_one(["probs", "logits"], [probs, logits])
+        self.probs = probs
         self.logits = logits
-        self.add_dependency(p if p is not None else logits)
+        self.add_dependency(probs if probs is not None else logits)
 
     @property
     def _param(self):
-        return self.p if self.p is not None else self.logits
+        return self.probs if self.probs is not None else self.logits
 
-    @property
-    def probs(self):
-        if self.p is not None:
-            return resolve(self.p)
-        return torch.sigmoid(resolve(self.logits))
-
-    def _log_p_log_q(self, dtype=None):
+    def _log_p_log_q(self):
         """(log p, log(1-p)) computed stably."""
         if self.logits is not None:
             logits = _as_float(self.logits)
             return log_sigmoid(logits), log_sigmoid(-logits)
-        p = _as_float(self.p)
+        p = _as_float(self.probs)
         return torch.log(p), torch.log1p(-p)
 
     def _probs_float(self):
-        if self.p is not None:
-            return _as_float(self.p)
+        if self.probs is not None:
+            return _as_float(self.probs)
         return torch.sigmoid(_as_float(self.logits))
 
 
 class Geometric(_ProbsOrLogits, Distribution):
-    """Number of trials up to and including the first success (support 1, 2, ...)."""
+    """Number of trials up to and including the first success (support 1, 2, ...).
 
-    def __init__(self, p=None, logits=None):
+    Give exactly one of ``probs`` (success probability ``p`` in ``(0, 1]``)
+    or ``logits`` (``logit p``): ``log p(k) = log p + (k - 1) log(1 - p)``,
+    mean ``1 / p``. Note that ``torch.distributions.Geometric`` counts the
+    failures instead (support 0, 1, ...).
+    """
+
+    def __init__(self, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscretePositive(), DiscretePositive())
-        self._init_probs(p, logits)
+        self._init_probs(probs, logits)
 
     @property
     def batch_shape(self):
@@ -1410,7 +1724,7 @@ class Geometric(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             logits = _as_float(self.logits)
             return _restrict(log_sigmoid(logits) + (x - 1) * log_sigmoid(-logits), inside)
-        p = _as_float(self.p)
+        p = _as_float(self.probs)
         return _restrict(torch.log(p) + torch.special.xlog1py(x - 1, -p), inside)
 
     def log_pdf_grad(self, x):
@@ -1421,8 +1735,17 @@ class Geometric(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             s = torch.sigmoid(_as_float(self.logits))
             return {self.resolve_name("logits", self.logits): _zero_outside(1 - x * s, inside)}
-        p = _as_float(self.p)
-        return {self.resolve_name("p", self.p): _zero_outside(1 / p - (x - 1) / (1 - p), inside)}
+        p = _as_float(self.probs)
+        return {self.resolve_name("probs", self.probs): _zero_outside(1 / p - (x - 1) / (1 - p), inside)}
+
+
+    def mean(self):
+        """``1 / p`` (number of trials, support 1, 2, ...)."""
+        return 1 / self._probs_float()
+
+    def variance(self):
+        p = self._probs_float()
+        return (1 - p) / p ** 2
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1433,9 +1756,15 @@ class Geometric(_ProbsOrLogits, Distribution):
 
 
 class Bernoulli(_ProbsOrLogits, Distribution):
-    def __init__(self, p=None, logits=None):
+    """Bernoulli distribution on ``{0, 1}``.
+
+    Give exactly one of ``probs`` (``P(x = 1)``) or ``logits``
+    (``logit P(x = 1)``, numerically more stable).
+    """
+
+    def __init__(self, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscreteRange(0, 1), DiscreteRange(0, 1))
-        self._init_probs(p, logits)
+        self._init_probs(probs, logits)
 
     @property
     def batch_shape(self):
@@ -1451,7 +1780,7 @@ class Bernoulli(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             logits = _as_float(self.logits)
             return _restrict(x * logits - F.softplus(logits), inside)
-        p = _as_float(self.p)
+        p = _as_float(self.probs)
         return _restrict(torch.xlogy(x, p) + torch.special.xlog1py(1 - x, -p), inside)
 
     def log_pdf_grad(self, x):
@@ -1462,8 +1791,16 @@ class Bernoulli(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             grad = x - torch.sigmoid(_as_float(self.logits))
             return {self.resolve_name("logits", self.logits): _zero_outside(grad, inside)}
-        p = _as_float(self.p)
-        return {self.resolve_name("p", self.p): _zero_outside(x / p - (1 - x) / (1 - p), inside)}
+        p = _as_float(self.probs)
+        return {self.resolve_name("probs", self.probs): _zero_outside(x / p - (1 - x) / (1 - p), inside)}
+
+
+    def mean(self):
+        return self._probs_float()
+
+    def variance(self):
+        p = self._probs_float()
+        return p * (1 - p)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1474,11 +1811,18 @@ class Bernoulli(_ProbsOrLogits, Distribution):
 
 
 class Binomial(_ProbsOrLogits, Distribution):
-    def __init__(self, n, p=None, logits=None):
+    """Number of successes in ``n`` independent trials (support ``0, ..., n``).
+
+    ``n`` is the (integer-valued) number of trials; give exactly one of
+    ``probs`` (success probability ``p``) or ``logits`` (``logit p``):
+    ``log p(k) = log C(n, k) + k log p + (n - k) log(1 - p)``.
+    """
+
+    def __init__(self, n, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscreteRange(0, n), DiscreteRange(0, n))
         self.n = n
         self.add_dependency(n)
-        self._init_probs(p, logits)
+        self._init_probs(probs, logits)
 
     @property
     def batch_shape(self):
@@ -1504,7 +1848,7 @@ class Binomial(_ProbsOrLogits, Distribution):
             logits = _as_float(self.logits)
             log_p = self._log_binom_coeff(x) + x * logits - n * F.softplus(logits)
         else:
-            p = _as_float(self.p)
+            p = _as_float(self.probs)
             log_p = self._log_binom_coeff(x) + torch.xlogy(x, p) + torch.special.xlog1py(n - x, -p)
         return _restrict(log_p, inside)
 
@@ -1517,8 +1861,17 @@ class Binomial(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             grad = x - n * torch.sigmoid(_as_float(self.logits))
             return {self.resolve_name("logits", self.logits): _zero_outside(grad, inside)}
-        p = _as_float(self.p)
-        return {self.resolve_name("p", self.p): _zero_outside(x / p - (n - x) / (1 - p), inside)}
+        p = _as_float(self.probs)
+        return {self.resolve_name("probs", self.probs): _zero_outside(x / p - (n - x) / (1 - p), inside)}
+
+
+    def mean(self):
+        p = self._probs_float()
+        return self._count(p) * p
+
+    def variance(self):
+        p = self._probs_float()
+        return self._count(p) * p * (1 - p)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1569,6 +1922,15 @@ class DiscreteUniform(Distribution):
         inv = torch.where(inside, 1 / (high - low + 1), torch.zeros_like(x))
         return {self.resolve_name("low", self.low): inv, self.resolve_name("high", self.high): -inv}
 
+
+    def mean(self):
+        low, high = self._bounds(torch.empty(0))
+        return _expand((low + high) / 2, self.batch_shape)
+
+    def variance(self):
+        low, high = self._bounds(torch.empty(0))
+        return _expand(((high - low + 1) ** 2 - 1) / 12, self.batch_shape)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -1578,6 +1940,11 @@ class DiscreteUniform(Distribution):
 
 
 class Poisson(Distribution):
+    """Poisson distribution with mean ``rate > 0`` (support 0, 1, 2, ...).
+
+    ``log p(k) = k log rate - rate - log k!``.
+    """
+
     def __init__(self, rate):
         super().__init__(IdentityTransform(), DiscreteNonNegative(), DiscreteNonNegative())
         self.rate = rate
@@ -1605,6 +1972,13 @@ class Poisson(Distribution):
         rate = _as_float(self.rate)
         return {self.resolve_name("rate", self.rate): _zero_outside(x / rate - 1, inside)}
 
+
+    def mean(self):
+        return _as_float(self.rate)
+
+    def variance(self):
+        return _as_float(self.rate)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -1613,17 +1987,19 @@ class Poisson(Distribution):
 
 
 class NegativeBinomial(_ProbsOrLogits, Distribution):
-    """Number of successes before ``total_count`` failures, success probability ``p``.
+    """Number of successes before ``total_count`` failures, success probability ``probs``.
 
     ``log p(k) = log C(k + r - 1, k) + r log(1 - p) + k log p`` (the PyTorch /
-    Pyro convention), mean ``r p / (1 - p)``.
+    Pyro convention), mean ``r p / (1 - p)``, with ``r = total_count > 0``
+    (need not be an integer). Give exactly one of ``probs`` (``p``) or
+    ``logits`` (``logit p``).
     """
 
-    def __init__(self, total_count, p=None, logits=None):
+    def __init__(self, total_count, probs=None, logits=None):
         Distribution.__init__(self, IdentityTransform(), DiscreteNonNegative(), DiscreteNonNegative())
         self.total_count = total_count
         self.add_dependency(total_count)
-        self._init_probs(p, logits)
+        self._init_probs(probs, logits)
 
     @property
     def batch_shape(self):
@@ -1641,7 +2017,7 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             logits = _as_float(self.logits)
             return _restrict(log_norm + x * log_sigmoid(logits) + r * log_sigmoid(-logits), inside)
-        p = _as_float(self.p)
+        p = _as_float(self.probs)
         return _restrict(log_norm + torch.xlogy(x, p) + r * torch.log1p(-p), inside)
 
     def log_pdf_grad(self, x):
@@ -1655,9 +2031,25 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             grads[self.resolve_name("logits", self.logits)] = x - (x + r) * torch.sigmoid(_as_float(self.logits))
         else:
-            p = _as_float(self.p)
-            grads[self.resolve_name("p", self.p)] = x / p - r / (1 - p)
+            p = _as_float(self.probs)
+            grads[self.resolve_name("probs", self.probs)] = x / p - r / (1 - p)
         return {name: _zero_outside(grad, inside) for name, grad in grads.items()}
+
+
+    def _odds(self):
+        if self.logits is not None:
+            return torch.exp(_as_float(self.logits))
+        p = _as_float(self.probs)
+        return p / (1 - p)
+
+    def mean(self):
+        """``r p / (1 - p)`` (number of successes before ``total_count`` failures)."""
+        odds = self._odds()
+        return _as_float(self.total_count).to(odds.dtype) * odds
+
+    def variance(self):
+        odds = self._odds()
+        return _as_float(self.total_count).to(odds.dtype) * odds * (1 + odds)
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
@@ -1665,7 +2057,7 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
         if self.logits is not None:
             odds = torch.exp(_as_float(self.logits))
         else:
-            p = _as_float(self.p)
+            p = _as_float(self.probs)
             odds = p / (1 - p)
         r = _as_float(self.total_count).to(odds.dtype)
         shape = _sample_shape(n_samples, self.batch_shape)
@@ -1676,8 +2068,10 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
 class Categorical(Distribution):
     """Categorical distribution over ``{0, ..., K-1}`` given ``probs`` or ``logits`` (last dim = K).
 
-    ``probs`` need not be normalised; the gradients are those of
-    ``log(probs_k / sum(probs))``.
+    Give exactly one of ``probs`` or ``logits``, shape ``(..., K)``; leading
+    dimensions are batch dimensions. ``probs`` need not be normalised; the
+    density and gradients are those of ``log(probs_k / sum(probs))``.
+    Draws are returned as floating-point category indices.
     """
 
     _param_event_ndims = {"probs": 1, "logits": 1}
@@ -1736,6 +2130,19 @@ class Categorical(Distribution):
         grad = torch.where(onehot > 0, 1 / p, torch.zeros_like(p)) - 1 / p.sum(-1, keepdim=True)
         return {self.resolve_name("probs", self.probs): _zero_outside(grad, inside.unsqueeze(-1))}
 
+
+    def mean(self):
+        """Mean of the category index ``sum_k k p_k``."""
+        p = torch.exp(self._log_probs())
+        k = torch.arange(self.n_categories, dtype=p.dtype, device=p.device)
+        return (p * k).sum(-1)
+
+    def variance(self):
+        p = torch.exp(self._log_probs())
+        k = torch.arange(self.n_categories, dtype=p.dtype, device=p.device)
+        mean = (p * k).sum(-1)
+        return (p * k ** 2).sum(-1) - mean ** 2
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -1748,6 +2155,11 @@ class Categorical(Distribution):
 
 class Multinomial(Distribution):
     """Multinomial counts over K categories with ``total_count`` trials.
+
+    Give exactly one of ``probs`` (need not be normalised) or ``logits``,
+    shape ``(..., K)``. ``log p(x) = log n! - sum_k log x_k! + sum_k x_k
+    log p_k`` for non-negative integer counts summing to ``n =
+    total_count``.
 
     Supports ``log_pdf``, parameter gradients and ``sample``; it cannot be
     used as a latent variable for MCMC (its support, vectors summing to
@@ -1810,6 +2222,22 @@ class Multinomial(Distribution):
         grad = torch.where(x > 0, x / p, torch.zeros_like(x * p)) - n / p.sum(-1, keepdim=True)
         return {self.resolve_name("probs", self.probs): _zero_outside(grad, inside.unsqueeze(-1))}
 
+
+    def mean(self):
+        p = torch.exp(self._log_probs())
+        return _as_float(self.total_count).to(p.dtype) * p
+
+    def variance(self):
+        p = torch.exp(self._log_probs())
+        return _as_float(self.total_count).to(p.dtype) * p * (1 - p)
+
+    def covariance(self):
+        """``n (diag(p) - p p^T)``, shape ``(*batch_shape, K, K)``."""
+        p = torch.exp(self._log_probs())
+        n = _as_float(self.total_count).to(p.dtype)
+        n = n[..., None, None] if n.ndim else n
+        return n * (torch.diag_embed(p) - p.unsqueeze(-1) * p.unsqueeze(-2))
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         """Sequential conditional binomial draws."""
         if _reparametrization_trick_grad:
@@ -1833,7 +2261,10 @@ class Multinomial(Distribution):
 class ZeroInflated(Distribution):
     """Zero-inflated discrete distribution: ``0`` with probability ``gate``, else ``base``.
 
-    E.g. ``ZeroInflated(Poisson(rate), gate)`` is the zero-inflated Poisson.
+    ``p(0) = gate + (1 - gate) p_base(0)`` and ``p(k) = (1 - gate)
+    p_base(k)`` for ``k != 0``, with ``gate`` in ``(0, 1)``. The support and
+    transform are those of ``base``. E.g. ``ZeroInflated(Poisson(rate),
+    gate)`` is the zero-inflated Poisson.
     """
 
     def __init__(self, base, gate):
@@ -1882,6 +2313,16 @@ class ZeroInflated(Distribution):
         grads[gate_name] = grads.get(gate_name, 0) + grad_gate
         return grads
 
+
+    def mean(self):
+        gate = _as_float(self.gate)
+        return (1 - gate) * self.base.mean()
+
+    def variance(self):
+        gate = _as_float(self.gate)
+        mean = self.base.mean()
+        return (1 - gate) * (self.base.variance() + mean ** 2) - ((1 - gate) * mean) ** 2
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -1896,8 +2337,12 @@ class ZeroInflated(Distribution):
 class Truncated(Distribution):
     """A continuous ``base`` distribution truncated to ``[low, high]``.
 
-    Either bound may be ``None`` (no truncation on that side). The base must
-    provide ``cdf`` (and ``icdf`` for sampling). Gradients w.r.t. the base
+    ``log p(x) = log p_base(x) - log(F(high) - F(low))`` inside
+    ``[low, high]`` and ``-inf`` outside (``F`` the base cdf). Either bound
+    may be ``None`` (the default; no truncation on that side) and may be a
+    model node. The sampler works on ``logit`` (two bounds) or ``log`` (one
+    bound) of the value. The base must provide ``cdf`` (and ``icdf`` for
+    sampling, by inversion). Gradients w.r.t. the base
     parameters additionally need ``base.cdf_param_grads`` (Normal,
     Exponential, Cauchy and Laplace provide it).
     """
@@ -2013,7 +2458,8 @@ class TransformedDistribution(Distribution):
     ``log p(y) = log p_base(x) - log|det d inverse/dx|`` with
     ``x = transform.forward(y)``. MCMC runs in the base distribution's
     unconstrained space. ``state_space`` describes the support of ``y``
-    (default: real line).
+    (default ``None``: the real line). ``cdf`` and ``icdf`` assume an
+    increasing elementwise transform.
     """
 
     def __init__(self, base, transform, state_space=None):
@@ -2160,16 +2606,35 @@ class Ordered(Distribution):
 
 # ========================= Miscellaneous distributions =========================
 class Mixture(Distribution):
+    """Finite mixture ``p(x) = sum_k weights_k p_k(x)`` of ``components``.
+
+    ``components`` is a list of distributions with a common event shape;
+    ``weights`` (shape ``(..., K)``, last dimension = number of components,
+    leading dimensions batch dimensions) are the mixture probabilities and
+    must sum to one over the last dimension (``log_pdf`` does not normalise
+    them; ``sample`` does). Variational parameters of the components are
+    registered on the mixture, so a mixture can be used inside a guide (it
+    has no reparameterised sampler, so BBVI uses score-function gradients).
+    ``log_pdf_param_grads`` returns ``p_k(x) / p(x)`` for the weights and
+    the posterior-responsibility-weighted component gradients for the
+    component parameters.
+    """
+
     _param_event_ndims = {"weights": 1}
 
     def __init__(self, components, weights):
-        super().__init__(IdentityTransform(), Union(*[component.state_space for component in components]), Union(*[component.transformed_state_space for component in components]))
+        if components and all(isinstance(component.state_space, ContinuousReal) for component in components):
+            # A mixture of real-line components lives on the real line (so it can, e.g., be a guide family).
+            state_space, transformed_state_space = ContinuousReal(), ContinuousReal()
+        else:
+            state_space = Union(*[component.state_space for component in components])
+            transformed_state_space = Union(*[component.transformed_state_space for component in components])
+        super().__init__(IdentityTransform(), state_space, transformed_state_space)
         self.components = components
         self.weights = weights
         self.add_dependency(weights)
         for component in components:
-            for param in component.parameters:
-                self.parameters.add(param)
+            self._add_dependencies_of(component)
 
     @property
     def event_shape(self):
@@ -2178,9 +2643,8 @@ class Mixture(Distribution):
     @property
     def batch_shape(self):
         shapes = [c.batch_shape for c in self.components]
-        if shapes:
-            return torch.broadcast_shapes(*shapes)
-        return ()
+        shapes.append(self._weights().shape[:-1])
+        return torch.broadcast_shapes(*shapes)
 
     def _weights(self):
         weights = resolve(self.weights)
@@ -2238,6 +2702,25 @@ class Mixture(Distribution):
                 grads[name] = grads.get(name, 0) + coeff * gradient
         return grads
 
+
+    def _component_weight(self, k, like):
+        weight = self._weights()[..., k].to(dtype=like.dtype, device=like.device)
+        return weight.reshape(tuple(weight.shape) + (1,) * len(self.event_shape))
+
+    def mean(self):
+        """``sum_k w_k mean_k``."""
+        means = [component.mean() for component in self.components]
+        return sum(self._component_weight(k, m) * m for k, m in enumerate(means))
+
+    def variance(self):
+        """Law of total variance: ``sum_k w_k (var_k + mean_k^2) - mean^2``."""
+        means = [component.mean() for component in self.components]
+        second = sum(
+            self._component_weight(k, m) * (component.variance() + m ** 2)
+            for k, (component, m) in enumerate(zip(self.components, means))
+        )
+        return second - self.mean() ** 2
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         if _reparametrization_trick_grad:
             raise self._no_reparam()
@@ -2249,8 +2732,9 @@ class Mixture(Distribution):
             return s.reshape(n_samples, *([1] * missing), *s.shape[1:]).expand(shape)
         draws = torch.stack([_draw(c) for c in self.components], dim=0)  # (K, *shape)
         index_shape = (n_samples, *self.batch_shape)
-        probs = weights.to(draws.dtype) / weights.sum()
-        cdf = torch.cumsum(probs, dim=0)
+        weights = weights.to(dtype=draws.dtype, device=draws.device)
+        probs = weights / weights.sum(-1, keepdim=True)
+        cdf = torch.cumsum(probs, dim=-1)  # (*weight_batch, K), broadcasts against index_shape
         u = torch.rand((*index_shape, 1), dtype=draws.dtype, device=draws.device)
         idx = (cdf < u).sum(-1).clamp(max=len(self.components) - 1)
         idx = idx.reshape(1, *index_shape, *([1] * len(self.event_shape))).expand(1, *shape)

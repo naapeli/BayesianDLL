@@ -68,7 +68,7 @@ with Model() as model:
     intercept = RandomParameter("intercept", Normal(0.0, 1.5))
     slope = RandomParameter("slope", Normal(0.0, 1.5))
 
-    logits = Linear("logits", inputs, slope=slope, intercept=intercept)
+    logits = Linear("logits", inputs, coefficients=slope, intercept=intercept)
 
     with plate("observations", x):
         ObservedParameter("observations", Bernoulli(logits=logits), y)
@@ -90,7 +90,7 @@ hyperparameters:
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import Data, MeanFieldGuide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
+from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.Evaluation import Graphics, summary
@@ -122,7 +122,7 @@ with Model() as model:
 
 Graphics.plot_model(model)
 
-with MeanFieldGuide() as guide:
+with Guide(model) as guide:
     def q_normal(name):
         return RandomParameter(
             name,
@@ -140,7 +140,7 @@ with MeanFieldGuide() as guide:
     Exp("noise_variance", q_log_noise)
 
 BBVI(model, guide, n_samples=4, epochs=200, lr=5e-3)
-trace = guide.sample(200, 200, n_chains=2)
+trace = guide.sample(200, n_chains=2)
 print(summary(trace, include_deterministic=True))
 Graphics.plot_posterior(trace, vars="random")
 Graphics.plot_posterior(trace, vars="deterministic")

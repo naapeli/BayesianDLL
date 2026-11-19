@@ -15,10 +15,12 @@ nodes use for vectorized MCMC chains (see :mod:`BayesianDLL._batching`):
 The batched methods are :meth:`Kernel.batch_evaluate` (``(B, N, M)``),
 :meth:`Kernel.batch_derivatives` (``(B, *parameter_shape, N, M)``),
 :meth:`Kernel.batch_diag` (``(B, N)``), :meth:`Kernel.batch_diag_derivatives`
-(``(B, *parameter_shape, N)``) and :meth:`Kernel.batch_input_vjp`
-(``(B, N, D)``). The ordinary methods (``kernel(x1, x2)``, ``derivatives``,
-``diag``, ``diag_derivatives``, ``input_vjp``) are the ``B = 1`` case and
-keep their unbatched shapes.
+(``(B, *parameter_shape, N)``), :meth:`Kernel.batch_input_vjp`
+(``(B, N, D)``) and :meth:`Kernel.batch_diag_input_vjp` (``(B, N, D)``, the
+input gradient of ``g · diag K(X, X)``). The ordinary methods
+(``kernel(x1, x2)``, ``derivatives``, ``diag``, ``diag_derivatives``,
+``input_vjp``, ``diag_input_vjp``) are the ``B = 1`` case and keep their
+unbatched shapes.
 
 A user kernel that only overrides the unbatched ``evaluate`` (and
 ``derivatives`` / ``input_vjp``) still works in batched form: the default
@@ -154,6 +156,11 @@ def _times_matrix(derivative, matrix):
     return derivative * matrix.reshape(matrix.shape[0], *([1] * (derivative.ndim - 3)), *matrix.shape[-2:])
 
 
+def _zero_input_vjp(x, cotangent):
+    """Zero input gradient ``(B, N, D)`` (for kernels whose value does not depend on the inputs)."""
+    return torch.zeros((_batch_size(x, cotangent), *x.shape[1:]), dtype=x.dtype, device=x.device)
+
+
 def _slice_batch(value, index):
     return value[index] if value.shape[0] > 1 else value[0]
 
@@ -187,6 +194,11 @@ def _power_bessel_k(power, order, argument, nodes=_QUADRATURE_NODES):
     ``power log a - a - a (cosh t - 1) + log cosh(ν t)``, so neither tiny nor
     large arguments overflow. Entries with ``a <= 0`` return an arbitrary
     finite value; callers handle the limit ``a -> 0`` themselves.
+
+    Measured accuracy in float64 against ``scipy.special.kv`` (with the
+    default 96 nodes, orders ``ν`` and ``ν - 1`` for ``ν`` in 0.3–3.7): the
+    largest relative error is ``6e-14`` for ``a`` in ``[1e-6, 50]`` and
+    ``1.2e-13`` for ``a`` in ``[1e-8, 630]``.
     """
     order = abs(float(order))
     a = torch.where(argument > 0, argument, torch.ones_like(argument))
@@ -261,6 +273,7 @@ class Kernel(ABC):
 
     @property
     def parameters(self):
+        """The named model nodes among the kernel's hyperparameters (each once)."""
         return self._parameters
 
     # ------------------------------------------------------------------
@@ -275,6 +288,11 @@ class Kernel(ABC):
         return values
 
     def evaluate(self, x1, x2, parameter_values=None):
+        """Covariance matrix ``(N, M)`` of inputs ``x1`` ``(N, D)`` / ``(N,)`` and ``x2`` ``(M, D)`` / ``(M,)``.
+
+        ``parameter_values`` optionally maps parameter names to values that
+        replace the nodes' current values (e.g. a posterior draw).
+        """
         if type(self).batch_evaluate is Kernel.batch_evaluate:
             raise NotImplementedError(f"{type(self).__name__} must implement evaluate or batch_evaluate.")
         return self.batch_evaluate(_batch_inputs(x1), _batch_inputs(x2), self._single_values(parameter_values))[0]
@@ -320,7 +338,18 @@ class Kernel(ABC):
         """``∂⟨G, K(x, x)⟩ / ∂x`` with both arguments moving (shape ``(N, D)``)."""
         return self.input_vjp(x, x, cotangent + cotangent.transpose(-2, -1), parameter_values=parameter_values)
 
+    def diag_input_vjp(self, x, cotangent, parameter_values=None):
+        r"""``∂(g · diag K(x, x)) / ∂x``: ``out[i] = g_i d k(x_i, x_i) / d x_i`` (shape ``(N, D)``).
+
+        ``cotangent`` ``g`` has shape ``(N,)``. Stationary kernels have a
+        constant diagonal and give zero; see :meth:`batch_diag_input_vjp`.
+        """
+        return self.batch_diag_input_vjp(
+            _batch_inputs(x), torch.as_tensor(cotangent).unsqueeze(0), self._single_values(parameter_values)
+        )[0]
+
     def __call__(self, x1, x2=None, parameter_values=None):
+        """``kernel(x1, x2)`` is :meth:`evaluate`; ``x2`` defaults to ``x1``."""
         if x2 is None:
             x2 = x1
         return self.evaluate(x1, x2, parameter_values=parameter_values)
@@ -382,6 +411,21 @@ class Kernel(ABC):
     def batch_input_vjp_symmetric(self, x, cotangent, parameter_values):
         return self.batch_input_vjp(x, x, cotangent + cotangent.transpose(-2, -1), parameter_values)
 
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        r"""``(B, N, D)``: ``∂(g_b · diag K_b(x_b, x_b)) / ∂x_b`` for a cotangent ``g`` ``(B, N)``.
+
+        Generic fallback: by symmetry, ``d k(x_i, x_i) / d x_i = 2 ∂_1 k(x_i, x_i)``,
+        so the result is :meth:`batch_input_vjp` of square blocks of at most
+        ``chunk_size`` points with the diagonal cotangent ``2 diag(g)`` (no
+        ``N x N`` matrix). The built-in kernels override it with closed forms.
+        """
+        blocks = []
+        for start in range(0, x.shape[1], chunk_size):
+            block = x[:, start:start + chunk_size]
+            weights = 2.0 * torch.diag_embed(cotangent[:, start:start + chunk_size])
+            blocks.append(self.batch_input_vjp(block, block, weights, parameter_values))
+        return torch.cat(blocks, dim=1)
+
     def __add__(self, other):
         return SumKernel(self, other)
 
@@ -395,11 +439,9 @@ class Kernel(ABC):
         return ProductKernel(other, self)
 
 
-def _batch_shape_of(x1, x2, *values):
-    return max(x1.shape[0], x2.shape[0], *(v.shape[0] for v in values))
-
-
 class Constant(Kernel):
+    """``k(x1, x2) = v`` for all inputs, with a scalar ``variance`` ``v`` (default ``1.0``)."""
+
     def __init__(self, variance=1.0):
         super().__init__(variance)
         self.variance = variance
@@ -417,11 +459,21 @@ class Constant(Kernel):
 
     def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
         """Zero: the kernel does not depend on the input locations."""
-        return torch.zeros((_batch_size(x1, cotangent), *x1.shape[1:]), dtype=x1.dtype, device=x1.device)
+        return _zero_input_vjp(x1, cotangent)
+
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Zero: ``k(x, x) = v``."""
+        return _zero_input_vjp(x, cotangent)
 
 
 class WhiteNoise(Kernel):
-    """Independent noise on matching input points."""
+    """Independent noise: ``K(X1, X2) = v I`` when ``X1`` and ``X2`` are the same inputs, else ``0``.
+
+    "The same inputs" means equal tensors (same shape and values), so the
+    kernel adds ``v`` to the diagonal of ``K(X, X)`` and nothing to
+    cross-covariances, even at coincident points. ``variance`` ``v`` is a
+    scalar (default ``1e-6``).
+    """
 
     def __init__(self, variance=1e-6):
         super().__init__(variance)
@@ -444,7 +496,11 @@ class WhiteNoise(Kernel):
 
     def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
         """Zero: the identity pattern is piecewise constant in the inputs."""
-        return torch.zeros((_batch_size(x1, cotangent), *x1.shape[1:]), dtype=x1.dtype, device=x1.device)
+        return _zero_input_vjp(x1, cotangent)
+
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Zero: ``k(x, x) = v``."""
+        return _zero_input_vjp(x, cotangent)
 
 
 class _StationaryDiagonal:
@@ -467,6 +523,10 @@ class _StationaryDiagonal:
             derivatives[self.variance.name] = torch.ones((1, 1, x.shape[1]), dtype=x.dtype, device=x.device)
         return derivatives
 
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Zero: the diagonal ``k(x, x) = v`` does not depend on ``x``."""
+        return _zero_input_vjp(x, cotangent)
+
 
 class RBF(_StationaryDiagonal, Kernel):
     r"""Squared-exponential kernel with optional ARD length-scales.
@@ -478,7 +538,8 @@ class RBF(_StationaryDiagonal, Kernel):
     ``lengthscale`` is either a scalar shared by all ``D`` features or a
     vector with one value per feature (automatic relevance determination).
     It may be a constant, a ``RandomParameter`` (e.g. with ``shape=D`` or
-    inside a plate of size ``D``) or a ``DeterministicParameter``. The
+    inside a plate of size ``D``) or a ``DeterministicParameter``.
+    ``lengthscale`` and the scalar ``variance`` ``v`` default to ``1.0``. The
     derivative w.r.t. an ARD length-scale has shape ``(D, N, M)``:
     ``dk/dl_d = k (x_{1d}-x_{2d})^2 / l_d^3``; w.r.t. the inputs,
     ``dk/dx_{1d} = -k (x_{1d}-x_{2d}) / l_d^2``.
@@ -535,7 +596,9 @@ class Periodic(_StationaryDiagonal, Kernel):
             -2\sum_{d=1}^D \sin^2(\pi (x_{1d}-x_{2d}) / p) / l_d^2
         \Bigr).
 
-    Both forms agree for one-dimensional inputs.
+    Both forms agree for one-dimensional inputs. ``lengthscale``,
+    ``variance`` and ``period`` default to ``1.0``; ``variance`` and
+    ``period`` are scalars.
     """
 
     def __init__(self, lengthscale=1.0, variance=1.0, period=1.0):
@@ -608,14 +671,19 @@ class Matern(_StationaryDiagonal, Kernel):
     r"""Matérn kernel for any fixed positive finite smoothness ``nu``.
 
     With ``s = sqrt(sum_d (x_{1d}-x_{2d})^2 / l_d^2)`` and
-    ``a = sqrt(2 nu) s``, ``k = v 2^{1-nu}/Gamma(nu) a^nu K_nu(a)``.
-    ``lengthscale`` may be scalar or hold one value per feature (ARD).
+    ``a = sqrt(2 nu) s``, ``k = v 2^{1-nu}/Gamma(nu) a^nu K_nu(a)``
+    (``K_nu`` the modified Bessel function of the second kind).
+    ``lengthscale`` (default ``1.0``) may be scalar or hold one value per
+    feature (ARD); ``variance`` ``v`` is a scalar (default ``1.0``); ``nu``
+    is a fixed Python number (default ``1.5``) and receives no gradient.
 
     * Half-integer ``nu = p + 1/2`` (0.5, 1.5, 2.5, ...) uses the exact
       closed form ``k = v exp(-a) p!/(2p)! Σ_i (p+i)!/(i!(p-i)!) (2a)^{p-i}``.
     * Any other ``nu`` evaluates ``a^nu K_nu(a)`` with a trapezoidal
       quadrature of ``K_nu(a) = ∫_0^∞ exp(-a cosh t) cosh(nu t) dt``; the
-      limit ``a -> 0`` gives ``k = v``.
+      limit ``a -> 0`` gives ``k = v``. In float64 its relative error
+      against ``scipy.special.kv`` was measured at most ``1.2e-13`` (for
+      ``nu`` in 0.3–3.7 and ``a`` in ``[1e-8, 630]``).
 
     Both are pure torch. With ``f(a) = k / v`` the derivative w.r.t. each
     length-scale component is ``dk/dl_d = -v f'(a) sqrt(2 nu) (x_{1d}-x_{2d})^2 / (s l_d^3)``,
@@ -700,11 +768,15 @@ class Matern(_StationaryDiagonal, Kernel):
 
 
 class Matern32(Matern):
+    """Matérn kernel with ``nu = 3/2``: ``k = v (1 + a) exp(-a)``, ``a = sqrt(3) s``."""
+
     def __init__(self, lengthscale=1.0, variance=1.0):
         super().__init__(lengthscale=lengthscale, variance=variance, nu=1.5)
 
 
 class Matern52(Matern):
+    """Matérn kernel with ``nu = 5/2``: ``k = v (1 + a + a²/3) exp(-a)``, ``a = sqrt(5) s``."""
+
     def __init__(self, lengthscale=1.0, variance=1.0):
         super().__init__(lengthscale=lengthscale, variance=variance, nu=2.5)
 
@@ -722,7 +794,9 @@ class RationalQuadratic(_StationaryDiagonal, Kernel):
     ``B = 1 + r^2 / (2 alpha)`` the derivatives are
     ``dk/dl_d = k (x_{1d}-x_{2d})^2 / (l_d^3 B)``,
     ``dk/dalpha = k (r^2 / (2 alpha B) - log B)`` and
-    ``dk/dx_{1d} = -k (x_{1d}-x_{2d}) / (l_d^2 B)``.
+    ``dk/dx_{1d} = -k (x_{1d}-x_{2d}) / (l_d^2 B)``. All three
+    hyperparameters default to ``1.0``; ``variance`` and ``alpha`` are
+    scalars.
     """
 
     def __init__(self, lengthscale=1.0, variance=1.0, alpha=1.0):
@@ -765,7 +839,11 @@ class RationalQuadratic(_StationaryDiagonal, Kernel):
 
 
 class Linear(Kernel):
-    """``k(x1, x2) = v (x1 - c)·(x2 - c)`` with a scalar or per-feature offset ``c``."""
+    """``k(x1, x2) = v (x1 - c)·(x2 - c)`` with a scalar or per-feature offset ``c``.
+
+    ``variance`` ``v`` (scalar, default ``1.0``) and ``offset`` ``c``
+    (default ``0.0``). The kernel is not stationary.
+    """
 
     def __init__(self, variance=1.0, offset=0.0):
         super().__init__(variance, offset)
@@ -800,8 +878,21 @@ class Linear(Kernel):
         variance, _, _, _, right = self._centred(x1, x2, parameter_values)
         return variance.reshape(-1, 1, 1) * (cotangent @ right)
 
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """``k(x, x) = v ‖x - c‖²``, so the VJP is ``2 v (x - c) g``."""
+        variance, _, _, left, _ = self._centred(x, x, parameter_values)
+        return 2.0 * variance.reshape(-1, 1, 1) * left * cotangent.unsqueeze(-1)
+
 
 class SumKernel(Kernel):
+    """``k = k_1 + k_2 + ...`` (also built with ``k1 + k2``).
+
+    Parts may be :class:`Kernel` objects, numbers (constant kernels without
+    gradient) or plain callables ``k(x1, x2)`` (no gradients, unbatched
+    inputs only). A parameter shared by several parts gets the sum of their
+    derivatives.
+    """
+
     def __init__(self, *kernels):
         self.kernels = tuple(kernels)
         super().__init__(*(parameter for kernel in self.kernels for parameter in _kernel_parameters(kernel)))
@@ -819,8 +910,17 @@ class SumKernel(Kernel):
     def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
         return sum(_batch_kernel_input_vjp(kernel, x1, x2, cotangent, parameter_values) for kernel in self.kernels)
 
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Sum rule: the parts' diagonal input VJPs added up."""
+        return sum(_batch_kernel_diag_input_vjp(kernel, x, cotangent, parameter_values, chunk_size) for kernel in self.kernels)
+
 
 class ProductKernel(Kernel):
+    """``k = k_1 k_2 ...`` (elementwise product of the covariance matrices; also built with ``k1 * k2``).
+
+    Parts are as for :class:`SumKernel`; derivatives follow the product rule.
+    """
+
     def __init__(self, *kernels):
         self.kernels = tuple(kernels)
         super().__init__(*(parameter for kernel in self.kernels for parameter in _kernel_parameters(kernel)))
@@ -859,6 +959,18 @@ class ProductKernel(Kernel):
             result = result + _batch_kernel_input_vjp(kernel, x1, x2, weighted, parameter_values)
         return result
 
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Product rule on the diagonal: part ``k`` receives the cotangent ``g ⊙ Π_{j≠k} diag K_j``."""
+        diagonals = [_batch_kernel_diag(kernel, x, parameter_values, chunk_size) for kernel in self.kernels]
+        result = 0
+        for index, kernel in enumerate(self.kernels):
+            weighted = cotangent
+            for other_index, diagonal in enumerate(diagonals):
+                if other_index != index:
+                    weighted = weighted * diagonal
+            result = result + _batch_kernel_diag_input_vjp(kernel, x, weighted, parameter_values, chunk_size)
+        return result
+
 
 def _kernel_parameters(kernel):
     if isinstance(kernel, Kernel):
@@ -887,6 +999,24 @@ def _batch_kernel_derivatives(kernel, x1, x2, parameter_values):
     return {}
 
 
+def _batch_kernel_diag(kernel, x, parameter_values, chunk_size=256):
+    """``(B, N)`` diagonal of a part of a composite kernel (a kernel, a plain callable or a number)."""
+    if isinstance(kernel, Kernel):
+        return kernel.batch_diag(x, parameter_values, chunk_size=chunk_size)
+    if callable(kernel):
+        a, _ = _shared_inputs(x, x, "evaluate")
+        return torch.diagonal(torch.as_tensor(kernel(a, a))).unsqueeze(0)
+    return torch.as_tensor(kernel, dtype=x.dtype, device=x.device).reshape(1, 1)
+
+
+def _batch_kernel_diag_input_vjp(kernel, x, cotangent, parameter_values, chunk_size=256):
+    if isinstance(kernel, Kernel):
+        return kernel.batch_diag_input_vjp(x, cotangent, parameter_values, chunk_size=chunk_size)
+    if callable(kernel):
+        raise NotImplementedError("Input gradients are not available for plain callables inside a composite kernel.")
+    return _zero_input_vjp(x, cotangent)
+
+
 def _batch_kernel_input_vjp(kernel, x1, x2, cotangent, parameter_values):
     if isinstance(kernel, Kernel):
         return kernel.batch_input_vjp(x1, x2, cotangent, parameter_values)
@@ -894,11 +1024,3 @@ def _batch_kernel_input_vjp(kernel, x1, x2, cotangent, parameter_values):
         raise NotImplementedError("Input gradients are not available for plain callables inside a composite kernel.")
     return torch.zeros((_batch_size(x1, cotangent), *x1.shape[1:]), dtype=x1.dtype, device=x1.device)
 
-
-# Backwards-compatible helpers used by the GP nodes.
-def _evaluate_kernel(kernel, x1, x2, parameter_values=None):
-    if isinstance(kernel, Kernel):
-        return kernel.evaluate(x1, x2, parameter_values=parameter_values)
-    if callable(kernel):
-        return kernel(x1, x2)
-    return torch.as_tensor(kernel, dtype=_feature_matrix(x1).dtype, device=_feature_matrix(x1).device)

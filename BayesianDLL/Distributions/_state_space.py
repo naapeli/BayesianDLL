@@ -20,8 +20,11 @@ def _is_integer_valued(state):
 
 
 class StateSpace(ABC):
+    """The support of a distribution (or of its unconstrained transform)."""
+
     @abstractmethod
     def contains(self, state) -> bool:
+        """Whether every element of ``state`` lies in the space (leading dimensions are batch dimensions)."""
         pass
 
     @abstractmethod
@@ -33,6 +36,8 @@ class StateSpace(ABC):
         pass
 
 class DiscreteSpace(StateSpace, ABC):
+    """A countable space; iterating over it yields its values."""
+
     @abstractmethod
     def __iter__(self):
         pass
@@ -44,6 +49,8 @@ class DiscreteSpace(StateSpace, ABC):
         return True
 
 class ContinuousSpace(StateSpace, ABC):
+    """A continuous space."""
+
     def is_continuous(self):
         return True
 
@@ -51,6 +58,8 @@ class ContinuousSpace(StateSpace, ABC):
         return False
 
 class Union(StateSpace):
+    """Union of ``spaces`` (the support of a :class:`Mixture`); continuous only if all of them are."""
+
     def __init__(self, *spaces):
         self.state_spaces = spaces
         self._continuous = all(space.is_continuous() for space in spaces)
@@ -65,6 +74,8 @@ class Union(StateSpace):
         return not self._continuous
 
 class DiscreteRange(DiscreteSpace):
+    """The integers ``low, low + 1, ..., high`` (both included; bounds may be model parameters)."""
+
     def __init__(self, low, high):
         self.low = low
         self.high = high
@@ -102,6 +113,8 @@ class DiscreteRange(DiscreteSpace):
         return torch.arange(low, high + 1)
 
 class DiscretePositive(DiscreteSpace):
+    """The integers 1, 2, 3, ... (support of :class:`Geometric`)."""
+
     def contains(self, state) -> bool:
         """Return whether every element of ``state`` is a positive integer."""
         state = _as_tensor(state)
@@ -114,6 +127,8 @@ class DiscretePositive(DiscreteSpace):
             i += 1
 
 class ContinuousRange(ContinuousSpace):
+    """The interval ``[low, high]`` (bounds may be infinite or model parameters)."""
+
     def __init__(self, low, high):
         self.low = low
         self.high = high
@@ -125,14 +140,20 @@ class ContinuousRange(ContinuousSpace):
         return bool(torch.all((low <= state) & (state <= high)))
 
 class ContinuousPositive(ContinuousSpace):
+    """The positive reals ``(0, inf)``."""
+
     def contains(self, state) -> bool:
         return bool(torch.all(_as_tensor(state) > 0))
 
 class ContinuousReal(ContinuousSpace):
+    """The real line (``contains`` checks that every element is finite)."""
+
     def contains(self, state) -> bool:
         return bool(torch.all(torch.isfinite(_as_tensor(state))))
 
 class ContinuousSimplex(ContinuousSpace):
+    """Probability vectors along the last dimension: entries in ``[0, 1]`` summing to one."""
+
     def contains(self, state) -> bool:
         state = _as_tensor(state)
         between_0_and_1 = bool(torch.all((0 <= state) & (state <= 1)))
@@ -142,6 +163,12 @@ class ContinuousSimplex(ContinuousSpace):
         return between_0_and_1 and sum_to_1
 
 class JointStateSpace(StateSpace):
+    """Product of named spaces over a flat parameter vector.
+
+    ``spaces_dict`` maps names to spaces and ``slices`` maps names to
+    ``(start, end, shape)`` of their block in the flat vector.
+    """
+
     def __init__(self, spaces_dict, slices):
         self.spaces_dict = spaces_dict
         self.slices = slices

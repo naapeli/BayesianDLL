@@ -12,8 +12,8 @@ All three are positive and span orders of magnitude, so the model puts
 Normal priors on their **logarithms** and recovers them with ``Exp`` blocks.
 In these coordinates the posterior is close to Gaussian, but the
 hyperparameters are correlated (a longer lengthscale can be traded against
-more noise), so the guide is ``AutoMultivariateNormal``, a full-rank
-Normal over the three log-hyperparameters.
+more noise), so the guide is ``Guide(model, default_family="full_rank")``,
+one full-rank Normal over the three log-hyperparameters.
 
 NUTS on the same model serves as the reference. The figures show the ELBO,
 the marginal posteriors of the hyperparameters under both methods, and the
@@ -24,7 +24,7 @@ over the data.
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import AutoMultivariateNormal, Data, Model, ObservedParameter, RandomParameter, plate
+from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.GP import RBF, ExactGP, exact_gp_predictive
@@ -53,7 +53,7 @@ with Model() as model:
 # Fitting the guide and the reference
 # -----------------------------------
 
-guide = AutoMultivariateNormal(model)
+guide = Guide(model, default_family="full_rank")
 history = BBVI(model, guide, n_samples=4, epochs=800, lr=0.03, lrd=0.998, callback_frequency=5, verbose=False)
 variational = guide.sample(1200)
 print(f"final ELBO estimate: {sum(history[-20:]) / 20:.2f}")
@@ -71,9 +71,9 @@ print(f"NUTS: {sum(nuts.divergences)} divergences, largest R-hat {summary['r_hat
 # band combines the hyperparameter uncertainty and the GP's own uncertainty.
 # It widens outside the data range ``[0, 1]``.
 
-traces = {"AutoMultivariateNormal": variational, "NUTS": nuts}
+traces = {"full-rank guide": variational, "NUTS": nuts}
 predictive_traces = {label: trace.thin(4) for label, trace in traces.items()}  # 300 draws each
-colors = {"AutoMultivariateNormal": "C0", "NUTS": "black"}
+colors = {"full-rank guide": "C0", "NUTS": "black"}
 x_new = torch.linspace(-0.2, 1.2, 120, dtype=torch.float64)
 
 fig = plt.figure(figsize=(13, 8), layout="constrained")

@@ -42,7 +42,7 @@ with Model() as model:
     intercept = RandomParameter("intercept", Normal(0.0, 5.0))
     slope = RandomParameter("slope", Normal(0.0, 5.0))
     sigma = RandomParameter("sigma", HalfNormal(2.0))
-    mu = Linear("mu", x, slope=slope, intercept=intercept)
+    mu = Linear("mu", x, coefficients=slope, intercept=intercept)
     with plate("observations", x):
         ObservedParameter("y_obs", Normal(mu, sigma), y)
 

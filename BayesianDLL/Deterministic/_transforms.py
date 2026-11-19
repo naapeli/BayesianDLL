@@ -63,35 +63,28 @@ class Linear(DeterministicParameter):
     """A linear predictor with an optional intercept.
 
     For one-dimensional inputs and a scalar coefficient, this evaluates
-    ``inputs * slope + intercept``. For a design matrix with shape ``(N, D)``
-    and a coefficient vector with shape ``(D,)``, it evaluates
+    ``inputs * coefficients + intercept``. For a design matrix with shape
+    ``(N, D)`` and a coefficient vector with shape ``(D,)``, it evaluates
     ``inputs @ coefficients + intercept`` with shape ``(N,)``; this includes
     a single feature, ``D = 1``, where the coefficient may also be a scalar.
 
-    Parameters may be model nodes or constants. Named parameters are included
-    in the model graph and receive analytic derivatives. ``slope`` and
-    ``weights`` are accepted as readable aliases for ``coefficients``.
+    Arguments:
+
+    * ``name``: name of the deterministic node;
+    * ``inputs``: a named model node (usually ``Data``) holding the
+      covariates, shape ``(N,)`` or ``(N, D)``;
+    * ``coefficients``: the regression coefficient(s), a scalar or a
+      ``(D,)`` vector; a model node or a constant;
+    * ``intercept``: a scalar or one value per output (default ``0.0``); a
+      model node or a constant.
+
+    Named parameters are included in the model graph and receive analytic
+    derivatives. With vectorized chains a batched coefficient has a leading
+    chain dimension, ``(C,)`` or ``(C, D)``, and the output ``(C, N)``.
     """
 
-    def __init__(
-        self,
-        name,
-        inputs,
-        coefficients=None,
-        intercept=0.0,
-        *,
-        slope=None,
-        weights=None,
-    ):
+    def __init__(self, name, inputs, coefficients, intercept=0.0):
         _require_named(inputs, "inputs")
-        supplied_coefficients = [
-            value for value in (coefficients, slope, weights) if value is not None
-        ]
-        if len(supplied_coefficients) != 1:
-            raise TypeError(
-                "Provide exactly one of coefficients, slope, or weights."
-            )
-        coefficients = supplied_coefficients[0]
 
         named_inputs = [inputs]
         for value, description in (
@@ -180,8 +173,6 @@ class Linear(DeterministicParameter):
         super().__init__(name, forward, derivative, named_inputs, vjp_func=vjp)
         self.regression_inputs = inputs
         self.coefficients = coefficients
-        self.weights = coefficients
-        self.slope = coefficients
         self.intercept = intercept
 
     # ------------------------------------------------------------ batching
@@ -245,7 +236,7 @@ class Linear(DeterministicParameter):
 
 
 class Exp(DeterministicParameter):
-    """Apply the elementwise exponential transformation to a model node."""
+    """Deterministic node ``name`` with value ``exp(input)`` (elementwise) of the named node ``input``."""
 
     def __init__(self, name, input):
         _require_named(input, "input")
@@ -264,7 +255,7 @@ class Exp(DeterministicParameter):
 
 
 class Log(DeterministicParameter):
-    """Apply the elementwise natural logarithm to a positive model node."""
+    """Deterministic node ``name`` with value ``log(input)`` (elementwise) of a positive named node ``input``."""
 
     def __init__(self, name, input):
         _require_named(input, "input")
@@ -283,7 +274,7 @@ class Log(DeterministicParameter):
 
 
 class Sigmoid(DeterministicParameter):
-    """Map an unconstrained model node to the interval ``(0, 1)``."""
+    """Deterministic node ``name`` with value ``sigmoid(input)`` in ``(0, 1)`` (elementwise) of the named node ``input``."""
 
     def __init__(self, name, input):
         _require_named(input, "input")

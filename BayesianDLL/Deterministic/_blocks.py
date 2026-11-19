@@ -7,6 +7,11 @@ pass never builds a dense Jacobian. Inputs may be model nodes
 Python numbers; numbers adopt the floating dtype and device of the tensor
 inputs. Elementwise blocks broadcast their inputs like ``torch`` does, and the
 gradient of a broadcast input is summed back onto its shape.
+
+The first argument of every block is the name of the new deterministic
+node. ``Data`` inputs receive no gradient. With vectorized chains the values
+of batched nodes carry a leading chain dimension; ``dim`` arguments address
+the same axis with and without it (negative dimensions count from the right).
 """
 
 from __future__ import annotations
@@ -17,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from .._data import Data
-from .._parameters import DeterministicParameter, ObservedParameter, RandomParameter
+from .._parameters import DeterministicParameter, ObservedParameter, RandomParameter, VariationalParameter
 
 
 _NODE_TYPES = (RandomParameter, DeterministicParameter, ObservedParameter, Data)
@@ -72,9 +77,13 @@ class _Block(DeterministicParameter):
     def __init__(self, name, args):
         args = list(args)
         for i, arg in enumerate(args):
-            if not (_is_node(arg) or isinstance(arg, torch.Tensor) or (isinstance(arg, Number) and not isinstance(arg, bool))):
+            if not (
+                _is_node(arg) or isinstance(arg, torch.Tensor | VariationalParameter)
+                or (isinstance(arg, Number) and not isinstance(arg, bool))
+            ):
                 raise TypeError(
-                    f"Argument {i} of '{name}' must be a model node, a tensor or a number; got {type(arg).__name__}."
+                    f"Argument {i} of '{name}' must be a model node, a VariationalParameter, a tensor or a number; "
+                    f"got {type(arg).__name__}."
                 )
         nodes = []
         node_index = {}
@@ -93,12 +102,21 @@ class _Block(DeterministicParameter):
             _is_node(arg) and not isinstance(arg, Data) and i not in self._non_differentiable
             for i, arg in enumerate(args)
         )
+        # VariationalParameter arguments (blocks inside a guide) are read at
+        # every evaluation and receive gradients through variational_vjp.
+        self._vp_needs = tuple(
+            isinstance(arg, VariationalParameter) and i not in self._non_differentiable for i, arg in enumerate(args)
+        )
+        self.variational_parameters = {arg.name: arg for arg in args if isinstance(arg, VariationalParameter)}
         derivative = self._derivative_from_nodes if type(self)._local is not _Block._local else None
         super().__init__(name, self._forward_from_nodes, derivative, nodes, vjp_func=self._vjp_from_nodes)
 
     # ------------------------------------------------------------ plumbing
     def _values(self, node_values):
-        raw = [node_values[p] if p is not None else arg for p, arg in zip(self._positions, self._args)]
+        raw = [
+            node_values[p] if p is not None else (arg.value if isinstance(arg, VariationalParameter) else arg)
+            for p, arg in zip(self._positions, self._args)
+        ]
         dtype, device = _reference(raw)
         values = []
         for value in raw:
@@ -120,6 +138,21 @@ class _Block(DeterministicParameter):
             if not need or grad is None:
                 continue
             grad = _sum_to_shape(grad, value.shape)
+            result[arg.name] = result[arg.name] + grad if arg.name in result else grad
+        return result
+
+    def variational_vjp(self, cotangent):
+        """Gradients ``{name: cotangent^T J}`` w.r.t. the VariationalParameter arguments at the current inputs."""
+        if not self.variational_parameters:
+            return {}
+        values = self._values(self.input_values())
+        out = self._compute(values)
+        grads = self._arg_grads(cotangent, values, out, self._vp_needs)
+        result = {}
+        for arg, need, grad in zip(self._args, self._vp_needs, grads):
+            if not need or grad is None:
+                continue
+            grad = _sum_to_shape(grad, arg.value.shape)
             result[arg.name] = result[arg.name] + grad if arg.name in result else grad
         return result
 
@@ -286,7 +319,8 @@ class Affine(_ElementwiseBlock):
     ``theta = Affine("theta", z, loc=mu, scale=tau)``. The prior geometry of
     ``z`` no longer depends on ``tau``, which removes the funnel.
 
-    ``loc`` and ``scale`` may be model nodes, tensors or numbers.
+    ``loc`` (default ``0.0``) and ``scale`` (default ``1.0``) may be model
+    nodes, tensors or numbers.
     """
 
     def __init__(self, name, x, loc=0.0, scale=1.0):
@@ -369,7 +403,7 @@ class Tanh(_ElementwiseBlock):
 
 
 class Softmax(_Block):
-    """Softmax along ``dim``: maps real vectors to the probability simplex.
+    """Softmax of ``x`` along ``dim`` (default ``-1``): maps real vectors to the probability simplex.
 
     The VJP is ``s * (g - sum(g * s, dim))`` with ``s`` the output. For a
     categorical likelihood prefer ``Categorical(logits=...)``, which is
@@ -401,7 +435,10 @@ class Softmax(_Block):
 
 # ============================================================ reductions and shapes
 class Sum(_Block):
-    """Sum of ``x`` over ``dim`` (all elements when ``dim`` is ``None``)."""
+    """Sum of ``x`` over ``dim`` (an int or a tuple; all elements when ``dim`` is ``None``, the default).
+
+    ``keepdim`` (default ``False``) keeps the summed dimensions with size one.
+    """
 
     def __init__(self, name, x, dim=None, keepdim=False):
         self.dim = dim
@@ -449,7 +486,10 @@ class Sum(_Block):
 
 
 class Concat(_Block):
-    """Concatenate inputs along ``dim`` (``torch.cat``)."""
+    """Concatenate inputs along ``dim`` (keyword-only, default ``-1``; ``torch.cat``).
+
+    Scalar inputs are treated as vectors of length one.
+    """
 
     def __init__(self, name, *inputs, dim=-1):
         if len(inputs) < 1:
@@ -490,7 +530,10 @@ class Concat(_Block):
 
 
 class Stack(_Block):
-    """Stack equally shaped inputs along a new dimension ``dim`` (``torch.stack``)."""
+    """Stack inputs along a new dimension ``dim`` (keyword-only, default ``0``; ``torch.stack``).
+
+    The inputs are first broadcast to a common shape.
+    """
 
     def __init__(self, name, *inputs, dim=0):
         if len(inputs) < 1:
@@ -588,7 +631,7 @@ class MatMul(_Block):
 
 
 class Index(_Block):
-    """Gather ``x`` along ``dim`` with an integer index, e.g. ``theta[group_idx]``.
+    """Gather ``x`` along ``dim`` (default ``0``) with an integer index, e.g. ``theta[group_idx]``.
 
     ``index`` is an integer tensor (or list), or a model node holding integer
     values: a :class:`~BayesianDLL.Data` object -- which can be replaced with

@@ -93,6 +93,13 @@ def _apply_jacobian_transpose(transform, x_unconstrained, cotangent):
 
 
 class LogTransform(Transform):
+    """``x = border + exp(z)`` (``side="larger"``, the default) or ``x = border - exp(z)`` (``side="smaller"``).
+
+    Maps the real line to ``(border, inf)`` or ``(-inf, border)``;
+    ``border`` (default ``0``) may be a number, tensor or model parameter.
+    ``log|dx/dz| = z`` summed over the elements.
+    """
+
     def __init__(self, border=0, side="larger"):
         self.border = border
         self.side = side
@@ -121,6 +128,12 @@ class LogTransform(Transform):
 
 
 class InverseSoftPlusTransform(Transform):
+    """``x = border + softplus(z)`` (``side="larger"``) or ``x = border - softplus(z)`` (``side="smaller"``).
+
+    ``forward`` is the inverse softplus ``log(expm1(x - border))``.
+    ``log|dx/dz| = log sigmoid(z)`` summed over the elements.
+    """
+
     def __init__(self, border=0, side="larger"):
         super().__init__()
         self.border = border
@@ -154,9 +167,11 @@ class InverseSoftPlusTransform(Transform):
 
 
 class LogitTransform(Transform):
-    """``x = low + (high - low) * sigmoid(z)``.
+    """``x = low + (high - low) * sigmoid(z)``, mapping the real line to ``(low, high)``.
 
-    ``low`` and ``high`` may be numbers, tensors or model parameters; they are
+    ``log|dx/dz| = log(high - low) + log sigmoid(z) + log sigmoid(-z)``
+    summed over the elements. ``low`` (default ``0``) and ``high`` (default
+    ``1``) may be numbers, tensors or model parameters; they are
     resolved every time the transform is used, so the map follows parameters
     whose value changes during sampling.
     """
@@ -194,6 +209,8 @@ class LogitTransform(Transform):
 
 
 class IdentityTransform(Transform):
+    """The identity map (supports that are already unconstrained); ``log|det J| = 0``."""
+
     def forward(self, x_constrained):
         return x_constrained
 
@@ -202,36 +219,6 @@ class IdentityTransform(Transform):
 
     def derivative(self, x_unconstrained):
         return torch.ones_like(x_unconstrained)
-
-    def log_abs_det_jacobian(self, x_unconstrained):
-        return torch.zeros((), dtype=x_unconstrained.dtype, device=x_unconstrained.device)
-
-    def grad_log_abs_det_jacobian(self, x_unconstrained):
-        return torch.zeros_like(x_unconstrained)
-
-
-class SoftMaxTransform(Transform):
-    """Softmax map R^K -> simplex.
-
-    .. warning:: This map is **not** a bijection (it is invariant to adding a
-       constant to every coordinate), so it cannot be used as the sampling
-       transform of a distribution on the simplex. Use
-       :class:`StickBreakingTransform` instead. It is kept for backward
-       compatibility.
-    """
-
-    def __init__(self, dim=-1):
-        self.dim = dim
-
-    def forward(self, x_constrained):
-        return torch.log(x_constrained.clamp(min=_tiny(x_constrained)))
-
-    def inverse(self, x_unconstrained):
-        return torch.softmax(x_unconstrained, dim=self.dim)
-
-    def derivative(self, x_unconstrained):
-        sm = self.inverse(x_unconstrained)
-        return torch.diag_embed(sm) - sm.unsqueeze(-1) @ sm.unsqueeze(-2)
 
     def log_abs_det_jacobian(self, x_unconstrained):
         return torch.zeros((), dtype=x_unconstrained.dtype, device=x_unconstrained.device)
@@ -252,6 +239,8 @@ class StickBreakingTransform(Transform):
 
     The offset ``log(K - k)`` makes ``z = 0`` map to the uniform simplex.
     ``derivative`` returns the ``(..., K, K-1)`` Jacobian of the inverse map.
+    ``log|det J|`` is taken w.r.t. the first ``K-1`` coordinates of ``x``:
+    ``sum_k [log y_k + (K - k) log(1 - y_k)]`` (``k = 1, ..., K-1``).
     """
 
     def unconstrained_shape(self, constrained_shape):
@@ -350,6 +339,9 @@ class CorrCholeskyTransform(Transform):
         L_{ii} = \\sqrt{1 - \\sum_{k<i} L_{ik}^2}.
 
     The constrained value is the full ``(..., D, D)`` lower-triangular matrix.
+    ``log|det J|`` is taken w.r.t. its strictly lower-triangular entries:
+    ``sum_{i>j} [log(1 - w_ij^2) + (1/2) sum_{k<j} log(1 - w_ik^2)]``
+    (``dL_ij/dw_ij = sqrt(1 - sum_{k<j} L_ik^2)`` and ``dw/dz = 1 - w^2``).
     Because the Jacobian is not a (vector -> vector) matrix, this transform
     provides :meth:`vjp` which computes ``J^T`` applied to a ``(..., D, D)``
     cotangent.
@@ -524,10 +516,6 @@ class PositiveDefiniteTransform(Transform):
     def _indices(self, device):
         return torch.tril_indices(self.dim, self.dim, offset=0, device=device)
 
-    def _is_diag(self, device):
-        rows, cols = self._indices(device)
-        return rows == cols
-
     def _diag_weights(self, dtype, device):
         """(D + 1 - i) on diagonal positions, 0 elsewhere."""
         rows, cols = self._indices(device)
@@ -602,7 +590,7 @@ class OrderedTransform(Transform):
 
     @staticmethod
     def _increments(y):
-        """``(y_0, exp(y_1), ..., exp(y_{K-1}))``: the derivative of ``x_i`` w.r.t. ``y_k`` for ``k <= i``."""
+        """``(1, exp(y_1), ..., exp(y_{K-1}))``: the derivative of ``x_i`` w.r.t. ``y_k`` for ``k <= i``."""
         return torch.cat([torch.ones_like(y[..., :1]), torch.exp(y[..., 1:])], dim=-1)
 
     def forward(self, x_constrained):

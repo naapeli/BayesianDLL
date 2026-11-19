@@ -1,6 +1,6 @@
 import torch
 
-from ._active_model import _active_model
+from ._active_model._active_model import get_active_model
 
 
 class Data:
@@ -14,10 +14,23 @@ class Data:
     batch dimensions may change in number and size. The default, zero, treats
     each element as a scalar event. Dtype and device are preserved by converting
     the new values to match the original tensor.
+
+    Parameters
+    ----------
+    name : str
+        Unique, non-empty node name in the model.
+    value : array-like
+        The data (copied into a tensor).
+    event_ndim : int, default 0
+        Number of trailing event dimensions, between 0 and the rank of ``value``.
+
+    ``value`` (and ``constrained_value``) return the current tensor,
+    ``event_shape`` its trailing ``event_ndim`` dimensions and ``batch_shape``
+    the leading ones.
     """
 
     def __init__(self, name, value, event_ndim=0):
-        model = _active_model._active_model
+        model = get_active_model()
         if model is None:
             raise RuntimeError("One should select an active model before creating data.")
         if not isinstance(name, str) or not name:

@@ -93,3 +93,104 @@ def gaussian_kde(samples: torch.Tensor, grid: torch.Tensor, chunk_size: int = 2*
         z = (points[:, None] - samples[None, :]) / bandwidth
         density[start:start + step] = torch.exp(-0.5 * z * z).sum(dim=1) / norm
     return density.reshape(grid.shape)
+
+
+def _log_beta(a: float, b: float) -> float:
+    """``log B(a, b) = lgamma(a) + lgamma(b) - lgamma(a + b)``."""
+    return math.lgamma(a) + math.lgamma(b) - math.lgamma(a + b)
+
+
+def _betacf(a: float, b: float, x: float, max_iter: int = 100_000, tol: float = 1e-16) -> float:
+    """Continued fraction of the incomplete beta function, evaluated with the modified Lentz algorithm.
+
+    Returns ``K`` in ``I_x(a, b) = x^a (1 - x)^b / (a B(a, b)) * K`` where
+    ``K = 1 / (1 + d_1 / (1 + d_2 / (1 + ...)))`` with
+    ``d_{2m+1} = -(a + m)(a + b + m) x / ((a + 2m)(a + 2m + 1))`` and
+    ``d_{2m} = m (b - m) x / ((a + 2m - 1)(a + 2m))``. It converges quickly
+    for ``x < (a + 1) / (a + b + 2)``, in ``O(sqrt(max(a, b)))`` terms.
+    """
+    tiny = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for m in range(1, max_iter + 1):
+        m2 = 2 * m
+        aa = m * (b - m) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        d = tiny if abs(d) < tiny else d
+        c = 1.0 + aa / c
+        c = tiny if abs(c) < tiny else c
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        d = tiny if abs(d) < tiny else d
+        c = 1.0 + aa / c
+        c = tiny if abs(c) < tiny else c
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < tol:
+            return h
+    raise RuntimeError(f"The incomplete beta continued fraction did not converge for a={a}, b={b}, x={x}.")
+
+
+def _betainc(a: float, b: float, x: float) -> float:
+    """The regularised incomplete beta function ``I_x(a, b)``, for ``a, b > 0`` and ``0 <= x <= 1``.
+
+    ``I_x(a, b) = B(a, b)^-1 int_0^x t^(a-1) (1 - t)^(b-1) dt``, the cdf of
+    ``Beta(a, b)`` at ``x``. The prefactor ``x^a (1 - x)^b / B(a, b)`` is formed
+    in log space with ``lgamma``, the remaining factor is the continued fraction
+    of :func:`_betacf`, and for ``x > (a + 1) / (a + b + 2)``, where the
+    fraction converges slowly, the symmetry ``I_x(a, b) = 1 - I_{1-x}(b, a)``
+    is used. Matches ``scipy.special.betainc(a, b, x)``.
+    """
+    a, b, x = float(a), float(b), float(x)
+    if not (a > 0.0 and b > 0.0) or not (0.0 <= x <= 1.0):
+        return math.nan
+    if x == 0.0 or x == 1.0:
+        return x
+    log_front = a * math.log(x) + b * math.log1p(-x) - _log_beta(a, b)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return math.exp(log_front) * _betacf(a, b, x) / a
+    return 1.0 - math.exp(log_front) * _betacf(b, a, 1.0 - x) / b
+
+
+def _betaincinv(a: float, b: float, p: float, max_iter: int = 1000) -> float:
+    """The inverse of :func:`_betainc` in ``x``: the ``p`` quantile of ``Beta(a, b)``.
+
+    Solves ``I_x(a, b) = p`` on ``[0, 1]`` with a safeguarded Newton iteration:
+    the root is kept in a bracket ``[lo, hi]`` that shrinks with each evaluation,
+    a Newton step ``x - (I_x - p) / f(x)`` with the Beta density ``f`` is taken
+    when it lands inside the bracket, and the bracket is bisected otherwise.
+    Matches ``scipy.special.betaincinv(a, b, p)``.
+    """
+    a, b, p = float(a), float(b), float(p)
+    if not (a > 0.0 and b > 0.0) or not (0.0 <= p <= 1.0):
+        return math.nan
+    if p == 0.0 or p == 1.0:
+        return p
+    log_b = _log_beta(a, b)
+    lo, hi = 0.0, 1.0
+    x = a / (a + b)
+    for _ in range(max_iter):
+        f = _betainc(a, b, x) - p
+        if f == 0.0:
+            return x
+        if f < 0.0:
+            lo = x
+        else:
+            hi = x
+        log_density = (a - 1.0) * math.log(x) + (b - 1.0) * math.log1p(-x) - log_b
+        density = math.exp(log_density) if log_density < 700.0 else math.inf
+        candidate = x - f / density if density > 0.0 else math.nan
+        if not (lo < candidate < hi):
+            candidate = 0.5 * (lo + hi)
+        if abs(candidate - x) <= 4.0 * math.ulp(x) or hi - lo <= 4.0 * math.ulp(x):
+            return candidate
+        x = candidate
+    return x

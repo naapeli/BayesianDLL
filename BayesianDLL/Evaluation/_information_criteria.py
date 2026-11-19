@@ -37,18 +37,28 @@ def _logsumexp(values, axis=None):
 class ELPDResult:
     """Estimate of the expected log pointwise predictive density (ELPD).
 
-    Attributes
-    ----------
-    kind : ``"loo"`` or ``"waic"``.
-    elpd : the estimated ELPD (``elpd_loo`` or ``elpd_waic``), on the log scale.
-    se : its standard error, ``sqrt(n) * sd(elpd_i)``.
-    p : the effective number of parameters (``p_loo`` or ``p_waic``).
-    n_samples, n_data_points : number of posterior draws and of observations.
-    elpd_i : pointwise ELPD values (a tensor of the observation shape) when
-        ``pointwise=True``, else ``None``.
-    pareto_k : Pareto shape estimates k-hat per observation (LOO only).
-    good_k : the sample-size dependent k-hat threshold ``min(1 - 1/log10(S), 0.7)``.
-    warning : whether a reliability warning was issued.
+    Returned by :func:`loo` and :func:`waic`. Its fields are
+
+    - ``kind``: ``"loo"`` or ``"waic"``;
+    - ``elpd``: the estimated ELPD (``elpd_loo`` or ``elpd_waic``), the sum of
+      the pointwise values ``elpd_i``, on the log scale;
+    - ``se``: its standard error, ``sqrt(n * var(elpd_i))`` with the biased
+      (``ddof=0``) variance over the ``n`` observations;
+    - ``p``: the effective number of parameters (``p_loo`` or ``p_waic``);
+    - ``n_samples``, ``n_data_points``: the number of posterior draws
+      (chains times draws) and of observations;
+    - ``elpd_i``, ``p_i``: pointwise ELPD and effective-number-of-parameters
+      values (tensors of the observation shape) when ``pointwise=True``, else
+      ``None``;
+    - ``pareto_k``: Pareto shape estimates k-hat per observation (LOO only,
+      always returned; NaN where the tail was too short to fit);
+    - ``good_k``: the sample-size dependent k-hat threshold
+      ``min(1 - 1/log10(S), 0.7)`` (LOO only);
+    - ``warning``: whether a reliability warning was issued;
+    - ``var_name``: the observed node(s) used, ``"a+b"`` for several.
+
+    The property ``lppd`` is the log pointwise predictive density of the
+    full posterior, ``elpd + p``.
     """
 
     kind: str
@@ -68,10 +78,6 @@ class ELPDResult:
     @property
     def lppd(self):
         return self.elpd + self.p
-
-    def __getitem__(self, key):
-        aliases = {f"elpd_{self.kind}": "elpd", f"p_{self.kind}": "p", f"{self.kind}_i": "elpd_i"}
-        return getattr(self, aliases.get(key, key))
 
     def __repr__(self):
         lines = [
@@ -143,24 +149,40 @@ def _se(elpd_i):
 
 # -------------------------------------------------------------------- WAIC
 def waic(result, var_name=None, pointwise=False):
-    """Widely applicable information criterion (Watanabe 2010).
+    """Widely applicable information criterion (Watanabe 2010), on the ELPD scale.
+
+    With ``S`` pooled posterior draws ``theta_s`` and
+    ``l_is = log p(y_i | theta_s)``::
+
+        lppd_i      = log( (1/S) sum_s exp(l_is) )
+        p_waic_i    = var_s(l_is)                 (sample variance, ddof=1)
+        elpd_waic_i = lppd_i - p_waic_i
+
+    and ``elpd_waic`` and ``p_waic`` are the sums over the observations
+    (Vehtari, Gelman and Gabry, 2017). Multiply by -2 for the deviance scale.
 
     Parameters
     ----------
-    result : SamplingResult (sampled with ``log_likelihood=True``), a dict
+    result : SamplingResult, dict or Tensor
+        A SamplingResult sampled with ``log_likelihood=True``, a dict
         mapping observed names to log-likelihood tensors of shape
         ``(chains, draws, *obs_shape)``, or such a tensor.
-    var_name : the observed node to use. By default all observed nodes are
-        used and their observations are concatenated (the ELPD is the sum
-        over all of them).
-    pointwise : also return the pointwise ``elpd_waic_i`` and ``p_waic_i``.
+    var_name : str, optional
+        The observed node to use. By default all observed nodes are used and
+        their observations are concatenated (the ELPD is the sum over all of
+        them).
+    pointwise : bool, default False
+        Also return the pointwise ``elpd_waic_i`` and ``p_waic_i``
+        (``elpd_i`` and ``p_i``).
 
     Returns
     -------
-    ELPDResult with ``elpd`` (elpd_waic), ``se``, ``p`` (p_waic) and, if
-    requested, ``elpd_i``. A warning is issued when the posterior variance of
-    the log-likelihood of an observation exceeds 0.4, in which case WAIC is
-    unreliable and PSIS-LOO is preferable.
+    ELPDResult
+        With ``kind="waic"``, ``elpd`` (elpd_waic), ``se``, ``p`` (p_waic)
+        and, if requested, ``elpd_i`` and ``p_i``. A warning is issued (and
+        ``warning`` set) when ``p_waic_i``, the posterior variance of the
+        log-likelihood of an observation, exceeds 0.4, in which case WAIC is
+        unreliable and PSIS-LOO is preferable.
     """
     name, log_lik, shape, dtype, device = _log_likelihood_arrays(result, var_name)
     n_chains, n_draws, n_obs = log_lik.shape
@@ -248,12 +270,29 @@ def psis(log_ratios, r_eff=1.0, truncate=True):
     """Pareto smoothed importance sampling of one vector of log importance ratios.
 
     The ``M = ceil(min(0.2 S, 3 sqrt(S / r_eff)))`` largest ratios are
-    replaced by the expected order statistics (quantiles at ``(j - 1/2) / M``)
-    of a generalized Pareto distribution fitted to them, but never by more
+    replaced by the quantiles at ``(j - 1/2) / M``, ``j = 1..M``, of a
+    generalized Pareto distribution fitted (Zhang and Stephens, 2009, with
+    the weakly informative shape prior of Vehtari et al., 2024) to their
+    exceedances over the largest ratio not in the tail, but never by more
     than the largest raw ratio. With ``truncate`` the weights are then
-    truncated at ``S^(3/4)`` times their mean.
+    truncated at ``S^(3/4)`` times their mean. If ``M < 5`` (a warning is
+    issued) or ``M >= S`` the ratios are not smoothed and ``k_hat`` is NaN.
 
-    Returns ``(log_weights, k_hat)`` with log weights normalised to sum to one.
+    Parameters
+    ----------
+    log_ratios : array-like
+        The ``S`` log importance ratios (flattened); for LOO the negative
+        log-likelihood of one observation.
+    r_eff : float, default 1.0
+        Relative effective sample size of the draws, which sets the tail length.
+    truncate : bool, default True
+        Whether to truncate the smoothed weights at ``S^(3/4)`` times their mean.
+
+    Returns
+    -------
+    tuple of (numpy.ndarray, float)
+        ``(log_weights, k_hat)``: log weights of shape ``(S,)`` normalised to
+        sum to one, and the estimated Pareto shape.
     """
     log_ratios = np.asarray(log_ratios, dtype=np.float64).reshape(-1)
     n_samples = log_ratios.size
@@ -290,7 +329,8 @@ def relative_efficiency(log_lik):
 
     ``log_lik`` has shape ``(chains, draws, n)``. Uses the split-chain mean
     ESS of :func:`~BayesianDLL.Evaluation.effective_sample_size`; returns an
-    array of shape ``(n,)`` (ones for a single chain of fewer than 4 draws).
+    array of shape ``(n,)``: ``ESS / (chains * draws)``, with ones for chains of
+    fewer than 4 draws and wherever the estimate is not finite and positive.
     """
     n_chains, n_draws, _ = log_lik.shape
     if n_draws < 4:
@@ -308,25 +348,40 @@ def _good_k(n_samples):
 def loo(result, var_name=None, pointwise=False, reff=None):
     """Pareto smoothed importance sampling leave-one-out cross-validation (PSIS-LOO).
 
+    For each observation the importance ratios ``1 / p(y_i | theta_s)`` are
+    smoothed with :func:`psis`, giving normalised weights ``w_is``, and::
+
+        elpd_loo_i = log sum_s w_is p(y_i | theta_s)
+        p_loo_i    = lppd_i - elpd_loo_i,   lppd_i = log( (1/S) sum_s p(y_i | theta_s) )
+
+    with ``elpd_loo`` and ``p_loo`` the sums over the observations
+    (Vehtari, Gelman and Gabry, 2017).
+
     Parameters
     ----------
-    result : SamplingResult (sampled with ``log_likelihood=True``), a dict
+    result : SamplingResult, dict or Tensor
+        A SamplingResult sampled with ``log_likelihood=True``, a dict
         mapping observed names to log-likelihood tensors of shape
         ``(chains, draws, *obs_shape)``, or such a tensor.
-    var_name : the observed node to use. By default all observed nodes are
-        used and their observations are concatenated.
-    pointwise : also return ``elpd_i`` (and ``p_i``) per observation.
-    reff : relative effective sample size of the draws, a scalar or one
-        value per observation. By default it is estimated per observation as
-        the relative mean ESS of the likelihood ``exp(log p(y_i | theta))``.
+    var_name : str, optional
+        The observed node to use. By default all observed nodes are used and
+        their observations are concatenated.
+    pointwise : bool, default False
+        Also return ``elpd_i`` and ``p_i`` per observation.
+    reff : float or array-like, optional
+        Relative effective sample size of the draws, a scalar or one value per
+        (flattened) observation. By default it is estimated per observation
+        as the relative split-chain mean ESS of the likelihood
+        ``exp(log p(y_i | theta))`` (:func:`relative_efficiency`).
 
     Returns
     -------
-    ELPDResult with ``elpd`` (elpd_loo), ``se``, ``p`` (p_loo) and
-    ``pareto_k`` (k-hat per observation, always returned). k-hat above
-    ``good_k = min(1 - 1/log10(S), 0.7)`` (S posterior draws) means that the
-    importance sampling estimate of that observation is unreliable, and a
-    warning is issued.
+    ELPDResult
+        With ``kind="loo"``, ``elpd`` (elpd_loo), ``se``, ``p`` (p_loo),
+        ``good_k`` and ``pareto_k`` (k-hat per observation, always returned).
+        k-hat above ``good_k = min(1 - 1/log10(S), 0.7)`` (S posterior draws)
+        means that the importance sampling estimate of that observation is
+        unreliable, and a warning is issued.
     """
     name, log_lik, shape, dtype, device = _log_likelihood_arrays(result, var_name)
     n_chains, n_draws, n_obs = log_lik.shape
@@ -394,7 +449,10 @@ def stacking_weights(elpd_i, max_iter=10000, tol=1e-12):
     Maximises ``sum_i log sum_k w_k exp(elpd_i[i, k])`` over the simplex with
     projected gradient ascent and a backtracking (Armijo) line search; the
     objective is concave, so this converges to the global optimum.
-    ``elpd_i`` has shape ``(n_observations, n_models)``.
+    ``elpd_i`` has shape ``(n_observations, n_models)`` and holds the pointwise
+    (e.g. leave-one-out) log predictive densities; ``max_iter`` and ``tol``
+    bound the iterations and set the tolerance on the change of the weights.
+    Returns the weights, an array of shape ``(n_models,)`` summing to one.
     """
     elpd_i = np.asarray(elpd_i, dtype=np.float64)
     n_obs, n_models = elpd_i.shape
@@ -432,21 +490,31 @@ def compare(results, ic="loo", method="stacking", var_name=None):
 
     Parameters
     ----------
-    results : dict mapping a model name to a SamplingResult (with pointwise
-        log-likelihood), or to an ``ELPDResult`` computed with ``pointwise=True``.
-    ic : ``"loo"`` (PSIS-LOO) or ``"waic"``.
-    method : model weights, ``"stacking"`` (Yao et al. 2018) or
-        ``"pseudo-BMA"`` (Akaike-type weights ``exp(elpd_k)``, normalised).
-    var_name : observed node passed to :func:`loo` / :func:`waic`.
+    results : dict
+        Maps at least two model names to a SamplingResult (with pointwise
+        log-likelihood), or to an ``ELPDResult`` of kind ``ic`` computed
+        with ``pointwise=True``. All models must have the same number of
+        observations.
+    ic : {"loo", "waic"}, default "loo"
+        The ELPD estimate, PSIS-LOO or WAIC.
+    method : {"stacking", "pseudo-BMA"}, default "stacking"
+        Model weights: ``"stacking"`` (Yao et al. 2018, :func:`stacking_weights`
+        on the pointwise ELPDs) or ``"pseudo-BMA"`` (Akaike-type weights
+        ``exp(elpd_k)``, normalised, without the Bayesian bootstrap).
+        Case-insensitive.
+    var_name : str, optional
+        Observed node passed to :func:`loo` / :func:`waic`.
 
     Returns
     -------
-    pandas.DataFrame indexed by model name and sorted by ``elpd`` (best
-    first), with the columns ``rank``, ``elpd``, ``p``, ``elpd_diff``
-    (``elpd`` minus the ELPD of the best model, so zero or negative, as in
-    ArviZ and the R package loo), ``weight``, ``se``, ``dse`` (standard
-    error of the pointwise ELPD difference to the best model), ``warning``
-    and ``good_k`` / ``n_bad_k`` for LOO.
+    pandas.DataFrame
+        Indexed by model name and sorted by ``elpd`` (best first), with the
+        columns ``rank`` (0 for the best), ``elpd``, ``p``, ``elpd_diff``
+        (``elpd`` minus the ELPD of the best model, so zero or negative, as
+        in the R package loo), ``weight``, ``se``, ``dse`` (standard error of
+        the pointwise ELPD difference to the best model, ``sqrt(n var(d_i))``),
+        ``warning`` and, for LOO, ``n_bad_k`` (the number of observations
+        with k-hat above ``good_k``).
     """
     import pandas as pd
 
