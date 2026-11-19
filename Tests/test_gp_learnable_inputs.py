@@ -29,6 +29,7 @@ from BayesianDLL.GP import (
     SparseGP,
     ToeplitzGP,
     WhiteNoise,
+    exact_gp_predictive,
     sparse_gp_predictive,
 )
 
@@ -479,3 +480,17 @@ def test_toeplitz_gp_rejects_learnable_inputs():
             ToeplitzGP("g", Affine("xs", Data("grid", x), scale=spacing), RBF(0.5, 1.0), noise_variance=0.1)
         # Fixed inputs still work.
         ToeplitzGP("ok", Data("xd", x), RBF(0.5, 1.0), noise_variance=0.1)
+
+
+def test_exact_gp_predictive_reads_learnable_inputs_from_the_trace():
+    x, y, _ = _sparse_data()
+    with Model():
+        inputs = RandomParameter("x", Normal(0.0, 1.0), shape=tuple(x.shape), initial_value=x.clone())
+        gp = ExactGP("f", inputs, RBF(0.7, 1.3), noise_variance=0.05)
+    with Model():
+        reference_gp = ExactGP("r", Data("xr", x + 0.3), RBF(0.7, 1.3), noise_variance=0.05)
+    torch.manual_seed(0)
+    shifted = exact_gp_predictive(gp, {"x": (x + 0.3).reshape(1, 1, *x.shape)}, y, x[:3], n_samples=2)
+    torch.manual_seed(0)
+    reference = exact_gp_predictive(reference_gp, {"unused": torch.zeros(1, 1, 1)}, y, x[:3], n_samples=2)
+    torch.testing.assert_close(shifted, reference)

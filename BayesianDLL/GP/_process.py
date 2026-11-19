@@ -24,8 +24,18 @@ What is *not* batched:
   chain-by-chain loop mode with a warning.
 * The predictive functions and ``sample()`` work draw by draw (unbatched),
   except :func:`sparse_latent_gp_predictive`, which batches the draws.
-* Gradients w.r.t. learnable grid inputs of ``KroneckerGP`` /
-  ``ToeplitzGP`` are not implemented (in batched or unbatched mode).
+
+Learnable inputs
+----------------
+Every GP class except ``ToeplitzGP`` accepts learnable training inputs: a
+``RandomParameter`` or ``DeterministicParameter`` passed as ``inputs`` (for
+``KroneckerGP``, as any grid axis) gets hand-derived gradients through the
+kernel's input VJPs and the mean's input VJP, batched over chains like every
+other parameter. Typical uses are GP latent variable models (the inputs are
+latent coordinates with a prior), uncertain or noisy inputs, and input
+warping (inputs computed by deterministic blocks from fixed data). The
+predictive functions read learnable inputs from the trace draw by draw.
+``ToeplitzGP`` needs fixed, equally spaced inputs and raises a ``TypeError``.
 """
 
 from __future__ import annotations
@@ -343,9 +353,9 @@ class LatentGP(DeterministicParameter):
 
     Arguments:
 
-    * ``inputs``: a named node, normally a ``Data`` object, of shape
-      ``(N, D)`` or ``(N,)``; a learnable ``RandomParameter`` /
-      ``DeterministicParameter`` also gets gradients;
+    * ``inputs``: a named node of shape ``(N, D)`` or ``(N,)``: a ``Data``
+      object or a learnable ``RandomParameter`` / ``DeterministicParameter``
+      (see **Learnable inputs** below);
     * ``kernel``: a :class:`Kernel`;
     * ``latent``: a named ``RandomParameter`` with ``N`` values and a
       ``Normal(0, 1)`` prior (default ``None``: created automatically);
@@ -369,6 +379,13 @@ class LatentGP(DeterministicParameter):
     get ``⟨ḡ, ∂m(X)/∂θ⟩`` and learnable inputs also get the mean's input VJP
     ``∂⟨ḡ, m(X)⟩/∂X``. With vectorized chains all of this is batched over the
     chain dimension.
+
+    **Learnable inputs.** Supported: ``inputs`` may be a ``RandomParameter``
+    or ``DeterministicParameter`` (GP latent variable models, uncertain
+    inputs, input warping); it gets the kernel and mean input VJPs above,
+    and :func:`gp_predictive` reads it from the trace. Learnable inputs are supported by :class:`ExactGP`, :class:`LatentGP`,
+    :class:`SparseGP`, :class:`SparseLatentGP` and :class:`~BayesianDLL.GP.KroneckerGP`
+    (per grid axis), not by :class:`~BayesianDLL.GP.ToeplitzGP`.
     """
 
     def __init__(
@@ -575,6 +592,15 @@ class ExactGP(_GPDistribution):
     ``K + σ² I`` and included in the gradients). The observations have
     shape ``(N,)``; ``sample`` draws ``y`` including the noise. Use
     :func:`exact_gp_predictive` for predictions at new inputs.
+
+    **Learnable inputs.** Supported: ``inputs`` may be a ``RandomParameter``
+    or ``DeterministicParameter`` (GP latent variable models, uncertain
+    inputs, input warping). It gets
+    ``kernel.input_vjp_symmetric(X, ½(ααᵀ - Σ⁻¹))`` plus the mean's input VJP
+    of ``α``, and :func:`exact_gp_predictive` reads it from the trace.
+    Learnable inputs are supported by :class:`ExactGP`, :class:`LatentGP`,
+    :class:`SparseGP`, :class:`SparseLatentGP` and :class:`~BayesianDLL.GP.KroneckerGP`
+    (per grid axis), not by :class:`~BayesianDLL.GP.ToeplitzGP`.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=None, jitter=1e-6):
@@ -660,7 +686,7 @@ class ExactGP(_GPDistribution):
             parameter = next(p for p in self.kernel.parameters if p.name == name)
             gradients[name] = _to_parameter_shape(_contract(sensitivity, derivative), _parameter_shape(context, parameter))
         inputs = self.inputs
-        learnable_inputs = isinstance(inputs, (RandomParameter, DeterministicParameter))
+        learnable_inputs = _is_learnable(inputs)
         if learnable_inputs:
             input_gradient = self.kernel.batch_input_vjp_symmetric(x_values, sensitivity, parts["kernel_values"])
             shape = _parameter_shape(context, inputs)
@@ -725,6 +751,22 @@ class SparseGP(_GPDistribution):
     :meth:`log_pdf_param_grads`); the inducing-input gradient uses
     :meth:`Kernel.input_vjp`.
 
+    **Learnable inputs.** Supported: the training ``inputs`` ``X`` may be a
+    ``RandomParameter`` or ``DeterministicParameter`` (GP latent variable
+    models, uncertain inputs, input warping) for every ``method``. ``X`` gets
+    ``kernel.input_vjp(X, Z, G_mnᵀ)``, the diagonal term
+    ``kernel.diag_input_vjp(X, g_nn)`` (VFE and FITC; zero for stationary
+    kernels) and the mean's input VJP of ``α``; :func:`sparse_gp_predictive`
+    reads it from the trace. Learnable inputs are supported by :class:`ExactGP`, :class:`LatentGP`,
+    :class:`SparseGP`, :class:`SparseLatentGP` and :class:`~BayesianDLL.GP.KroneckerGP`
+    (per grid axis), not by :class:`~BayesianDLL.GP.ToeplitzGP`.
+
+    **Independent outputs.** ``n_outputs = R`` models ``R`` independent
+    output dimensions that share ``X``, ``Z``, the kernel, the mean and the
+    noise: the observations have shape ``(R, n)`` and the log density is the
+    sum over the rows, computed with one set of ``m x m`` factors. With
+    learnable ``X`` this is a sparse GP latent variable model.
+
     **Learnable inducing inputs: use VFE.** The VFE bound can only increase
     towards the exact marginal likelihood as ``Z`` improves, so optimizing or
     sampling ``Z`` is safe. DTC and FITC are not bounds: moving ``Z`` can
@@ -738,7 +780,8 @@ class SparseGP(_GPDistribution):
     ``X`` (defaults to ``ZeroMean()``; a number is a ``ConstantMean``),
     ``method`` is ``"vfe"``, ``"dtc"`` or ``"fitc"`` (case
     insensitive) and ``jitter`` (default ``1e-6``) is the relative jitter of
-    the ``K_mm`` Cholesky factor. Use it as the distribution of an
+    the ``K_mm`` Cholesky factor, and ``n_outputs`` (default ``None``: one
+    output, observations of shape ``(n,)``). Use it as the distribution of an
     ``ObservedParameter``::
 
         gp = SparseGP("function", inputs, kernel, inducing_points=Z, noise_variance=noise)
@@ -1131,7 +1174,9 @@ def exact_gp_predictive(
     ``mean = m(X*) + K_*X (K + σ² I)⁻¹ (y - m(X))`` and
     ``cov = K_** - K_*X (K + σ² I)⁻¹ K_X*``, with the mean function ``m``
     evaluated per draw. Every named kernel parameter, the noise variance and
-    every named parameter of the mean function must be in the trace. A given
+    every named parameter of the mean function must be in the trace;
+    learnable training inputs are read from the trace draw by draw (or keep
+    their current value when they are not traced). A given
     ``observation_noise`` variance is added to the diagonal to predict
     noisy observations. The returned tensor has shape
     ``(n_parameter_draws, n_samples, n_new)``.
@@ -1170,11 +1215,15 @@ def exact_gp_predictive(
     parameter_draws = _parameter_draws(trace, gp.kernel.parameters, n_draws, dtype, device)
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
     mean_draws = _parameter_draws(trace, gp.mean.parameters, n_draws, dtype, device)
+    training_shape = training_values.shape
+    training_draws = _draws_of(trace, gp.inputs, n_draws, dtype, device) if _is_learnable(gp.inputs) else None
 
     outputs = []
     for draw_index in range(n_draws):
         kernel_values = _draw(parameter_draws, draw_index)
         mean_values = _draw(mean_draws, draw_index)
+        if training_draws is not None:
+            training_values = training_draws[draw_index if training_draws.shape[0] > 1 else 0].reshape(training_shape)
         covariance = gp.kernel(
             training_values,
             training_values,
@@ -1379,8 +1428,9 @@ class SparseLatentGP(DeterministicParameter):
 
     Arguments:
 
-    * ``inputs``: a named ``Data`` node (or a learnable parameter) of shape
-      ``(n, D)`` or ``(n,)``;
+    * ``inputs``: a named node of shape ``(n, D)`` or ``(n,)``: a ``Data``
+      node or a learnable ``RandomParameter`` / ``DeterministicParameter``
+      (see **Learnable inputs** below);
     * ``inducing_points``: ``(m, D)`` or ``(m,)``; a fixed tensor, a ``Data``
       node, or a learnable ``RandomParameter`` / ``DeterministicParameter``
       (e.g. ``RandomParameter("Z", Normal(Z0, 1.0), initial_value=Z0)``);
@@ -1415,6 +1465,13 @@ class SparseLatentGP(DeterministicParameter):
     With vectorized chains everything is batched over the chain dimension
     (``v`` ``(C, m)``, ``Z`` ``(C, m, D)``, hyperparameters ``(C, ...)``).
     Use :func:`sparse_latent_gp_predictive` for predictions at new inputs.
+
+    **Learnable inputs.** Supported: ``inputs`` may be a ``RandomParameter``
+    or ``DeterministicParameter`` (GP latent variable models, uncertain
+    inputs, input warping); it gets the kernel and mean input VJPs above.
+    Learnable inputs are supported by :class:`ExactGP`, :class:`LatentGP`,
+    :class:`SparseGP`, :class:`SparseLatentGP` and :class:`~BayesianDLL.GP.KroneckerGP`
+    (per grid axis), not by :class:`~BayesianDLL.GP.ToeplitzGP`.
     """
 
     def __init__(

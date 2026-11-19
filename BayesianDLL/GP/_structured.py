@@ -153,14 +153,16 @@ class KroneckerGP(_GPDistribution):
     ``N`` grid points (the factors' features concatenated, in row-major
     order), gets the cotangent ``α`` for its parameters.
 
-    **Learnable grid axes.** Each ``grid_inputs[p]`` may be a
+    **Learnable inputs (grid axes).** Supported: each ``grid_inputs[p]`` may be a
     ``RandomParameter`` or ``DeterministicParameter`` of shape ``(n_p,)`` or
     ``(n_p, D_p)`` (the grid stays a Cartesian product, but its points along
     every axis can move). The axis gets ``kernels[p].input_vjp_symmetric(X_p, G_p)``
     (the same ``G_p`` as the hyperparameters) plus the mean's input VJP of
     ``α`` at the grid points, whose columns of factor ``p`` are summed over
     all other axes. :func:`kronecker_gp_predictive` reads learnable axes from
-    the trace draw by draw.
+    the trace draw by draw. Learnable inputs are supported by ``ExactGP``,
+    ``LatentGP``, ``SparseGP``, ``SparseLatentGP`` and ``KroneckerGP`` (per
+    grid axis), not by :class:`ToeplitzGP`.
 
     ``noise_variance`` is the scalar noise variance ``σ²`` (default
     ``1e-6``), ``mean`` a :class:`~BayesianDLL.GP.MeanFunction` (defaults to
@@ -690,7 +692,7 @@ class ToeplitzGP(_GPDistribution):
     ``spacing_tolerance`` (default ``1e-6``) the relative tolerance of
     the equal-spacing check.
 
-    **Fixed inputs only.** The Toeplitz structure needs fixed, equally
+    **Learnable inputs: not supported.** The Toeplitz structure needs fixed, equally
     spaced inputs, and a learnable spacing would be redundant with the
     kernel's length-scale. ``inputs`` given as a ``RandomParameter`` or
     ``DeterministicParameter`` raises a ``TypeError``; use :class:`ExactGP`
