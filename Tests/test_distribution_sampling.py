@@ -247,3 +247,21 @@ def test_wishart_nuts_recovers_mean():
     trace = model.sample(1000, 500, n_chains=2, progress_bar=False)
     X = trace["X"].reshape(-1, 2, 2)
     torch.testing.assert_close(X.mean(0), 6.0 * S, atol=0.4, rtol=0)
+
+
+@pytest.mark.parametrize("batched_components", [False, True])
+def test_mixture_sample_with_batched_weights(batched_components):
+    """Component frequencies per batch row follow that row's weights (normalised over the last dim)."""
+    torch.manual_seed(0)
+    weights = torch.tensor([[0.1, 0.9], [0.5, 0.5], [0.8, 0.2]], dtype=torch.float64)
+    if batched_components:
+        # Component 0 sits at -100 in rows 0 and 2 and at +100 in row 1.
+        components = [Normal(torch.tensor([-100.0, 100.0, -100.0]), 1.0), Normal(torch.tensor([100.0, -100.0, 100.0]), 1.0)]
+        is_first_negative = torch.tensor([True, False, True])
+    else:
+        components = [Normal(-100.0, 1.0), Normal(100.0, 1.0)]
+        is_first_negative = torch.tensor([True, True, True])
+    draws = Mixture(components, 2 * weights).sample(20000)  # unnormalised weights are normalised per row
+    assert draws.shape == (20000, 3)
+    first = torch.where(is_first_negative, draws < 0, draws > 0).double().mean(0)
+    torch.testing.assert_close(first, weights[:, 0], atol=0.015, rtol=0)

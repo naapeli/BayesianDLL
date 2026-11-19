@@ -45,6 +45,7 @@ from ._process import (
     _finish,
     _input_value,
     _parameter_shape,
+    _prediction_means,
     _resolved_value,
     _to_parameter_shape,
     _trace_draws,
@@ -366,7 +367,7 @@ def _rowwise_contract(rows, tensor):
     return current.reshape(n_new)
 
 
-def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None, diagonal=False):
+def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None, diagonal=False, new_mean=None):
     r"""Sample predictions of a :class:`KroneckerGP` at new points.
 
     ``inputs`` is either a list with one array per grid factor (a new grid,
@@ -383,9 +384,15 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
     ``O(n* N)``) and the draws are independent across points, which is
     enough for pointwise credible bands on large prediction grids. Here
     ``α = (K + σ² I)⁻¹ (y - mean)`` with ``y = observed_values`` (grid
-    shaped or flattened); the kernel parameters, the noise variance and the
-    (scalar) mean are read from ``trace``, and a given ``observation_noise``
-    variance is added to the diagonal. The result has shape
+    shaped or flattened); the kernel parameters, the noise variance and a
+    named mean are read from ``trace``, and a given ``observation_noise``
+    variance is added to the diagonal.
+
+    ``new_mean`` is the mean at the new points (shape ``(n*,)``, or
+    ``(n_parameter_draws, n*)`` for one per draw). A scalar mean is used at
+    the new points when it is omitted; a mean given per grid point cannot
+    be evaluated at new points, so ``new_mean`` is then required
+    (``ValueError`` otherwise). The result has shape
     ``(n_parameter_draws, n_samples, n*)``.
     """
     if not isinstance(gp, KroneckerGP):
@@ -403,17 +410,17 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
         for kernel in gp.kernels for parameter in kernel.parameters
     }
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
-    mean_draws = _trace_draws(trace, gp.mean, n_draws, dtype, device)
+    shape = tuple(x.shape[0] for x in xs)
+    mean_train_draws, mean_new_draws = _prediction_means(
+        _trace_draws(trace, gp.mean, n_draws, dtype, device), new_mean,
+        math.prod(shape), n_new, n_draws, dtype, device, "KroneckerGP",
+    )
 
     outputs = []
     for draw_index in range(n_draws):
         values = {name: draws[draw_index] for name, draws in parameter_draws.items()}
         noise = noise_draws[draw_index].reshape(-1)[0]
-        mean_value = mean_draws[draw_index].reshape(-1)
-        if mean_value.numel() != 1:
-            raise ValueError("kronecker_gp_predictive supports only a scalar mean.")
-        shape = tuple(x.shape[0] for x in xs)
-        residual = observed_values.reshape(shape) - mean_value[0]
+        residual = observed_values.reshape(shape) - mean_train_draws[draw_index].reshape(shape)
         _, eigenvalues, eigenvectors = gp._decompose(xs, values)
         inverse = 1.0 / (_kronecker_eigenvalues(eigenvalues).clamp_min(0.0) + noise + gp.jitter)
         rotated = residual
@@ -422,7 +429,7 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
         scaled = rotated * inverse  # Qᵀ α
         cross = [kernel(x_new, x, parameter_values=values) for kernel, x_new, x in zip(gp.kernels, new, xs)]
         projected = [k @ q for k, q in zip(cross, eigenvectors)]  # U_p
-        predictive_mean = mean_value[0] + _rowwise_contract(projected, scaled)
+        predictive_mean = mean_new_draws[draw_index] + _rowwise_contract(projected, scaled)
         extra = 0.0
         if observation_noise is not None:
             extra = _resolved_value(observation_noise, dtype, device).reshape(-1)[0]
@@ -645,9 +652,16 @@ class ToeplitzGP(_GPDistribution):
     factorisation stays competitive up to one or two thousand points; the
     recursion wins beyond that, and its memory use is ``O(n)`` throughout.
     With vectorized chains the same loop serves all chains.
-    Levinson's recursion is weakly stable for positive-definite matrices;
-    very smooth kernels with a tiny noise variance are ill-conditioned for
-    any solver, and the recursion raises if it breaks down.
+    Levinson's recursion is weakly stable for symmetric positive-definite
+    Toeplitz matrices (Cybenko 1980): its error is of the same order as that
+    of a backward-stable solver of a system with condition number ``κ(T)``,
+    i.e. it grows like ``κ(T) ε``, although a small residual is not
+    guaranteed in general. On RBF-plus-nugget matrices with ``n = 50`` and
+    ``κ = 1e2, 1e6, 1e10`` the relative residual ``‖Tx - y‖ / ‖y‖`` was
+    ``4e-15, 4e-11, 5e-7`` (dense Cholesky: ``4e-15, 4e-11, 3e-7``) and the
+    log determinant agreed with Cholesky's to ``3e-14, 4e-10, 4e-7``. Very
+    smooth kernels with a tiny noise variance are ill-conditioned for any
+    solver, and the recursion raises if it breaks down.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=0.0, jitter=1e-6, spacing_tolerance=1e-6):
@@ -797,16 +811,23 @@ class ToeplitzGP(_GPDistribution):
         return self._mean_vector(x.shape[0], x.dtype, x.device) + draws
 
 
-def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
+def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None, new_mean=None):
     r"""Sample predictions of a :class:`ToeplitzGP` at arbitrary new 1-D inputs.
 
     ``mean = m + K_*X α`` and ``cov = K_** - K_*X T⁻¹ K_X*``, where the solves
     use :func:`levinson_solve` with ``n*`` right-hand sides
     (``O(n² n*)``; no ``n x n`` matrix is formed), ``T = K + σ² I`` plus
     jitter and ``α = T⁻¹ (y - mean)`` with ``y = observed_values``. The
-    kernel parameters, noise variance and (scalar) mean are read from
+    kernel parameters, noise variance and a named mean are read from
     ``trace``; a given ``observation_noise`` variance is added to the
-    diagonal. The result has shape ``(n_parameter_draws, n_samples, n*)``.
+    diagonal.
+
+    ``new_mean`` is the mean at the new inputs (shape ``(n*,)``, or
+    ``(n_parameter_draws, n*)`` for one per draw). A scalar mean is used at
+    the new inputs when it is omitted; a mean given per training input
+    cannot be evaluated at new inputs, so ``new_mean`` is then required
+    (``ValueError`` otherwise). The result has shape
+    ``(n_parameter_draws, n_samples, n*)``.
     """
     from ._process import stable_cholesky
     if not isinstance(gp, ToeplitzGP):
@@ -822,19 +843,19 @@ def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obse
     n_draws = _draw_count(trace)
     parameter_draws = {p.name: _trace_draws(trace, p, n_draws, dtype, device) for p in gp.kernel.parameters}
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
-    mean_draws = _trace_draws(trace, gp.mean, n_draws, dtype, device)
+    mean_train_draws, mean_new_draws = _prediction_means(
+        _trace_draws(trace, gp.mean, n_draws, dtype, device), new_mean,
+        n, n_new, n_draws, dtype, device, "ToeplitzGP",
+    )
     outputs = []
     for draw_index in range(n_draws):
         values = {name: draws[draw_index] for name, draws in parameter_draws.items()}
         noise = noise_draws[draw_index].reshape(-1)[0]
-        mean_value = mean_draws[draw_index].reshape(-1)
-        if mean_value.numel() != 1:
-            raise ValueError("toeplitz_gp_predictive supports only a scalar mean.")
         column, _ = gp._first_column(x, values, noise)
         cross = gp.kernel(x, new, parameter_values=values)  # (n, n*)
-        rhs = torch.cat([(observed_values - mean_value[0]).reshape(n, 1), cross], dim=1)
+        rhs = torch.cat([(observed_values - mean_train_draws[draw_index]).reshape(n, 1), cross], dim=1)
         solution, _ = levinson_solve(column, rhs)
-        predictive_mean = mean_value[0] + cross.transpose(-2, -1) @ solution[:, 0]
+        predictive_mean = mean_new_draws[draw_index] + cross.transpose(-2, -1) @ solution[:, 0]
         covariance = gp.kernel(new, new, parameter_values=values) - cross.transpose(-2, -1) @ solution[:, 1:]
         if observation_noise is not None:
             covariance = covariance + _resolved_value(observation_noise, dtype, device).reshape(-1)[0] * torch.eye(n_new, dtype=dtype, device=device)

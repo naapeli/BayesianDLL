@@ -350,3 +350,37 @@ def test_bbvi_guide_and_auto_normal_reach_the_same_optimum(normal_model):
     assert hand_scale == pytest.approx(math.sqrt(4 / 13), abs=0.05)
     assert hand_loc == pytest.approx(auto_loc, abs=0.05)
     assert hand_scale == pytest.approx(auto_scale, abs=0.05)
+
+
+def test_guide_mixture_registers_component_variational_parameters():
+    """A Mixture in a guide exposes its components' VariationalParameters and gets an ELBO gradient for them."""
+    from BayesianDLL.Distributions import Mixture
+
+    with Model() as model:
+        RandomParameter("x", Normal(0.0, 1.0))
+    m1 = VariationalParameter("m1", torch.tensor(-1.0, dtype=torch.float64))
+    m2 = VariationalParameter("m2", torch.tensor(1.5, dtype=torch.float64))
+    with Guide() as guide:
+        RandomParameter("x", Mixture([Normal(m1, 1.0), Normal(m2, 1.0)], torch.tensor([0.4, 0.6], dtype=torch.float64)))
+    assert set(guide.variational_parameters()) == {"x_m1", "x_m2"}
+    assert not Mixture.has_rsample  # score-function path
+
+    # Oracle: the exact ELBO by quadrature, differentiated by central differences.
+    grid = torch.linspace(-15, 15, 30001, dtype=torch.float64)
+
+    def exact_elbo(a, b):
+        log_q = torch.logsumexp(torch.stack([
+            math.log(0.4) - 0.5 * (grid - a) ** 2, math.log(0.6) - 0.5 * (grid - b) ** 2,
+        ]), 0) - 0.5 * math.log(2 * math.pi)
+        log_p = -0.5 * grid ** 2 - 0.5 * math.log(2 * math.pi)
+        return torch.trapezoid(log_q.exp() * (log_p - log_q), grid)
+
+    h = 1e-4
+    expected = torch.stack([
+        (exact_elbo(-1.0 + h, 1.5) - exact_elbo(-1.0 - h, 1.5)) / (2 * h),
+        (exact_elbo(-1.0, 1.5 + h) - exact_elbo(-1.0, 1.5 - h)) / (2 * h),
+    ])
+    torch.manual_seed(0)
+    _, grads = elbo(model, guide, n_samples=4000)
+    actual = torch.stack([grads["x_m1"], grads["x_m2"]]).reshape(2)
+    torch.testing.assert_close(actual, expected.to(actual.dtype), atol=0.1, rtol=0)

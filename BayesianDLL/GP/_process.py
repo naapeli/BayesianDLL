@@ -916,48 +916,64 @@ class SparseGP(_GPDistribution):
         return mean + first + second
 
 
-def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
+def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None, new_mean=None):
     """Sample latent GP values at new inputs from posterior latent traces.
 
     ``gp`` is a :class:`LatentGP`. ``trace`` may be a ``SamplingResult`` or
     a mapping with values of shape ``(n_chains, n_draws, *shape)``
-    containing the GP's deterministic trace (``trace[gp.name]``) and the
-    kernel-parameter traces (a kernel parameter missing from the trace keeps
-    its current value). For every draw ``f`` the function at ``inputs`` is
-    drawn ``n_samples`` times from the noise-free GP conditional
+    containing the GP's deterministic trace (``trace[gp.name]``). Kernel
+    parameters, a learned (named) ``gp_mean`` and learnable training inputs
+    are read from the trace draw by draw; a node missing from the trace
+    keeps its current value. For every draw ``f`` the function at ``inputs``
+    is drawn ``n_samples`` times from the noise-free GP conditional
     ``N(m* + K_*X K⁻¹ (f - m), K_** - K_*X K⁻¹ K_X*)``; a given
-    ``observation_noise`` variance is added to the diagonal. The mean is
-    the node's current ``gp_mean`` value (it is not read from the trace).
+    ``observation_noise`` variance is added to the diagonal.
+
+    ``new_mean`` is the mean ``m*`` at the new inputs (shape ``(n_new,)``,
+    or ``(n_parameter_draws, n_new)`` for one per draw). A scalar mean is
+    used at the new inputs when it is omitted; a mean given per training
+    input (a vector or vector-valued node) cannot be evaluated at new
+    inputs, so ``new_mean`` is then required (``ValueError`` otherwise).
     The result has shape ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not hasattr(gp, "gp_kernel"):
         raise TypeError("gp must be a LatentGP function returned by BayesianDLL.GP.LatentGP.")
     if not hasattr(trace, "__getitem__"):
         raise TypeError("trace must be a SamplingResult or mapping-like object.")
-
-    function_trace = trace[gp.name]
-    latent_draws = function_trace.reshape(-1, function_trace.shape[-1])
-    training_values = _input_value(gp.gp_inputs).to(dtype=latent_draws.dtype, device=latent_draws.device)
-    new_values = _input_value(inputs).to(dtype=latent_draws.dtype, device=latent_draws.device)
-    total_draws = latent_draws.shape[0]
     if n_samples < 1:
         raise ValueError("n_samples must be at least 1.")
 
+    function_trace = torch.as_tensor(trace[gp.name])
+    latent_draws = function_trace.reshape(-1, function_trace.shape[-1])
+    dtype, device = latent_draws.dtype, latent_draws.device
+    total_draws = latent_draws.shape[0]
+    training_shape = _input_value(gp.gp_inputs).shape
+    training_draws = _draws_of(trace, gp.gp_inputs, total_draws, dtype, device)
+    new_values = _input_value(inputs).to(dtype=dtype, device=device)
+    n_new = new_values.shape[0] if new_values.ndim > 0 else 1
+    mean_train, mean_new = _prediction_means(
+        _draws_of(trace, gp.gp_mean, total_draws, dtype, device), new_mean,
+        _feature_count(gp.gp_inputs), n_new, total_draws, dtype, device, "LatentGP",
+    )
+    kernel_draws = {
+        parameter.name: _draws_of(trace, parameter, total_draws, dtype, device)
+        for parameter in gp.gp_kernel.parameters
+    }
+
     outputs = []
     for draw_index in range(total_draws):
-        parameter_values = {}
-        for parameter in gp.gp_kernel.parameters:
-            if parameter.name in trace:
-                values = trace[parameter.name].reshape(-1, *trace[parameter.name].shape[2:])
-                parameter_values[parameter.name] = values[draw_index]
+        parameter_values = {
+            name: draws[draw_index if draws.shape[0] > 1 else 0] for name, draws in kernel_draws.items()
+        }
+        training_values = training_draws[draw_index if training_draws.shape[0] > 1 else 0].reshape(training_shape)
 
         covariance = gp.gp_kernel(training_values, training_values, parameter_values=parameter_values)
         cross_covariance = gp.gp_kernel(training_values, new_values, parameter_values=parameter_values)
         new_covariance = gp.gp_kernel(new_values, new_values, parameter_values=parameter_values)
         factor = stable_cholesky(covariance, jitter=gp.gp_jitter)
-        residual = latent_draws[draw_index] - _mean_value(gp.gp_mean, training_values)
+        residual = latent_draws[draw_index] - mean_train[draw_index]
         alpha = torch.cholesky_solve(residual.reshape(-1, 1), factor).reshape(-1)
-        predictive_mean = _mean_value(gp.gp_mean, new_values) + cross_covariance.transpose(-2, -1) @ alpha
+        predictive_mean = mean_new[draw_index] + cross_covariance.transpose(-2, -1) @ alpha
         conditional_covariance = new_covariance - cross_covariance.transpose(-2, -1) @ torch.cholesky_solve(cross_covariance, factor)
         conditional_covariance = (conditional_covariance + conditional_covariance.transpose(-2, -1)) / 2
         if observation_noise is not None:
@@ -995,6 +1011,45 @@ def _trace_draws(trace, parameter, n_draws, dtype, device):
     return value.expand(n_draws, *value.shape[1:])
 
 
+def _prediction_means(mean_draws, new_mean, n_training, n_new, n_draws, dtype, device, what):
+    """Per-draw means ``(n_draws, n_training)`` at the training and ``(n_draws, n_new)`` at the new inputs.
+
+    ``mean_draws`` has shape ``(n_draws or 1, *mean_shape)``. A scalar mean
+    (a number or a named scalar node) is used at the new inputs as well. A
+    mean given per training input (a vector or a vector-valued node) cannot
+    be evaluated at new inputs: the mean there must then be passed as
+    ``new_mean`` (shape ``(n_new,)``, or ``(n_draws, n_new)`` for one per
+    draw), whatever the number of new inputs. A given ``new_mean`` is also
+    used with a scalar mean.
+    """
+    flat = torch.as_tensor(mean_draws).to(dtype=dtype, device=device)
+    flat = flat.reshape(flat.shape[0], -1)
+    if flat.shape[0] not in (1, n_draws):
+        raise ValueError(f"The trace of the {what} mean has {flat.shape[0]} draws; expected {n_draws}.")
+    if flat.shape[1] == 1:
+        mean_train = flat.expand(n_draws, n_training)
+        if new_mean is None:
+            return mean_train, flat.expand(n_draws, n_new)
+    elif flat.shape[1] == n_training:
+        mean_train = flat.expand(n_draws, n_training)
+        if new_mean is None:
+            raise ValueError(
+                f"The {what} mean is given per training input and cannot be evaluated at the new inputs; "
+                f"pass new_mean= (the mean at the {n_new} new inputs, shape (n_new,) or (n_draws, n_new))."
+            )
+    else:
+        raise ValueError(
+            f"The {what} mean must be scalar or contain one value per training input ({n_training}); got {flat.shape[1]} values."
+        )
+    value = _input_value(new_mean) if _is_named(new_mean) else _as_tensor(new_mean)
+    value = torch.as_tensor(value).to(dtype=dtype, device=device)
+    if value.numel() == 1:
+        return mean_train, value.reshape(1, 1).expand(n_draws, n_new)
+    if value.shape[-1] != n_new or value.reshape(-1, n_new).shape[0] not in (1, n_draws):
+        raise ValueError(f"new_mean must have shape ({n_new},) or ({n_draws}, {n_new}); got {tuple(value.shape)}.")
+    return mean_train, value.reshape(-1, n_new).expand(n_draws, n_new)
+
+
 def exact_gp_predictive(
     gp,
     trace,
@@ -1002,6 +1057,7 @@ def exact_gp_predictive(
     inputs,
     n_samples=1,
     observation_noise=None,
+    new_mean=None,
 ):
     """Sample exact-GP predictions conditional on observed training values.
 
@@ -1014,7 +1070,15 @@ def exact_gp_predictive(
     ``cov = K_** - K_*X (K + σ² I)⁻¹ K_X*``. Every named kernel parameter,
     the noise variance and the mean must be in the trace. A given
     ``observation_noise`` variance is added to the diagonal to predict
-    noisy observations. The returned tensor has shape
+    noisy observations.
+
+    ``new_mean`` is the mean ``m*`` at the new inputs (shape ``(n_new,)``,
+    or ``(n_parameter_draws, n_new)`` for one per draw). A scalar mean is
+    used at the new inputs when it is omitted; a mean given per training
+    input (a vector or vector-valued node) cannot be evaluated at new
+    inputs, so ``new_mean`` is then required (``ValueError`` otherwise,
+    even when the number of new inputs equals the number of training
+    inputs). The returned tensor has shape
     ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not isinstance(gp, ExactGP):
@@ -1054,7 +1118,10 @@ def exact_gp_predictive(
         if _is_named(parameter)
     }
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
-    mean_draws = _trace_draws(trace, gp.mean, n_draws, dtype, device)
+    mean_train_draws, mean_new_draws = _prediction_means(
+        _trace_draws(trace, gp.mean, n_draws, dtype, device), new_mean,
+        n_training, new_values.shape[0], n_draws, dtype, device, "ExactGP",
+    )
 
     outputs = []
     for draw_index in range(n_draws):
@@ -1085,16 +1152,8 @@ def exact_gp_predictive(
             covariance + noise[0] * torch.eye(n_training, dtype=dtype, device=device),
             jitter=gp.jitter,
         )
-        mean_train = mean_draws[draw_index].reshape(-1)
-        if mean_train.numel() == 1:
-            mean_train = mean_train.expand(n_training)
-        mean_new = mean_train.new_zeros(new_values.shape[0])
-        if mean_draws[draw_index].numel() == 1:
-            mean_new = mean_draws[draw_index].reshape(()).expand(new_values.shape[0])
-        elif mean_draws[draw_index].numel() == new_values.shape[0]:
-            mean_new = mean_draws[draw_index].reshape(-1)
-        else:
-            raise ValueError("Exact GP mean must be scalar or match prediction inputs.")
+        mean_train = mean_train_draws[draw_index]
+        mean_new = mean_new_draws[draw_index]
 
         alpha = torch.cholesky_solve(
             (observed_values - mean_train).reshape(-1, 1),
@@ -1129,6 +1188,7 @@ def sparse_gp_predictive(
     inputs,
     n_samples=1,
     observation_noise=None,
+    new_mean=None,
 ):
     r"""Sample sparse-GP predictions conditional on observed training values.
 
@@ -1142,10 +1202,16 @@ def sparse_gp_predictive(
 
     Here ``r = y - mean`` with ``y = observed_values``. All solves use
     ``m x m`` Cholesky factors, so the cost is linear in the number of
-    training points. Kernel parameters, the noise variance and the (scalar)
+    training points. Kernel parameters, the noise variance and a named
     mean must be in ``trace``; learnable inducing inputs are read from the
     trace draw by draw. A given ``observation_noise`` variance is added to
-    the diagonal. The result has shape
+    the diagonal.
+
+    ``new_mean`` is the mean at the new inputs (shape ``(n_new,)``, or
+    ``(n_parameter_draws, n_new)`` for one per draw). A scalar mean is used
+    at the new inputs when it is omitted; a mean given per training input
+    cannot be evaluated at new inputs, so ``new_mean`` is then required
+    (``ValueError`` otherwise). The result has shape
     ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not isinstance(gp, SparseGP):
@@ -1179,7 +1245,10 @@ def sparse_gp_predictive(
         if _is_named(parameter)
     }
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
-    mean_draws = _trace_draws(trace, gp.mean, n_draws, dtype, device)
+    mean_train_draws, mean_new_draws = _prediction_means(
+        _trace_draws(trace, gp.mean, n_draws, dtype, device), new_mean,
+        n_training, n_new, n_draws, dtype, device, "SparseGP",
+    )
     eye_m = torch.eye(_feature_count(inducing_values), dtype=dtype, device=device)
     learnable_inducing = _is_named(gp.inducing_points) and not isinstance(gp.inducing_points, Data)
     if learnable_inducing:
@@ -1193,11 +1262,8 @@ def sparse_gp_predictive(
         noise = noise_draws[draw_index].reshape(-1)
         if noise.numel() != 1:
             raise ValueError("Sparse GP noise_variance must be scalar.")
-        mean_value = mean_draws[draw_index].reshape(-1)
-        if mean_value.numel() != 1:
-            raise ValueError("sparse_gp_predictive supports only a scalar mean.")
-        mean_train = mean_value.reshape(()).expand(n_training)
-        mean_new = mean_value.reshape(()).expand(n_new)
+        mean_train = mean_train_draws[draw_index]
+        mean_new = mean_new_draws[draw_index]
 
         k_mm = gp.kernel(inducing_values, inducing_values, parameter_values=kernel_values)
         k_mn = gp.kernel(inducing_values, training_values, parameter_values=kernel_values)
@@ -1472,7 +1538,7 @@ def _draws_of(trace, node, n_draws, dtype, device):
     return torch.as_tensor(value).to(dtype=dtype, device=device).unsqueeze(0)
 
 
-def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_variance=False, chunk_size=64):
+def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_variance=False, chunk_size=64, new_mean=None):
     r"""Values of a :class:`SparseLatentGP` at new inputs for every draw of ``trace``.
 
     Under the DTC approximation the function is deterministic given the
@@ -1489,7 +1555,13 @@ def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_
     contain the whitened values; learnable inducing inputs, kernel
     parameters and a named mean are read from it as well (a node missing
     from the trace keeps its current value). Draws are evaluated in batches
-    of ``chunk_size`` (default ``64``) with the batched kernel API. The result has shape
+    of ``chunk_size`` (default ``64``) with the batched kernel API.
+
+    ``new_mean`` is the mean at the new inputs (shape ``(n_new,)``, or
+    ``(n_parameter_draws, n_new)`` for one per draw). A scalar mean is used
+    at the new inputs when it is omitted; a mean given per training input
+    cannot be evaluated at new inputs, so ``new_mean`` is then required
+    (``ValueError`` otherwise). The result has shape
     ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not isinstance(gp, SparseLatentGP):
@@ -1509,10 +1581,10 @@ def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_
     new = torch.as_tensor(_input_value(new_inputs)).to(dtype=dtype, device=device)
     new = (new.reshape(-1, 1) if new.ndim <= 1 else new).unsqueeze(0)
     kernel_draws = {p.name: _draws_of(trace, p, n_draws, dtype, device) for p in gp.gp_kernel.parameters}
-    mean = _draws_of(trace, gp.gp_mean, n_draws, dtype, device)
-    mean = mean.reshape(mean.shape[0], -1)
-    if mean.shape[-1] != 1:
-        raise ValueError("sparse_latent_gp_predictive supports only a scalar mean.")
+    _, mean = _prediction_means(
+        _draws_of(trace, gp.gp_mean, n_draws, dtype, device), new_mean,
+        _feature_count(gp.gp_inputs), new.shape[1], n_draws, dtype, device, "SparseLatentGP",
+    )
 
     def take(tensor, start, stop):
         return tensor if tensor.shape[0] == 1 else tensor[start:stop]

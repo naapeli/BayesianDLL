@@ -29,6 +29,9 @@ def test_linear_regression_supports_design_matrices_and_weights():
 
     torch.testing.assert_close(mean.constrained_value, design @ weights + 1.0)
     assert mean.derivatives() == {}
+    # The coefficients are only exposed as ``coefficients`` (no ``weights``/``slope`` aliases).
+    assert mean.coefficients is weights
+    assert not hasattr(mean, "weights") and not hasattr(mean, "slope")
 
 
 def test_exponential_transform_has_matching_derivative():

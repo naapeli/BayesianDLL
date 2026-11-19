@@ -173,8 +173,6 @@ class Linear(DeterministicParameter):
         super().__init__(name, forward, derivative, named_inputs, vjp_func=vjp)
         self.regression_inputs = inputs
         self.coefficients = coefficients
-        self.weights = coefficients
-        self.slope = coefficients
         self.intercept = intercept
 
     # ------------------------------------------------------------ batching

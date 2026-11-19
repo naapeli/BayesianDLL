@@ -577,3 +577,91 @@ def test_structured_gps_follow_model_to_float32():
     for name, gradient in gradients.items():
         assert gradient.dtype == torch.float32
         torch.testing.assert_close(gradient.double(), reference[name], rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("structure", ["toeplitz", "kronecker"])
+def test_structured_gp_predictive_vector_mean_needs_new_mean(structure):
+    """A mean given per training input is never reused at new inputs, even when the counts match."""
+    x = torch.linspace(0.0, 1.0, 6, dtype=DTYPE)
+    y = torch.sin(5 * x)
+    train_mean = torch.linspace(1.0, 2.0, 6, dtype=DTYPE)
+    new = torch.linspace(0.05, 1.4, 6, dtype=DTYPE)  # n_new == n_train
+    new_mean = torch.linspace(-1.0, 0.5, 6, dtype=DTYPE)
+    trace = {"noise": torch.tensor([[[0.1], [0.2]]], dtype=DTYPE)}
+
+    def build(mean):
+        with Model():
+            noise = RandomParameter("noise", Normal(0.1, 1.0), initial_value=torch.tensor([0.1], dtype=DTYPE))
+            if structure == "toeplitz":
+                gp = ToeplitzGP("f", Data("x", x), RBF(0.4, 1.3), noise_variance=noise, mean=mean)
+            else:
+                gp = KroneckerGP("f", [Data("x", x)], [RBF(0.4, 1.3)], noise_variance=noise, mean=mean)
+        return gp
+
+    predictive = toeplitz_gp_predictive if structure == "toeplitz" else kronecker_gp_predictive
+    points = new if structure == "toeplitz" else new.reshape(-1, 1)
+    with pytest.raises(ValueError, match="new_mean"):
+        predictive(build(train_mean), trace, y, points)
+    torch.manual_seed(0)
+    actual = predictive(build(train_mean), trace, y, points, n_samples=2, new_mean=new_mean)
+    torch.manual_seed(0)
+    expected = predictive(build(0.0), trace, y - train_mean, points, n_samples=2) + new_mean
+    torch.testing.assert_close(actual, expected)
+
+
+def _toeplitz_column(kind, n=50):
+    lags = torch.arange(n, dtype=DTYPE)
+    nugget = (lags == 0).to(DTYPE)
+    if kind == "exponential":
+        return 1.3 * torch.exp(-lags / 4.0) + 0.2 * nugget
+    if kind == "rbf":
+        return torch.exp(-0.5 * (lags / 3.0) ** 2) + 1e-2 * nugget
+    if kind == "matern52":
+        scaled = 5 ** 0.5 * lags / 5.0
+        return (1 + scaled + scaled ** 2 / 3) * torch.exp(-scaled) + 1e-3 * nugget
+    # quasi-periodic: periodic times RBF
+    return torch.exp(-2 * torch.sin(torch.pi * lags / 12) ** 2 / 0.8 ** 2 - 0.5 * (lags / 20) ** 2) + 0.05 * nugget
+
+
+def _dense_toeplitz(column):
+    lags = torch.arange(column.shape[-1])
+    return column[(lags[:, None] - lags[None, :]).abs()]
+
+
+@pytest.mark.parametrize("kind", ["exponential", "rbf", "matern52", "quasi_periodic"])
+def test_gohberg_semencul_diagonal_sums_match_dense_inverse(kind):
+    """D_k = Σ_i (T⁻¹)_{i+k,i} from the first column of T⁻¹ matches a dense inverse (n = 50, κ up to 1e4)."""
+    from BayesianDLL.GP._structured import _toeplitz_inverse_diagonal_sums
+
+    column = _toeplitz_column(kind)
+    n = column.shape[0]
+    inverse = torch.linalg.inv(_dense_toeplitz(column))
+    expected = torch.stack([torch.diagonal(inverse, offset=-k).sum() for k in range(n)])
+    first_column, _ = levinson_solve(column, torch.eye(n, dtype=DTYPE)[:, 0])
+    actual = _toeplitz_inverse_diagonal_sums(first_column)
+    # Measured: max error <= 1e-13 relative to the largest sum.
+    assert (actual - expected).abs().max() <= 1e-10 * expected.abs().max()
+
+
+@pytest.mark.parametrize("condition", [1e2, 1e6, 1e10])
+def test_levinson_accuracy_against_cholesky(condition):
+    """Residual and log det of the Levinson solve against a dense Cholesky (RBF plus nugget, n = 50)."""
+    n = 50
+    lags = torch.arange(n, dtype=DTYPE)
+    base = torch.exp(-0.5 * (lags / 5.0) ** 2)
+    column = base.clone()
+    column[0] += torch.linalg.eigvalsh(_dense_toeplitz(base)).max() / condition
+    matrix = _dense_toeplitz(column)
+    assert torch.linalg.cond(matrix).item() == pytest.approx(condition, rel=0.05)
+    rhs = torch.randn(n, generator=torch.Generator().manual_seed(0), dtype=DTYPE)
+    solution, log_det = levinson_solve(column, rhs)
+    factor = torch.linalg.cholesky(matrix)
+    cholesky_solution = torch.cholesky_solve(rhs.reshape(-1, 1), factor).reshape(-1)
+    residual = torch.linalg.norm(matrix @ solution - rhs) / torch.linalg.norm(rhs)
+    cholesky_residual = torch.linalg.norm(matrix @ cholesky_solution - rhs) / torch.linalg.norm(rhs)
+    eps = torch.finfo(DTYPE).eps
+    # Measured residuals 4e-15, 4e-11, 5e-7 (Cholesky: 4e-15, 4e-11, 3e-7): about κ ε, like Cholesky.
+    assert residual <= 10 * eps * condition
+    assert residual <= 10 * cholesky_residual
+    # Measured |Δ log det| 3e-14, 4e-10, 4e-7.
+    assert abs(log_det - 2 * torch.log(torch.diagonal(factor)).sum()) <= 10 * eps * condition

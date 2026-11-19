@@ -2330,23 +2330,32 @@ class Mixture(Distribution):
     """Finite mixture ``p(x) = sum_k weights_k p_k(x)`` of ``components``.
 
     ``components`` is a list of distributions with a common event shape;
-    ``weights`` (shape ``(K,)``, last dimension = number of components) are
-    the mixture probabilities and must sum to one (``log_pdf`` does not
-    normalise them). ``log_pdf_param_grads`` returns ``p_k(x) / p(x)`` for
-    the weights and the posterior-responsibility-weighted component
-    gradients for the component parameters.
+    ``weights`` (shape ``(..., K)``, last dimension = number of components,
+    leading dimensions batch dimensions) are the mixture probabilities and
+    must sum to one over the last dimension (``log_pdf`` does not normalise
+    them; ``sample`` does). Variational parameters of the components are
+    registered on the mixture, so a mixture can be used inside a guide (it
+    has no reparameterised sampler, so BBVI uses score-function gradients).
+    ``log_pdf_param_grads`` returns ``p_k(x) / p(x)`` for the weights and
+    the posterior-responsibility-weighted component gradients for the
+    component parameters.
     """
 
     _param_event_ndims = {"weights": 1}
 
     def __init__(self, components, weights):
-        super().__init__(IdentityTransform(), Union(*[component.state_space for component in components]), Union(*[component.transformed_state_space for component in components]))
+        if components and all(isinstance(component.state_space, ContinuousReal) for component in components):
+            # A mixture of real-line components lives on the real line (so it can, e.g., be a guide family).
+            state_space, transformed_state_space = ContinuousReal(), ContinuousReal()
+        else:
+            state_space = Union(*[component.state_space for component in components])
+            transformed_state_space = Union(*[component.transformed_state_space for component in components])
+        super().__init__(IdentityTransform(), state_space, transformed_state_space)
         self.components = components
         self.weights = weights
         self.add_dependency(weights)
         for component in components:
-            for param in component.parameters:
-                self.parameters.add(param)
+            self._add_dependencies_of(component)
 
     @property
     def event_shape(self):
@@ -2355,9 +2364,8 @@ class Mixture(Distribution):
     @property
     def batch_shape(self):
         shapes = [c.batch_shape for c in self.components]
-        if shapes:
-            return torch.broadcast_shapes(*shapes)
-        return ()
+        shapes.append(self._weights().shape[:-1])
+        return torch.broadcast_shapes(*shapes)
 
     def _weights(self):
         weights = resolve(self.weights)
@@ -2426,8 +2434,9 @@ class Mixture(Distribution):
             return s.reshape(n_samples, *([1] * missing), *s.shape[1:]).expand(shape)
         draws = torch.stack([_draw(c) for c in self.components], dim=0)  # (K, *shape)
         index_shape = (n_samples, *self.batch_shape)
-        probs = weights.to(draws.dtype) / weights.sum()
-        cdf = torch.cumsum(probs, dim=0)
+        weights = weights.to(dtype=draws.dtype, device=draws.device)
+        probs = weights / weights.sum(-1, keepdim=True)
+        cdf = torch.cumsum(probs, dim=-1)  # (*weight_batch, K), broadcasts against index_shape
         u = torch.rand((*index_shape, 1), dtype=draws.dtype, device=draws.device)
         idx = (cdf < u).sum(-1).clamp(max=len(self.components) - 1)
         idx = idx.reshape(1, *index_shape, *([1] * len(self.event_shape))).expand(1, *shape)

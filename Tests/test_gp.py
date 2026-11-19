@@ -774,7 +774,7 @@ def test_sparse_gp_nuts_and_predictive():
 # ----------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("nu", [0.3, 0.8, 1.0, 2.0, 3.7])
+@pytest.mark.parametrize("nu", [0.3, 0.8, 1.0, 1.7, 2.0, 3.2, 3.7])
 def test_power_bessel_k_matches_scipy(nu):
     from scipy.special import kv
 
@@ -784,7 +784,7 @@ def test_power_bessel_k_matches_scipy(nu):
     for order in (nu, nu - 1.0):
         expected = a ** nu * torch.as_tensor(kv(order, a.numpy()), dtype=torch.float64)
         actual = _power_bessel_k(nu, order, a)
-        torch.testing.assert_close(actual, expected, rtol=1e-8, atol=0.0)
+        torch.testing.assert_close(actual, expected, rtol=1e-12, atol=0.0)  # measured: <= 1.2e-13
 
 
 def _scipy_matern(x1, x2, lengthscale, variance, nu):
@@ -873,3 +873,89 @@ def test_exact_gp_with_rational_quadratic_matches_finite_differences():
         kernel = RationalQuadratic(lengthscale, 1.2, alpha)
         ObservedParameter("observations", ExactGP("function", inputs, kernel, noise_variance=noise), y)
     _finite_difference_check(model)
+
+
+def test_gp_predictive_reads_learned_mean_and_inputs_from_the_trace():
+    """Per-draw gp_mean and learnable inputs come from the trace, not the nodes' current values."""
+    dtype = torch.float64
+    x0 = torch.linspace(0.0, 1.0, 4, dtype=dtype)
+    with Model() as model:
+        inputs = RandomParameter("x_in", Normal(x0, 0.1), shape=4, initial_value=x0.clone())
+        offset = RandomParameter("offset", Normal(0.0, 1.0), initial_value=torch.tensor([0.0], dtype=dtype))
+        latent = LatentGP("function", inputs, RBF(0.4, 1.0), mean=offset, jitter=1e-10)
+        ObservedParameter("observations", Normal(latent, 0.3), torch.sin(6 * x0))
+    generator = torch.Generator().manual_seed(0)
+    traced_inputs = x0 + 0.3  # one set of inputs, different from the nodes' current value
+    draws = {"function": [], "x_in": [], "offset": []}
+    for mean in (-2.0, 0.5, 3.0):
+        inputs.set_constrained_value(traced_inputs.clone())
+        offset.set_constrained_value(torch.tensor([mean], dtype=dtype))
+        white = model.params["function_white"]
+        white.set_unconstrained_value(torch.randn(white.unconstrained_value.shape, generator=generator, dtype=dtype))
+        for name, node in (("function", latent), ("x_in", inputs), ("offset", offset)):
+            draws[name].append(node.constrained_value.clone())
+    trace = {name: torch.stack(values).unsqueeze(0) for name, values in draws.items()}
+    inputs.set_constrained_value(x0.clone())
+    offset.set_constrained_value(torch.tensor([0.0], dtype=dtype))
+
+    torch.manual_seed(0)
+    predictions = gp_predictive(latent, trace, traced_inputs, n_samples=2)
+    assert predictions.shape == (3, 2, 4)
+    for sample in range(2):
+        torch.testing.assert_close(predictions[:, sample], trace["function"][0], atol=1e-4, rtol=0)
+
+
+def _exact_gp_with_mean(mean):
+    x = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    with Model():
+        noise = RandomParameter("noise", Uniform(0.01, 0.5), initial_value=torch.tensor([0.1], dtype=torch.float64))
+        gp = ExactGP("function", Data("inputs", x), RBF(0.4, 1.3), noise_variance=noise, mean=mean)
+    return gp
+
+
+def test_exact_gp_predictive_vector_mean_needs_new_mean():
+    y = torch.tensor([0.3, -0.2, 0.8, 1.1], dtype=torch.float64)
+    train_mean = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
+    new_inputs = torch.linspace(0.1, 1.3, 4, dtype=torch.float64)  # as many new inputs as training inputs
+    new_mean = torch.tensor([-1.0, 0.0, 1.0, 5.0], dtype=torch.float64)
+    trace = {"noise": torch.tensor([[[0.1], [0.2]]], dtype=torch.float64)}
+    vector = _exact_gp_with_mean(train_mean)
+    with pytest.raises(ValueError, match="new_mean"):
+        exact_gp_predictive(vector, trace, y, new_inputs)
+
+    # Reference: a zero-mean GP on the centred observations, shifted by the mean at the new inputs.
+    zero = _exact_gp_with_mean(0.0)
+    torch.manual_seed(1)
+    actual = exact_gp_predictive(vector, trace, y, new_inputs, n_samples=3, new_mean=new_mean)
+    torch.manual_seed(1)
+    expected = exact_gp_predictive(zero, trace, y - train_mean, new_inputs, n_samples=3) + new_mean
+    torch.testing.assert_close(actual, expected)
+
+    # A scalar mean is still used at the new inputs.
+    scalar = _exact_gp_with_mean(2.5)
+    torch.manual_seed(1)
+    actual = exact_gp_predictive(scalar, trace, y, new_inputs, n_samples=3)
+    torch.manual_seed(1)
+    expected = exact_gp_predictive(zero, trace, y - 2.5, new_inputs, n_samples=3) + 2.5
+    torch.testing.assert_close(actual, expected)
+
+
+def test_latent_and_sparse_gp_predictive_vector_mean_needs_new_mean():
+    x = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    y = torch.sin(6 * x)
+    train_mean = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
+    with Model():
+        noise = RandomParameter("noise", Uniform(0.01, 0.5), initial_value=torch.tensor([0.1], dtype=torch.float64))
+        inputs = Data("inputs", x)
+        sparse = SparseGP("sparse", inputs, RBF(0.4, 1.3), x[:2].clone(), noise_variance=noise, mean=train_mean)
+        latent = LatentGP("latent", inputs, RBF(0.4, 1.3), mean=train_mean, jitter=1e-10)
+    trace = {"noise": torch.tensor([[[0.1]]], dtype=torch.float64), "latent": train_mean.reshape(1, 1, 4)}
+    with pytest.raises(ValueError, match="new_mean"):
+        sparse_gp_predictive(sparse, trace, y, x)
+    with pytest.raises(ValueError, match="new_mean"):
+        gp_predictive(latent, trace, x)
+    # The traced function equals the training mean, so at the training inputs the prediction is new_mean.
+    new_mean = torch.tensor([0.0, -1.0, 1.0, 0.5], dtype=torch.float64)
+    prediction = gp_predictive(latent, trace, x, new_mean=new_mean)
+    torch.testing.assert_close(prediction[0, 0], new_mean, atol=1e-4, rtol=0)
+    assert sparse_gp_predictive(sparse, trace, y, x, new_mean=new_mean).shape == (1, 1, 4)
