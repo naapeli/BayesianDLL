@@ -337,17 +337,8 @@ def test_predictive_with_guide_samples():
     assert torch.isfinite(predictions).all()
 
 
-def test_predictive_with_a_vector_mean_needs_new_mean():
-    x, _, targets = _data(n=5)
-    z = x[:3].clone()
-    train_mean = torch.linspace(-1.0, 1.0, 5, dtype=DTYPE)
+def test_a_per_input_vector_mean_is_rejected():
+    x, _, _ = _data(n=5)
     with Model():
-        f = SparseLatentGP("f", Data("x", x), RBF(0.5, 1.0), z, mean=train_mean)
-        ObservedParameter("y", Normal(f, 0.3), targets)
-    trace = {f.gp_latent.name: torch.randn(1, 2, 3, dtype=DTYPE)}
-    with pytest.raises(ValueError, match="new_mean"):
-        sparse_latent_gp_predictive(f, trace, x)
-    new_mean = torch.linspace(2.0, 3.0, 5, dtype=DTYPE)
-    shifted = sparse_latent_gp_predictive(f, trace, x, new_mean=new_mean)
-    zero = sparse_latent_gp_predictive(f, trace, x, new_mean=torch.zeros(5, dtype=DTYPE))
-    torch.testing.assert_close(shifted - zero, new_mean.expand_as(shifted))
+        with pytest.raises(ValueError, match="mean function"):
+            SparseLatentGP("f", Data("x", x), RBF(0.5, 1.0), x[:3].clone(), mean=torch.linspace(-1.0, 1.0, 5, dtype=DTYPE))

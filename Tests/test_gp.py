@@ -913,25 +913,11 @@ def _exact_gp_with_mean(mean):
     return gp
 
 
-def test_exact_gp_predictive_vector_mean_needs_new_mean():
+def test_exact_gp_predictive_scalar_mean_is_used_at_the_new_inputs():
     y = torch.tensor([0.3, -0.2, 0.8, 1.1], dtype=torch.float64)
-    train_mean = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
-    new_inputs = torch.linspace(0.1, 1.3, 4, dtype=torch.float64)  # as many new inputs as training inputs
-    new_mean = torch.tensor([-1.0, 0.0, 1.0, 5.0], dtype=torch.float64)
+    new_inputs = torch.linspace(0.1, 1.3, 4, dtype=torch.float64)
     trace = {"noise": torch.tensor([[[0.1], [0.2]]], dtype=torch.float64)}
-    vector = _exact_gp_with_mean(train_mean)
-    with pytest.raises(ValueError, match="new_mean"):
-        exact_gp_predictive(vector, trace, y, new_inputs)
-
-    # Reference: a zero-mean GP on the centred observations, shifted by the mean at the new inputs.
     zero = _exact_gp_with_mean(0.0)
-    torch.manual_seed(1)
-    actual = exact_gp_predictive(vector, trace, y, new_inputs, n_samples=3, new_mean=new_mean)
-    torch.manual_seed(1)
-    expected = exact_gp_predictive(zero, trace, y - train_mean, new_inputs, n_samples=3) + new_mean
-    torch.testing.assert_close(actual, expected)
-
-    # A scalar mean is still used at the new inputs.
     scalar = _exact_gp_with_mean(2.5)
     torch.manual_seed(1)
     actual = exact_gp_predictive(scalar, trace, y, new_inputs, n_samples=3)
@@ -940,22 +926,16 @@ def test_exact_gp_predictive_vector_mean_needs_new_mean():
     torch.testing.assert_close(actual, expected)
 
 
-def test_latent_and_sparse_gp_predictive_vector_mean_needs_new_mean():
+def test_gp_classes_reject_a_per_input_vector_mean():
+    """A per-input constant vector cannot be evaluated at new inputs: a mean function is required."""
     x = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
-    y = torch.sin(6 * x)
     train_mean = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64)
+    with pytest.raises(ValueError, match="mean function"):
+        _exact_gp_with_mean(train_mean)
     with Model():
-        noise = RandomParameter("noise", Uniform(0.01, 0.5), initial_value=torch.tensor([0.1], dtype=torch.float64))
         inputs = Data("inputs", x)
-        sparse = SparseGP("sparse", inputs, RBF(0.4, 1.3), x[:2].clone(), noise_variance=noise, mean=train_mean)
-        latent = LatentGP("latent", inputs, RBF(0.4, 1.3), mean=train_mean, jitter=1e-10)
-    trace = {"noise": torch.tensor([[[0.1]]], dtype=torch.float64), "latent": train_mean.reshape(1, 1, 4)}
-    with pytest.raises(ValueError, match="new_mean"):
-        sparse_gp_predictive(sparse, trace, y, x)
-    with pytest.raises(ValueError, match="new_mean"):
-        gp_predictive(latent, trace, x)
-    # The traced function equals the training mean, so at the training inputs the prediction is new_mean.
-    new_mean = torch.tensor([0.0, -1.0, 1.0, 0.5], dtype=torch.float64)
-    prediction = gp_predictive(latent, trace, x, new_mean=new_mean)
-    torch.testing.assert_close(prediction[0, 0], new_mean, atol=1e-4, rtol=0)
-    assert sparse_gp_predictive(sparse, trace, y, x, new_mean=new_mean).shape == (1, 1, 4)
+        vector_node = RandomParameter("vector_mean", Normal(0.0, 1.0), shape=4)
+        with pytest.raises(ValueError, match="LinearMean"):
+            SparseGP("sparse", inputs, RBF(0.4, 1.3), x[:2].clone(), noise_variance=0.1, mean=train_mean)
+        with pytest.raises(ValueError, match="MeanFunction"):
+            LatentGP("latent", inputs, RBF(0.4, 1.3), mean=vector_node)

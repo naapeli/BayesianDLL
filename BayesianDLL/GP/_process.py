@@ -41,6 +41,7 @@ from ..Distributions._distributions import Distribution
 from ..Distributions._resolve import resolve
 from ..Distributions import Normal
 from ._kernels import Kernel, _is_named
+from ._means import MeanFunction, _is_zero, as_mean_function
 
 
 # ----------------------------------------------------------------------------
@@ -178,15 +179,6 @@ def _resolved_value(value, dtype, device, parameter_values=None):
     return torch.as_tensor(value, dtype=dtype, device=device)
 
 
-def _mean_value(mean, x):
-    if _is_named(mean):
-        mean = _input_value(mean)
-    mean = _as_tensor(mean).to(dtype=x.dtype, device=x.device)
-    if mean.ndim == 0:
-        return mean.expand(x.shape[0])
-    return mean
-
-
 class _BatchContext:
     """Which nodes carry a chain dimension in the current evaluation.
 
@@ -268,14 +260,36 @@ def _to_parameter_shape(gradient, shape):
     raise ValueError(f"Cannot map a gradient of shape {tuple(gradient.shape[1:])} to a parameter of shape {tuple(shape)}.")
 
 
-def _batched_mean(context, mean, n, dtype, device, what, raw=None):
-    value = context.value(mean, dtype, device, raw)
-    flat = value.reshape(value.shape[0], -1)
-    if flat.shape[1] == 1:
-        return flat.expand(flat.shape[0], n)
-    if flat.shape[1] != n:
-        raise ValueError(f"{what} mean must be scalar or contain one value per input ({n}); got {flat.shape[1]} values.")
-    return flat
+def _accumulate(gradients, name, gradient):
+    gradients[name] = gradients[name] + gradient if name in gradients else gradient
+
+
+def _evaluate_mean(context, mean, x, dtype, device, raw=None):
+    """Mean ``m(X)`` ``(B, n)`` of batched inputs ``x`` ``(B, n, D)`` (``raw`` overrides parameter values)."""
+    if _is_zero(mean):
+        return torch.zeros((1, x.shape[1]), dtype=dtype, device=device)
+    return mean.batch_evaluate(x, context.kernel_values(mean, dtype, device, raw))
+
+
+def _add_mean_gradients(gradients, mean, context, x, cotangent, shape_of, dtype, device, raw=None, input_node=None, input_shape=None):
+    r"""Add ``⟨g, ∂m(X)/∂θ⟩`` for every named mean parameter ``θ`` to ``gradients``.
+
+    ``cotangent`` ``g`` ``(B, n)`` is the gradient w.r.t. ``m(X)``;
+    ``shape_of(node)`` gives a parameter's (unbatched) value shape. When
+    ``input_node`` (the learnable inputs ``X``) is given, it also gets the
+    mean's input VJP ``∂⟨g, m(X)⟩/∂X`` reshaped to ``input_shape``. A
+    :class:`ZeroMean` adds nothing.
+    """
+    if _is_zero(mean):
+        return gradients
+    values = context.kernel_values(mean, dtype, device, raw)
+    for name, derivative in mean.batch_derivatives(x, values).items():
+        parameter = next(p for p in mean.parameters if p.name == name)
+        _accumulate(gradients, name, _to_parameter_shape(_contract_diagonal(cotangent, derivative), shape_of(parameter)))
+    if input_node is not None:
+        vjp = mean.batch_input_vjp(x, cotangent, values)
+        _accumulate(gradients, input_node.name, vjp.reshape(vjp.shape[0], *input_shape))
+    return gradients
 
 
 def _expand_batch(tensor, size):
@@ -291,6 +305,22 @@ def _finish(value, batched):
     return value[0]
 
 
+def _with_parameters(nodes, parameters):
+    """``nodes`` followed by the named ``parameters`` that are not among them yet."""
+    nodes = list(nodes)
+    names = {node.name for node in nodes if _is_named(node)}
+    for parameter in parameters:
+        if parameter.name not in names:
+            names.add(parameter.name)
+            nodes.append(parameter)
+    return nodes
+
+
+def _raw_values(nodes, values):
+    """``{name: value}`` of the named input nodes of a deterministic node."""
+    return {node.name: value for node, value in zip(nodes, values) if _is_named(node)}
+
+
 # ----------------------------------------------------------------------------
 # Latent (whitened) GP
 # ----------------------------------------------------------------------------
@@ -300,7 +330,7 @@ class LatentGP(DeterministicParameter):
     r"""An explicit whitened latent GP function node.
 
     The object is a ``DeterministicParameter`` whose value is
-    ``mean + L @ z`` with ``L Lᵀ = K(X, X) + jitter I`` (the jitter of
+    ``m(X) + L @ z`` with ``L Lᵀ = K(X, X) + jitter I`` (the jitter of
     :func:`stable_cholesky`). If ``latent`` is omitted, a standard-normal
     latent vector of ``N`` values named ``latent_name`` (default
     ``<name>_white``) is created automatically. This is a non-centred
@@ -314,7 +344,8 @@ class LatentGP(DeterministicParameter):
     * ``kernel``: a :class:`Kernel`;
     * ``latent``: a named ``RandomParameter`` with ``N`` values and a
       ``Normal(0, 1)`` prior (default ``None``: created automatically);
-    * ``mean``: a scalar, one value per input, or a named node (default ``0.0``);
+    * ``mean``: a :class:`~BayesianDLL.GP.MeanFunction` ``m`` (defaults to ``ZeroMean()``;
+      a number, 0-d tensor or named scalar node is a ``ConstantMean``);
     * ``jitter``: relative diagonal jitter (default ``1e-6``);
     * ``latent_name``: name of the automatically created latent.
 
@@ -329,8 +360,10 @@ class LatentGP(DeterministicParameter):
     (``Φ`` takes the lower triangle and halves the diagonal) every kernel
     hyperparameter gets ``⟨G_K, ∂K/∂θ⟩`` with
     ``G_K = sym(L⁻ᵀ S L⁻¹)``, ``S = Φ(Lᵀ ḡ zᵀ)``. Learnable inputs get
-    ``kernel.input_vjp(X, X, G_K + G_Kᵀ)``. With vectorized chains all of
-    this is batched over the chain dimension.
+    ``kernel.input_vjp(X, X, G_K + G_Kᵀ)``. The mean function's parameters
+    get ``⟨ḡ, ∂m(X)/∂θ⟩`` and learnable inputs also get the mean's input VJP
+    ``∂⟨ḡ, m(X)⟩/∂X``. With vectorized chains all of this is batched over the
+    chain dimension.
     """
 
     def __init__(
@@ -339,7 +372,7 @@ class LatentGP(DeterministicParameter):
         inputs,
         kernel: Kernel,
         latent=None,
-        mean=0.0,
+        mean=None,
         jitter=1e-6,
         latent_name=None,
     ):
@@ -348,6 +381,7 @@ class LatentGP(DeterministicParameter):
         if not _is_named(inputs):
             raise TypeError("inputs must be a named Data or model parameter node.")
 
+        mean = as_mean_function(mean, "LatentGP")
         n = _feature_count(inputs)
         if latent is None:
             latent = RandomParameter(latent_name or f"{name}_white", Normal(0.0, 1.0), shape=n)
@@ -360,12 +394,8 @@ class LatentGP(DeterministicParameter):
             )
 
         kernel_parameters = list(kernel.parameters)
-        model_inputs = [inputs, latent, *kernel_parameters]
-        mean_input = mean if _is_named(mean) else None
-        if mean_input is not None:
-            model_inputs.append(mean_input)
+        model_inputs = _with_parameters([inputs, latent, *kernel_parameters], mean.parameters)
         self._kernel_parameters = kernel_parameters
-        self._mean_input = mean_input
 
         def forward(*values):
             return self._batched_function(values, [False] * len(values))[0][0]
@@ -394,21 +424,17 @@ class LatentGP(DeterministicParameter):
         z = z.reshape(z.shape[0], -1)
         dtype, device = z.dtype, z.device
         x = context.inputs(self.inputs[0], dtype, device, raw=values[0])
-        raw = {p.name: v for p, v in zip(self.inputs[2:2 + len(self._kernel_parameters)], values[2:])}
+        raw = _raw_values(self.inputs, values)
         kernel_values = context.kernel_values(self.gp_kernel, dtype, device, raw)
         covariance = self.gp_kernel.batch_evaluate(x, x, kernel_values)
         size = max(covariance.shape[0], z.shape[0])
         factor, jitter_info = batched_stable_cholesky(_expand_batch(covariance, size), jitter=self.gp_jitter)
-        n = z.shape[-1]
-        if self._mean_input is not None:
-            mean = _batched_mean(context, self._mean_input, n, dtype, device, "LatentGP", raw=values[-1])
-        else:
-            mean = _mean_value(self.gp_mean, torch.zeros(n, dtype=dtype, device=device)).reshape(1, n)
+        mean = _evaluate_mean(context, self.gp_mean, x, dtype, device, raw)
         f = mean + (factor @ z.unsqueeze(-1)).squeeze(-1)
-        return f, (context, x, z, kernel_values, factor, jitter_info)
+        return f, (context, x, z, kernel_values, factor, jitter_info, raw)
 
     def _batched_vjp(self, cotangent, values, flags):
-        _, (context, x, z, kernel_values, factor, jitter_info) = self._batched_function(values, flags)
+        _, (context, x, z, kernel_values, factor, jitter_info, raw) = self._batched_function(values, flags)
         cotangent = cotangent.reshape(cotangent.shape[0], -1).to(dtype=z.dtype)
         projected = (factor.transpose(-2, -1) @ cotangent.unsqueeze(-1)).squeeze(-1)  # Lᵀ ḡ
         latent = self.inputs[1]
@@ -420,20 +446,23 @@ class LatentGP(DeterministicParameter):
         covariance_cotangent = torch.linalg.solve_triangular(factor, left, upper=False, left=False)
         covariance_cotangent = 0.5 * (covariance_cotangent + covariance_cotangent.transpose(-2, -1))
         covariance_cotangent = _jitter_cotangent(jitter_info, covariance_cotangent)
+        def shape_of(node):
+            value = _as_tensor(values[self.inputs.index(node)])
+            return tuple(value.shape[1:]) if context.is_batched(node) else tuple(value.shape)
+
         for name, derivative in self.gp_kernel.batch_derivatives(x, x, kernel_values).items():
             parameter = next(p for p in self._kernel_parameters if p.name == name)
-            value = values[self.inputs.index(parameter)]
-            shape = tuple(_as_tensor(value).shape[1:]) if context.is_batched(parameter) else tuple(_as_tensor(value).shape)
-            grads[name] = _to_parameter_shape(_contract(covariance_cotangent, derivative), shape)
+            _accumulate(grads, name, _to_parameter_shape(_contract(covariance_cotangent, derivative), shape_of(parameter)))
         inputs_node = self.inputs[0]
-        if not isinstance(inputs_node, Data) and isinstance(inputs_node, (RandomParameter, DeterministicParameter)):
+        learnable_inputs = not isinstance(inputs_node, Data) and isinstance(inputs_node, (RandomParameter, DeterministicParameter))
+        if learnable_inputs:
             input_gradient = self.gp_kernel.batch_input_vjp_symmetric(x, covariance_cotangent, kernel_values)
-            shape = tuple(_as_tensor(values[0]).shape[1:]) if context.is_batched(inputs_node) else tuple(_as_tensor(values[0]).shape)
-            grads[inputs_node.name] = input_gradient.reshape(input_gradient.shape[0], *shape)
-        if self._mean_input is not None:
-            value = values[-1]
-            shape = tuple(_as_tensor(value).shape[1:]) if context.is_batched(self._mean_input) else tuple(_as_tensor(value).shape)
-            grads[self._mean_input.name] = _to_parameter_shape(cotangent, shape)
+            _accumulate(grads, inputs_node.name, input_gradient.reshape(input_gradient.shape[0], *shape_of(inputs_node)))
+        # f = m(X) + L z: the mean parameters and the inputs get the mean's VJP of ḡ.
+        _add_mean_gradients(
+            grads, self.gp_mean, context, x, cotangent, shape_of, z.dtype, z.device, raw,
+            input_node=inputs_node if learnable_inputs else None, input_shape=shape_of(inputs_node),
+        )
         return grads
 
     def _jacobians(self, values):
@@ -487,6 +516,20 @@ class _GPDistribution(Distribution):
         for parameter in kernel.parameters:
             self.add_dependency(parameter)
 
+    def _register_mean(self, mean, what):
+        """Convert ``mean`` to a :class:`MeanFunction` and register its parameter nodes like the kernel's."""
+        self.mean = as_mean_function(mean, what)
+        self._mean_parameter_nodes = list(self.mean.parameters)
+        for parameter in self._mean_parameter_nodes:
+            self.add_dependency(parameter)
+
+    def _mean_at(self, x, parameter_values=None):
+        """Unbatched mean ``(n,)`` at inputs ``x`` (current node values, or ``parameter_values``)."""
+        values = dict(parameter_values or {})
+        for parameter in self.mean.parameters:
+            values.setdefault(parameter.name, resolve(parameter))
+        return self.mean(x, parameter_values=values)
+
     @property
     def batch_shape(self):
         return torch.Size()
@@ -498,10 +541,10 @@ class _GPDistribution(Distribution):
 class ExactGP(_GPDistribution):
     """Gaussian-process marginal likelihood with the latent function integrated out.
 
-    If ``f ~ Normal(mean, K)`` and ``y | f ~ Normal(f, noise_variance * I)``,
+    If ``f ~ Normal(m(X), K)`` and ``y | f ~ Normal(f, noise_variance * I)``,
     this distribution evaluates the exact marginal likelihood
 
-    ``y ~ Normal(mean, K + noise_variance * I)``.
+    ``y ~ Normal(m(X), K + noise_variance * I)``.
 
     The object is used as the distribution of an ``ObservedParameter``::
 
@@ -518,15 +561,18 @@ class ExactGP(_GPDistribution):
     Arguments: ``name`` (a label for the node), ``inputs`` (a named ``Data``
     or model node of shape ``(N, D)`` or ``(N,)``), ``kernel`` (a
     :class:`Kernel`), ``noise_variance`` (the scalar noise **variance**
-    ``σ²``, default ``1e-6``), ``mean`` (scalar, one value per input or a
-    named node; default ``0.0``) and ``jitter`` (default ``1e-6``; the
+    ``σ²``, default ``1e-6``), ``mean`` (a :class:`~BayesianDLL.GP.MeanFunction`
+    ``m``; defaults to ``ZeroMean()``, and a number, 0-d tensor or named
+    scalar node is a ``ConstantMean``; its parameters get ``⟨α, ∂m(X)/∂θ⟩``
+    with ``α = (K + σ² I)⁻¹ (y - m(X))``, and learnable inputs also get the
+    mean's input VJP of ``α``) and ``jitter`` (default ``1e-6``; the
     relative diagonal jitter of :func:`batched_stable_cholesky`, applied to
     ``K + σ² I`` and included in the gradients). The observations have
     shape ``(N,)``; ``sample`` draws ``y`` including the noise. Use
     :func:`exact_gp_predictive` for predictions at new inputs.
     """
 
-    def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=0.0, jitter=1e-6):
+    def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=None, jitter=1e-6):
         super().__init__()
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
@@ -536,13 +582,12 @@ class ExactGP(_GPDistribution):
         self.inputs = inputs
         self.kernel = kernel
         self.noise_variance = noise_variance
-        self.mean = mean
         self.jitter = jitter
 
         self.add_dependency(inputs)
         self._register_kernel(kernel)
         self.add_dependency(noise_variance)
-        self.add_dependency(mean)
+        self._register_mean(mean, "Exact GP")
 
     @property
     def event_shape(self):
@@ -550,7 +595,7 @@ class ExactGP(_GPDistribution):
 
     def _named_parameter_values(self):
         values = {}
-        for parameter in [*self.kernel.parameters, self.noise_variance, self.mean]:
+        for parameter in [*self.kernel.parameters, self.noise_variance, *self.mean.parameters]:
             if _is_named(parameter):
                 values[parameter.name] = resolve(parameter)
         return values
@@ -573,7 +618,7 @@ class ExactGP(_GPDistribution):
         noise = noise.reshape(noise.shape[0], -1)
         if noise.shape[1] != 1:
             raise ValueError("Exact GP noise_variance must be scalar.")
-        mean = _batched_mean(context, self.mean, n, dtype, device, "Exact GP")
+        mean = _evaluate_mean(context, self.mean, x, dtype, device)
         size = max(covariance.shape[0], noise.shape[0], mean.shape[0])
         eye = torch.eye(n, dtype=dtype, device=device)
         covariance = _expand_batch(covariance, size) + noise[:, :1, None] * eye
@@ -583,7 +628,7 @@ class ExactGP(_GPDistribution):
         alpha = _expand_batch(alpha, size)
         log_det = 2 * torch.log(torch.diagonal(factor, dim1=-2, dim2=-1)).sum(-1)
         log_probability = -0.5 * ((residual * alpha).sum(-1) + log_det + n * math.log(2 * math.pi))
-        batched = context.any([self.inputs, self.noise_variance, self.mean, *self.kernel.parameters])
+        batched = context.any([self.inputs, self.noise_variance, *self.mean.parameters, *self.kernel.parameters])
         return {
             "context": context, "x": x, "kernel_values": kernel_values, "factor": factor, "jitter_info": jitter_info,
             "alpha": alpha, "log_probability": log_probability, "batched": batched,
@@ -610,25 +655,29 @@ class ExactGP(_GPDistribution):
             parameter = next(p for p in self.kernel.parameters if p.name == name)
             gradients[name] = _to_parameter_shape(_contract(sensitivity, derivative), _parameter_shape(context, parameter))
         inputs = self.inputs
-        if isinstance(inputs, (RandomParameter, DeterministicParameter)):
+        learnable_inputs = isinstance(inputs, (RandomParameter, DeterministicParameter))
+        if learnable_inputs:
             input_gradient = self.kernel.batch_input_vjp_symmetric(x_values, sensitivity, parts["kernel_values"])
             shape = _parameter_shape(context, inputs)
             gradients[inputs.name] = input_gradient.reshape(input_gradient.shape[0], *shape)
         if _is_named(self.noise_variance):
             # d(K + σ² I + jitter I) / dσ² = I + c e_i* e_i*ᵀ is folded into the sensitivity.
             noise_gradient = torch.diagonal(sensitivity, dim1=-2, dim2=-1).sum(-1, keepdim=True)
-            gradients[self.noise_variance.name] = _to_parameter_shape(noise_gradient, _parameter_shape(context, self.noise_variance))
-        if _is_named(self.mean):
-            gradients[self.mean.name] = _to_parameter_shape(alpha, _parameter_shape(context, self.mean))
+            _accumulate(gradients, self.noise_variance.name,
+                        _to_parameter_shape(noise_gradient, _parameter_shape(context, self.noise_variance)))
+        # The residual is y - m(X), so ∂ log p / ∂m(X) = α (and learnable inputs get the mean's VJP of α).
+        _add_mean_gradients(
+            gradients, self.mean, context, x_values, alpha, lambda node: _parameter_shape(context, node),
+            alpha.dtype, alpha.device, input_node=inputs if learnable_inputs else None,
+            input_shape=_parameter_shape(context, inputs) if learnable_inputs else None,
+        )
         return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
         x = _input_value(self.inputs)
         zero = torch.zeros(_feature_count(x), dtype=x.dtype, device=x.device)
         factor = self._components(zero)["factor"][0]
-        mean = _resolved_value(self.mean, x.dtype, x.device)
-        if mean.numel() == 1:
-            mean = mean.reshape(()).expand(zero.numel())
+        mean = self._mean_at(x)
         return mean + torch.randn(
             (n_samples, zero.numel()), dtype=zero.dtype, device=zero.device
         ) @ factor.transpose(-2, -1)
@@ -649,12 +698,12 @@ class SparseGP(_GPDistribution):
     log density of the observations ``y`` (one value per training input) is
 
     * ``method="vfe"`` (default): Titsias' collapsed variational bound,
-      ``log N(y | mean, Q_nn + σ² I) - tr(K_nn - Q_nn) / (2σ²)``. It is a lower
+      ``log N(y | m(X), Q_nn + σ² I) - tr(K_nn - Q_nn) / (2σ²)``. It is a lower
       bound on the exact log marginal likelihood and equals it when ``Z``
       equals the training inputs.
-    * ``method="dtc"``: ``log N(y | mean, Q_nn + σ² I)`` (deterministic
+    * ``method="dtc"``: ``log N(y | m(X), Q_nn + σ² I)`` (deterministic
       training conditional).
-    * ``method="fitc"``: ``log N(y | mean, Q_nn + diag(K_nn - Q_nn) + σ² I)``
+    * ``method="fitc"``: ``log N(y | m(X), Q_nn + diag(K_nn - Q_nn) + σ² I)``
       (fully independent training conditional).
 
     Everything is evaluated with Cholesky factors of ``m x m`` matrices, the
@@ -666,7 +715,8 @@ class SparseGP(_GPDistribution):
     node, or a learnable ``RandomParameter`` / ``DeterministicParameter``,
     e.g. ``RandomParameter("Z", Normal(Z0, 0.5), initial_value=Z0)`` with
     ``Z0`` of shape ``(m, D)``. Kernel hyperparameters, ``noise_variance``,
-    ``mean`` and learnable inducing inputs get hand-derived gradients (see
+    the parameters of the mean function and learnable inducing inputs get
+    hand-derived gradients (see
     :meth:`log_pdf_param_grads`); the inducing-input gradient uses
     :meth:`Kernel.input_vjp`.
 
@@ -678,8 +728,10 @@ class SparseGP(_GPDistribution):
     overfit ``Z``.
 
     The other arguments are as for :class:`ExactGP`: ``noise_variance`` is
-    the scalar noise variance ``σ²`` (default ``1e-6``), ``mean`` defaults to
-    ``0.0``, ``method`` is ``"vfe"``, ``"dtc"`` or ``"fitc"`` (case
+    the scalar noise variance ``σ²`` (default ``1e-6``), ``mean`` is a
+    :class:`~BayesianDLL.GP.MeanFunction` evaluated at the training inputs
+    ``X`` (defaults to ``ZeroMean()``; a number is a ``ConstantMean``),
+    ``method`` is ``"vfe"``, ``"dtc"`` or ``"fitc"`` (case
     insensitive) and ``jitter`` (default ``1e-6``) is the relative jitter of
     the ``K_mm`` Cholesky factor. Use it as the distribution of an
     ``ObservedParameter``::
@@ -690,7 +742,7 @@ class SparseGP(_GPDistribution):
     Use :func:`sparse_gp_predictive` for predictions at new inputs.
     """
 
-    def __init__(self, name, inputs, kernel: Kernel, inducing_points, noise_variance=1e-6, mean=0.0, method="vfe", jitter=1e-6):
+    def __init__(self, name, inputs, kernel: Kernel, inducing_points, noise_variance=1e-6, mean=None, method="vfe", jitter=1e-6):
         super().__init__()
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
@@ -704,7 +756,6 @@ class SparseGP(_GPDistribution):
         self.kernel = kernel
         self.inducing_points = inducing_points
         self.noise_variance = noise_variance
-        self.mean = mean
         self.method = method
         self.jitter = jitter
 
@@ -712,7 +763,7 @@ class SparseGP(_GPDistribution):
         self.add_dependency(inducing_points)
         self._register_kernel(kernel)
         self.add_dependency(noise_variance)
-        self.add_dependency(mean)
+        self._register_mean(mean, "Sparse GP")
 
     @property
     def event_shape(self):
@@ -720,7 +771,7 @@ class SparseGP(_GPDistribution):
 
     def _named_parameter_values(self):
         values = {}
-        for parameter in [*self.kernel.parameters, self.noise_variance, self.mean]:
+        for parameter in [*self.kernel.parameters, self.noise_variance, *self.mean.parameters]:
             if _is_named(parameter):
                 values[parameter.name] = resolve(parameter)
         return values
@@ -758,7 +809,7 @@ class SparseGP(_GPDistribution):
         if noise.shape[1] != 1:
             raise ValueError("Sparse GP noise_variance must be scalar.")
         noise = noise[:, 0]
-        mean = _batched_mean(context, self.mean, n, dtype, device, "Sparse GP")
+        mean = _evaluate_mean(context, self.mean, x, dtype, device)
         kernel_values = context.kernel_values(self.kernel, dtype, device)
 
         k_mm = self.kernel.batch_evaluate(z, z, kernel_values)
@@ -790,7 +841,7 @@ class SparseGP(_GPDistribution):
         trace_term = (k_diag - q_diag).sum(-1)
         if self.method == "vfe":
             log_probability = log_probability - 0.5 * trace_term / noise
-        batched = context.any([self.inputs, self.inducing_points, self.noise_variance, self.mean, *self.kernel.parameters])
+        batched = context.any([self.inputs, self.inducing_points, self.noise_variance, *self.mean.parameters, *self.kernel.parameters])
         return {
             "context": context, "x": x, "z": z, "noise": noise, "factor": factor, "jitter_info": jitter_info,
             "v": v, "lam": lam, "factor_b": factor_b, "alpha": alpha, "trace_term": trace_term,
@@ -859,8 +910,12 @@ class SparseGP(_GPDistribution):
           for VFE);
         * learnable inducing inputs ``Z`` get
           ``kernel.input_vjp(Z, X, G_mn) + kernel.input_vjp(Z, Z, G_mm + G_mmᵀ)``
-          (``K_nn`` does not depend on ``Z``);
-        * the mean gets ``α``.
+          (``K_nn`` does not depend on ``Z``, and the mean is evaluated at
+          ``X``, so ``Z`` gets no mean term);
+        * a parameter ``θ`` of the mean function gets ``⟨α, ∂m(X)/∂θ⟩``.
+
+        Gradients w.r.t. learnable training inputs ``X`` are not
+        implemented.
         """
         parts = self._components(x)
         context, x_values, z = parts["context"], parts["x"], parts["z"]
@@ -883,6 +938,7 @@ class SparseGP(_GPDistribution):
             gradients[name] = _to_parameter_shape(gradient, _parameter_shape(context, parameter))
 
         if self._learnable_inducing():
+            # The mean is evaluated at X, not Z, so Z gets kernel terms only.
             z_gradient = self.kernel.batch_input_vjp(z, x_values, g_mn, kernel_values)
             z_gradient = z_gradient + self.kernel.batch_input_vjp_symmetric(z, g_mm, kernel_values)
             shape = _parameter_shape(context, self.inducing_points)
@@ -892,15 +948,19 @@ class SparseGP(_GPDistribution):
             noise_gradient = diag_weight.sum(-1)
             if self.method == "vfe":
                 noise_gradient = noise_gradient + 0.5 * parts["trace_term"] / noise.square()
-            gradients[self.noise_variance.name] = _to_parameter_shape(noise_gradient.unsqueeze(-1), _parameter_shape(context, self.noise_variance))
+            _accumulate(gradients, self.noise_variance.name,
+                        _to_parameter_shape(noise_gradient.unsqueeze(-1), _parameter_shape(context, self.noise_variance)))
 
-        if _is_named(self.mean):
-            gradients[self.mean.name] = _to_parameter_shape(alpha, _parameter_shape(context, self.mean))
+        # The residual is y - m(X) and the trace term does not depend on the mean: ∂/∂m(X) = α.
+        _add_mean_gradients(
+            gradients, self.mean, context, x_values, alpha, lambda node: _parameter_shape(context, node),
+            alpha.dtype, alpha.device,
+        )
 
         return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
-        """Draw from the approximate prior ``Normal(mean, Q_nn + Λ)``.
+        """Draw from the approximate prior ``Normal(m(X), Q_nn + Λ)``.
 
         Uses ``Vᵀ ε₁ + sqrt(Λ) ε₂`` with ``V = L⁻¹ K_mn``, so no ``n x n``
         covariance is formed.
@@ -908,33 +968,26 @@ class SparseGP(_GPDistribution):
         x = self._training_inputs()
         parts = self._components(torch.zeros(_feature_count(x), dtype=x.dtype, device=x.device))
         v, lam = parts["v"][0], parts["lam"][0]
-        mean = _resolved_value(self.mean, x.dtype, x.device)
-        if mean.numel() == 1:
-            mean = mean.reshape(()).expand(lam.numel())
+        mean = self._mean_at(x)
         first = torch.randn((n_samples, v.shape[0]), dtype=x.dtype, device=x.device) @ v
         second = torch.randn((n_samples, lam.numel()), dtype=x.dtype, device=x.device) * lam.sqrt()
         return mean + first + second
 
 
-def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None, new_mean=None):
+def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
     """Sample latent GP values at new inputs from posterior latent traces.
 
     ``gp`` is a :class:`LatentGP`. ``trace`` may be a ``SamplingResult`` or
     a mapping with values of shape ``(n_chains, n_draws, *shape)``
     containing the GP's deterministic trace (``trace[gp.name]``). Kernel
-    parameters, a learned (named) ``gp_mean`` and learnable training inputs
-    are read from the trace draw by draw; a node missing from the trace
-    keeps its current value. For every draw ``f`` the function at ``inputs``
-    is drawn ``n_samples`` times from the noise-free GP conditional
-    ``N(m* + K_*X K⁻¹ (f - m), K_** - K_*X K⁻¹ K_X*)``; a given
-    ``observation_noise`` variance is added to the diagonal.
-
-    ``new_mean`` is the mean ``m*`` at the new inputs (shape ``(n_new,)``,
-    or ``(n_parameter_draws, n_new)`` for one per draw). A scalar mean is
-    used at the new inputs when it is omitted; a mean given per training
-    input (a vector or vector-valued node) cannot be evaluated at new
-    inputs, so ``new_mean`` is then required (``ValueError`` otherwise).
-    The result has shape ``(n_parameter_draws, n_samples, n_new)``.
+    parameters, the parameters of the mean function and learnable training
+    inputs are read from the trace draw by draw; a node missing from the
+    trace keeps its current value. For every draw ``f`` the function at
+    ``inputs`` is drawn ``n_samples`` times from the noise-free GP
+    conditional ``N(m(X*) + K_*X K⁻¹ (f - m(X)), K_** - K_*X K⁻¹ K_X*)``,
+    with the mean function ``m`` evaluated at the training and the new
+    inputs for that draw; a given ``observation_noise`` variance is added to
+    the diagonal. The result has shape ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not hasattr(gp, "gp_kernel"):
         raise TypeError("gp must be a LatentGP function returned by BayesianDLL.GP.LatentGP.")
@@ -950,30 +1003,22 @@ def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None, new_me
     training_shape = _input_value(gp.gp_inputs).shape
     training_draws = _draws_of(trace, gp.gp_inputs, total_draws, dtype, device)
     new_values = _input_value(inputs).to(dtype=dtype, device=device)
-    n_new = new_values.shape[0] if new_values.ndim > 0 else 1
-    mean_train, mean_new = _prediction_means(
-        _draws_of(trace, gp.gp_mean, total_draws, dtype, device), new_mean,
-        _feature_count(gp.gp_inputs), n_new, total_draws, dtype, device, "LatentGP",
-    )
-    kernel_draws = {
-        parameter.name: _draws_of(trace, parameter, total_draws, dtype, device)
-        for parameter in gp.gp_kernel.parameters
-    }
+    kernel_draws = _parameter_draws(trace, gp.gp_kernel.parameters, total_draws, dtype, device, _draws_of)
+    mean_draws = _parameter_draws(trace, gp.gp_mean.parameters, total_draws, dtype, device, _draws_of)
 
     outputs = []
     for draw_index in range(total_draws):
-        parameter_values = {
-            name: draws[draw_index if draws.shape[0] > 1 else 0] for name, draws in kernel_draws.items()
-        }
+        parameter_values = _draw(kernel_draws, draw_index)
+        mean_values = _draw(mean_draws, draw_index)
         training_values = training_draws[draw_index if training_draws.shape[0] > 1 else 0].reshape(training_shape)
 
         covariance = gp.gp_kernel(training_values, training_values, parameter_values=parameter_values)
         cross_covariance = gp.gp_kernel(training_values, new_values, parameter_values=parameter_values)
         new_covariance = gp.gp_kernel(new_values, new_values, parameter_values=parameter_values)
         factor = stable_cholesky(covariance, jitter=gp.gp_jitter)
-        residual = latent_draws[draw_index] - mean_train[draw_index]
+        residual = latent_draws[draw_index] - gp.gp_mean(training_values, parameter_values=mean_values)
         alpha = torch.cholesky_solve(residual.reshape(-1, 1), factor).reshape(-1)
-        predictive_mean = mean_new[draw_index] + cross_covariance.transpose(-2, -1) @ alpha
+        predictive_mean = gp.gp_mean(new_values, parameter_values=mean_values) + cross_covariance.transpose(-2, -1) @ alpha
         conditional_covariance = new_covariance - cross_covariance.transpose(-2, -1) @ torch.cholesky_solve(cross_covariance, factor)
         conditional_covariance = (conditional_covariance + conditional_covariance.transpose(-2, -1)) / 2
         if observation_noise is not None:
@@ -1011,43 +1056,14 @@ def _trace_draws(trace, parameter, n_draws, dtype, device):
     return value.expand(n_draws, *value.shape[1:])
 
 
-def _prediction_means(mean_draws, new_mean, n_training, n_new, n_draws, dtype, device, what):
-    """Per-draw means ``(n_draws, n_training)`` at the training and ``(n_draws, n_new)`` at the new inputs.
+def _parameter_draws(trace, parameters, n_draws, dtype, device, draws_of=_trace_draws):
+    """``{name: (n_draws or 1, *shape)}`` draws of the named ``parameters`` (kernel or mean parameters)."""
+    return {p.name: draws_of(trace, p, n_draws, dtype, device) for p in parameters if _is_named(p)}
 
-    ``mean_draws`` has shape ``(n_draws or 1, *mean_shape)``. A scalar mean
-    (a number or a named scalar node) is used at the new inputs as well. A
-    mean given per training input (a vector or a vector-valued node) cannot
-    be evaluated at new inputs: the mean there must then be passed as
-    ``new_mean`` (shape ``(n_new,)``, or ``(n_draws, n_new)`` for one per
-    draw), whatever the number of new inputs. A given ``new_mean`` is also
-    used with a scalar mean.
-    """
-    flat = torch.as_tensor(mean_draws).to(dtype=dtype, device=device)
-    flat = flat.reshape(flat.shape[0], -1)
-    if flat.shape[0] not in (1, n_draws):
-        raise ValueError(f"The trace of the {what} mean has {flat.shape[0]} draws; expected {n_draws}.")
-    if flat.shape[1] == 1:
-        mean_train = flat.expand(n_draws, n_training)
-        if new_mean is None:
-            return mean_train, flat.expand(n_draws, n_new)
-    elif flat.shape[1] == n_training:
-        mean_train = flat.expand(n_draws, n_training)
-        if new_mean is None:
-            raise ValueError(
-                f"The {what} mean is given per training input and cannot be evaluated at the new inputs; "
-                f"pass new_mean= (the mean at the {n_new} new inputs, shape (n_new,) or (n_draws, n_new))."
-            )
-    else:
-        raise ValueError(
-            f"The {what} mean must be scalar or contain one value per training input ({n_training}); got {flat.shape[1]} values."
-        )
-    value = _input_value(new_mean) if _is_named(new_mean) else _as_tensor(new_mean)
-    value = torch.as_tensor(value).to(dtype=dtype, device=device)
-    if value.numel() == 1:
-        return mean_train, value.reshape(1, 1).expand(n_draws, n_new)
-    if value.shape[-1] != n_new or value.reshape(-1, n_new).shape[0] not in (1, n_draws):
-        raise ValueError(f"new_mean must have shape ({n_new},) or ({n_draws}, {n_new}); got {tuple(value.shape)}.")
-    return mean_train, value.reshape(-1, n_new).expand(n_draws, n_new)
+
+def _draw(draws, index):
+    """The values of draw ``index`` from :func:`_parameter_draws` (an untraced node has one draw)."""
+    return {name: values[index if values.shape[0] > 1 else 0] for name, values in draws.items()}
 
 
 def exact_gp_predictive(
@@ -1057,7 +1073,6 @@ def exact_gp_predictive(
     inputs,
     n_samples=1,
     observation_noise=None,
-    new_mean=None,
 ):
     """Sample exact-GP predictions conditional on observed training values.
 
@@ -1066,19 +1081,12 @@ def exact_gp_predictive(
     (values of shape ``(n_chains, n_draws, *shape)``) contains only
     hyperparameter draws; the latent function is integrated out during
     inference and is sampled here from the GP posterior
-    ``mean = m* + K_*X (K + σ² I)⁻¹ (y - m)`` and
-    ``cov = K_** - K_*X (K + σ² I)⁻¹ K_X*``. Every named kernel parameter,
-    the noise variance and the mean must be in the trace. A given
+    ``mean = m(X*) + K_*X (K + σ² I)⁻¹ (y - m(X))`` and
+    ``cov = K_** - K_*X (K + σ² I)⁻¹ K_X*``, with the mean function ``m``
+    evaluated per draw. Every named kernel parameter, the noise variance and
+    every named parameter of the mean function must be in the trace. A given
     ``observation_noise`` variance is added to the diagonal to predict
-    noisy observations.
-
-    ``new_mean`` is the mean ``m*`` at the new inputs (shape ``(n_new,)``,
-    or ``(n_parameter_draws, n_new)`` for one per draw). A scalar mean is
-    used at the new inputs when it is omitted; a mean given per training
-    input (a vector or vector-valued node) cannot be evaluated at new
-    inputs, so ``new_mean`` is then required (``ValueError`` otherwise,
-    even when the number of new inputs equals the number of training
-    inputs). The returned tensor has shape
+    noisy observations. The returned tensor has shape
     ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not isinstance(gp, ExactGP):
@@ -1112,23 +1120,14 @@ def exact_gp_predictive(
     n_draws = first_value.shape[0] * first_value.shape[1] if first_value.ndim >= 2 else first_value.shape[0]
     dtype = training_values.dtype
     device = training_values.device
-    parameter_draws = {
-        parameter.name: _trace_draws(trace, parameter, n_draws, dtype, device)
-        for parameter in gp.kernel.parameters
-        if _is_named(parameter)
-    }
+    parameter_draws = _parameter_draws(trace, gp.kernel.parameters, n_draws, dtype, device)
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
-    mean_train_draws, mean_new_draws = _prediction_means(
-        _trace_draws(trace, gp.mean, n_draws, dtype, device), new_mean,
-        n_training, new_values.shape[0], n_draws, dtype, device, "ExactGP",
-    )
+    mean_draws = _parameter_draws(trace, gp.mean.parameters, n_draws, dtype, device)
 
     outputs = []
     for draw_index in range(n_draws):
-        kernel_values = {
-            name: values[draw_index]
-            for name, values in parameter_draws.items()
-        }
+        kernel_values = _draw(parameter_draws, draw_index)
+        mean_values = _draw(mean_draws, draw_index)
         covariance = gp.kernel(
             training_values,
             training_values,
@@ -1152,8 +1151,8 @@ def exact_gp_predictive(
             covariance + noise[0] * torch.eye(n_training, dtype=dtype, device=device),
             jitter=gp.jitter,
         )
-        mean_train = mean_train_draws[draw_index]
-        mean_new = mean_new_draws[draw_index]
+        mean_train = gp.mean(training_values, parameter_values=mean_values)
+        mean_new = gp.mean(new_values, parameter_values=mean_values)
 
         alpha = torch.cholesky_solve(
             (observed_values - mean_train).reshape(-1, 1),
@@ -1188,7 +1187,6 @@ def sparse_gp_predictive(
     inputs,
     n_samples=1,
     observation_noise=None,
-    new_mean=None,
 ):
     r"""Sample sparse-GP predictions conditional on observed training values.
 
@@ -1198,21 +1196,15 @@ def sparse_gp_predictive(
     the DTC posterior, and for FITC the same with its diagonal ``Λ``) is
     projected to the new inputs:
 
-    ``mean = K_*m Σ_u K_mn Λ⁻¹ r`` and ``cov = K_** - Q_** + K_*m Σ_u K_m*``.
+    ``mean = m(X*) + K_*m Σ_u K_mn Λ⁻¹ r`` and ``cov = K_** - Q_** + K_*m Σ_u K_m*``.
 
-    Here ``r = y - mean`` with ``y = observed_values``. All solves use
-    ``m x m`` Cholesky factors, so the cost is linear in the number of
-    training points. Kernel parameters, the noise variance and a named
-    mean must be in ``trace``; learnable inducing inputs are read from the
-    trace draw by draw. A given ``observation_noise`` variance is added to
-    the diagonal.
-
-    ``new_mean`` is the mean at the new inputs (shape ``(n_new,)``, or
-    ``(n_parameter_draws, n_new)`` for one per draw). A scalar mean is used
-    at the new inputs when it is omitted; a mean given per training input
-    cannot be evaluated at new inputs, so ``new_mean`` is then required
-    (``ValueError`` otherwise). The result has shape
-    ``(n_parameter_draws, n_samples, n_new)``.
+    Here ``r = y - m(X)`` with ``y = observed_values`` and the mean function
+    ``m`` evaluated per draw. All solves use ``m x m`` Cholesky factors, so
+    the cost is linear in the number of training points. Kernel parameters,
+    the noise variance and the named parameters of the mean function must
+    be in ``trace``; learnable inducing inputs are read from the trace draw
+    by draw. A given ``observation_noise`` variance is added to the
+    diagonal. The result has shape ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not isinstance(gp, SparseGP):
         raise TypeError("gp must be a SparseGP distribution returned by BayesianDLL.GP.SparseGP.")
@@ -1239,16 +1231,9 @@ def sparse_gp_predictive(
 
     first_value = next(iter(trace.values()))
     n_draws = first_value.shape[0] * first_value.shape[1] if first_value.ndim >= 2 else first_value.shape[0]
-    parameter_draws = {
-        parameter.name: _trace_draws(trace, parameter, n_draws, dtype, device)
-        for parameter in gp.kernel.parameters
-        if _is_named(parameter)
-    }
+    parameter_draws = _parameter_draws(trace, gp.kernel.parameters, n_draws, dtype, device)
     noise_draws = _trace_draws(trace, gp.noise_variance, n_draws, dtype, device)
-    mean_train_draws, mean_new_draws = _prediction_means(
-        _trace_draws(trace, gp.mean, n_draws, dtype, device), new_mean,
-        n_training, n_new, n_draws, dtype, device, "SparseGP",
-    )
+    mean_draws = _parameter_draws(trace, gp.mean.parameters, n_draws, dtype, device)
     eye_m = torch.eye(_feature_count(inducing_values), dtype=dtype, device=device)
     learnable_inducing = _is_named(gp.inducing_points) and not isinstance(gp.inducing_points, Data)
     if learnable_inducing:
@@ -1256,14 +1241,15 @@ def sparse_gp_predictive(
 
     outputs = []
     for draw_index in range(n_draws):
-        kernel_values = {name: values[draw_index] for name, values in parameter_draws.items()}
+        kernel_values = _draw(parameter_draws, draw_index)
+        mean_values = _draw(mean_draws, draw_index)
         if learnable_inducing:
             inducing_values = inducing_draws[draw_index].reshape(gp._inducing_inputs(dtype, device).shape)
         noise = noise_draws[draw_index].reshape(-1)
         if noise.numel() != 1:
             raise ValueError("Sparse GP noise_variance must be scalar.")
-        mean_train = mean_train_draws[draw_index]
-        mean_new = mean_new_draws[draw_index]
+        mean_train = gp.mean(training_values, parameter_values=mean_values)
+        mean_new = gp.mean(new_values, parameter_values=mean_values)
 
         k_mm = gp.kernel(inducing_values, inducing_values, parameter_values=kernel_values)
         k_mn = gp.kernel(inducing_values, training_values, parameter_values=kernel_values)
@@ -1314,7 +1300,7 @@ class SparseLatentGP(DeterministicParameter):
     With ``m`` inducing inputs ``Z``, ``L Lᵀ = K_mm(Z) + jitter I`` and a
     standard-normal *whitened* vector ``v`` of shape ``(m,)``, the value is
 
-    ``f(X) = mean + K_nm L⁻ᵀ v``.
+    ``f(X) = m(X) + K_nm L⁻ᵀ v``.
 
     Equivalently ``u = L v ~ Normal(0, K_mm)`` are the function values at
     ``Z`` and ``f = K_nm K_mm⁻¹ u`` is their kernel interpolation, so the
@@ -1340,8 +1326,8 @@ class SparseLatentGP(DeterministicParameter):
       (e.g. ``RandomParameter("Z", Normal(Z0, 1.0), initial_value=Z0)``);
     * ``whitened_values``: a ``RandomParameter`` with ``m`` values and a
       ``Normal(0, 1)`` prior; ``None`` creates ``<name>_white``;
-    * ``mean``: a scalar, a vector with one value per input, or a named
-      parameter (default ``0.0``);
+    * ``mean``: a :class:`~BayesianDLL.GP.MeanFunction` ``m`` (defaults to ``ZeroMean()``;
+      a number, 0-d tensor or named scalar node is a ``ConstantMean``), evaluated at ``X``;
     * ``jitter``: relative diagonal jitter of ``K_mm`` (default ``1e-6``).
 
     The node stores them as ``gp_inputs``, ``gp_inducing_points``,
@@ -1349,7 +1335,7 @@ class SparseLatentGP(DeterministicParameter):
     ``gp_jitter``.
 
     **Gradients** (hand-derived VJP). For a cotangent ``g`` of ``f`` let
-    ``a = L⁻ᵀ v``, so that ``f = mean + K_nm a``:
+    ``a = L⁻ᵀ v``, so that ``f = m(X) + K_nm a``:
 
     * ``v`` gets ``c = L⁻¹ K_mn g``;
     * ``K_mn = K(Z, X)`` gets ``G_mn = a gᵀ``;
@@ -1362,7 +1348,9 @@ class SparseLatentGP(DeterministicParameter):
     * learnable inducing inputs get
       ``kernel.input_vjp(Z, X, G_mn) + kernel.input_vjp_symmetric(Z, G_mm)``
       and learnable training inputs ``kernel.input_vjp(X, Z, G_mnᵀ)``;
-    * the mean gets ``g``.
+    * a parameter ``θ`` of the mean function gets ``⟨g, ∂m(X)/∂θ⟩``, and
+      learnable training inputs also get the mean's input VJP
+      ``∂⟨g, m(X)⟩/∂X``; ``Z`` gets no mean term.
 
     With vectorized chains everything is batched over the chain dimension
     (``v`` ``(C, m)``, ``Z`` ``(C, m, D)``, hyperparameters ``(C, ...)``).
@@ -1376,7 +1364,7 @@ class SparseLatentGP(DeterministicParameter):
         kernel: Kernel,
         inducing_points,
         whitened_values=None,
-        mean=0.0,
+        mean=None,
         jitter=1e-6,
     ):
         if not isinstance(kernel, Kernel):
@@ -1387,6 +1375,7 @@ class SparseLatentGP(DeterministicParameter):
             inducing_points = _as_tensor(inducing_points)
             if not inducing_points.is_floating_point():
                 inducing_points = inducing_points.to(torch.get_default_dtype())
+        mean = as_mean_function(mean, "SparseLatentGP")
         m = _feature_count(inducing_points)
         if whitened_values is None:
             whitened_values = RandomParameter(f"{name}_white", Normal(0.0, 1.0), shape=m)
@@ -1404,13 +1393,9 @@ class SparseLatentGP(DeterministicParameter):
         if _is_named(inducing_points):
             self._inducing_index = len(model_inputs)
             model_inputs.append(inducing_points)
-        self._kernel_start = len(model_inputs)
         model_inputs.extend(kernel_parameters)
-        mean_input = mean if _is_named(mean) else None
-        if mean_input is not None:
-            model_inputs.append(mean_input)
+        model_inputs = _with_parameters(model_inputs, mean.parameters)
         self._kernel_parameters = kernel_parameters
-        self._mean_input = mean_input
         self._fixed_inducing = None if _is_named(inducing_points) else inducing_points
 
         def forward(*values):
@@ -1443,25 +1428,20 @@ class SparseLatentGP(DeterministicParameter):
             z = context.inputs(self.inputs[self._inducing_index], dtype, device, raw=values[self._inducing_index])
         else:
             z = context.inputs(self._fixed_inducing, dtype, device)
-        stop = self._kernel_start + len(self._kernel_parameters)
-        raw = {p.name: value for p, value in zip(self.inputs[self._kernel_start:stop], values[self._kernel_start:stop])}
+        raw = _raw_values(self.inputs, values)
         kernel_values = context.kernel_values(self.gp_kernel, dtype, device, raw)
         k_mm = self.gp_kernel.batch_evaluate(z, z, kernel_values)
         k_mn = self.gp_kernel.batch_evaluate(z, x, kernel_values)
         size = max(k_mm.shape[0], k_mn.shape[0], v.shape[0])
         factor, jitter_info = batched_stable_cholesky(_expand_batch(k_mm, size), jitter=self.gp_jitter)
-        # a = L⁻ᵀ v, so that f = mean + K_nm a.
+        # a = L⁻ᵀ v, so that f = m(X) + K_nm a.
         a = torch.linalg.solve_triangular(factor.transpose(-2, -1), v.unsqueeze(-1), upper=True)
-        n = x.shape[1]
-        if self._mean_input is not None:
-            mean = _batched_mean(context, self._mean_input, n, dtype, device, "SparseLatentGP", raw=values[-1])
-        else:
-            mean = _mean_value(self.gp_mean, torch.zeros(n, dtype=dtype, device=device)).reshape(1, n)
+        mean = _evaluate_mean(context, self.gp_mean, x, dtype, device, raw)
         f = mean + (k_mn.transpose(-2, -1) @ a).squeeze(-1)
-        return f, (context, x, z, v, kernel_values, k_mn, factor, jitter_info, a)
+        return f, (context, x, z, v, kernel_values, k_mn, factor, jitter_info, a, raw)
 
     def _batched_vjp(self, cotangent, values, flags):
-        _, (context, x, z, v, kernel_values, k_mn, factor, jitter_info, a) = self._batched_function(values, flags)
+        _, (context, x, z, v, kernel_values, k_mn, factor, jitter_info, a, raw) = self._batched_function(values, flags)
         g = cotangent.reshape(cotangent.shape[0], -1).to(dtype=v.dtype)
 
         def shape_of(node, value):
@@ -1494,20 +1474,26 @@ class SparseLatentGP(DeterministicParameter):
                 gradient = gradient + _contract(g_mm, inducing[name])
             parameter = next(p for p in self._kernel_parameters if p.name == name)
             value = values[self.inputs.index(parameter)]
-            grads[name] = _to_parameter_shape(gradient, shape_of(parameter, value))
+            _accumulate(grads, name, _to_parameter_shape(gradient, shape_of(parameter, value)))
 
         if self._inducing_index is not None and self._learnable(self.inputs[self._inducing_index]):
+            # The mean is evaluated at X, not Z, so Z gets kernel terms only.
             node = self.inputs[self._inducing_index]
             z_full = _expand_batch(z, size)
             z_gradient = self.gp_kernel.batch_input_vjp(z_full, x, g_mn, kernel_values)
             z_gradient = z_gradient + self.gp_kernel.batch_input_vjp_symmetric(z_full, g_mm, kernel_values)
             grads[node.name] = z_gradient.reshape(size, *shape_of(node, values[self._inducing_index]))
-        if self._learnable(self.inputs[0]):
+        learnable_inputs = self._learnable(self.inputs[0])
+        if learnable_inputs:
             node = self.inputs[0]
             x_gradient = self.gp_kernel.batch_input_vjp(_expand_batch(x, size), z, g_mn.transpose(-2, -1), kernel_values)
-            grads[node.name] = x_gradient.reshape(size, *shape_of(node, values[0]))
-        if self._mean_input is not None:
-            grads[self._mean_input.name] = _to_parameter_shape(g, shape_of(self._mean_input, values[-1]))
+            _accumulate(grads, node.name, x_gradient.reshape(size, *shape_of(node, values[0])))
+        # f = m(X) + K_nm a: the mean parameters and X get the mean's VJP of g.
+        _add_mean_gradients(
+            grads, self.gp_mean, context, x, g, lambda node: shape_of(node, values[self.inputs.index(node)]),
+            v.dtype, v.device, raw, input_node=self.inputs[0] if learnable_inputs else None,
+            input_shape=shape_of(self.inputs[0], values[0]),
+        )
         return grads
 
     # -- vectorized chains -------------------------------------------------
@@ -1538,12 +1524,12 @@ def _draws_of(trace, node, n_draws, dtype, device):
     return torch.as_tensor(value).to(dtype=dtype, device=device).unsqueeze(0)
 
 
-def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_variance=False, chunk_size=64, new_mean=None):
+def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_variance=False, chunk_size=64):
     r"""Values of a :class:`SparseLatentGP` at new inputs for every draw of ``trace``.
 
     Under the DTC approximation the function is deterministic given the
     whitened values ``v``, the inducing inputs and the hyperparameters:
-    ``f* = mean + K_*m L⁻ᵀ v`` at ``new_inputs``, so the ``n_samples``
+    ``f* = m(X*) + K_*m L⁻ᵀ v`` at ``new_inputs``, so the ``n_samples``
     samples per draw are identical by default. With
     ``conditional_variance=True`` (default ``False``)
     independent Normal noise with the FITC-style variance
@@ -1553,15 +1539,10 @@ def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_
     ``trace`` is a ``SamplingResult`` (from NUTS or ``guide.sample``) or a
     mapping with values of shape ``(n_chains, n_draws, *shape)``. It must
     contain the whitened values; learnable inducing inputs, kernel
-    parameters and a named mean are read from it as well (a node missing
-    from the trace keeps its current value). Draws are evaluated in batches
-    of ``chunk_size`` (default ``64``) with the batched kernel API.
-
-    ``new_mean`` is the mean at the new inputs (shape ``(n_new,)``, or
-    ``(n_parameter_draws, n_new)`` for one per draw). A scalar mean is used
-    at the new inputs when it is omitted; a mean given per training input
-    cannot be evaluated at new inputs, so ``new_mean`` is then required
-    (``ValueError`` otherwise). The result has shape
+    parameters and the parameters of the mean function ``m`` are read from
+    it as well (a node missing from the trace keeps its current value).
+    Draws are evaluated in batches of ``chunk_size`` (default ``64``) with
+    the batched kernel and mean-function API. The result has shape
     ``(n_parameter_draws, n_samples, n_new)``.
     """
     if not isinstance(gp, SparseLatentGP):
@@ -1580,11 +1561,8 @@ def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_
         z = z.unsqueeze(-1)
     new = torch.as_tensor(_input_value(new_inputs)).to(dtype=dtype, device=device)
     new = (new.reshape(-1, 1) if new.ndim <= 1 else new).unsqueeze(0)
-    kernel_draws = {p.name: _draws_of(trace, p, n_draws, dtype, device) for p in gp.gp_kernel.parameters}
-    _, mean = _prediction_means(
-        _draws_of(trace, gp.gp_mean, n_draws, dtype, device), new_mean,
-        _feature_count(gp.gp_inputs), new.shape[1], n_draws, dtype, device, "SparseLatentGP",
-    )
+    kernel_draws = _parameter_draws(trace, gp.gp_kernel.parameters, n_draws, dtype, device, _draws_of)
+    mean_draws = _parameter_draws(trace, gp.gp_mean.parameters, n_draws, dtype, device, _draws_of)
 
     def take(tensor, start, stop):
         return tensor if tensor.shape[0] == 1 else tensor[start:stop]
@@ -1594,12 +1572,13 @@ def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_
         stop = min(start + chunk_size, n_draws)
         size = stop - start
         values = {name: take(draws, start, stop) for name, draws in kernel_draws.items()}
+        mean_values = {name: take(draws, start, stop) for name, draws in mean_draws.items()}
         z_chunk = take(z, start, stop)
         k_mm = gp.gp_kernel.batch_evaluate(z_chunk, z_chunk, values)
         k_ms = gp.gp_kernel.batch_evaluate(z_chunk, new, values)
         factor, _ = batched_stable_cholesky(_expand_batch(k_mm, size), jitter=gp.gp_jitter)
         a = torch.linalg.solve_triangular(factor.transpose(-2, -1), v[start:stop].unsqueeze(-1), upper=True)
-        f = take(mean, start, stop) + (k_ms.transpose(-2, -1) @ a).squeeze(-1)  # (size, n_new)
+        f = gp.gp_mean.batch_evaluate(new, mean_values) + (k_ms.transpose(-2, -1) @ a).squeeze(-1)  # (size, n_new)
         f = f.unsqueeze(1).expand(size, n_samples, f.shape[-1])
         if conditional_variance:
             projected = torch.linalg.solve_triangular(factor, _expand_batch(k_ms, size), upper=False)

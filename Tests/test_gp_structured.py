@@ -580,33 +580,15 @@ def test_structured_gps_follow_model_to_float32():
 
 
 @pytest.mark.parametrize("structure", ["toeplitz", "kronecker"])
-def test_structured_gp_predictive_vector_mean_needs_new_mean(structure):
-    """A mean given per training input is never reused at new inputs, even when the counts match."""
+def test_structured_gp_rejects_a_per_input_vector_mean(structure):
     x = torch.linspace(0.0, 1.0, 6, dtype=DTYPE)
-    y = torch.sin(5 * x)
     train_mean = torch.linspace(1.0, 2.0, 6, dtype=DTYPE)
-    new = torch.linspace(0.05, 1.4, 6, dtype=DTYPE)  # n_new == n_train
-    new_mean = torch.linspace(-1.0, 0.5, 6, dtype=DTYPE)
-    trace = {"noise": torch.tensor([[[0.1], [0.2]]], dtype=DTYPE)}
-
-    def build(mean):
-        with Model():
-            noise = RandomParameter("noise", Normal(0.1, 1.0), initial_value=torch.tensor([0.1], dtype=DTYPE))
+    with Model():
+        with pytest.raises(ValueError, match="mean function"):
             if structure == "toeplitz":
-                gp = ToeplitzGP("f", Data("x", x), RBF(0.4, 1.3), noise_variance=noise, mean=mean)
+                ToeplitzGP("f", Data("x", x), RBF(0.4, 1.3), noise_variance=0.1, mean=train_mean)
             else:
-                gp = KroneckerGP("f", [Data("x", x)], [RBF(0.4, 1.3)], noise_variance=noise, mean=mean)
-        return gp
-
-    predictive = toeplitz_gp_predictive if structure == "toeplitz" else kronecker_gp_predictive
-    points = new if structure == "toeplitz" else new.reshape(-1, 1)
-    with pytest.raises(ValueError, match="new_mean"):
-        predictive(build(train_mean), trace, y, points)
-    torch.manual_seed(0)
-    actual = predictive(build(train_mean), trace, y, points, n_samples=2, new_mean=new_mean)
-    torch.manual_seed(0)
-    expected = predictive(build(0.0), trace, y - train_mean, points, n_samples=2) + new_mean
-    torch.testing.assert_close(actual, expected)
+                KroneckerGP("f", [Data("x", x)], [RBF(0.4, 1.3)], noise_variance=0.1, mean=train_mean)
 
 
 def _toeplitz_column(kind, n=50):
