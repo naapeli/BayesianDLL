@@ -15,20 +15,44 @@ def _normalize_slice(s):
 
 
 class SampleStats:
-    """Per-iteration sampler statistics of the post-warmup draws, one entry per sampling block.
+    """Per-iteration sampler diagnostic statistics for post-warmup draws.
 
-    Each block entry is a dict with the block's ``"params"`` (parameter
-    names), its ``"sampler"`` (``"nuts"``, ``"metropolis"``, ``"slice"``
-    or ``"gibbs"``) and ``"stats"``, a dict mapping a statistic name to a tensor of shape
-    ``(n_chains, n_samples)``. NUTS records ``step_size``, ``accept_stat``,
-    ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` and ``lp``;
-    Metropolis records ``accept_stat``, ``accepted``, ``step_size`` (the
-    proposal scale) and ``lp``; the slice sampler ``n_evals``,
-    ``accept_stat``, ``step_size`` (the mean width) and ``lp``; the finite
-    Gibbs sampler ``accept_stat``, ``step_size`` and ``lp``.
+    Parameters
+    ----------
+    blocks : list of dict, optional
+        List of block diagnostics dictionaries. Each dictionary contains:
+        - ``"params"``: list of parameter names updated by this block.
+        - ``"sampler"``: name of the sampler (e.g. ``"nuts"``, ``"metropolis"``,
+          ``"slice"``, or ``"gibbs"``).
+        - ``"stats"``: mapping from statistic name (e.g. ``"step_size"``,
+          ``"accept_stat"``, ``"diverging"``, ``"energy"``, ``"lp"``) to
+          a tensor of shape ``(n_chains, n_samples)``.
 
-    ``stats[i]`` returns the statistics of block ``i`` and ``stats["energy"]``
-    the statistic of the only block that records it.
+    Attributes
+    ----------
+    blocks : list of dict
+        Internal list of sampling block dictionaries.
+    params : list of list of str
+        Parameter names updated by each block.
+    samplers : list of str
+        The sampler type for each block.
+
+    Notes
+    -----
+    Indexing behavior (``sample_stats[key]``):
+
+    * **Integer index** ``sample_stats[i]``:
+      Returns the ``dict`` of statistics for block ``i``, where each value is
+      a tensor of shape ``(n_chains, n_samples)``.
+    * **String key** ``sample_stats["stat_name"]``:
+      If a statistic is unique across blocks (such as ``"energy"`` or
+      ``"tree_depth"`` in a NUTS block, or when there is only a single sampling
+      block), indexing directly by its name returns the statistic tensor of
+      shape ``(n_chains, n_samples)``.
+      If multiple blocks record the same statistic (for instance ``"step_size"``
+      or ``"accept_stat"`` in a multi-block model), direct string indexing raises
+      a :class:`KeyError` instructing to index the desired block first, e.g.:
+      ``sample_stats[0]["step_size"]``.
     """
 
     def __init__(self, blocks=None):
@@ -49,6 +73,32 @@ class SampleStats:
         return (block["stats"] for block in self.blocks)
 
     def __getitem__(self, key):
+        """Access sampler statistics by block index or unique statistic name.
+
+        Parameters
+        ----------
+        key : int or str
+            - If an integer ``i``: returns the statistics dictionary
+              ``dict[str, Tensor]`` for the ``i``-th sampling block.
+            - If a string ``name``: returns the tensor of shape
+              ``(n_chains, n_samples)`` for that statistic, provided exactly
+              one sampling block recorded it.
+
+        Returns
+        -------
+        dict[str, Tensor] or Tensor
+            The block dictionary if ``key`` is an ``int``, or the statistic
+            tensor if ``key`` is a unique ``str``.
+
+        Raises
+        ------
+        IndexError
+            If an integer block index is out of bounds.
+        KeyError
+            If a string key is not recorded by any block, or if it is recorded
+            by multiple blocks (in which case index by block first, e.g.
+            ``sample_stats[0][key]``).
+        """
         if isinstance(key, int):
             return self.blocks[key]["stats"]
         matches = [block["stats"][key] for block in self.blocks if key in block["stats"]]
