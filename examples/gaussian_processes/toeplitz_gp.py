@@ -25,6 +25,16 @@ integrated out) times the log-normal priors of the hyperparameters, working
 on their log scale.
 
 The kernel is a Matérn-5/2 (twice differentiable sample paths).
+
+Note on Learnable Grids
+-----------------------
+``ToeplitzGP`` requires fixed, equally spaced 1-D inputs. A learnable uniform
+spacing ``Δt`` would be mathematically redundant with the kernel lengthscale
+``l`` (since stationary kernels depend only on ``|t_i - t_j| / l = |i - j| Δt / l``),
+while non-uniform or independently learnable grid locations destroy the Toeplitz
+Toeplitz structure. For models where grid coordinates are learnable parameters,
+use :class:`~BayesianDLL.GP.KroneckerGP` (which supports learnable axes on Cartesian
+grids) or :class:`~BayesianDLL.GP.ExactGP` / :class:`~BayesianDLL.GP.SparseGP`.
 """
 
 import time

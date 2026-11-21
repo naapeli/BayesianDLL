@@ -43,7 +43,7 @@ import torch
 
 from BayesianDLL import Data, Group, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
 from BayesianDLL.Deterministic import Add, Index, Linear
-from BayesianDLL.Distributions import HalfNormal, LogNormal, Normal
+from BayesianDLL.Distributions import HalfNormal, LogNormal, LogTransform, Normal
 from BayesianDLL.Variational import BBVI
 
 torch.manual_seed(0)
@@ -81,7 +81,7 @@ with Model() as model:
 with Guide(model, default_family="mean_field") as grouped:
     Group(["mu", "beta"], family="full_rank", name="line")
     RandomParameter("sigma", LogNormal(VariationalParameter("sigma_loc", torch.tensor([0.0], dtype=torch.float64)),
-                                       VariationalParameter("sigma_scale", torch.tensor([0.2], dtype=torch.float64), log_scale=True)))
+                                       VariationalParameter("sigma_scale", torch.tensor([0.2], dtype=torch.float64), transform=LogTransform())))
 
 guides = {
     "all mean-field": Guide(model, default_family="mean_field"),
@@ -103,12 +103,12 @@ histories, traces, seconds = {}, {}, {}
 for label, guide in guides.items():
     torch.manual_seed(1)
     start = time.perf_counter()
-    histories[label] = BBVI(model, guide, n_samples=2, epochs=1500, lr=0.03, lrd=0.999, callback_frequency=5, verbose=False)
+    histories[label] = BBVI(model, guide, n_samples=2, epochs=2500, lr=0.03, lrd=0.999, callback_frequency=5, verbose=False)
     seconds[label] = time.perf_counter() - start
     traces[label] = guide.sample(1500)
 
 start = time.perf_counter()
-traces["NUTS"] = model.sample(n_samples=400, warmup_length=400, n_chains=4, progress_bar=False, seed=0,
+traces["NUTS"] = model.sample(n_samples=150, warmup_length=150, n_chains=2, progress_bar=False, seed=0,
                               metric="dense", chain_method="vectorized")
 seconds["NUTS"] = time.perf_counter() - start
 print(f"NUTS: {sum(traces['NUTS'].divergences)} divergences")
@@ -255,11 +255,12 @@ for space in ("unconstrained", "constrained"):
         print(f"{'':>15}standard error of the mean of {name}: {error.item():.4f} (n = {result.n_samples})")
 
 unconstrained, constrained = grouped.covariance("unconstrained"), grouped.covariance("constrained")
+mean_unconstrained, mean_constrained = grouped.mean("unconstrained"), grouped.mean("constrained")
 block = constrained.block("mu", "beta")[0, 0] / (constrained.block("mu") * constrained.block("beta")).sqrt()
 print(f"corr(mu, beta) inside the full-rank group: {block.item():+.3f}; "
       f"cov(mu, tau) between independent pieces: {constrained.block('mu', 'tau').item():.1f}")
-print(f"tau: exp(E[log tau]) = {unconstrained.means()['tau'].exp().item():.4f}, "
-      f"E[tau] = {constrained.means()['tau'].item():.4f}, "
+print(f"tau: exp(E[log tau]) = {mean_unconstrained['tau'].exp().item():.4f}, "
+      f"E[tau] = {mean_constrained['tau'].item():.4f}, "
       f"Monte Carlo from guide.sample: {traces['grouped']['tau'].mean().item():.4f}")
-print(f"sigma: E[sigma] = {constrained.means()['sigma'].item():.4f} (closed form of the LogNormal entry), "
-      f"E[log sigma] = {unconstrained.means()['sigma'].item():.4f} +- {unconstrained.standard_error['sigma'].item():.4f} (Monte Carlo)")
+print(f"sigma: E[sigma] = {mean_constrained['sigma'].item():.4f} (closed form of the LogNormal entry), "
+      f"E[log sigma] = {mean_unconstrained['sigma'].item():.4f} +- {unconstrained.standard_error['sigma'].item():.4f} (Monte Carlo)")

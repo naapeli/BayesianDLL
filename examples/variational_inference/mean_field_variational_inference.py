@@ -7,7 +7,7 @@ The target is a one-dimensional, two-component Gaussian mixture
 ``q(x) = N(m, s)``. The guide is written by hand in a ``Guide``
 block: a ``RandomParameter`` with the same name as the model's latent,
 whose distribution has the ``VariationalParameter`` objects ``m`` and ``s``.
-``s`` is created with ``log_scale=True``, so the optimiser updates
+``s`` is created with ``transform=LogTransform()``, so the optimiser updates
 ``log(s)``: the standard deviation stays positive and can change by large
 factors without overshooting.
 
@@ -30,7 +30,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Guide, Model, RandomParameter, VariationalParameter
-from BayesianDLL.Distributions import Mixture, Normal
+from BayesianDLL.Distributions import LogTransform, Mixture, Normal
 from BayesianDLL.Variational import BBVI
 
 
@@ -44,7 +44,7 @@ with Model() as model:
 def normal_guide(initial_mean):
     with Guide(model) as guide:
         m = VariationalParameter("m", torch.tensor([initial_mean], dtype=torch.float64))
-        s = VariationalParameter("s", torch.tensor([1.0], dtype=torch.float64), log_scale=True)
+        s = VariationalParameter("s", torch.tensor([1.0], dtype=torch.float64), transform=LogTransform())
         RandomParameter("x", Normal(m, s))
     return guide, m, s
 

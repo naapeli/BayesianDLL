@@ -53,7 +53,12 @@ def piecewise_partials(early, late, tau):
 
 def change_point_model(tau_sampler):
     with Model() as model:
-        tau = RandomParameter("tau", DiscreteUniform(1, n_years - 1), sampler=tau_sampler)
+        tau = RandomParameter(
+            "tau",
+            DiscreteUniform(1, n_years - 1),
+            sampler=tau_sampler,
+            initial_value=torch.tensor([n_years // 2], dtype=torch.float64),
+        )
         early = RandomParameter("early_rate", Gamma(prior_shape, prior_rate), delta=0.9)
         late = RandomParameter("late_rate", Gamma(prior_shape, prior_rate), delta=0.9)
         rate = Elementwise("rate", piecewise, piecewise_partials, early, late, tau)
@@ -86,7 +91,7 @@ exact = torch.softmax(log_evidence, dim=0)
 # (their R-hat would be far above 1.01), which is exactly the point here.
 gibbs = change_point_model("auto").sample(500, 300, n_chains=4, seed=0, progress_bar=False,
                                           chain_method="vectorized")
-metropolis = change_point_model("metropolis").sample(2000, 300, n_chains=1, seed=0, progress_bar=False,
+metropolis = change_point_model("metropolis").sample(2000, 500, n_chains=1, seed=0, progress_bar=False,
                                                     check_convergence=False, chain_method="vectorized")
 
 print("samplers per block (Gibbs run):", list(zip(gibbs.sample_stats.params, gibbs.sample_stats.samplers)))

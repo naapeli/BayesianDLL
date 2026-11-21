@@ -13,7 +13,7 @@ is approximated with a mean-field guide written by hand in a
 ``Guide`` block:
 
 * ``a`` and ``b`` get Normal factors with a free mean and a standard
-  deviation that is a ``VariationalParameter`` with ``log_scale=True``, so
+  deviation that is a ``VariationalParameter`` with ``transform=LogTransform()``, so
   the optimiser updates ``log(sd)`` and the scale stays positive;
 * ``sigma`` must stay positive, so the guide puts a Normal on
   ``log_sigma`` and defines ``sigma = Exp(log_sigma)``. A deterministic
@@ -34,7 +34,7 @@ import torch
 
 from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
 from BayesianDLL.Deterministic import Exp, Linear
-from BayesianDLL.Distributions import HalfNormal, Normal
+from BayesianDLL.Distributions import HalfNormal, LogTransform, Normal
 from BayesianDLL.Variational import BBVI
 
 
@@ -60,7 +60,7 @@ with Model() as model:
 def normal_factor(name, mean=0.0, sd=1.0):
     """A Normal guide factor with a free mean and a log-scale standard deviation."""
     loc = VariationalParameter(f"{name}_loc", torch.tensor([mean], dtype=torch.float64))
-    scale = VariationalParameter(f"{name}_scale", torch.tensor([sd], dtype=torch.float64), log_scale=True)
+    scale = VariationalParameter(f"{name}_scale", torch.tensor([sd], dtype=torch.float64), transform=LogTransform())
     return RandomParameter(name, Normal(loc, scale))
 
 

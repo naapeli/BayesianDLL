@@ -30,4 +30,4 @@ in turn.
 
 A discrete parameter with a finite support can also be summed out of the
 model exactly instead of being sampled (``RandomParameter(...,
-enumerate=True)``); the Gaussian mixture examples show this enumeration.
+marginalize=True)``); the Gaussian mixture examples show this marginalization.

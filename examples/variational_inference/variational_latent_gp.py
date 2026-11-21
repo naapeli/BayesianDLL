@@ -34,7 +34,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
-from BayesianDLL.Distributions import Normal
+from BayesianDLL.Distributions import LogTransform, Normal
 from BayesianDLL.GP import RBF, LatentGP, gp_predictive
 from BayesianDLL.Variational import BBVI
 
@@ -54,7 +54,7 @@ with Model() as model:
 
 with Guide(model) as guide:
     z_loc = VariationalParameter("z_loc", torch.zeros(n_observations, dtype=torch.float64))
-    z_scale = VariationalParameter("z_scale", torch.ones(n_observations, dtype=torch.float64), log_scale=True)
+    z_scale = VariationalParameter("z_scale", torch.ones(n_observations, dtype=torch.float64), transform=LogTransform())
     RandomParameter("f_white", Normal(z_loc, z_scale), shape=(n_observations,))
 
 # %%

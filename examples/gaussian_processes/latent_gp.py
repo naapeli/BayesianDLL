@@ -26,7 +26,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Bernoulli, Normal
-from BayesianDLL.GP import LatentGP, RBF, gp_predictive
+from BayesianDLL.GP import ConstantMean, LatentGP, RBF, gp_predictive
 
 
 torch.manual_seed(3)
@@ -51,8 +51,9 @@ with Model() as model:
     inputs = Data("inputs", x)
     log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 0.5))
     log_variance = RandomParameter("log_variance", Normal(1.0, 0.7))
+    intercept = RandomParameter("intercept", Normal(0.0, 1.0))
     kernel = RBF(Exp("lengthscale", log_lengthscale), Exp("variance", log_variance))
-    f = LatentGP("f", inputs, kernel)
+    f = LatentGP("f", inputs, kernel, mean=ConstantMean(intercept))
     ObservedParameter("y", Bernoulli(logits=f), y)
 
 # %%

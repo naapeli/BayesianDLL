@@ -10,7 +10,7 @@ every observation:
     y_i \\mid z_i \\sim \\mathcal{N}(\\mu_{z_i}, \\sigma_{z_i}^2).
 
 The labels are discrete, so NUTS cannot sample them. Declaring them with
-``enumerate=True`` sums them out of the joint density exactly: each ``z_i``
+``marginalize=True`` sums them out of the joint density exactly: each ``z_i``
 only touches ``y_i`` (they live in a plate), so the sum over all ``2 ** n``
 label vectors factorises into ``n`` sums of two terms. NUTS samples ``w``,
 ``mu`` and ``sigma`` from the marginal posterior, and after every draw the
@@ -59,7 +59,7 @@ with Model() as model:
     stds = Exp("stds", log_stds)
 
     with plate("data", n):
-        z = RandomParameter("z", Bernoulli(weight), shape=(), enumerate=True)
+        z = RandomParameter("z", Bernoulli(weight), shape=(), marginalize=True)
         ObservedParameter("y", Normal(Index("mean", means, z), Index("std", stds, z)), data)
 
 

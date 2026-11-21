@@ -43,7 +43,7 @@ import torch
 
 from BayesianDLL import Group, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter
 from BayesianDLL.Deterministic import Add, Affine, Multiply
-from BayesianDLL.Distributions import HalfCauchy, LogNormal, Normal
+from BayesianDLL.Distributions import HalfCauchy, LogNormal, LogTransform, Normal
 from BayesianDLL.Variational import BBVI
 
 torch.manual_seed(0)
@@ -75,17 +75,17 @@ with Model() as non_centered:
 # everything outside it. Here it covers the whole model.
 
 
-def vp(name, value, shape=(1,), log_scale=False):
-    return VariationalParameter(name, torch.full(shape, value, dtype=torch.float64), log_scale=log_scale)
+def vp(name, value, shape=(1,), transform=None):
+    return VariationalParameter(name, torch.full(shape, value, dtype=torch.float64), transform=transform)
 
 
 with Guide(model) as structured:
     with Group(["mu", "tau", "theta"]):
-        q_mu = RandomParameter("mu", Normal(vp("mu_loc", 0.0), vp("mu_scale", 2.0, log_scale=True)))
-        q_tau = RandomParameter("tau", LogNormal(vp("tau_loc", 1.0), vp("tau_scale", 0.5, log_scale=True)))
+        q_mu = RandomParameter("mu", Normal(vp("mu_loc", 0.0), vp("mu_scale", 2.0, transform=LogTransform())))
+        q_tau = RandomParameter("tau", LogNormal(vp("tau_loc", 1.0), vp("tau_scale", 0.5, transform=LogTransform())))
         shift = Multiply("theta_shift", q_tau, vp("a", 0.0, (n_schools,)))
         loc = Add("theta_loc", q_mu, shift)
-        scale = Multiply("theta_scale", q_tau, vp("b", 1.0, (n_schools,), log_scale=True))
+        scale = Multiply("theta_scale", q_tau, vp("b", 1.0, (n_schools,), transform=LogTransform()))
         RandomParameter("theta", Normal(loc, scale), shape=(n_schools,))
 
 mean_field = Guide(model, default_family="mean_field", init_scale=1.0)
@@ -153,6 +153,7 @@ plt.show()
 # Monte Carlo in both spaces, from exact ancestral draws, and lists them in
 # ``estimated``.
 
+mean = structured.mean("constrained", n_samples=2000)
 result = structured.covariance("constrained", n_samples=2000)
 print(f"estimated: {result.estimated}, n = {result.n_samples}")
-print(f"E[tau] = {result.means()['tau'].item():.2f} +- {result.standard_error['tau'].item():.2f}")
+print(f"E[tau] = {mean['tau'].item():.2f} +- {result.standard_error['tau'].item():.2f}")

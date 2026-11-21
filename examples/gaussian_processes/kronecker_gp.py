@@ -159,3 +159,28 @@ ax.set(xlabel="number of grid points N", ylabel="seconds per log density + gradi
 ax.legend(loc="upper left", fontsize="small")
 ax.grid(True, which="both", alpha=0.3)
 plt.show()
+
+# %%
+# Learnable Grid Coordinates
+# --------------------------
+# While stationary Toeplitz models require fixed regular spacing,
+# ``KroneckerGP`` supports learnable grid inputs along any axis.
+# A grid axis can be a ``RandomParameter`` or ``DeterministicParameter``: the
+# Cartesian product structure is preserved while the grid coordinates along each
+# axis can move and be estimated jointly with the kernel parameters.
+
+with Model() as learnable_model:
+    la = RandomParameter("la", Normal(-1.5, 1.0))
+    lb = RandomParameter("lb", Normal(-1.5, 1.0))
+    axis_a_param = RandomParameter("axis_a_learned", Normal(0.5, 0.5), shape=size, initial_value=axis_a.clone())
+    gp_learnable = KroneckerGP(
+        "gp_learnable",
+        [axis_a_param, Data("axis_b", axis_b)],
+        [RBF(Exp("lengthscale_a", la), 1.0), RBF(Exp("lengthscale_b", lb), 1.0)],
+        noise_variance=0.04,
+    )
+    ObservedParameter("y_learnable", gp_learnable, y)
+
+print("KroneckerGP with learnable grid axis log prob:", learnable_model.model_log_prob().item())
+grads = learnable_model.joint_grad_log_prob()
+print(f"Learned grid axis gradient computed successfully: shape {grads['axis_a_learned'].shape}")

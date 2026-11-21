@@ -16,9 +16,7 @@ checked against the exact probabilities.
 
 Each distribution is sampled with four chains in one process
 (``chain_method="vectorized"``). The figure compares the draws with the exact
-probability mass or density, and the last panel shows how a random walk moves
-through an Exponential distribution: successive draws are strongly
-correlated.
+probability mass or density across all five distributions.
 """
 
 import matplotlib.pyplot as plt
@@ -75,11 +73,7 @@ for k, (ax, (title, distribution, grid)) in enumerate(zip(axes[1, :2], continuou
     ax.set_xlabel("value")
     ax.set_ylabel("density")
 
-ax = axes[1, 2]
-ax.plot(traces["Exponential(rate 0.3)"][0, :300].reshape(-1), color="C0")
-ax.set_title("Random walk: first 300 draws of one chain")
-ax.set_xlabel("iteration")
-ax.set_ylabel("value (Exponential)")
+fig.delaxes(axes[1, 2])
 
 handles, labels = axes[0, 0].get_legend_handles_labels()
 handles2, labels2 = axes[1, 0].get_legend_handles_labels()
