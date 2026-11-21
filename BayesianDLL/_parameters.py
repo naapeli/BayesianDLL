@@ -10,11 +10,11 @@ from ._data import Data
 class RandomParameter:
     """A latent random variable of the active model.
 
-    With ``enumerate=True`` the parameter is not sampled but summed out of the
+    With ``marginalize=True`` the parameter is not sampled but summed out of the
     joint density exactly. This requires a finite discrete support (a
     ``DiscreteRange``, e.g. ``Bernoulli`` or ``DiscreteUniform``). The other
     parameters are then sampled from the marginal posterior and posterior
-    draws of the enumerated parameter are added to the sampling result
+    draws of the marginalized parameter are added to the sampling result
     afterwards (see :func:`BayesianDLL.marginalize`).
 
     Parameters
@@ -38,8 +38,6 @@ class RandomParameter:
         :func:`~BayesianDLL.sample`.
     marginalize : bool, default False
         Sum (marginalize) the parameter out instead of sampling it.
-    enumerate : bool, optional
-        Alias for ``marginalize`` (kept for backward compatibility).
     **sampler_params
         Settings for the sampler of this parameter's block (e.g. ``delta=0.9``).
 
@@ -52,9 +50,7 @@ class RandomParameter:
         With ``marginalize=True`` for a distribution without finite support.
     """
 
-    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", enumerate=None, marginalize=False, **sampler_params):
-        if enumerate is not None:
-            marginalize = enumerate
+    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", marginalize=False, **sampler_params):
         if marginalize:
             _check_enumerable(name, distribution)
         # Capture active plates at creation time
@@ -501,18 +497,15 @@ class VariationalParameter:
         Lower clamp bound for updates in constrained space.
     max : float, default inf
         Upper clamp bound for updates in constrained space.
-    log_scale : bool, default False
-        Shortcut for optimizing in log space (equivalent to
-        ``transform=LogTransform()``). Recommended for positive parameters such
-        as variances or scales.
     transform : Transform, optional
         Bijection between constrained and unconstrained parameter space. If
-        omitted, defaults to :class:`~BayesianDLL.Distributions.IdentityTransform`
-        (or :class:`~BayesianDLL.Distributions.LogTransform` when
-        ``log_scale=True``).
+        omitted, defaults to :class:`~BayesianDLL.Distributions.IdentityTransform`.
+        Use :class:`~BayesianDLL.Distributions.LogTransform` for positive parameters
+        (such as variances or standard deviations) so that optimization proceeds
+        in unconstrained log-space.
     """
 
-    def __init__(self, name, value, min=-float("inf"), max=float("inf"), log_scale=False, transform=None):
+    def __init__(self, name, value, min=-float("inf"), max=float("inf"), transform=None):
         self.name = name
         self.min = min
         self.max = max
@@ -520,23 +513,12 @@ class VariationalParameter:
         if value.ndim == 0:
             value = value.unsqueeze(0)
 
-        if log_scale and transform is not None:
-            raise ValueError(f"VariationalParameter '{name}' cannot specify both log_scale and transform.")
-        if log_scale:
-            from .Distributions._transforms import LogTransform
-            self.transform = LogTransform()
-            self.log_scale = True
-        elif transform is not None:
-            self.transform = transform
-            from .Distributions._transforms import LogTransform
-            self.log_scale = isinstance(transform, LogTransform)
-        else:
+        if transform is None:
             from .Distributions._transforms import IdentityTransform
             self.transform = IdentityTransform()
-            self.log_scale = False
+        else:
+            self.transform = transform
 
-        if self.log_scale and not bool((value > 0).all()):
-            raise ValueError(f"VariationalParameter '{name}' uses log_scale=True and must be positive.")
         self.value = value
 
     @property
@@ -546,8 +528,7 @@ class VariationalParameter:
 
     def unconstrained_grad(self, grad):
         """Convert a gradient w.r.t. ``value`` into one w.r.t. ``unconstrained_value``."""
-        derivative = self.transform.derivative(self.unconstrained_value)
-        return grad * derivative
+        return grad * self.transform.derivative(self.unconstrained_value)
 
     def set_unconstrained_value(self, unconstrained_value):
         value = self.transform.inverse(unconstrained_value)

@@ -146,8 +146,9 @@ def test_lognormal_guide_elbo_is_zero_for_the_exact_posterior():
 def test_bbvi_lognormal_guide_reaches_known_optimum():
     """For p = Exp(1) the best LogNormal(m, s) has s = 1 and m = -1/2."""
     model = _exponential_model()
+    from BayesianDLL.Distributions import LogTransform
     with Guide(model) as guide:
-        RandomParameter("x", LogNormal(VariationalParameter("m", torch.tensor([1.0])), VariationalParameter("s", torch.tensor([0.4]), log_scale=True)))
+        RandomParameter("x", LogNormal(VariationalParameter("m", torch.tensor([1.0])), VariationalParameter("s", torch.tensor([0.4]), transform=LogTransform())))
     BBVI(model, guide, n_samples=16, epochs=1500, lr=0.02, verbose=False)
     distribution = guide.params["x"].distribution
     assert distribution.mu.value.item() == pytest.approx(-0.5, abs=0.12)
@@ -313,10 +314,10 @@ def test_guide_must_be_mean_field(normal_model):
 
 def test_guide_rejects_enumerated_latents():
     with Model() as model:
-        RandomParameter("z", Bernoulli(0.3), enumerate=True)
+        RandomParameter("z", Bernoulli(0.3), marginalize=True)
         RandomParameter("x", Normal(0.0, 1.0))
     with Guide(model) as guide:
-        RandomParameter("z", Bernoulli(VariationalParameter("p", torch.tensor([0.5]))), enumerate=True)
+        RandomParameter("z", Bernoulli(VariationalParameter("p", torch.tensor([0.5]))), marginalize=True)
         RandomParameter("x", Normal(VariationalParameter("m", torch.zeros(1)), VariationalParameter("s", torch.ones(1))))
     with pytest.raises(ValueError, match="enumerated"):
         guide.validate(model)

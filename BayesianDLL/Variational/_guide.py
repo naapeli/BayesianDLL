@@ -206,7 +206,7 @@ class Guide(Model, BaseGuide):
         with Guide(model, default_family="mean_field") as guide:
             Group(["mu", "beta"], family="full_rank")         # dependent latents share a group
             RandomParameter("sigma", LogNormal(VariationalParameter("sigma_loc", 0.0),
-                                               VariationalParameter("sigma_scale", 0.5, log_scale=True)))
+                                               VariationalParameter("sigma_scale", 0.5, transform=LogTransform())))
         BBVI(model, guide, ...)
         trace = guide.sample(1000)
 
@@ -547,7 +547,7 @@ class Guide(Model, BaseGuide):
         dict[str, Tensor]
             Mapping from latent parameter name to its mean tensor.
         """
-        return self.covariance(space, n_samples, seed).means()
+        return self.covariance(space, n_samples, seed)._means()
 
     def covariance(self, space="unconstrained", n_samples=4000, seed=0):
         """Compute the joint moments (mean and block-diagonal covariance) of the guide.
@@ -556,7 +556,8 @@ class Guide(Model, BaseGuide):
         Returns a :class:`~BayesianDLL.Variational.GuideCovariance` containing
         the full covariance matrix (``.matrix``), block accessors
         (``.block(latent)``), per-latent variances (``.variances()``), and
-        means (``.means()``).
+        covariances (``.covariance()`` or ``.covariances()``). For parameter
+        means, use :meth:`mean` on the guide or group directly.
 
         Parameters
         ----------

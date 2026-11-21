@@ -100,7 +100,7 @@ class GuideCovariance:
             offset += size
         self.n_samples = int(n_samples)
 
-    def means(self):
+    def _means(self):
         """``{latent: mean}`` with each latent's shape."""
         return {name: self.mean[slice(*self.slices[name])].reshape(self.shapes[name]) for name in self.names}
 

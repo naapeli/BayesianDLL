@@ -277,7 +277,7 @@ def _mixture_model(n, data, shared_assignment=False):
         mean0 = RandomParameter("mean0", Normal(-1.0, 1.0))
         mean1 = RandomParameter("mean1", Normal(1.0, 1.0))
         if shared_assignment:
-            z = RandomParameter("z", Bernoulli(weight), enumerate=True)
+            z = RandomParameter("z", Bernoulli(weight), marginalize=True)
             mean = DeterministicParameter(
                 "mean", lambda m0, m1, z: m0 + (m1 - m0) * z,
                 lambda m0, m1, z: {"mean0": 1 - z, "mean1": z}, [mean0, mean1, z],
@@ -285,7 +285,7 @@ def _mixture_model(n, data, shared_assignment=False):
             ObservedParameter("y", Normal(mean, 1.0), data)
         else:
             with plate("data", n):
-                z = RandomParameter("z", Bernoulli(weight), shape=(), enumerate=True)
+                z = RandomParameter("z", Bernoulli(weight), shape=(), marginalize=True)
                 mean = DeterministicParameter(
                     "mean", lambda m0, m1, z: m0 + (m1 - m0) * z,
                     lambda m0, m1, z: {"mean0": 1 - z, "mean1": z}, [mean0, mean1, z],

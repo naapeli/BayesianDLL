@@ -249,7 +249,7 @@ class Model:
         self.data = {}
         self.params: dict[str, RandomParameter] = {}
         # Finite-support discrete parameters that are summed out of the joint
-        # density instead of being sampled (see ``RandomParameter(enumerate=True)``).
+        # density instead of being sampled (see ``RandomParameter(marginalize=True)``).
         self.enumerated_params: dict[str, RandomParameter] = {}
         self.observed_params: dict[str, ObservedParameter] = {}
         self.deterministic_params: dict[str, DeterministicParameter] = {}
@@ -1348,7 +1348,7 @@ def marginalize(model: Model, names) -> Model:
     """Return a copy of ``model`` in which the parameters ``names`` are summed out.
 
     Equivalent to creating the parameters with ``RandomParameter(...,
-    enumerate=True)``: the parameters must have a finite discrete support,
+    marginalize=True)``: the parameters must have a finite discrete support,
     they are no longer sampled, every log density and gradient of the new
     model is that of the marginal model, and :func:`~BayesianDLL.sample`
     adds exact posterior draws of them to the result.

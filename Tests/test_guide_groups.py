@@ -11,7 +11,7 @@ from BayesianDLL import (
 )
 from BayesianDLL.Distributions import (
     Bernoulli, Beta, Binomial, Categorical, Dirichlet, DiscreteUniform, Exponential, Gamma, Geometric, HalfNormal,
-    InvGamma, Laplace, LogNormal, Mixture, MultivariateNormal, NegativeBinomial, Normal, Poisson, StudentT, Uniform,
+    InvGamma, Laplace, LogNormal, LogTransform, Mixture, MultivariateNormal, NegativeBinomial, Normal, Poisson, StudentT, Uniform,
     Cauchy, Wishart,
 )
 from BayesianDLL.Variational import BBVI, elbo
@@ -82,10 +82,10 @@ def test_discrete_latents_are_rejected_by_groups_but_allowed_as_entries():
         p = RandomParameter("p", Beta(2.0, 2.0))
         z = RandomParameter("z", Bernoulli(p))
         ObservedParameter("y", Normal(z, 1.0), torch.tensor([0.8]))
-    with pytest.raises(ValueError, match=r"enumerat.*hand-written guide entry"):
+    with pytest.raises(ValueError, match=r"marginaliz.*hand-written guide entry"):
         with Guide(model, default_family="mean_field"):
             Group([z])
-    with pytest.raises(ValueError, match="enumerat"):
+    with pytest.raises(ValueError, match="marginaliz"):
         Guide(model, default_family="mean_field").validate()
     with Guide(model, default_family="mean_field") as guide:
         RandomParameter("z", Bernoulli(VariationalParameter("q", torch.tensor([0.4]), min=1e-3, max=1 - 1e-3)))
@@ -504,9 +504,9 @@ def _structured_guide(model, J, m=0.0, s=1.0, b=0.0, a=1.0, t=1.0):
 
     with Guide(model) as guide:
         with Group(["mu", "theta"]) as group:
-            mu = RandomParameter("mu", Normal(vp("m", m), vp("s", s, log_scale=True)))
+            mu = RandomParameter("mu", Normal(vp("m", m), vp("s", s, transform=LogTransform())))
             loc = Affine("theta_loc", mu, loc=vp("b", b, (J, 1)), scale=vp("a", a, (J, 1)))
-            RandomParameter("theta", Normal(loc, vp("t", t, (J, 1), log_scale=True)), shape=(J, 1))
+            RandomParameter("theta", Normal(loc, vp("t", t, (J, 1), transform=LogTransform())), shape=(J, 1))
     return guide, group
 
 

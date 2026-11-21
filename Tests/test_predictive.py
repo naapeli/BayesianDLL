@@ -102,7 +102,7 @@ def test_predictive_with_enumerated_parameter(monkeypatch):
     with Model() as model:
         p = RandomParameter("p", Beta(2.0, 2.0))
         with plate("n", 4):
-            z = RandomParameter("z", Bernoulli(p), shape=(), enumerate=True)
+            z = RandomParameter("z", Bernoulli(p), shape=(), marginalize=True)
             mean = DeterministicParameter(
                 "mean", lambda z: 10 * z, lambda z: {}, [z],
             )

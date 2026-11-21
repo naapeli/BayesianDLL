@@ -91,7 +91,7 @@ def enumerated_mixture():
         means = RandomParameter("means", Normal(0.0, 3.0), shape=2)
         scale = RandomParameter("scale", HalfNormal(1.0))
         with plate("data", len(y)):
-            z = RandomParameter("z", Bernoulli(0.4), shape=(), enumerate=True)
+            z = RandomParameter("z", Bernoulli(0.4), shape=(), marginalize=True)
         mean = Index("mean", means, z)
         ObservedParameter("y", Normal(mean, scale), y)
     return model
@@ -221,8 +221,8 @@ def binomial_logits_regression():
 def brute_force_enumeration():
     with Model() as model:
         mean = RandomParameter("mean", Normal(0.0, 1.0))
-        z1 = RandomParameter("z1", Bernoulli(0.3), enumerate=True)
-        z2 = RandomParameter("z2", Bernoulli(0.6), enumerate=True)
+        z1 = RandomParameter("z1", Bernoulli(0.3), marginalize=True)
+        z2 = RandomParameter("z2", Bernoulli(0.6), marginalize=True)
         both = Add("both", z1, z2)
         ObservedParameter("y", Normal(Add("m", mean, both), 1.0), torch.tensor([0.4, 1.3]))
     return model
@@ -510,7 +510,7 @@ def asymmetric_enumerated_mixture():
         # A prior tight enough to rule out the label-switched mode.
         means = RandomParameter("means", Normal(torch.tensor([-2.0, 2.0]), 0.5), shape=2)
         with plate("data", len(y)):
-            z = RandomParameter("z", Bernoulli(0.4), shape=(), enumerate=True)
+            z = RandomParameter("z", Bernoulli(0.4), shape=(), marginalize=True)
         ObservedParameter("y", Normal(Index("mean", means, z), 0.7), y)
     return model
 

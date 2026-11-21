@@ -93,9 +93,9 @@ def test_default_groups_reject_discrete_latents():
     with Model() as model:
         RandomParameter("z", Bernoulli(0.3))
     for family in ("mean_field", "full_rank"):
-        with pytest.raises(ValueError, match="enumerat"):
+        with pytest.raises(ValueError, match="marginaliz"):
             Guide(model, default_family=family).validate()
-    with pytest.raises(ValueError, match="enumerat"):
+    with pytest.raises(ValueError, match="marginaliz"):
         laplace_approximation(model)
 
 
