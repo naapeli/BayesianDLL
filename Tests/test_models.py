@@ -320,3 +320,20 @@ def test_variational_parameter_log_scale():
     torch.testing.assert_close(p.value, torch.tensor([0.1, 3.0]))
     with pytest.raises(ValueError, match="positive"):
         VariationalParameter("bad", torch.tensor([-1.0]), log_scale=True)
+
+
+def test_variational_parameter_transform():
+    from BayesianDLL.Distributions import LogTransform, LogitTransform
+    p_log = VariationalParameter("var", torch.tensor([1.5]), transform=LogTransform())
+    assert p_log.log_scale is True
+    torch.testing.assert_close(p_log.unconstrained_value, torch.log(torch.tensor([1.5])))
+
+    p_logit = VariationalParameter("prob", torch.tensor([0.7]), transform=LogitTransform())
+    expected_unconstrained = torch.logit(torch.tensor([0.7]))
+    torch.testing.assert_close(p_logit.unconstrained_value, expected_unconstrained)
+    grad = torch.tensor([2.0])
+    # d/dz (sigmoid(z)) = sigmoid(z) * (1 - sigmoid(z)) = 0.7 * 0.3 = 0.21
+    torch.testing.assert_close(p_logit.unconstrained_grad(grad), grad * 0.7 * 0.3)
+
+    with pytest.raises(ValueError, match="both log_scale and transform"):
+        VariationalParameter("both", torch.tensor([1.0]), log_scale=True, transform=LogTransform())

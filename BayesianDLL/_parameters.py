@@ -491,39 +491,66 @@ class DeterministicParameter:
 class VariationalParameter:
     """A parameter of a variational distribution that is optimized by BBVI.
 
-    With ``log_scale=True`` the optimizer works on ``log(value)`` instead of
-    ``value``. This is recommended for positive parameters such as variances:
-    Adam then takes multiplicative steps, so small variances can be reached
-    without overshooting the lower bound.
-
-    ``value`` is converted to a tensor (float32 unless it already is a
-    tensor) of at least one dimension; every update is clamped to
-    ``[min, max]``. With ``log_scale=True`` the value must be positive.
+    Parameters
+    ----------
+    name : str
+        Unique parameter name.
+    value : float or Tensor
+        Initial value of the parameter.
+    min : float, default -inf
+        Lower clamp bound for updates in constrained space.
+    max : float, default inf
+        Upper clamp bound for updates in constrained space.
+    log_scale : bool, default False
+        Shortcut for optimizing in log space (equivalent to
+        ``transform=LogTransform()``). Recommended for positive parameters such
+        as variances or scales.
+    transform : Transform, optional
+        Bijection between constrained and unconstrained parameter space. If
+        omitted, defaults to :class:`~BayesianDLL.Distributions.IdentityTransform`
+        (or :class:`~BayesianDLL.Distributions.LogTransform` when
+        ``log_scale=True``).
     """
 
-    def __init__(self, name, value, min=-float("inf"), max=float("inf"), log_scale=False):
+    def __init__(self, name, value, min=-float("inf"), max=float("inf"), log_scale=False, transform=None):
         self.name = name
-        self.log_scale = log_scale
         self.min = min
         self.max = max
         value = torch.as_tensor(value, dtype=value.dtype if torch.is_tensor(value) else torch.float32)
         if value.ndim == 0:
             value = value.unsqueeze(0)
-        if log_scale and not bool((value > 0).all()):
+
+        if log_scale and transform is not None:
+            raise ValueError(f"VariationalParameter '{name}' cannot specify both log_scale and transform.")
+        if log_scale:
+            from .Distributions._transforms import LogTransform
+            self.transform = LogTransform()
+            self.log_scale = True
+        elif transform is not None:
+            self.transform = transform
+            from .Distributions._transforms import LogTransform
+            self.log_scale = isinstance(transform, LogTransform)
+        else:
+            from .Distributions._transforms import IdentityTransform
+            self.transform = IdentityTransform()
+            self.log_scale = False
+
+        if self.log_scale and not bool((value > 0).all()):
             raise ValueError(f"VariationalParameter '{name}' uses log_scale=True and must be positive.")
         self.value = value
 
     @property
     def unconstrained_value(self):
         """The coordinate in which the optimizer takes its steps."""
-        return torch.log(self.value) if self.log_scale else self.value
+        return self.transform.forward(self.value)
 
     def unconstrained_grad(self, grad):
         """Convert a gradient w.r.t. ``value`` into one w.r.t. ``unconstrained_value``."""
-        return grad * self.value if self.log_scale else grad
+        derivative = self.transform.derivative(self.unconstrained_value)
+        return grad * derivative
 
     def set_unconstrained_value(self, unconstrained_value):
-        value = torch.exp(unconstrained_value) if self.log_scale else unconstrained_value
+        value = self.transform.inverse(unconstrained_value)
         self.set_new_value(value)
 
     def __repr__(self):
