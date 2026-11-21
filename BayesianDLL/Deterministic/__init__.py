@@ -5,6 +5,7 @@ from ._blocks import (
     CholeskyCovariance,
     Concat,
     CovarianceFromCholesky,
+    Dense,
     Divide,
     Elementwise,
     Index,
@@ -20,6 +21,7 @@ from ._blocks import (
 
 __all__ = [
     "Linear",
+    "Dense",
     "Exp",
     "Log",
     "Sigmoid",
