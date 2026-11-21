@@ -340,3 +340,12 @@ def test_scalar_enumerated_parameter_sampling():
     assert result.enumerated_probs["z"][..., 1].mean().item() == pytest.approx(p_z, abs=0.03)
     expected_mu = p_z * (-0.5) + (1 - p_z) * 1.0
     assert result["mu"].mean().item() == pytest.approx(expected_mu, abs=0.1)
+
+
+def test_random_parameter_marginalize_alias():
+    from BayesianDLL.Distributions import Bernoulli
+    with Model() as model:
+        z = RandomParameter("z", Bernoulli(0.3), marginalize=True)
+    assert z.marginalized is True
+    assert z.enumerated is True
+    assert "z" in model.enumerated_params

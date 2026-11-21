@@ -36,8 +36,10 @@ class RandomParameter:
     sampler : {"auto", "nuts", "metropolis", "slice", "gibbs"}, default "auto"
         The sampler requested for this parameter's block in
         :func:`~BayesianDLL.sample`.
-    enumerate : bool, default False
-        Sum the parameter out instead of sampling it, see above.
+    marginalize : bool, default False
+        Sum (marginalize) the parameter out instead of sampling it.
+    enumerate : bool, optional
+        Alias for ``marginalize`` (kept for backward compatibility).
     **sampler_params
         Settings for the sampler of this parameter's block (e.g. ``delta=0.9``).
 
@@ -47,11 +49,13 @@ class RandomParameter:
         Outside an active model, or if the distribution refers to a node not
         in the model.
     ValueError
-        With ``enumerate=True`` for a distribution without finite support.
+        With ``marginalize=True`` for a distribution without finite support.
     """
 
-    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", enumerate=False, **sampler_params):
-        if enumerate:
+    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", enumerate=None, marginalize=False, **sampler_params):
+        if enumerate is not None:
+            marginalize = enumerate
+        if marginalize:
             _check_enumerable(name, distribution)
         # Capture active plates at creation time
         self.plates = get_active_plates()
@@ -94,7 +98,8 @@ class RandomParameter:
         self.state_space = self.distribution.state_space
         self.transformed_state_space = self.distribution.transformed_state_space
 
-        self.enumerated = bool(enumerate)
+        self.marginalized = bool(marginalize)
+        self.enumerated = self.marginalized
 
         if get_active_model() is not None:
             if self.enumerated:
