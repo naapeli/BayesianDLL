@@ -527,18 +527,51 @@ class Guide(Model, BaseGuide):
 
     # --- moments --------------------------------------------------------------
     def mean(self, space="unconstrained", n_samples=4000, seed=0):
-        """``{latent: mean}`` of the guide in ``space`` (see :meth:`covariance` and "Accuracy and cost")."""
+        """Return posterior means ``{latent: mean}`` under the guide.
+
+        Convenience shortcut that evaluates the guide's joint moments via
+        :meth:`covariance` and returns the reshaped means per latent parameter.
+
+        Parameters
+        ----------
+        space : {"unconstrained", "constrained"}, default "unconstrained"
+            Coordinate space in which the moments are computed.
+        n_samples : int, default 4000
+            Number of Monte Carlo draws for latents whose moments have no closed
+            form.
+        seed : int, default 0
+            Seed for Monte Carlo moment estimates.
+
+        Returns
+        -------
+        dict[str, Tensor]
+            Mapping from latent parameter name to its mean tensor.
+        """
         return self.covariance(space, n_samples, seed).means()
 
     def covariance(self, space="unconstrained", n_samples=4000, seed=0):
-        """Mean and block-diagonal covariance of the guide over the concatenated flattened latents.
+        """Compute the joint moments (mean and block-diagonal covariance) of the guide.
 
-        Returns a :class:`GuideCovariance` with the latents in model order.
-        Blocks between different groups or entries are exactly zero; see the
-        table in the class docstring for which blocks are exact and which
-        are Monte Carlo estimates (listed in ``estimated``, with standard
-        errors, from ``n_samples`` independent draws of that piece only,
-        seeded with ``seed``).
+        Evaluates the first and second moments of the guide's parameters.
+        Returns a :class:`~BayesianDLL.Variational.GuideCovariance` containing
+        the full covariance matrix (``.matrix``), block accessors
+        (``.block(latent)``), per-latent variances (``.variances()``), and
+        means (``.means()``).
+
+        Parameters
+        ----------
+        space : {"unconstrained", "constrained"}, default "unconstrained"
+            Coordinate space in which the moments are computed.
+        n_samples : int, default 4000
+            Number of Monte Carlo draws for latents whose moments have no closed
+            form.
+        seed : int, default 0
+            Seed for Monte Carlo moment estimates.
+
+        Returns
+        -------
+        GuideCovariance
+            A moment container holding the mean and covariance matrix.
         """
         if space not in ("unconstrained", "constrained"):
             raise ValueError(f"space must be 'unconstrained' or 'constrained', got {space!r}.")
@@ -551,6 +584,8 @@ class Guide(Model, BaseGuide):
             else:
                 parts.append(self._entry_moments(piece, space, n_samples, seed))
         return GuideCovariance.combine(space, parts, list(self.model.params))
+
+    moments = covariance
 
     def _entry_moments(self, piece, space, n_samples, seed):
         model, plan = self.model, piece.plan

@@ -233,6 +233,9 @@ def test_unconstrained_moments_are_exact():
     result = guide.covariance()
     assert result.estimated == [] and result.n_samples is None
     torch.testing.assert_close(result.matrix, L @ L.T)
+    torch.testing.assert_close(result.covariance(), L @ L.T)
+    torch.testing.assert_close(result.covariance("mean"), result.block("mean"))
+    assert "mean" in result.covariances() and "sigma" in result.covariances()
     torch.testing.assert_close(result.mean, torch.tensor([0.7, -0.2]))
     means = guide.mean()
     torch.testing.assert_close(means["sigma"], torch.tensor([-0.2]))

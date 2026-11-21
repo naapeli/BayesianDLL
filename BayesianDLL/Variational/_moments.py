@@ -104,6 +104,16 @@ class GuideCovariance:
         """``{latent: mean}`` with each latent's shape."""
         return {name: self.mean[slice(*self.slices[name])].reshape(self.shapes[name]) for name in self.names}
 
+    def covariance(self, first=None, second=None):
+        """The full covariance matrix if arguments are omitted, or the block between ``first`` and ``second``."""
+        if first is None and second is None:
+            return self.matrix
+        return self.block(first, second)
+
+    def covariances(self):
+        """``{latent: covariance_block}`` for each latent."""
+        return {name: self.block(name) for name in self.names}
+
     def block(self, first, second=None):
         """The covariance block between the flattened latents ``first`` and ``second`` (default ``first``)."""
         second = first if second is None else second
