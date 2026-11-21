@@ -154,20 +154,17 @@ def _mvdigamma(a, p):
 
 
 class Distribution(ABC):
-    """Base class of all distributions.
+    r"""Base class for all probability distributions.
 
-    A distribution's parameters may be Python numbers, tensors, model nodes
-    (``RandomParameter``, ``DeterministicParameter``, ``ObservedParameter``,
-    ``Data``) or ``VariationalParameter`` objects; they are resolved to
-    tensors every time a density is evaluated. Parameters broadcast like
-    ``torch`` tensors to ``batch_shape``. Inside a vectorized (batched)
-    evaluation the values of batched model nodes carry a leading chain
-    dimension, which broadcasts in the same way.
-
-    ``transform`` maps the unconstrained sampling space to the support
-    (``transform.inverse``: unconstrained -> constrained), ``state_space``
-    describes the support and ``transformed_state_space`` the unconstrained
-    space.
+    Parameters
+    ----------
+    transform : Transform, optional
+        Bijection mapping unconstrained parameter space to the support of the distribution.
+        Default is :class:`~BayesianDLL.Distributions.IdentityTransform`.
+    state_space : StateSpace, optional
+        Support of the distribution in constrained space. Default is :class:`~BayesianDLL.Distributions.ContinuousReal`.
+    transformed_state_space : StateSpace, optional
+        Support in unconstrained space. Default is :class:`~BayesianDLL.Distributions.ContinuousReal`.
     """
 
     #: ``True`` when ``sample(..., _reparametrization_trick_grad=True)`` is supported.
@@ -295,13 +292,20 @@ class Distribution(ABC):
 
 # ========================= CONTINUOUS =========================
 class Normal(Distribution):
-    """Normal distribution with mean ``mu`` and **standard deviation** ``sigma``.
+    r"""Normal (Gaussian) distribution.
 
-    ``log p(x) = -(x - mu)^2 / (2 sigma^2) - log sigma - log(2 pi) / 2`` on
-    the real line. ``mu`` and ``sigma > 0`` are numbers, tensors or model
-    nodes and broadcast to ``batch_shape``. Supports ``cdf``, ``icdf``,
-    ``cdf_param_grads`` (used by :class:`Truncated`) and reparameterised
-    sampling.
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid \mu, \sigma) = \frac{1}{\sigma \sqrt{2\pi}} \exp\left( -\frac{(x - \mu)^2}{2\sigma^2} \right)
+
+    Parameters
+    ----------
+    mu : float or torch.Tensor or Parameter
+        Mean parameter :math:`\mu`.
+    sigma : float or torch.Tensor or Parameter
+        Standard deviation parameter :math:`\sigma > 0`.
     """
 
     has_rsample = True
@@ -371,11 +375,18 @@ class Normal(Distribution):
 
 
 class HalfNormal(Distribution):
-    """Half-normal distribution ``|N(0, sigma^2)|`` with scale ``sigma``.
+    r"""Half-normal distribution :math:`|N(0, \sigma^2)|`.
 
-    ``log p(x) = log(2 / pi) / 2 - log sigma - x^2 / (2 sigma^2)`` for
-    ``x > 0``; ``sigma > 0`` is the standard deviation of the underlying
-    normal. Sampled on ``log x`` (:class:`LogTransform`).
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid \sigma) = \frac{\sqrt{2}}{\sigma \sqrt{\pi}} \exp\left( -\frac{x^2}{2\sigma^2} \right) \quad \text{for } x > 0
+
+    Parameters
+    ----------
+    sigma : float or torch.Tensor or Parameter
+        Scale (standard deviation of the underlying normal) :math:`\sigma > 0`.
     """
 
     has_rsample = True
@@ -435,11 +446,20 @@ class HalfNormal(Distribution):
 
 
 class LogNormal(Distribution):
-    """Log-normal distribution ``exp(N(mu, sigma^2))``.
+    r"""Log-normal distribution :math:`\exp(N(\mu, \sigma^2))`.
 
-    ``mu`` and ``sigma > 0`` are the mean and **standard deviation** of
-    ``log x``: ``log p(x) = -log x - log sigma - log(2 pi) / 2 -
-    (log x - mu)^2 / (2 sigma^2)`` for ``x > 0``. Sampled on ``log x``.
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid \mu, \sigma) = \frac{1}{x \sigma \sqrt{2\pi}} \exp\left( -\frac{(\ln x - \mu)^2}{2\sigma^2} \right) \quad \text{for } x > 0
+
+    Parameters
+    ----------
+    mu : float or torch.Tensor or Parameter
+        Mean of the underlying normal distribution :math:`\mu`.
+    sigma : float or torch.Tensor or Parameter
+        Standard deviation of the underlying normal distribution :math:`\sigma > 0`.
     """
 
     has_rsample = True
@@ -506,20 +526,25 @@ class LogNormal(Distribution):
 
 
 class MultivariateNormal(Distribution):
-    """Multivariate normal parameterised by ``covariance`` **or** ``scale_tril``.
+    r"""Multivariate normal (Gaussian) distribution.
 
-    ``MultivariateNormal(mu, covariance)`` or
-    ``MultivariateNormal(mu, scale_tril=L)`` with ``L`` lower triangular
-    (positive diagonal) and ``covariance = L @ L.T``; exactly one of the two
-    must be given. ``mu`` has shape ``(..., D)`` (a scalar is broadcast to
-    ``D`` entries) and the matrix ``(..., D, D)``; leading dimensions are
-    batch dimensions. ``log_pdf`` returns one value per batch element. The
-    covariance gradient returned by
-    :meth:`log_pdf_param_grads` is the full symmetric matrix
-    ``0.5 * (S^-1 d d^T S^-1 - S^-1)``; the ``scale_tril`` gradient is lower
-    triangular. Reparameterised sampling gives gradients w.r.t. ``mu``
-    only, so ``has_rsample`` is ``False`` when the matrix is a
-    ``VariationalParameter``.
+    The probability density function for a :math:`D`-dimensional vector :math:`\mathbf{x}` is:
+
+    .. math::
+
+        f(\mathbf{x} \mid \boldsymbol{\mu}, \boldsymbol{\Sigma}) = (2\pi)^{-D/2} |\boldsymbol{\Sigma}|^{-1/2} \exp\left( -\frac{1}{2}(\mathbf{x} - \boldsymbol{\mu})^\top \boldsymbol{\Sigma}^{-1} (\mathbf{x} - \boldsymbol{\mu}) \right)
+
+    Parameters
+    ----------
+    mu : torch.Tensor or Parameter
+        Mean vector :math:`\boldsymbol{\mu}`, shape ``(..., D)`` or broadcastable.
+    covariance : torch.Tensor or Parameter, optional
+        Covariance matrix :math:`\boldsymbol{\Sigma}`, shape ``(..., D, D)``.
+        Exactly one of ``covariance`` or ``scale_tril`` must be specified.
+    scale_tril : torch.Tensor or Parameter, optional
+        Lower-triangular Cholesky factor :math:`\mathbf{L}` of the covariance matrix
+        such that :math:`\boldsymbol{\Sigma} = \mathbf{L}\mathbf{L}^\top`.
+        Exactly one of ``covariance`` or ``scale_tril`` must be specified.
     """
 
     _param_event_ndims = {"mu": 1, "covariance_matrix": 2, "scale_tril": 2}
@@ -619,10 +644,22 @@ class MultivariateNormal(Distribution):
 
 
 class Beta(Distribution):
-    """Beta distribution on ``(0, 1)`` with concentrations ``a > 0`` and ``b > 0``.
+    r"""Beta distribution on the open interval :math:`(0, 1)`.
 
-    ``log p(x) = (a - 1) log x + (b - 1) log(1 - x) - log B(a, b)``; mean
-    ``a / (a + b)``. Sampled on ``logit x`` (:class:`LogitTransform`).
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid a, b) = \frac{x^{a - 1}(1 - x)^{b - 1}}{\mathrm{B}(a, b)} \quad \text{for } 0 < x < 1
+
+    where :math:`\mathrm{B}(a, b) = \frac{\Gamma(a)\Gamma(b)}{\Gamma(a + b)}`.
+
+    Parameters
+    ----------
+    a : float or torch.Tensor or Parameter
+        First shape parameter :math:`a > 0`.
+    b : float or torch.Tensor or Parameter
+        Second shape parameter :math:`b > 0`.
     """
 
     def __init__(self, a, b):
@@ -683,11 +720,18 @@ class Beta(Distribution):
 
 
 class Exponential(Distribution):
-    """Exponential distribution with **rate** ``rate > 0`` (mean ``1 / rate``).
+    r"""Exponential distribution.
 
-    ``log p(x) = log rate - rate x`` for ``x > 0``. Sampled on ``log x``;
-    supports ``cdf``, ``icdf``, ``cdf_param_grads`` and reparameterised
-    sampling.
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid \lambda) = \lambda \exp(-\lambda x) \quad \text{for } x > 0
+
+    Parameters
+    ----------
+    rate : float or torch.Tensor or Parameter
+        Rate parameter :math:`\lambda > 0` (mean is :math:`1/\lambda`).
     """
 
     has_rsample = True
@@ -762,11 +806,20 @@ class Exponential(Distribution):
 
 
 class Gamma(Distribution):
-    """Gamma distribution with shape ``alpha > 0`` and **rate** ``beta > 0``.
+    r"""Gamma distribution.
 
-    ``log p(x) = alpha log beta - log Gamma(alpha) + (alpha - 1) log x -
-    beta x`` for ``x > 0``; mean ``alpha / beta`` (the scale is
-    ``1 / beta``). Sampled on ``log x``; no reparameterised sampler.
+    The probability density function is parameterized by shape :math:`\alpha` and rate :math:`\beta`:
+
+    .. math::
+
+        f(x \mid \alpha, \beta) = \frac{\beta^\alpha}{\Gamma(\alpha)} x^{\alpha - 1} \exp(-\beta x) \quad \text{for } x > 0
+
+    Parameters
+    ----------
+    alpha : float or torch.Tensor or Parameter
+        Shape parameter :math:`\alpha > 0`.
+    beta : float or torch.Tensor or Parameter
+        Rate parameter :math:`\beta > 0` (inverse scale, mean is :math:`\alpha / \beta`).
     """
 
     def __init__(self, alpha, beta):
@@ -823,18 +876,20 @@ class Gamma(Distribution):
 
 
 class Uniform(Distribution):
-    """Continuous uniform distribution on ``[low, high]``.
+    r"""Continuous uniform distribution on a bounded interval :math:`[a, b]`.
 
-    ``log_pdf_param_grads`` returns the gradient of ``log p(x | low, high)``
-    at a **fixed** value ``x`` inside the support (``d/dlow = 1/(high-low)``,
-    ``d/dhigh = -1/(high-low)``, zero outside the support). This is exact for
-    observed data. For a *latent* Uniform the sampling transform
-    ``x = low + (high-low) sigmoid(z)`` itself depends on the bounds, and the
-    unconstrained density ``log p(x(z)) + log|dx/dz| = log sigmoid(z) +
-    log sigmoid(-z)`` does not depend on them at all; the model gradient does
-    not account for ``x`` moving with the bounds, so for random bounds prefer
-    the Metropolis sampler or write ``x = low + (high - low) * u`` with
-    ``u ~ Uniform(0, 1)``.
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid a, b) = \frac{1}{b - a} \quad \text{for } a \le x \le b
+
+    Parameters
+    ----------
+    low : float or torch.Tensor or Parameter
+        Lower bound :math:`a`.
+    high : float or torch.Tensor or Parameter
+        Upper bound :math:`b > a`.
     """
 
     has_rsample = True
@@ -910,11 +965,21 @@ class Uniform(Distribution):
 
 
 class InvGamma(Distribution):
-    """Inverse-gamma distribution with shape ``alpha > 0`` and **scale** ``beta > 0``.
+    r"""Inverse-gamma distribution.
 
-    ``1 / X ~ Gamma(alpha, rate=beta)``, i.e. ``log p(x) = alpha log beta -
-    log Gamma(alpha) - (alpha + 1) log x - beta / x`` for ``x > 0``; mean
-    ``beta / (alpha - 1)`` for ``alpha > 1``. Sampled on ``log x``.
+    If :math:`X \sim \mathrm{Gamma}(\alpha, \beta)`, then :math:`1/X \sim \mathrm{InvGamma}(\alpha, \beta)`.
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid \alpha, \beta) = \frac{\beta^\alpha}{\Gamma(\alpha)} x^{-(\alpha + 1)} \exp\left(-\frac{\beta}{x}\right) \quad \text{for } x > 0
+
+    Parameters
+    ----------
+    alpha : float or torch.Tensor or Parameter
+        Shape parameter :math:`\alpha > 0`.
+    beta : float or torch.Tensor or Parameter
+        Scale parameter :math:`\beta > 0`.
     """
 
     def __init__(self, alpha, beta):
@@ -983,10 +1048,18 @@ class InvGamma(Distribution):
 
 
 class HalfCauchy(Distribution):
-    """Half-Cauchy distribution ``|Cauchy(0, scale)|`` with ``scale > 0``.
+    r"""Half-Cauchy distribution :math:`|\mathrm{Cauchy}(0, \gamma)|`.
 
-    ``log p(x) = log 2 - log pi - log scale - log(1 + (x / scale)^2)`` for
-    ``x > 0``. Sampled on ``log x``.
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid \gamma) = \frac{2}{\pi \gamma \left( 1 + (x/\gamma)^2 \right)} \quad \text{for } x > 0
+
+    Parameters
+    ----------
+    scale : float or torch.Tensor or Parameter
+        Scale parameter :math:`\gamma > 0`.
     """
 
     has_rsample = True
@@ -1054,9 +1127,20 @@ class HalfCauchy(Distribution):
 
 
 class Cauchy(Distribution):
-    """Cauchy distribution with location ``mu`` and scale ``scale > 0``.
+    r"""Cauchy (Lorentz) distribution.
 
-    ``log p(x) = -log pi - log scale - log(1 + ((x - mu) / scale)^2)``.
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid \mu, \gamma) = \frac{1}{\pi \gamma \left( 1 + ((x - \mu)/\gamma)^2 \right)}
+
+    Parameters
+    ----------
+    mu : float or torch.Tensor or Parameter
+        Location parameter :math:`\mu`.
+    scale : float or torch.Tensor or Parameter
+        Scale parameter :math:`\gamma > 0`.
     """
 
     has_rsample = True
@@ -1120,10 +1204,20 @@ class Cauchy(Distribution):
 
 
 class Laplace(Distribution):
-    """Laplace (double-exponential) distribution with location ``mu`` and scale ``scale > 0``.
+    r"""Laplace (double-exponential) distribution.
 
-    ``log p(x) = -log 2 - log scale - |x - mu| / scale``; the variance is
-    ``2 scale^2``.
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid \mu, b) = \frac{1}{2b} \exp\left( -\frac{|x - \mu|}{b} \right)
+
+    Parameters
+    ----------
+    mu : float or torch.Tensor or Parameter
+        Location parameter :math:`\mu`.
+    scale : float or torch.Tensor or Parameter
+        Scale parameter :math:`b > 0` (variance is :math:`2b^2`).
     """
 
     has_rsample = True
@@ -1190,16 +1284,22 @@ class Laplace(Distribution):
 
 
 class StudentT(Distribution):
-    """Student's t with ``nu`` degrees of freedom, location ``mu`` and scale ``sigma``.
+    r"""Student's t-distribution.
 
-    ``mu`` defaults to ``0.0`` and ``sigma`` to ``1.0``. With
-    ``t = (x - mu) / sigma``: ``log p(x) = log Gamma((nu + 1) / 2) -
-    log Gamma(nu / 2) - log(nu pi) / 2 - log sigma - (nu + 1) / 2
-    log(1 + t^2 / nu)``. ``sigma`` is a scale, not the standard deviation
-    (which is ``sigma sqrt(nu / (nu - 2))`` for ``nu > 2``).
+    The probability density function is given by:
 
-    Reparameterised sampling gives gradients w.r.t. ``mu`` and ``sigma`` only,
-    so ``has_rsample`` is ``False`` when ``nu`` is a VariationalParameter.
+    .. math::
+
+        f(x \mid \nu, \mu, \sigma) = \frac{\Gamma((\nu + 1)/2)}{\Gamma(\nu/2)\sqrt{\pi\nu}\sigma} \left( 1 + \frac{1}{\nu}\left(\frac{x - \mu}{\sigma}\right)^2 \right)^{-(\nu + 1)/2}
+
+    Parameters
+    ----------
+    nu : float or torch.Tensor or Parameter
+        Degrees of freedom :math:`\nu > 0`.
+    mu : float or torch.Tensor or Parameter, default 0.0
+        Location parameter :math:`\mu`.
+    sigma : float or torch.Tensor or Parameter, default 1.0
+        Scale parameter :math:`\sigma > 0`.
     """
 
     def __init__(self, nu, mu=0.0, sigma=1.0):
@@ -1270,16 +1370,20 @@ class StudentT(Distribution):
 
 
 class Dirichlet(Distribution):
-    """Dirichlet distribution on the simplex with concentrations ``alpha``.
+    r"""Dirichlet distribution on the probability simplex.
 
-    ``alpha`` has shape ``(..., K)`` with positive entries (last dimension =
-    number of categories; leading dimensions are batch dimensions) and
-    ``log p(x) = sum_k (alpha_k - 1) log x_k - (sum_k log Gamma(alpha_k) -
-    log Gamma(sum_k alpha_k))``.
+    For :math:`\mathbf{x} = (x_1, \dots, x_K)` such that :math:`x_k \ge 0` and :math:`\sum_{k=1}^K x_k = 1`:
 
-    Sampled in the ``K-1`` dimensional unconstrained space of a
-    :class:`StickBreakingTransform` (the unconstrained value has shape
-    ``(..., K-1)`` while the constrained value has shape ``(..., K)``).
+    .. math::
+
+        f(\mathbf{x} \mid \boldsymbol{\alpha}) = \frac{1}{\mathrm{B}(\boldsymbol{\alpha})} \prod_{k=1}^K x_k^{\alpha_k - 1}
+
+    where :math:`\mathrm{B}(\boldsymbol{\alpha}) = \frac{\prod_{k=1}^K \Gamma(\alpha_k)}{\Gamma\left(\sum_{k=1}^K \alpha_k\right)}`.
+
+    Parameters
+    ----------
+    alpha : torch.Tensor or Parameter
+        Concentration parameters :math:`\boldsymbol{\alpha}`, shape ``(..., K)`` with positive entries.
     """
 
     _param_event_ndims = {"alpha": 1}
@@ -1357,17 +1461,22 @@ class Dirichlet(Distribution):
 
 
 class LKJCholesky(Distribution):
-    """LKJ distribution over Cholesky factors ``L`` of ``dim x dim`` correlation matrices.
+    r"""LKJ distribution over Cholesky factors of correlation matrices.
 
-    ``p(L) ∝ prod_{i>=2} L_ii^{dim - i + 2 eta - 2}`` (1-indexed), i.e. the
-    correlation matrix ``L L^T`` has density ``∝ det(L L^T)^(eta - 1)``.
-    The density is taken w.r.t. the strictly lower-triangular entries of
-    ``L`` and is normalised (the same convention as
-    ``torch.distributions.LKJCholesky``). ``dim >= 2`` is an integer and
-    ``eta > 0`` (default ``1.0``, uniform over correlation matrices) may be a
-    model node; ``eta > 1`` concentrates mass near the identity. The
-    unconstrained space is ``R^{dim(dim-1)/2}`` via
-    :class:`CorrCholeskyTransform` (tanh of canonical partial correlations).
+    For a :math:`D \times D` lower-triangular Cholesky factor :math:`\mathbf{L}` with positive diagonal
+    and unit-norm rows (:math:`\mathbf{L}\mathbf{L}^\top` is a correlation matrix):
+
+    .. math::
+
+        p(\mathbf{L} \mid \eta) \propto \prod_{i=2}^D L_{ii}^{D - i + 2\eta - 2}
+
+    Parameters
+    ----------
+    dim : int
+        Dimension :math:`D \ge 2` of the correlation matrix.
+    eta : float or torch.Tensor or Parameter, default 1.0
+        Shape parameter :math:`\eta > 0`. When :math:`\eta = 1`, the distribution is uniform
+        over correlation matrices; :math:`\eta > 1` concentrates density toward the identity.
     """
 
     def __init__(self, dim, eta=1.0):
@@ -1520,21 +1629,23 @@ class _WishartFamily(Distribution):
 
 
 class Wishart(_WishartFamily):
-    """Wishart distribution over ``D x D`` SPD matrices with ``df`` degrees of freedom.
+    r"""Wishart distribution over :math:`D \times D` symmetric positive-definite matrices.
 
-    ``Wishart(df, scale)`` or ``Wishart(df, scale_tril=L)`` with
-    ``scale = L L^T`` (exactly one of the two); ``df > D - 1`` and
-    ``E[X] = df * scale``. The density is
+    The probability density function for a :math:`D \times D` SPD matrix :math:`\mathbf{X}` is:
 
-    ``log p(X) = (df - D - 1)/2 log|X| - tr(scale^-1 X)/2 - df D/2 log 2 -
-    df/2 log|scale| - log Gamma_D(df/2)``
+    .. math::
 
-    (``Gamma_D`` the multivariate gamma function), w.r.t. the ``D(D+1)/2``
-    unique entries of ``X``. Sampled in the
-    ``D(D+1)/2``-dimensional unconstrained space of a
-    :class:`PositiveDefiniteTransform`. Matrix gradients are full symmetric
-    matrices (entries treated as independent), the ``scale_tril`` gradient is
-    lower triangular.
+        f(\mathbf{X} \mid \nu, \mathbf{S}) = \frac{|\mathbf{X}|^{(\nu - D - 1)/2} \exp\left( -\frac{1}{2}\mathrm{tr}(\mathbf{S}^{-1}\mathbf{X}) \right)}{2^{\nu D/2} |\mathbf{S}|^{\nu/2} \Gamma_D(\nu/2)}
+
+    Parameters
+    ----------
+    df : float or torch.Tensor or Parameter
+        Degrees of freedom :math:`\nu > D - 1`.
+    scale : torch.Tensor or Parameter, optional
+        Scale matrix :math:`\mathbf{S}`, shape ``(..., D, D)``. Exactly one of ``scale`` or ``scale_tril`` must be given.
+    scale_tril : torch.Tensor or Parameter, optional
+        Lower-triangular Cholesky factor :math:`\mathbf{L}` of the scale matrix such that :math:`\mathbf{S} = \mathbf{L}\mathbf{L}^\top`.
+        Exactly one of ``scale`` or ``scale_tril`` must be given.
     """
 
     def log_pdf(self, x):
@@ -1609,16 +1720,24 @@ class Wishart(_WishartFamily):
 
 
 class InverseWishart(_WishartFamily):
-    """Inverse-Wishart distribution: ``X^-1 ~ Wishart(df, scale^-1)``.
+    r"""Inverse-Wishart distribution over :math:`D \times D` symmetric positive-definite matrices.
 
-    ``InverseWishart(df, scale)`` or ``InverseWishart(df, scale_tril=L)``
-    (``scale = L L^T``); ``df > D - 1`` and ``E[X] = scale / (df - D - 1)``
-    for ``df > D + 1``. The density is
+    If :math:`\mathbf{X} \sim \mathrm{Wishart}(\nu, \mathbf{S}^{-1})`, then :math:`\mathbf{X}^{-1} \sim \mathrm{InverseWishart}(\nu, \mathbf{S})`.
+    The probability density function is:
 
-    ``log p(X) = df/2 log|scale| - df D/2 log 2 - log Gamma_D(df/2) -
-    (df + D + 1)/2 log|X| - tr(scale X^-1)/2``.
+    .. math::
 
-    Same transform and gradient conventions as :class:`Wishart`.
+        f(\mathbf{X} \mid \nu, \boldsymbol{\Psi}) = \frac{|\boldsymbol{\Psi}|^{\nu/2} |\mathbf{X}|^{-(\nu + D + 1)/2} \exp\left( -\frac{1}{2}\mathrm{tr}(\boldsymbol{\Psi}\mathbf{X}^{-1}) \right)}{2^{\nu D/2} \Gamma_D(\nu/2)}
+
+    Parameters
+    ----------
+    df : float or torch.Tensor or Parameter
+        Degrees of freedom :math:`\nu > D - 1`.
+    scale : torch.Tensor or Parameter, optional
+        Scale matrix :math:`\boldsymbol{\Psi}`, shape ``(..., D, D)``. Exactly one of ``scale`` or ``scale_tril`` must be given.
+    scale_tril : torch.Tensor or Parameter, optional
+        Lower-triangular Cholesky factor :math:`\mathbf{L}` such that :math:`\boldsymbol{\Psi} = \mathbf{L}\mathbf{L}^\top`.
+        Exactly one of ``scale`` or ``scale_tril`` must be given.
     """
 
     def log_pdf(self, x):
@@ -1698,12 +1817,20 @@ class _ProbsOrLogits:
 
 
 class Geometric(_ProbsOrLogits, Distribution):
-    """Number of trials up to and including the first success (support 1, 2, ...).
+    r"""Geometric distribution for the number of trials until the first success.
 
-    Give exactly one of ``probs`` (success probability ``p`` in ``(0, 1]``)
-    or ``logits`` (``logit p``): ``log p(k) = log p + (k - 1) log(1 - p)``,
-    mean ``1 / p``. Note that ``torch.distributions.Geometric`` counts the
-    failures instead (support 0, 1, ...).
+    The probability mass function on :math:`\{1, 2, \dots\}` is:
+
+    .. math::
+
+        P(X = k \mid p) = (1 - p)^{k - 1} p
+
+    Parameters
+    ----------
+    probs : float or torch.Tensor or Parameter, optional
+        Success probability :math:`p \in (0, 1]`. Exactly one of ``probs`` or ``logits`` must be given.
+    logits : float or torch.Tensor or Parameter, optional
+        Log-odds of success :math:`\mathrm{logit}(p) = \ln(p / (1 - p))`. Exactly one of ``probs`` or ``logits`` must be given.
     """
 
     def __init__(self, probs=None, logits=None):
@@ -1756,10 +1883,20 @@ class Geometric(_ProbsOrLogits, Distribution):
 
 
 class Bernoulli(_ProbsOrLogits, Distribution):
-    """Bernoulli distribution on ``{0, 1}``.
+    r"""Bernoulli distribution on :math:`\{0, 1\}`.
 
-    Give exactly one of ``probs`` (``P(x = 1)``) or ``logits``
-    (``logit P(x = 1)``, numerically more stable).
+    The probability mass function is:
+
+    .. math::
+
+        P(X = 1 \mid p) = p, \quad P(X = 0 \mid p) = 1 - p
+
+    Parameters
+    ----------
+    probs : float or torch.Tensor or Parameter, optional
+        Success probability :math:`p \in [0, 1]`. Exactly one of ``probs`` or ``logits`` must be given.
+    logits : float or torch.Tensor or Parameter, optional
+        Log-odds of success :math:`\mathrm{logit}(p)`. Exactly one of ``probs`` or ``logits`` must be given.
     """
 
     def __init__(self, probs=None, logits=None):
@@ -1811,11 +1948,22 @@ class Bernoulli(_ProbsOrLogits, Distribution):
 
 
 class Binomial(_ProbsOrLogits, Distribution):
-    """Number of successes in ``n`` independent trials (support ``0, ..., n``).
+    r"""Binomial distribution for the number of successes in :math:`n` independent trials.
 
-    ``n`` is the (integer-valued) number of trials; give exactly one of
-    ``probs`` (success probability ``p``) or ``logits`` (``logit p``):
-    ``log p(k) = log C(n, k) + k log p + (n - k) log(1 - p)``.
+    The probability mass function on :math:`\{0, 1, \dots, n\}` is:
+
+    .. math::
+
+        P(X = k \mid n, p) = \binom{n}{k} p^k (1 - p)^{n - k}
+
+    Parameters
+    ----------
+    n : int or torch.Tensor or Parameter
+        Number of independent trials :math:`n \ge 0`.
+    probs : float or torch.Tensor or Parameter, optional
+        Success probability :math:`p \in [0, 1]`. Exactly one of ``probs`` or ``logits`` must be given.
+    logits : float or torch.Tensor or Parameter, optional
+        Log-odds of success :math:`\mathrm{logit}(p)`. Exactly one of ``probs`` or ``logits`` must be given.
     """
 
     def __init__(self, n, probs=None, logits=None):
@@ -1883,11 +2031,20 @@ class Binomial(_ProbsOrLogits, Distribution):
 
 
 class DiscreteUniform(Distribution):
-    """Uniform distribution on the integers ``low, ..., high``.
+    r"""Discrete uniform distribution on the contiguous integers :math:`\{\mathrm{low}, \dots, \mathrm{high}\}`.
 
-    ``log_pdf_param_grads`` treats the bounds as continuous-valued: inside the
-    support ``d/dlow log p = 1/(high-low+1)`` and ``d/dhigh = -1/(high-low+1)``
-    (zero outside the support).
+    The probability mass function is:
+
+    .. math::
+
+        P(X = k) = \frac{1}{\mathrm{high} - \mathrm{low} + 1} \quad \text{for } k \in \{\mathrm{low}, \dots, \mathrm{high}\}
+
+    Parameters
+    ----------
+    low : int or torch.Tensor or Parameter
+        Lower bound (inclusive).
+    high : int or torch.Tensor or Parameter
+        Upper bound (inclusive, :math:`\mathrm{high} \ge \mathrm{low}`).
     """
 
     def __init__(self, low, high):
@@ -1940,9 +2097,18 @@ class DiscreteUniform(Distribution):
 
 
 class Poisson(Distribution):
-    """Poisson distribution with mean ``rate > 0`` (support 0, 1, 2, ...).
+    r"""Poisson distribution.
 
-    ``log p(k) = k log rate - rate - log k!``.
+    The probability mass function on :math:`\{0, 1, 2, \dots\}` is:
+
+    .. math::
+
+        P(X = k \mid \lambda) = \frac{\lambda^k \exp(-\lambda)}{k!}
+
+    Parameters
+    ----------
+    rate : float or torch.Tensor or Parameter
+        Rate (mean) parameter :math:`\lambda > 0`.
     """
 
     def __init__(self, rate):
@@ -1987,12 +2153,23 @@ class Poisson(Distribution):
 
 
 class NegativeBinomial(_ProbsOrLogits, Distribution):
-    """Number of successes before ``total_count`` failures, success probability ``probs``.
+    r"""Negative binomial distribution.
 
-    ``log p(k) = log C(k + r - 1, k) + r log(1 - p) + k log p`` (the PyTorch /
-    Pyro convention), mean ``r p / (1 - p)``, with ``r = total_count > 0``
-    (need not be an integer). Give exactly one of ``probs`` (``p``) or
-    ``logits`` (``logit p``).
+    Number of successes before :math:`r` failures with success probability :math:`p`.
+    The probability mass function on :math:`\{0, 1, 2, \dots\}` is:
+
+    .. math::
+
+        P(X = k \mid r, p) = \binom{k + r - 1}{k} (1 - p)^r p^k
+
+    Parameters
+    ----------
+    total_count : float or torch.Tensor or Parameter
+        Number of failures :math:`r > 0` until the process is stopped.
+    probs : float or torch.Tensor or Parameter, optional
+        Success probability :math:`p \in [0, 1)`. Exactly one of ``probs`` or ``logits`` must be given.
+    logits : float or torch.Tensor or Parameter, optional
+        Log-odds of success :math:`\mathrm{logit}(p)`. Exactly one of ``probs`` or ``logits`` must be given.
     """
 
     def __init__(self, total_count, probs=None, logits=None):
@@ -2066,12 +2243,20 @@ class NegativeBinomial(_ProbsOrLogits, Distribution):
 
 
 class Categorical(Distribution):
-    """Categorical distribution over ``{0, ..., K-1}`` given ``probs`` or ``logits`` (last dim = K).
+    r"""Categorical distribution over :math:`\{0, 1, \dots, K-1\}`.
 
-    Give exactly one of ``probs`` or ``logits``, shape ``(..., K)``; leading
-    dimensions are batch dimensions. ``probs`` need not be normalised; the
-    density and gradients are those of ``log(probs_k / sum(probs))``.
-    Draws are returned as floating-point category indices.
+    The probability mass function is:
+
+    .. math::
+
+        P(X = k \mid \mathbf{p}) = \frac{p_k}{\sum_{j=1}^K p_j}
+
+    Parameters
+    ----------
+    probs : torch.Tensor or Parameter, optional
+        Event probabilities of shape ``(..., K)``. Exactly one of ``probs`` or ``logits`` must be given.
+    logits : torch.Tensor or Parameter, optional
+        Unnormalized log probabilities (logits) of shape ``(..., K)``. Exactly one of ``probs`` or ``logits`` must be given.
     """
 
     _param_event_ndims = {"probs": 1, "logits": 1}
@@ -2154,16 +2339,22 @@ class Categorical(Distribution):
 
 
 class Multinomial(Distribution):
-    """Multinomial counts over K categories with ``total_count`` trials.
+    r"""Multinomial distribution over :math:`K` categories with :math:`n` trials.
 
-    Give exactly one of ``probs`` (need not be normalised) or ``logits``,
-    shape ``(..., K)``. ``log p(x) = log n! - sum_k log x_k! + sum_k x_k
-    log p_k`` for non-negative integer counts summing to ``n =
-    total_count``.
+    For count vector :math:`\mathbf{k} = (k_1, \dots, k_K)` such that :math:`\sum_{j=1}^K k_j = n`:
 
-    Supports ``log_pdf``, parameter gradients and ``sample``; it cannot be
-    used as a latent variable for MCMC (its support, vectors summing to
-    ``total_count``, is not represented by the state space).
+    .. math::
+
+        P(\mathbf{X} = \mathbf{k} \mid n, \mathbf{p}) = \frac{n!}{\prod_{j=1}^K k_j!} \prod_{j=1}^K p_j^{k_j}
+
+    Parameters
+    ----------
+    total_count : int or torch.Tensor or Parameter
+        Total number of trials :math:`n`.
+    probs : torch.Tensor or Parameter, optional
+        Event probabilities of shape ``(..., K)``. Exactly one of ``probs`` or ``logits`` must be given.
+    logits : torch.Tensor or Parameter, optional
+        Logits of shape ``(..., K)``. Exactly one of ``probs`` or ``logits`` must be given.
     """
 
     _param_event_ndims = {"probs": 1, "logits": 1}
@@ -2259,12 +2450,22 @@ class Multinomial(Distribution):
 
 
 class ZeroInflated(Distribution):
-    """Zero-inflated discrete distribution: ``0`` with probability ``gate``, else ``base``.
+    r"""Zero-inflated discrete distribution.
 
-    ``p(0) = gate + (1 - gate) p_base(0)`` and ``p(k) = (1 - gate)
-    p_base(k)`` for ``k != 0``, with ``gate`` in ``(0, 1)``. The support and
-    transform are those of ``base``. E.g. ``ZeroInflated(Poisson(rate),
-    gate)`` is the zero-inflated Poisson.
+    Mixture of a point mass at zero and a discrete base distribution:
+
+    .. math::
+
+        P(X = 0 \mid \pi) = \pi + (1 - \pi) P_{\text{base}}(0)
+
+        P(X = k \mid \pi) = (1 - \pi) P_{\text{base}}(k) \quad \text{for } k \neq 0
+
+    Parameters
+    ----------
+    base : Distribution
+        Discrete base distribution (such as :class:`Poisson` or :class:`NegativeBinomial`).
+    gate : float or torch.Tensor or Parameter
+        Zero-inflation probability :math:`\pi \in (0, 1)`.
     """
 
     def __init__(self, base, gate):
@@ -2335,16 +2536,24 @@ class ZeroInflated(Distribution):
 
 
 class Truncated(Distribution):
-    """A continuous ``base`` distribution truncated to ``[low, high]``.
+    r"""Continuous distribution truncated to an interval :math:`[a, b]`.
 
-    ``log p(x) = log p_base(x) - log(F(high) - F(low))`` inside
-    ``[low, high]`` and ``-inf`` outside (``F`` the base cdf). Either bound
-    may be ``None`` (the default; no truncation on that side) and may be a
-    model node. The sampler works on ``logit`` (two bounds) or ``log`` (one
-    bound) of the value. The base must provide ``cdf`` (and ``icdf`` for
-    sampling, by inversion). Gradients w.r.t. the base
-    parameters additionally need ``base.cdf_param_grads`` (Normal,
-    Exponential, Cauchy and Laplace provide it).
+    The probability density function is given by:
+
+    .. math::
+
+        f(x \mid a, b) = \frac{f_{\text{base}}(x)}{F_{\text{base}}(b) - F_{\text{base}}(a)} \quad \text{for } a \le x \le b
+
+    where :math:`F_{\text{base}}` is the cumulative distribution function of the base distribution.
+
+    Parameters
+    ----------
+    base : Distribution
+        Continuous base distribution providing ``cdf`` (and ``icdf`` for sampling).
+    low : float or torch.Tensor or Parameter, optional
+        Lower truncation bound :math:`a`. If ``None``, the support is unbounded below.
+    high : float or torch.Tensor or Parameter, optional
+        Upper truncation bound :math:`b`. If ``None``, the support is unbounded above.
     """
 
     def __init__(self, base, low=None, high=None):
@@ -2450,16 +2659,22 @@ class Truncated(Distribution):
 
 
 class TransformedDistribution(Distribution):
-    """Distribution of ``y = transform.inverse(x)`` with ``x ~ base``.
+    r"""Distribution of a transformed random variable :math:`Y = T^{-1}(X)` where :math:`X \sim \text{base}`.
 
-    The library's transforms map unconstrained -> constrained with
-    ``inverse``, so e.g. ``TransformedDistribution(Normal(mu, sigma),
-    LogTransform())`` is a log-normal. Densities use the change of variables
-    ``log p(y) = log p_base(x) - log|det d inverse/dx|`` with
-    ``x = transform.forward(y)``. MCMC runs in the base distribution's
-    unconstrained space. ``state_space`` describes the support of ``y``
-    (default ``None``: the real line). ``cdf`` and ``icdf`` assume an
-    increasing elementwise transform.
+    The density is computed via the change-of-variables formula:
+
+    .. math::
+
+        p_Y(y) = p_X(T(y)) \cdot \left| \det \frac{d T(y)}{dy} \right|
+
+    Parameters
+    ----------
+    base : Distribution
+        Base distribution of :math:`X`.
+    transform : Transform
+        Bijection :math:`T` mapping constrained values to unconstrained values.
+    state_space : StateSpace, optional
+        Support of the transformed variable. Default is :class:`~BayesianDLL.Distributions.ContinuousReal`.
     """
 
     def __init__(self, base, transform, state_space=None):
@@ -2527,26 +2742,21 @@ class TransformedDistribution(Distribution):
 
 
 class Ordered(Distribution):
-    """Strictly increasing vector of length ``K`` with elementwise density ``base``.
+    r"""Distribution over sorted vectors :math:`x_1 < x_2 < \dots < x_K`.
 
-    ``Ordered(base, K)`` is the distribution of a vector ``x`` of shape
-    ``(*batch, K)`` with ``x_0 < x_1 < ... < x_{K-1}`` and (unnormalised)
-    log density ``sum_k base.log_pdf(x_k)``: the density of ``K`` draws of
-    ``base`` restricted to the ordered region. For a base with parameters
-    shared by all elements the normalising constant is ``K!``, which is left
-    out (it does not depend on ``x`` or on the parameters). The parameters of
-    ``base`` broadcast against ``x``, so they may be scalars or have a
-    trailing dimension of size ``K`` (e.g. one prior mean per element).
+    Evaluates the joint density of :math:`K` draws from a univariate continuous base distribution
+    restricted to the strictly ordered region:
 
-    The sampler works in an unconstrained space through
-    :class:`OrderedTransform` (``x_0 = y_0``, ``x_k = x_{k-1} + exp(y_k)``).
-    A base with a bounded support (e.g. ``Exponential``) composes its own
-    increasing elementwise transform after the ordering, so the ordered
-    values stay in the base support.
+    .. math::
 
-    The typical use is to break the label-switching symmetry of a mixture::
+        p(\mathbf{x}) = \sum_{k=1}^K \ln p_{\text{base}}(x_k) \quad \text{for } x_1 < x_2 < \dots < x_K
 
-        means = RandomParameter("means", Ordered(Normal(0.0, 5.0), 2))
+    Parameters
+    ----------
+    base : Distribution
+        Univariate continuous base distribution.
+    K : int
+        Length of the ordered vector (:math:`K \ge 1`).
     """
 
     _param_event_ndims = {"base": 1}
@@ -2606,18 +2816,22 @@ class Ordered(Distribution):
 
 # ========================= Miscellaneous distributions =========================
 class Mixture(Distribution):
-    """Finite mixture ``p(x) = sum_k weights_k p_k(x)`` of ``components``.
+    r"""Finite mixture distribution over :math:`K` components.
 
-    ``components`` is a list of distributions with a common event shape;
-    ``weights`` (shape ``(..., K)``, last dimension = number of components,
-    leading dimensions batch dimensions) are the mixture probabilities and
-    must sum to one over the last dimension (``log_pdf`` does not normalise
-    them; ``sample`` does). Variational parameters of the components are
-    registered on the mixture, so a mixture can be used inside a guide (it
-    has no reparameterised sampler, so BBVI uses score-function gradients).
-    ``log_pdf_param_grads`` returns ``p_k(x) / p(x)`` for the weights and
-    the posterior-responsibility-weighted component gradients for the
-    component parameters.
+    The probability density (or mass) function is:
+
+    .. math::
+
+        p(x) = \sum_{k=1}^K w_k p_k(x)
+
+    where :math:`w_k \ge 0` and :math:`\sum_{k=1}^K w_k = 1`.
+
+    Parameters
+    ----------
+    components : list of Distribution
+        Component distributions sharing the same event shape.
+    weights : torch.Tensor or Parameter
+        Mixture weights :math:`\mathbf{w}` of shape ``(..., K)`` summing to 1 along the last dimension.
     """
 
     _param_event_ndims = {"weights": 1}

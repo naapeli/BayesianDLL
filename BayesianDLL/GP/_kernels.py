@@ -259,13 +259,7 @@ def _half_integer_matern(p, u):
 
 
 class Kernel(ABC):
-    """Base class for covariance functions ``k(X1, X2)``.
-
-    Subclasses implement the batched methods (``batch_evaluate`` and, where
-    available, ``batch_derivatives``, ``batch_input_vjp``, ...; see the module
-    docstring). A user kernel may instead override the unbatched
-    ``evaluate`` / ``derivatives`` / ``input_vjp``; the batched methods then
-    loop over the batch.
+    r"""Base class for covariance kernels :math:`k(\mathbf{x}_1, \mathbf{x}_2)`.
     """
 
     def __init__(self, *parameters):
@@ -440,7 +434,17 @@ class Kernel(ABC):
 
 
 class Constant(Kernel):
-    """``k(x1, x2) = v`` for all inputs, with a scalar ``variance`` ``v`` (default ``1.0``)."""
+    r"""Constant covariance kernel.
+
+    .. math::
+
+        k(\mathbf{x}_1, \mathbf{x}_2) = v
+
+    Parameters
+    ----------
+    variance : float or torch.Tensor or Parameter, default 1.0
+        Constant variance parameter :math:`v > 0`.
+    """
 
     def __init__(self, variance=1.0):
         super().__init__(variance)
@@ -467,12 +471,16 @@ class Constant(Kernel):
 
 
 class WhiteNoise(Kernel):
-    """Independent noise: ``K(X1, X2) = v I`` when ``X1`` and ``X2`` are the same inputs, else ``0``.
+    r"""Independent white noise covariance kernel.
 
-    "The same inputs" means equal tensors (same shape and values), so the
-    kernel adds ``v`` to the diagonal of ``K(X, X)`` and nothing to
-    cross-covariances, even at coincident points. ``variance`` ``v`` is a
-    scalar (default ``1e-6``).
+    .. math::
+
+        k(\mathbf{x}_1, \mathbf{x}_2) = v \cdot \delta(\mathbf{x}_1, \mathbf{x}_2)
+
+    Parameters
+    ----------
+    variance : float or torch.Tensor or Parameter, default 1.0
+        Noise variance parameter :math:`v > 0`.
     """
 
     def __init__(self, variance=1e-6):
@@ -529,20 +537,18 @@ class _StationaryDiagonal:
 
 
 class RBF(_StationaryDiagonal, Kernel):
-    r"""Squared-exponential kernel with optional ARD length-scales.
+    r"""Squared exponential (Radial Basis Function / Gaussian) covariance kernel.
 
     .. math::
 
-        k(x_1, x_2) = v\exp\Bigl(-\tfrac12\sum_{d=1}^D (x_{1d}-x_{2d})^2 / l_d^2\Bigr).
+        k(\mathbf{x}_1, \mathbf{x}_2) = v \exp\left( -\frac{1}{2} \sum_{d=1}^D \frac{(x_{1d} - x_{2d})^2}{l_d^2} \right)
 
-    ``lengthscale`` is either a scalar shared by all ``D`` features or a
-    vector with one value per feature (automatic relevance determination).
-    It may be a constant, a ``RandomParameter`` (e.g. with ``shape=D`` or
-    inside a plate of size ``D``) or a ``DeterministicParameter``.
-    ``lengthscale`` and the scalar ``variance`` ``v`` default to ``1.0``. The
-    derivative w.r.t. an ARD length-scale has shape ``(D, N, M)``:
-    ``dk/dl_d = k (x_{1d}-x_{2d})^2 / l_d^3``; w.r.t. the inputs,
-    ``dk/dx_{1d} = -k (x_{1d}-x_{2d}) / l_d^2``.
+    Parameters
+    ----------
+    lengthscale : float or torch.Tensor or Parameter, default 1.0
+        Characteristic lengthscale :math:`l`. Scalar or shape ``(D,)`` for automatic relevance determination (ARD).
+    variance : float or torch.Tensor or Parameter, default 1.0
+        Output variance :math:`v > 0`.
     """
 
     def __init__(self, lengthscale=1.0, variance=1.0):
@@ -576,29 +582,22 @@ class RBF(_StationaryDiagonal, Kernel):
 
 
 class Periodic(_StationaryDiagonal, Kernel):
-    r"""Exponentiated-sine-squared kernel for periodic relationships.
+    r"""Periodic (exponentiated sine squared) covariance kernel.
 
-    With a scalar length-scale the kernel is
-
-    .. math::
-
-        k(x_1, x_2) = v\exp\left(
-            -\frac{2\sin^2(\pi\lVert x_1-x_2\rVert / p)}{l^2}
-        \right),
-
-    where ``v`` is the variance, ``l`` is the length-scale, and ``p`` is
-    the (scalar) period. With an ARD length-scale holding one value per
-    feature, the sine is applied feature by feature:
+    For scalar lengthscale :math:`l` and period :math:`p`:
 
     .. math::
 
-        k(x_1, x_2) = v\exp\Bigl(
-            -2\sum_{d=1}^D \sin^2(\pi (x_{1d}-x_{2d}) / p) / l_d^2
-        \Bigr).
+        k(\mathbf{x}_1, \mathbf{x}_2) = v \exp\left( -\frac{2\sin^2\left(\frac{\pi \|\mathbf{x}_1 - \mathbf{x}_2\|}{p}\right)}{l^2} \right)
 
-    Both forms agree for one-dimensional inputs. ``lengthscale``,
-    ``variance`` and ``period`` default to ``1.0``; ``variance`` and
-    ``period`` are scalars.
+    Parameters
+    ----------
+    lengthscale : float or torch.Tensor or Parameter, default 1.0
+        Lengthscale parameter :math:`l > 0`.
+    period : float or torch.Tensor or Parameter, default 1.0
+        Period of the repetition :math:`p > 0`.
+    variance : float or torch.Tensor or Parameter, default 1.0
+        Output variance :math:`v > 0`.
     """
 
     def __init__(self, lengthscale=1.0, variance=1.0, period=1.0):
@@ -668,28 +667,24 @@ class Periodic(_StationaryDiagonal, Kernel):
 
 
 class Matern(_StationaryDiagonal, Kernel):
-    r"""Matérn kernel for any fixed positive finite smoothness ``nu``.
+    r"""Matérn covariance kernel for arbitrary smoothness :math:`\nu > 0`.
 
-    With ``s = sqrt(sum_d (x_{1d}-x_{2d})^2 / l_d^2)`` and
-    ``a = sqrt(2 nu) s``, ``k = v 2^{1-nu}/Gamma(nu) a^nu K_nu(a)``
-    (``K_nu`` the modified Bessel function of the second kind).
-    ``lengthscale`` (default ``1.0``) may be scalar or hold one value per
-    feature (ARD); ``variance`` ``v`` is a scalar (default ``1.0``); ``nu``
-    is a fixed Python number (default ``1.5``) and receives no gradient.
+    The covariance between two points at distance :math:`r = \sqrt{\sum_{d=1}^D (x_{1d} - x_{2d})^2 / l_d^2}` is:
 
-    * Half-integer ``nu = p + 1/2`` (0.5, 1.5, 2.5, ...) uses the exact
-      closed form ``k = v exp(-a) p!/(2p)! Σ_i (p+i)!/(i!(p-i)!) (2a)^{p-i}``.
-    * Any other ``nu`` evaluates ``a^nu K_nu(a)`` with a trapezoidal
-      quadrature of ``K_nu(a) = ∫_0^∞ exp(-a cosh t) cosh(nu t) dt``; the
-      limit ``a -> 0`` gives ``k = v``. In float64 its relative error
-      against ``scipy.special.kv`` was measured at most ``1.2e-13`` (for
-      ``nu`` in 0.3–3.7 and ``a`` in ``[1e-8, 630]``).
+    .. math::
 
-    Both are pure torch. With ``f(a) = k / v`` the derivative w.r.t. each
-    length-scale component is ``dk/dl_d = -v f'(a) sqrt(2 nu) (x_{1d}-x_{2d})^2 / (s l_d^3)``,
-    where ``f'(a) = -2^{1-nu}/Gamma(nu) a^nu K_{nu-1}(a)`` in general; it
-    tends to zero as ``s -> 0``. W.r.t. the inputs,
-    ``dk/dx_{1d} = v f'(a) sqrt(2 nu) (x_{1d}-x_{2d}) / (s l_d^2)``.
+        k(\mathbf{x}_1, \mathbf{x}_2) = v \frac{2^{1-\nu}}{\Gamma(\nu)} \left(\sqrt{2\nu} r\right)^\nu K_\nu\left(\sqrt{2\nu} r\right)
+
+    where :math:`K_\nu` is the modified Bessel function of the second kind.
+
+    Parameters
+    ----------
+    lengthscale : float or torch.Tensor or Parameter, default 1.0
+        Lengthscale parameter :math:`l`, scalar or ARD vector of shape ``(D,)``.
+    variance : float or torch.Tensor or Parameter, default 1.0
+        Output variance :math:`v > 0`.
+    nu : float, default 1.5
+        Smoothness parameter :math:`\nu > 0`.
     """
 
     def __init__(self, lengthscale=1.0, variance=1.0, nu=1.5):
@@ -768,35 +763,64 @@ class Matern(_StationaryDiagonal, Kernel):
 
 
 class Matern32(Matern):
-    """Matérn kernel with ``nu = 3/2``: ``k = v (1 + a) exp(-a)``, ``a = sqrt(3) s``."""
+    r"""Matérn 3/2 covariance kernel (:math:`\nu = 1.5`).
+
+    .. math::
+
+        k(\mathbf{x}_1, \mathbf{x}_2) = v (1 + \sqrt{3}r) \exp(-\sqrt{3}r)
+
+    where :math:`r = \sqrt{\sum_{d=1}^D (x_{1d} - x_{2d})^2 / l_d^2}`.
+
+    Parameters
+    ----------
+    lengthscale : float or torch.Tensor or Parameter, default 1.0
+        Lengthscale parameter :math:`l`, scalar or ARD vector of shape ``(D,)``.
+    variance : float or torch.Tensor or Parameter, default 1.0
+        Output variance :math:`v > 0`.
+    """
 
     def __init__(self, lengthscale=1.0, variance=1.0):
         super().__init__(lengthscale=lengthscale, variance=variance, nu=1.5)
 
 
 class Matern52(Matern):
-    """Matérn kernel with ``nu = 5/2``: ``k = v (1 + a + a²/3) exp(-a)``, ``a = sqrt(5) s``."""
+    r"""Matérn 5/2 covariance kernel (:math:`\nu = 2.5`).
+
+    .. math::
+
+        k(\mathbf{x}_1, \mathbf{x}_2) = v \left(1 + \sqrt{5}r + \frac{5}{3}r^2\right) \exp(-\sqrt{5}r)
+
+    where :math:`r = \sqrt{\sum_{d=1}^D (x_{1d} - x_{2d})^2 / l_d^2}`.
+
+    Parameters
+    ----------
+    lengthscale : float or torch.Tensor or Parameter, default 1.0
+        Lengthscale parameter :math:`l`, scalar or ARD vector of shape ``(D,)``.
+    variance : float or torch.Tensor or Parameter, default 1.0
+        Output variance :math:`v > 0`.
+    """
 
     def __init__(self, lengthscale=1.0, variance=1.0):
         super().__init__(lengthscale=lengthscale, variance=variance, nu=2.5)
 
 
 class RationalQuadratic(_StationaryDiagonal, Kernel):
-    r"""Rational-quadratic kernel, a scale mixture of RBF kernels.
+    r"""Rational quadratic covariance kernel.
+
+    Equivalent to a continuous scale mixture of RBF kernels with Gamma-distributed inverse lengthscales:
 
     .. math::
 
-        k(x_1, x_2) = v\Bigl(1 + \frac{r^2}{2\alpha}\Bigr)^{-\alpha},
-        \qquad r^2 = \sum_{d=1}^D (x_{1d}-x_{2d})^2 / l_d^2,
+        k(\mathbf{x}_1, \mathbf{x}_2) = v \left( 1 + \frac{r^2}{2\alpha} \right)^{-\alpha}, \quad r^2 = \sum_{d=1}^D \frac{(x_{1d} - x_{2d})^2}{l_d^2}
 
-    with a scalar or ARD ``lengthscale``, ``variance`` ``v`` and shape
-    ``alpha > 0`` (``alpha -> ∞`` recovers the RBF kernel). With
-    ``B = 1 + r^2 / (2 alpha)`` the derivatives are
-    ``dk/dl_d = k (x_{1d}-x_{2d})^2 / (l_d^3 B)``,
-    ``dk/dalpha = k (r^2 / (2 alpha B) - log B)`` and
-    ``dk/dx_{1d} = -k (x_{1d}-x_{2d}) / (l_d^2 B)``. All three
-    hyperparameters default to ``1.0``; ``variance`` and ``alpha`` are
-    scalars.
+    Parameters
+    ----------
+    lengthscale : float or torch.Tensor or Parameter, default 1.0
+        Lengthscale parameter :math:`l`, scalar or ARD vector of shape ``(D,)``.
+    variance : float or torch.Tensor or Parameter, default 1.0
+        Output variance :math:`v > 0`.
+    alpha : float or torch.Tensor or Parameter, default 1.0
+        Scale mixture shape parameter :math:`\alpha > 0`.
     """
 
     def __init__(self, lengthscale=1.0, variance=1.0, alpha=1.0):
@@ -839,10 +863,18 @@ class RationalQuadratic(_StationaryDiagonal, Kernel):
 
 
 class Linear(Kernel):
-    """``k(x1, x2) = v (x1 - c)·(x2 - c)`` with a scalar or per-feature offset ``c``.
+    r"""Linear covariance kernel with offset.
 
-    ``variance`` ``v`` (scalar, default ``1.0``) and ``offset`` ``c``
-    (default ``0.0``). The kernel is not stationary.
+    .. math::
+
+        k(\mathbf{x}_1, \mathbf{x}_2) = v (\mathbf{x}_1 - \mathbf{c})^\top (\mathbf{x}_2 - \mathbf{c})
+
+    Parameters
+    ----------
+    variance : float or torch.Tensor or Parameter, default 1.0
+        Variance scaling factor :math:`v > 0`.
+    offset : float or torch.Tensor or Parameter, default 0.0
+        Offset vector :math:`\mathbf{c}`, scalar or shape ``(D,)``.
     """
 
     def __init__(self, variance=1.0, offset=0.0):
@@ -885,12 +917,12 @@ class Linear(Kernel):
 
 
 class SumKernel(Kernel):
-    """``k = k_1 + k_2 + ...`` (also built with ``k1 + k2``).
+    r"""Sum of covariance kernels :math:`k = k_1 + k_2 + \dots`.
 
-    Parts may be :class:`Kernel` objects, numbers (constant kernels without
-    gradient) or plain callables ``k(x1, x2)`` (no gradients, unbatched
-    inputs only). A parameter shared by several parts gets the sum of their
-    derivatives.
+    Parameters
+    ----------
+    kernels : sequence of Kernel
+        Kernels to sum.
     """
 
     def __init__(self, *kernels):
@@ -916,9 +948,12 @@ class SumKernel(Kernel):
 
 
 class ProductKernel(Kernel):
-    """``k = k_1 k_2 ...`` (elementwise product of the covariance matrices; also built with ``k1 * k2``).
+    r"""Elementwise product of covariance kernels :math:`k = k_1 \cdot k_2 \cdot \dots`.
 
-    Parts are as for :class:`SumKernel`; derivatives follow the product rule.
+    Parameters
+    ----------
+    kernels : sequence of Kernel
+        Kernels to multiply.
     """
 
     def __init__(self, *kernels):

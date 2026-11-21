@@ -6,8 +6,7 @@ The core modelling building blocks are importable directly from ``BayesianDLL``.
 :class:`BayesianDLL.Variational.Guide` and :class:`BayesianDLL.Variational.Group`.
 
 .. automodule:: BayesianDLL
-   :members: Model, condition, Data, RandomParameter, ObservedParameter, DeterministicParameter, VariationalParameter, plate
-   :undoc-members:
+   :members: Model, condition, marginalize, Data, RandomParameter, ObservedParameter, DeterministicParameter, VariationalParameter, plate, sample, sample_prior_predicative, sample_posterior_predicative, laplace_approximation, find_MAP
    :show-inheritance:
 
 .. toctree::

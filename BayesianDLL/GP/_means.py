@@ -47,13 +47,7 @@ from ._kernels import (
 
 
 class MeanFunction(ABC):
-    """Base class for GP mean functions ``m(X)``.
-
-    Subclasses implement the batched methods (``batch_evaluate`` and, where
-    available, ``batch_derivatives`` and ``batch_input_vjp``; see the module
-    docstring) or the unbatched ``evaluate`` / ``derivatives`` /
-    ``input_vjp``. Mean functions are added with ``+`` (:class:`SumMean`); a
-    number in a sum is a :class:`ConstantMean`.
+    r"""Base class for Gaussian Process mean functions :math:`m(X)`.
     """
 
     def __init__(self, *parameters):
@@ -145,7 +139,8 @@ def _zeros_like_inputs(x, *others):
 
 
 class ZeroMean(MeanFunction):
-    """``m(x) = 0``: the default mean of every GP. It has no parameters and adds no work to the gradients."""
+    r"""Zero mean function :math:`m(x) = 0`.
+    """
 
     def __init__(self):
         super().__init__()
@@ -161,9 +156,12 @@ class ZeroMean(MeanFunction):
 
 
 class ConstantMean(MeanFunction):
-    """``m(x) = c`` with a scalar ``value`` ``c``: a number, a 0-d tensor or a named scalar node.
+    r"""Constant mean function :math:`m(x) = c`.
 
-    ``∂m/∂c = 1``; the input VJP is zero.
+    Parameters
+    ----------
+    value : float or torch.Tensor or Parameter, default 0.0
+        Scalar constant value :math:`c`.
     """
 
     def __init__(self, value=0.0):
@@ -185,17 +183,14 @@ class ConstantMean(MeanFunction):
 
 
 class LinearMean(MeanFunction):
-    r"""``m(x) = x·w + b``: a linear trend with ``coefficients`` ``w`` and an ``intercept`` ``b``.
+    r"""Linear trend mean function :math:`m(x) = \mathbf{x}^\top \mathbf{w} + b`.
 
-    ``w`` has one value per input feature, shape ``(D,)``, or is a scalar
-    for one-dimensional inputs; ``b`` is a scalar (default ``0.0``). Both may
-    be constants or named nodes. Derivatives: ``∂m_i/∂w_d = x_id`` (shape
-    ``(D, N)``), ``∂m_i/∂b = 1``; the input VJP is ``out[i, d] = g_i w_d``.
-
-    Unlike a :class:`~BayesianDLL.GP.Linear` *kernel*, which puts a Gaussian
-    prior on a random slope and integrates it out, the mean function is a
-    fixed trend whose slope is a parameter of the model (learned with its
-    own prior); the GP then models the deviations from that trend.
+    Parameters
+    ----------
+    coefficients : float or torch.Tensor or Parameter
+        Weight vector :math:`\mathbf{w}` of shape ``(D,)`` or scalar for 1-D input.
+    intercept : float or torch.Tensor or Parameter, default 0.0
+        Scalar intercept :math:`b`.
     """
 
     def __init__(self, coefficients, intercept=0.0):
@@ -236,9 +231,12 @@ class LinearMean(MeanFunction):
 
 
 class SumMean(MeanFunction):
-    """``m = m_1 + m_2 + ...`` (also built with ``m1 + m2``); numbers become :class:`ConstantMean`.
+    r"""Sum of mean functions :math:`m(x) = m_1(x) + m_2(x) + \dots`.
 
-    A parameter shared by several parts gets the sum of their derivatives.
+    Parameters
+    ----------
+    means : sequence of MeanFunction
+        Mean functions to sum.
     """
 
     def __init__(self, *means):

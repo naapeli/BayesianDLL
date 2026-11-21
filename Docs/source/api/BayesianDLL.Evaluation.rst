@@ -3,7 +3,6 @@ Evaluation
 
 .. automodule:: BayesianDLL.Evaluation
    :members:
-   :undoc-members:
    :show-inheritance:
    :imported-members:
 

@@ -342,50 +342,34 @@ def _raw_values(nodes, values):
 
 
 class LatentGP(DeterministicParameter):
-    r"""An explicit whitened latent GP function node.
+    r"""Explicit whitened latent Gaussian Process function node.
 
-    The object is a ``DeterministicParameter`` whose value is
-    ``m(X) + L @ z`` with ``L Lᵀ = K(X, X) + jitter I`` (the jitter of
-    :func:`stable_cholesky`). If ``latent`` is omitted, a standard-normal
-    latent vector of ``N`` values named ``latent_name`` (default
-    ``<name>_white``) is created automatically. This is a non-centred
-    parameterization intended for NUTS and variational inference.
+    Represents a latent GP function :math:`\mathbf{f}` via non-centred reparameterization:
 
-    Arguments:
+    .. math::
 
-    * ``inputs``: a named node of shape ``(N, D)`` or ``(N,)``: a ``Data``
-      object or a learnable ``RandomParameter`` / ``DeterministicParameter``
-      (see **Learnable inputs** below);
-    * ``kernel``: a :class:`Kernel`;
-    * ``latent``: a named ``RandomParameter`` with ``N`` values and a
-      ``Normal(0, 1)`` prior (default ``None``: created automatically);
-    * ``mean``: a :class:`~BayesianDLL.GP.MeanFunction` ``m`` (defaults to ``ZeroMean()``;
-      a number, 0-d tensor or named scalar node is a ``ConstantMean``);
-    * ``jitter``: relative diagonal jitter (default ``1e-6``);
-    * ``latent_name``: name of the automatically created latent.
+        \mathbf{f} = \mathbf{m}(X) + \mathbf{L} \mathbf{z}, \quad \mathbf{z} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})
 
-    The node stores them as ``gp_inputs``, ``gp_latent``, ``gp_kernel``,
-    ``gp_mean`` and ``gp_jitter``. The likelihood can use the returned
-    function directly, for example
-    ``ObservedParameter("y", Normal(f, noise), y)``; see
-    :func:`gp_predictive` for predictions at new inputs.
+    where :math:`\mathbf{L}` is the Cholesky factor of :math:`\mathbf{K}(X, X) + \text{jitter} \cdot \mathbf{I}`.
 
-    **Gradients** (vector-Jacobian product, hand-derived). For a cotangent
-    ``ḡ`` of ``f``: ``z`` gets ``Lᵀ ḡ``; with ``dL = L Φ(L⁻¹ dK L⁻ᵀ)``
-    (``Φ`` takes the lower triangle and halves the diagonal) every kernel
-    hyperparameter gets ``⟨G_K, ∂K/∂θ⟩`` with
-    ``G_K = sym(L⁻ᵀ S L⁻¹)``, ``S = Φ(Lᵀ ḡ zᵀ)``. Learnable inputs get
-    ``kernel.input_vjp(X, X, G_K + G_Kᵀ)``. The mean function's parameters
-    get ``⟨ḡ, ∂m(X)/∂θ⟩`` and learnable inputs also get the mean's input VJP
-    ``∂⟨ḡ, m(X)⟩/∂X``. With vectorized chains all of this is batched over the
-    chain dimension.
-
-    **Learnable inputs.** Supported: ``inputs`` may be a ``RandomParameter``
-    or ``DeterministicParameter`` (GP latent variable models, uncertain
-    inputs, input warping); it gets the kernel and mean input VJPs above,
-    and :func:`gp_predictive` reads it from the trace. Learnable inputs are supported by :class:`ExactGP`, :class:`LatentGP`,
-    :class:`SparseGP`, :class:`SparseLatentGP` and :class:`~BayesianDLL.GP.KroneckerGP`
-    (per grid axis), not by :class:`~BayesianDLL.GP.ToeplitzGP`.
+    Parameters
+    ----------
+    name : str
+        Name of the deterministic function node.
+    inputs : torch.Tensor or Data or Parameter
+        Input covariates :math:`X` of shape ``(N, D)`` or ``(N,)``.
+    kernel : Kernel
+        Covariance kernel function :math:`k(x_1, x_2)`.
+    latent : RandomParameter, optional
+        Standard normal latent parameter :math:`\mathbf{z}` of :math:`N` values.
+        If ``None``, a parameter named ``latent_name`` is created automatically.
+    mean : MeanFunction, optional
+        GP mean function :math:`m(x)`. Default is :class:`~BayesianDLL.GP.ZeroMean`.
+    jitter : float, default 1e-6
+        Relative diagonal jitter for numerical stability.
+    latent_name : str, optional
+        Name of the latent parameter created when ``latent`` is not provided.
+        Defaults to ``f"{name}_white"``.
     """
 
     def __init__(
@@ -561,46 +545,32 @@ class _GPDistribution(Distribution):
 
 
 class ExactGP(_GPDistribution):
-    """Gaussian-process marginal likelihood with the latent function integrated out.
+    r"""Gaussian Process marginal likelihood with the latent function integrated out.
 
-    If ``f ~ Normal(m(X), K)`` and ``y | f ~ Normal(f, noise_variance * I)``,
-    this distribution evaluates the exact marginal likelihood
+    Given latent function values :math:`\mathbf{f} \sim \mathcal{N}(\mathbf{m}(X), \mathbf{K})`
+    and Gaussian observations :math:`\mathbf{y} \mid \mathbf{f} \sim \mathcal{N}(\mathbf{f}, \sigma^2 \mathbf{I})`,
+    this distribution evaluates the exact marginal likelihood:
 
-    ``y ~ Normal(m(X), K + noise_variance * I)``.
+    .. math::
 
-    The object is used as the distribution of an ``ObservedParameter``::
+        \mathbf{y} \sim \mathcal{N}\left(\mathbf{m}(X), \mathbf{K}(X, X) + \sigma^2 \mathbf{I}\right)
 
-        gp = ExactGP("function", inputs, kernel, noise_variance=0.05)
-        ObservedParameter("observations", gp, y)
-
-    Unlike :class:`LatentGP`, this does not create a latent random
-    variable. Kernel and noise hyperparameters remain ordinary model
-    parameters and can be sampled with MCMC (or optimised with
-    :func:`~BayesianDLL.Variational.find_MAP`, a type-II MAP estimate when
-    they have priors). With vectorized chains the covariance matrices of all
-    chains are factorised as one batch.
-
-    Arguments: ``name`` (a label for the node), ``inputs`` (a named ``Data``
-    or model node of shape ``(N, D)`` or ``(N,)``), ``kernel`` (a
-    :class:`Kernel`), ``noise_variance`` (the scalar noise **variance**
-    ``σ²``, default ``1e-6``), ``mean`` (a :class:`~BayesianDLL.GP.MeanFunction`
-    ``m``; defaults to ``ZeroMean()``, and a number, 0-d tensor or named
-    scalar node is a ``ConstantMean``; its parameters get ``⟨α, ∂m(X)/∂θ⟩``
-    with ``α = (K + σ² I)⁻¹ (y - m(X))``, and learnable inputs also get the
-    mean's input VJP of ``α``) and ``jitter`` (default ``1e-6``; the
-    relative diagonal jitter of :func:`batched_stable_cholesky`, applied to
-    ``K + σ² I`` and included in the gradients). The observations have
-    shape ``(N,)``; ``sample`` draws ``y`` including the noise. Use
-    :func:`exact_gp_predictive` for predictions at new inputs.
-
-    **Learnable inputs.** Supported: ``inputs`` may be a ``RandomParameter``
-    or ``DeterministicParameter`` (GP latent variable models, uncertain
-    inputs, input warping). It gets
-    ``kernel.input_vjp_symmetric(X, ½(ααᵀ - Σ⁻¹))`` plus the mean's input VJP
-    of ``α``, and :func:`exact_gp_predictive` reads it from the trace.
-    Learnable inputs are supported by :class:`ExactGP`, :class:`LatentGP`,
-    :class:`SparseGP`, :class:`SparseLatentGP` and :class:`~BayesianDLL.GP.KroneckerGP`
-    (per grid axis), not by :class:`~BayesianDLL.GP.ToeplitzGP`.
+    Parameters
+    ----------
+    name : str
+        Name of the GP node.
+    inputs : torch.Tensor or Data or Parameter
+        Input covariates :math:`X` of shape ``(N, D)`` or ``(N,)``. May be a
+        fixed ``Data`` node or a learnable ``RandomParameter`` / ``DeterministicParameter``.
+    kernel : Kernel
+        Covariance kernel function :math:`k(x_1, x_2)`.
+    noise_variance : float or torch.Tensor or Parameter, default 1e-6
+        Observation noise variance :math:`\sigma^2 > 0`.
+    mean : MeanFunction, optional
+        GP mean function :math:`m(x)`. Default is :class:`~BayesianDLL.GP.ZeroMean`.
+        A constant or scalar node is automatically wrapped in :class:`~BayesianDLL.GP.ConstantMean`.
+    jitter : float, default 1e-6
+        Relative diagonal jitter added to :math:`\mathbf{K} + \sigma^2 \mathbf{I}` for numerical stability.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=None, jitter=1e-6):
@@ -723,71 +693,33 @@ _SPARSE_METHODS = ("vfe", "dtc", "fitc")
 
 
 class SparseGP(_GPDistribution):
-    r"""Inducing-point approximation of the GP marginal likelihood.
+    r"""Sparse inducing-point Gaussian Process marginal likelihood approximation.
 
-    With ``m`` inducing inputs ``Z`` and ``Q_nn = K_nm K_mm⁻¹ K_mn``, the
-    log density of the observations ``y`` (one value per training input) is
+    Uses the deterministic training conditional (DTC) / projected process approximation
+    with :math:`M` inducing inputs :math:`Z`:
 
-    * ``method="vfe"`` (default): Titsias' collapsed variational bound,
-      ``log N(y | m(X), Q_nn + σ² I) - tr(K_nn - Q_nn) / (2σ²)``. It is a lower
-      bound on the exact log marginal likelihood and equals it when ``Z``
-      equals the training inputs.
-    * ``method="dtc"``: ``log N(y | m(X), Q_nn + σ² I)`` (deterministic
-      training conditional).
-    * ``method="fitc"``: ``log N(y | m(X), Q_nn + diag(K_nn - Q_nn) + σ² I)``
-      (fully independent training conditional).
+    .. math::
 
-    Everything is evaluated with Cholesky factors of ``m x m`` matrices, the
-    Woodbury identity and the matrix determinant lemma, i.e. in ``O(n m²)``
-    time and ``O(n m)`` memory; no ``n x n`` matrix is ever formed. With
-    vectorized chains all matrices carry a leading chain dimension.
+        \mathbf{y} \sim \mathcal{N}\left(\mathbf{m}(X), \mathbf{Q}_{nn} + \sigma^2 \mathbf{I}\right)
 
-    ``inducing_points`` (shape ``(m, D)`` or ``(m,)``) is a tensor, a ``Data``
-    node, or a learnable ``RandomParameter`` / ``DeterministicParameter``,
-    e.g. ``RandomParameter("Z", Normal(Z0, 0.5), initial_value=Z0)`` with
-    ``Z0`` of shape ``(m, D)``. Kernel hyperparameters, ``noise_variance``,
-    the parameters of the mean function and learnable inducing inputs get
-    hand-derived gradients (see
-    :meth:`log_pdf_param_grads`); the inducing-input gradient uses
-    :meth:`Kernel.input_vjp`.
+    where :math:`\mathbf{Q}_{nn} = \mathbf{K}_{nm} \mathbf{K}_{mm}^{-1} \mathbf{K}_{mn}`.
 
-    **Learnable inputs.** Supported: the training ``inputs`` ``X`` may be a
-    ``RandomParameter`` or ``DeterministicParameter`` (GP latent variable
-    models, uncertain inputs, input warping) for every ``method``. ``X`` gets
-    ``kernel.input_vjp(X, Z, G_mnᵀ)``, the diagonal term
-    ``kernel.diag_input_vjp(X, g_nn)`` (VFE and FITC; zero for stationary
-    kernels) and the mean's input VJP of ``α``; :func:`sparse_gp_predictive`
-    reads it from the trace. Learnable inputs are supported by :class:`ExactGP`, :class:`LatentGP`,
-    :class:`SparseGP`, :class:`SparseLatentGP` and :class:`~BayesianDLL.GP.KroneckerGP`
-    (per grid axis), not by :class:`~BayesianDLL.GP.ToeplitzGP`.
-
-    **Independent outputs.** ``n_outputs = R`` models ``R`` independent
-    output dimensions that share ``X``, ``Z``, the kernel, the mean and the
-    noise: the observations have shape ``(R, n)`` and the log density is the
-    sum over the rows, computed with one set of ``m x m`` factors. With
-    learnable ``X`` this is a sparse GP latent variable model.
-
-    **Learnable inducing inputs: use VFE.** The VFE bound can only increase
-    towards the exact marginal likelihood as ``Z`` improves, so optimizing or
-    sampling ``Z`` is safe. DTC and FITC are not bounds: moving ``Z`` can
-    raise their likelihood above the exact one (FITC in particular is known
-    to collapse inducing points and underestimate the noise), so they can
-    overfit ``Z``.
-
-    The other arguments are as for :class:`ExactGP`: ``noise_variance`` is
-    the scalar noise variance ``σ²`` (default ``1e-6``), ``mean`` is a
-    :class:`~BayesianDLL.GP.MeanFunction` evaluated at the training inputs
-    ``X`` (defaults to ``ZeroMean()``; a number is a ``ConstantMean``),
-    ``method`` is ``"vfe"``, ``"dtc"`` or ``"fitc"`` (case
-    insensitive) and ``jitter`` (default ``1e-6``) is the relative jitter of
-    the ``K_mm`` Cholesky factor, and ``n_outputs`` (default ``None``: one
-    output, observations of shape ``(n,)``). Use it as the distribution of an
-    ``ObservedParameter``::
-
-        gp = SparseGP("function", inputs, kernel, inducing_points=Z, noise_variance=noise)
-        ObservedParameter("observations", gp, y)
-
-    Use :func:`sparse_gp_predictive` for predictions at new inputs.
+    Parameters
+    ----------
+    name : str
+        Name of the GP node.
+    inputs : torch.Tensor or Data or Parameter
+        Training inputs :math:`X` of shape ``(N, D)`` or ``(N,)``.
+    inducing_inputs : torch.Tensor or Data or Parameter
+        Inducing locations :math:`Z` of shape ``(M, D)`` or ``(M,)``.
+    kernel : Kernel
+        Covariance kernel function :math:`k(x_1, x_2)`.
+    noise_variance : float or torch.Tensor or Parameter, default 1e-6
+        Observation noise variance :math:`\sigma^2 > 0`.
+    mean : MeanFunction, optional
+        GP mean function :math:`m(x)`. Default is :class:`~BayesianDLL.GP.ZeroMean`.
+    jitter : float, default 1e-6
+        Relative diagonal jitter added to :math:`\mathbf{K}_{mm}` for numerical stability.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, inducing_points, noise_variance=1e-6, mean=None, method="vfe", jitter=1e-6,
@@ -1404,74 +1336,36 @@ def sparse_gp_predictive(
 
 
 class SparseLatentGP(DeterministicParameter):
-    r"""A whitened inducing-point latent GP function node (DTC / projected process).
+    r"""Whitened sparse inducing-point latent Gaussian Process function node.
 
-    With ``m`` inducing inputs ``Z``, ``L Lᵀ = K_mm(Z) + jitter I`` and a
-    standard-normal *whitened* vector ``v`` of shape ``(m,)``, the value is
+    Represents the approximate GP function values :math:`\mathbf{f}` at inputs :math:`X`
+    using :math:`M` inducing locations :math:`Z`:
 
-    ``f(X) = m(X) + K_nm L⁻ᵀ v``.
+    .. math::
 
-    Equivalently ``u = L v ~ Normal(0, K_mm)`` are the function values at
-    ``Z`` and ``f = K_nm K_mm⁻¹ u`` is their kernel interpolation, so the
-    prior covariance of ``f`` is the Nyström / DTC approximation
-    ``Q_nn = K_nm K_mm⁻¹ K_mn`` of ``K_nn``. Only ``m x m`` matrices are
-    factorised and ``m`` latent values are sampled, whatever the number of
-    training inputs ``n``; with ``Z = X`` (``m = n``) the node equals
-    :class:`LatentGP` up to the jitter.
+        \mathbf{f} = \mathbf{m}(X) + \mathbf{K}_{nm} \mathbf{L}_m^{-\top} \mathbf{z}
 
-    No FITC-style diagonal correction ``diag(K_nn - Q_nn)`` is added to the
-    prior: it would need ``n`` further latent values and a square root whose
-    derivative is infinite where the correction vanishes. The prior variance
-    of ``f`` is therefore smaller than ``k(x, x)`` away from the inducing
-    inputs; this is the DTC approximation, and it is why the inducing inputs
-    should cover the data (or be learned).
+    where :math:`\mathbf{L}_m \mathbf{L}_m^\top = \mathbf{K}_{mm} + \text{jitter} \cdot \mathbf{I}`
+    and :math:`\mathbf{z} \sim \mathcal{N}(\mathbf{0}, \mathbf{I}_M)`.
 
-    Arguments:
-
-    * ``inputs``: a named node of shape ``(n, D)`` or ``(n,)``: a ``Data``
-      node or a learnable ``RandomParameter`` / ``DeterministicParameter``
-      (see **Learnable inputs** below);
-    * ``inducing_points``: ``(m, D)`` or ``(m,)``; a fixed tensor, a ``Data``
-      node, or a learnable ``RandomParameter`` / ``DeterministicParameter``
-      (e.g. ``RandomParameter("Z", Normal(Z0, 1.0), initial_value=Z0)``);
-    * ``whitened_values``: a ``RandomParameter`` with ``m`` values and a
-      ``Normal(0, 1)`` prior; ``None`` creates ``<name>_white``;
-    * ``mean``: a :class:`~BayesianDLL.GP.MeanFunction` ``m`` (defaults to ``ZeroMean()``;
-      a number, 0-d tensor or named scalar node is a ``ConstantMean``), evaluated at ``X``;
-    * ``jitter``: relative diagonal jitter of ``K_mm`` (default ``1e-6``).
-
-    The node stores them as ``gp_inputs``, ``gp_inducing_points``,
-    ``gp_latent`` (the whitened values), ``gp_kernel``, ``gp_mean`` and
-    ``gp_jitter``.
-
-    **Gradients** (hand-derived VJP). For a cotangent ``g`` of ``f`` let
-    ``a = L⁻ᵀ v``, so that ``f = m(X) + K_nm a``:
-
-    * ``v`` gets ``c = L⁻¹ K_mn g``;
-    * ``K_mn = K(Z, X)`` gets ``G_mn = a gᵀ``;
-    * ``L`` gets ``L̄ = -a cᵀ`` (from ``da = -L⁻ᵀ dLᵀ a``), and the Cholesky
-      VJP maps it to ``G_mm = sym(L⁻ᵀ Φ(Lᵀ L̄) L⁻¹)`` with ``Lᵀ L̄ = -v cᵀ``
-      (``Φ`` takes the lower triangle and halves the diagonal), plus the
-      correction for the scale-dependent jitter;
-    * a kernel hyperparameter ``θ`` gets
-      ``⟨G_mn, ∂K_mn/∂θ⟩ + ⟨G_mm, ∂K_mm/∂θ⟩``;
-    * learnable inducing inputs get
-      ``kernel.input_vjp(Z, X, G_mn) + kernel.input_vjp_symmetric(Z, G_mm)``
-      and learnable training inputs ``kernel.input_vjp(X, Z, G_mnᵀ)``;
-    * a parameter ``θ`` of the mean function gets ``⟨g, ∂m(X)/∂θ⟩``, and
-      learnable training inputs also get the mean's input VJP
-      ``∂⟨g, m(X)⟩/∂X``; ``Z`` gets no mean term.
-
-    With vectorized chains everything is batched over the chain dimension
-    (``v`` ``(C, m)``, ``Z`` ``(C, m, D)``, hyperparameters ``(C, ...)``).
-    Use :func:`sparse_latent_gp_predictive` for predictions at new inputs.
-
-    **Learnable inputs.** Supported: ``inputs`` may be a ``RandomParameter``
-    or ``DeterministicParameter`` (GP latent variable models, uncertain
-    inputs, input warping); it gets the kernel and mean input VJPs above.
-    Learnable inputs are supported by :class:`ExactGP`, :class:`LatentGP`,
-    :class:`SparseGP`, :class:`SparseLatentGP` and :class:`~BayesianDLL.GP.KroneckerGP`
-    (per grid axis), not by :class:`~BayesianDLL.GP.ToeplitzGP`.
+    Parameters
+    ----------
+    name : str
+        Name of the deterministic function node.
+    inputs : torch.Tensor or Data or Parameter
+        Input locations :math:`X` of shape ``(N, D)`` or ``(N,)``.
+    inducing_inputs : torch.Tensor or Data or Parameter
+        Inducing locations :math:`Z` of shape ``(M, D)`` or ``(M,)``.
+    kernel : Kernel
+        Covariance kernel function :math:`k(x_1, x_2)`.
+    latent : RandomParameter, optional
+        Standard normal latent parameter of :math:`M` values. Created automatically if ``None``.
+    mean : MeanFunction, optional
+        GP mean function :math:`m(x)`. Default is :class:`~BayesianDLL.GP.ZeroMean`.
+    jitter : float, default 1e-6
+        Relative diagonal jitter added to :math:`\mathbf{K}_{mm}`.
+    latent_name : str, optional
+        Name of the latent parameter created if ``latent`` is omitted. Defaults to ``f"{name}_white"``.
     """
 
     def __init__(

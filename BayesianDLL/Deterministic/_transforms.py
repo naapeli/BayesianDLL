@@ -60,27 +60,18 @@ def _linear_output(inputs, coefficients, intercept):
 
 
 class Linear(DeterministicParameter):
-    """A linear predictor with an optional intercept.
+    r"""Linear transformation node :math:`y = X \mathbf{w} + b`.
 
-    For one-dimensional inputs and a scalar coefficient, this evaluates
-    ``inputs * coefficients + intercept``. For a design matrix with shape
-    ``(N, D)`` and a coefficient vector with shape ``(D,)``, it evaluates
-    ``inputs @ coefficients + intercept`` with shape ``(N,)``; this includes
-    a single feature, ``D = 1``, where the coefficient may also be a scalar.
-
-    Arguments:
-
-    * ``name``: name of the deterministic node;
-    * ``inputs``: a named model node (usually ``Data``) holding the
-      covariates, shape ``(N,)`` or ``(N, D)``;
-    * ``coefficients``: the regression coefficient(s), a scalar or a
-      ``(D,)`` vector; a model node or a constant;
-    * ``intercept``: a scalar or one value per output (default ``0.0``); a
-      model node or a constant.
-
-    Named parameters are included in the model graph and receive analytic
-    derivatives. With vectorized chains a batched coefficient has a leading
-    chain dimension, ``(C,)`` or ``(C, D)``, and the output ``(C, N)``.
+    Parameters
+    ----------
+    name : str
+        Node name.
+    inputs : Parameter or Data or torch.Tensor
+        Covariates :math:`X` of shape ``(N, D)`` or ``(N,)``.
+    coefficients : Parameter or torch.Tensor
+        Coefficients :math:`\mathbf{w}` of shape ``(D,)`` or scalar.
+    intercept : Parameter or torch.Tensor or float, default 0.0
+        Intercept :math:`b`, scalar or broadcastable.
     """
 
     def __init__(self, name, inputs, coefficients, intercept=0.0):
@@ -236,7 +227,15 @@ class Linear(DeterministicParameter):
 
 
 class Exp(DeterministicParameter):
-    """Deterministic node ``name`` with value ``exp(input)`` (elementwise) of the named node ``input``."""
+    r"""Elementwise exponential node :math:`y = \exp(x)`.
+
+    Parameters
+    ----------
+    name : str
+        Node name.
+    input : Parameter or Data or torch.Tensor
+        Input tensor.
+    """
 
     def __init__(self, name, input):
         _require_named(input, "input")
@@ -255,7 +254,15 @@ class Exp(DeterministicParameter):
 
 
 class Log(DeterministicParameter):
-    """Deterministic node ``name`` with value ``log(input)`` (elementwise) of a positive named node ``input``."""
+    r"""Elementwise natural logarithm node :math:`y = \ln(x)`.
+
+    Parameters
+    ----------
+    name : str
+        Node name.
+    input : Parameter or Data or torch.Tensor
+        Input tensor (must be strictly positive).
+    """
 
     def __init__(self, name, input):
         _require_named(input, "input")
@@ -274,7 +281,15 @@ class Log(DeterministicParameter):
 
 
 class Sigmoid(DeterministicParameter):
-    """Deterministic node ``name`` with value ``sigmoid(input)`` in ``(0, 1)`` (elementwise) of the named node ``input``."""
+    r"""Elementwise sigmoid (logistic) node :math:`y = \frac{1}{1 + e^{-x}}`.
+
+    Parameters
+    ----------
+    name : str
+        Node name.
+    input : Parameter or Data or torch.Tensor
+        Input tensor.
+    """
 
     def __init__(self, name, input):
         _require_named(input, "input")

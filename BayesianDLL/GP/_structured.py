@@ -109,68 +109,31 @@ def _batched_kronecker_eigenvalues(eigenvalues):
 
 
 class KroneckerGP(_GPDistribution):
-    r"""Exact GP marginal likelihood for inputs on a complete Cartesian grid.
+    r"""Exact Gaussian Process marginal likelihood for inputs on a Cartesian product grid.
 
-    The inputs are ``X = X_1 × … × X_P`` (``grid_inputs[p]`` has shape
-    ``(n_p,)`` or ``(n_p, D_p)``) and the kernel is the product
-    ``k(x, x') = Π_p k_p(x_p, x'_p)`` of one kernel per grid factor, so the
-    covariance of the ``N = Π_p n_p`` grid points is
-    ``K = K_1 ⊗ … ⊗ K_P``. With the eigendecompositions
-    ``K_p = Q_p Λ_p Q_pᵀ`` (``torch.linalg.eigh`` on each ``n_p x n_p``
-    factor) and ``Q = Q_1 ⊗ … ⊗ Q_P``, ``λ = λ_1 ⊗ … ⊗ λ_P``:
+    Exploits the Kronecker structure of the covariance matrix across grid axes:
 
-    * ``ỹ = Qᵀ (y - m(X))`` via sequential mode products,
-    * ``log det(K + σ² I) = Σ log(λ + σ²)``,
-    * ``α = Q (ỹ / (λ + σ²))`` and
-      ``log p(y) = -½ (Σ ỹ² / (λ + σ²) + log det + N log 2π)``.
+    .. math::
 
-    The cost is ``O(Σ_p n_p³ + N Σ_p n_p)`` time and ``O(N + Σ_p n_p²)``
-    memory: a 100 x 100 grid (``N = 10⁴``) needs two 100 x 100
-    eigendecompositions instead of a 10⁴ x 10⁴ Cholesky factor. With
-    vectorized chains the factors of all chains are decomposed as one batch
-    and the mode products carry the chain dimension.
+        \mathbf{K} = \mathbf{K}_1 \otimes \mathbf{K}_2 \otimes \dots \otimes \mathbf{K}_P
 
-    **Observations.** ``y`` has shape ``(n_1, …, n_P)`` or is flattened in
-    row-major (C) order, i.e. the grid point ``(i_1, …, i_P)`` is entry
-    ``i_1 n_2 ⋯ n_P + … + i_P``, the order of
-    ``torch.cartesian_prod(x_1, …, x_P)`` and of ``torch.kron``. The grid
-    must be complete: missing observations are not supported (they break the
-    Kronecker structure; an exact treatment needs iterative solvers).
+    Evaluating likelihoods and inverses in :math:`\mathcal{O}\left(\sum_{p=1}^P n_p^3\right)` time
+    instead of :math:`\mathcal{O}(N^3)` where :math:`N = \prod_{p=1}^P n_p`.
 
-    **Gradients** (hand-derived). With ``A = α`` as an ``(n_1, …, n_P)``
-    tensor, a hyperparameter of ``k_p`` changes ``K`` by
-    ``dK = K_1 ⊗ … ⊗ dK_p ⊗ … ⊗ K_P`` and
-    ``d log p = ½ αᵀ dK α - ½ tr((K + σ²I)⁻¹ dK) = ⟨G_p, dK_p⟩`` with
-
-    * ``½ αᵀ dK α = ½ ⟨dK_p, A_(p) B_(p)ᵀ⟩``, ``B = A ×_{q≠p} K_q``
-      (``A_(p)`` is the mode-``p`` unfolding),
-    * ``tr((K + σ²I)⁻¹ dK) = Σ diag(Q_pᵀ dK_p Q_p) ⊗ (⊗_{q≠p} λ_q) / (λ + σ²)
-      = ⟨dK_p, Q_p diag(s_p) Q_pᵀ⟩`` where ``s_p`` sums
-      ``Π_{q≠p} λ_q / (λ + σ²)`` over all modes but ``p``,
-
-    so ``G_p = ½ A_(p) B_(p)ᵀ - ½ Q_p diag(s_p) Q_pᵀ``. The noise variance
-    gets ``½ (αᵀα - Σ 1/(λ + σ²))``; the mean function, evaluated at the
-    ``N`` grid points (the factors' features concatenated, in row-major
-    order), gets the cotangent ``α`` for its parameters.
-
-    **Learnable inputs (grid axes).** Supported: each ``grid_inputs[p]`` may be a
-    ``RandomParameter`` or ``DeterministicParameter`` of shape ``(n_p,)`` or
-    ``(n_p, D_p)`` (the grid stays a Cartesian product, but its points along
-    every axis can move). The axis gets ``kernels[p].input_vjp_symmetric(X_p, G_p)``
-    (the same ``G_p`` as the hyperparameters) plus the mean's input VJP of
-    ``α`` at the grid points, whose columns of factor ``p`` are summed over
-    all other axes. :func:`kronecker_gp_predictive` reads learnable axes from
-    the trace draw by draw. Learnable inputs are supported by ``ExactGP``,
-    ``LatentGP``, ``SparseGP``, ``SparseLatentGP`` and ``KroneckerGP`` (per
-    grid axis), not by :class:`ToeplitzGP`.
-
-    ``noise_variance`` is the scalar noise variance ``σ²`` (default
-    ``1e-6``), ``mean`` a :class:`~BayesianDLL.GP.MeanFunction` (defaults to
-    ``ZeroMean()``; a number or named scalar node is a ``ConstantMean``) and
-    ``jitter`` (default ``1e-8``) a constant added to the noise variance. Use it as the distribution of an ``ObservedParameter``::
-
-        gp = KroneckerGP("f", grid_inputs=[x1, x2], kernels=[RBF(l1, v), RBF(l2)], noise_variance=s2)
-        ObservedParameter("y", gp, y_grid)  # y_grid: (len(x1), len(x2))
+    Parameters
+    ----------
+    name : str
+        Name of the GP node.
+    grid_inputs : list of torch.Tensor or Parameter
+        Coordinates along each grid axis :math:`p = 1, \dots, P`.
+    kernels : list of Kernel
+        Kernel function for each corresponding grid axis.
+    noise_variance : float or torch.Tensor or Parameter, default 1e-6
+        Observation noise variance :math:`\sigma^2 > 0`.
+    mean : MeanFunction, optional
+        GP mean function :math:`m(X)`. Default is :class:`~BayesianDLL.GP.ZeroMean`.
+    jitter : float, default 1e-8
+        Additive jitter on the noise variance for numerical stability.
     """
 
     def __init__(self, name, grid_inputs, kernels, noise_variance=1e-6, mean=None, jitter=1e-8):
@@ -661,61 +624,29 @@ def _check_stationary(kernel):
 
 
 class ToeplitzGP(_GPDistribution):
-    r"""Exact GP marginal likelihood for equally spaced 1-D inputs (Toeplitz covariance).
+    r"""Exact Gaussian Process marginal likelihood for equally spaced 1-D inputs.
 
-    For a stationary kernel on ``x_i = x_0 + i h`` the covariance
-    ``K + σ² I`` is symmetric Toeplitz, determined by its first column
-    ``t_k = k(0, k h) + σ² δ_k0``. :func:`levinson_solve` gives
-    ``α = (K + σ² I)⁻¹ (y - m(X))`` and the log determinant in ``O(n²)``
-    time and ``O(n)`` memory (a dense Cholesky needs ``O(n³)`` and
-    ``O(n²)``). With vectorized chains one Levinson recursion of ``n`` steps
-    runs on ``(C, …)`` tensors, i.e. all chains in the same Python loop.
+    For a stationary kernel on regularly spaced 1-D inputs :math:`x_i = x_0 + i h`,
+    the covariance matrix :math:`\mathbf{K} + \sigma^2 \mathbf{I}` is symmetric Toeplitz.
+    The marginal likelihood and solve are evaluated via Levinson-Durbin recursion in :math:`\mathcal{O}(N^2)` time
+    and :math:`\mathcal{O}(N)` memory.
 
-    **Gradients** (hand-derived). They need ``T⁻¹ e_0`` as a second
-    right-hand side of the same Levinson recursion and then ``O(n log n)``
-    work. A hyperparameter changes the first column by ``dt``; with
-    ``c_k = Σ_i α_i α_{i+k}``
-    and the diagonal sums ``D_k`` of ``T⁻¹`` (Gohberg-Semencul formula from
-    ``T⁻¹ e_0``, evaluated with FFT correlations)
-
-    ``d log p = ½ αᵀ dT α - ½ tr(T⁻¹ dT) = Σ_k w_k dt_k (c_k - D_k) / 2``,
-
-    with ``w_0 = 1`` and ``w_k = 2`` for ``k > 0``. The noise variance only
-    changes ``t_0``. ``jitter`` (default ``1e-6``) follows the first attempt
-    of :class:`ExactGP`'s jitter: ``jitter * max(1, k(0) + σ²)`` is added to
-    the diagonal (including its derivative), per chain; unlike
-    :func:`stable_cholesky` it is not increased on failure.
-    ``noise_variance`` is the scalar noise variance ``σ²`` (default
-    ``1e-6``), ``mean`` a :class:`~BayesianDLL.GP.MeanFunction` (defaults
-    to ``ZeroMean()``; a number or named scalar node is a ``ConstantMean``;
-    its parameters get the cotangent ``α`` of ``m(X)``), and
-    ``spacing_tolerance`` (default ``1e-6``) the relative tolerance of
-    the equal-spacing check.
-
-    **Learnable inputs: not supported.** The Toeplitz structure needs fixed, equally
-    spaced inputs, and a learnable spacing would be redundant with the
-    kernel's length-scale. ``inputs`` given as a ``RandomParameter`` or
-    ``DeterministicParameter`` raises a ``TypeError``; use :class:`ExactGP`
-    or :class:`SparseGP` for learnable inputs.
-
-    The kernel must be stationary (RBF, Matern, RationalQuadratic,
-    Periodic, Constant and their sums/products); ``inputs`` must be equally
-    spaced with shape ``(n,)`` or ``(n, 1)``. Levinson's recursion is
-    sequential in ``n`` (a Python loop with a few tensor operations per
-    step, roughly 0.1 ms), so on a CPU a multi-threaded dense Cholesky
-    factorisation stays competitive up to one or two thousand points; the
-    recursion wins beyond that, and its memory use is ``O(n)`` throughout.
-    With vectorized chains the same loop serves all chains.
-    Levinson's recursion is weakly stable for symmetric positive-definite
-    Toeplitz matrices (Cybenko 1980): its error is of the same order as that
-    of a backward-stable solver of a system with condition number ``κ(T)``,
-    i.e. it grows like ``κ(T) ε``, although a small residual is not
-    guaranteed in general. On RBF-plus-nugget matrices with ``n = 50`` and
-    ``κ = 1e2, 1e6, 1e10`` the relative residual ``‖Tx - y‖ / ‖y‖`` was
-    ``4e-15, 4e-11, 5e-7`` (dense Cholesky: ``4e-15, 4e-11, 3e-7``) and the
-    log determinant agreed with Cholesky's to ``3e-14, 4e-10, 4e-7``. Very
-    smooth kernels with a tiny noise variance are ill-conditioned for any
-    solver, and the recursion raises if it breaks down.
+    Parameters
+    ----------
+    name : str
+        Name of the GP node.
+    inputs : torch.Tensor or Data
+        Equally spaced 1-D coordinates of shape ``(N,)`` or ``(N, 1)``.
+    kernel : Kernel
+        Stationary kernel function (e.g. :class:`~BayesianDLL.GP.RBF`, :class:`~BayesianDLL.GP.Matern`, :class:`~BayesianDLL.GP.Periodic`).
+    noise_variance : float or torch.Tensor or Parameter, default 1e-6
+        Observation noise variance :math:`\sigma^2 > 0`.
+    mean : MeanFunction, optional
+        GP mean function :math:`m(x)`. Default is :class:`~BayesianDLL.GP.ZeroMean`.
+    jitter : float, default 1e-6
+        Diagonal jitter for numerical stability.
+    spacing_tolerance : float, default 1e-6
+        Relative tolerance for verifying equal grid spacing.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=None, jitter=1e-6, spacing_tolerance=1e-6):
