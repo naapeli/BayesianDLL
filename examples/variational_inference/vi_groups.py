@@ -103,12 +103,12 @@ histories, traces, seconds = {}, {}, {}
 for label, guide in guides.items():
     torch.manual_seed(1)
     start = time.perf_counter()
-    histories[label] = BBVI(model, guide, n_samples=2, epochs=2500, lr=0.03, lrd=0.999, callback_frequency=5, verbose=False)
+    histories[label] = BBVI(model, guide, n_samples=2, epochs=4500, lr=0.03, lrd=0.999, callback_frequency=5, verbose=False)
     seconds[label] = time.perf_counter() - start
     traces[label] = guide.sample(1500)
 
 start = time.perf_counter()
-traces["NUTS"] = model.sample(n_samples=150, warmup_length=150, n_chains=2, progress_bar=False, seed=0,
+traces["NUTS"] = model.sample(n_samples=50, warmup_length=50, n_chains=2, progress_bar=False, seed=0,
                               metric="dense", chain_method="vectorized")
 seconds["NUTS"] = time.perf_counter() - start
 print(f"NUTS: {sum(traces['NUTS'].divergences)} divergences")
