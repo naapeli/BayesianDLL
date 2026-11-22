@@ -3,6 +3,64 @@ import torch
 from .. import Model
 
 
+class MAPResult:
+    """The result of maximum a posteriori (MAP) optimization.
+
+    Attributes
+    ----------
+    params : dict[str, torch.Tensor]
+        Dictionary mapping parameter names to their constrained values at the mode.
+    history : list[float]
+        Log joint probability recorded at each callback frequency epoch.
+    log_prob : float
+        Final log joint probability at the mode.
+    """
+
+    def __init__(self, mode: dict[str, torch.Tensor], history: list[float], log_prob: float):
+        self._mode = mode
+        self.history = history
+        self.log_prob = log_prob
+
+    def mode(self) -> dict[str, torch.Tensor]:
+        """Return the dictionary of parameter values at the posterior mode."""
+        return {k: v.clone() for k, v in self._mode.items()}
+
+    @property
+    def params(self) -> dict[str, torch.Tensor]:
+        return self._mode
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            if key in self._mode:
+                return self._mode[key]
+            raise KeyError(f"Parameter '{key}' not found in MAP result.")
+        elif isinstance(key, (int, slice)):
+            return self.history[key]
+        raise TypeError(f"Key must be str (for parameter) or int/slice (for history), got {type(key).__name__}")
+
+    def __contains__(self, key):
+        return key in self._mode
+
+    def __len__(self):
+        return len(self.history)
+
+    def __iter__(self):
+        return iter(self.history)
+
+    def keys(self):
+        return self._mode.keys()
+
+    def values(self):
+        return self._mode.values()
+
+    def items(self):
+        return self._mode.items()
+
+    def __repr__(self):
+        params_str = ", ".join(f"{k}: {tuple(v.shape)}" for k, v in self._mode.items())
+        return f"MAPResult(log_prob={self.log_prob:.3f}, params={{{params_str}}})"
+
+
 def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
     """Maximise the model's log joint density with Adam, in place.
 
@@ -20,7 +78,8 @@ def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_fre
 
     The model's latents are left at the final values. Every
     ``callback_frequency`` epochs the log joint is recorded (and printed if
-    ``verbose``). Returns the list of recorded log joint values.
+    ``verbose``). Returns a :class:`MAPResult` containing the mode and
+    convergence history.
     """
     history = []
 
@@ -51,5 +110,15 @@ def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_fre
             if verbose:
                 print(f"Epoch: {epoch + 1} - Log_prob: {logp.item():.2f}")
 
-    return history
+    final_logp = history[-1] if history else model.model_log_prob().item()
+    mode = {
+        name: param.constrained_value.detach().clone()
+        for name, param in model.params.items()
+    }
+    for name, param in model.deterministic_params.items():
+        val = getattr(param, "constrained_value", getattr(param, "value", None))
+        if val is not None:
+            mode[name] = torch.as_tensor(val).detach().clone()
+
+    return MAPResult(mode, history, final_logp)
 

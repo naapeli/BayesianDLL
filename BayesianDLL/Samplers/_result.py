@@ -250,6 +250,118 @@ class SamplingResult:
         from ..Evaluation._summary import summary as _summary
         return _summary(self, hdi_prob=hdi_prob, ci_kind=ci_kind, round_to=round_to, include_deterministic=include_deterministic)
 
+    @property
+    def lp(self) -> torch.Tensor | None:
+        """The log posterior density tensor of shape ``(n_chains, n_samples)`` for each draw, if recorded."""
+        if self.sample_stats is None:
+            return None
+        try:
+            return self.sample_stats["lp"]
+        except (KeyError, ValueError, IndexError):
+            return None
+
+    def mode(self, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
+        """Return the parameter values of the draw with the highest log posterior density (MAP sample).
+
+        If log posterior densities are not available, falls back to coordinate-wise mode/median.
+
+        Parameters
+        ----------
+        include_deterministic : bool, default=False
+            Whether to include deterministic parameters in the returned dictionary.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary mapping parameter names to tensors of shape ``(*param_shape)``.
+        """
+        traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
+        lp = self.lp
+        if lp is not None and lp.numel() > 0:
+            flat_lp = lp.flatten(0, 1)
+            best_idx = torch.argmax(flat_lp).item()
+            chain_idx = best_idx // lp.shape[1]
+            sample_idx = best_idx % lp.shape[1]
+            return {name: val[chain_idx, sample_idx].clone() for name, val in traces.items()}
+
+        res = {}
+        for name, val in traces.items():
+            flat = val.flatten(0, 1)
+            if not flat.is_floating_point():
+                res[name] = torch.mode(flat, dim=0).values.clone()
+            else:
+                res[name] = torch.median(flat, dim=0).values.clone()
+        return res
+
+    def median(self, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
+        """Return the coordinate-wise posterior median for each parameter.
+
+        Parameters
+        ----------
+        include_deterministic : bool, default=False
+            Whether to include deterministic parameters in the returned dictionary.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary mapping parameter names to tensors of shape ``(*param_shape)``.
+        """
+        traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
+        res = {}
+        for name, val in traces.items():
+            flat = val.flatten(0, 1)
+            res[name] = torch.median(flat, dim=0).values.clone()
+        return res
+
+    def mean(self, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
+        """Return the coordinate-wise posterior mean for each parameter.
+
+        Parameters
+        ----------
+        include_deterministic : bool, default=False
+            Whether to include deterministic parameters in the returned dictionary.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary mapping parameter names to tensors of shape ``(*param_shape)``.
+        """
+        traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
+        res = {}
+        for name, val in traces.items():
+            flat = val.flatten(0, 1)
+            if flat.is_floating_point():
+                res[name] = torch.mean(flat, dim=0).clone()
+            else:
+                res[name] = torch.mean(flat.double(), dim=0).to(val.dtype).clone()
+        return res
+
+    def quantile(self, q: float | torch.Tensor, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
+        """Return the coordinate-wise posterior quantile for each parameter.
+
+        Parameters
+        ----------
+        q : float or Tensor
+            Quantile to compute, e.g. 0.05 or 0.95.
+        include_deterministic : bool, default=False
+            Whether to include deterministic parameters in the returned dictionary.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary mapping parameter names to tensors of shape ``(*param_shape)``.
+        """
+        traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
+        res = {}
+        q_tensor = torch.as_tensor(q, dtype=torch.float64)
+        for name, val in traces.items():
+            flat = val.flatten(0, 1)
+            if flat.is_floating_point():
+                res[name] = torch.quantile(flat, q=q_tensor, dim=0).clone()
+            else:
+                res[name] = torch.quantile(flat.double(), q=q_tensor, dim=0).to(val.dtype).clone()
+        return res
+
     def __repr__(self):
         params = list(self.trace.keys()) + list(self.deterministic_trace.keys())
         return f"SamplingResult(params={params}, divergences={self.divergences})"

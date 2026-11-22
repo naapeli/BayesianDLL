@@ -170,8 +170,9 @@ def test_gp_posterior_predictive_toeplitz_and_sparse():
         ObservedParameter("y", f_toep, y_train)
 
     t_new = torch.linspace(4.0, 7.0, 15, dtype=torch.float64)
-    # Using trace=None (uses current model values)
-    pred_toep = model_toep.posterior_predicative(t=t_new, samples_per_step=10, progress_bar=False)
+    t_data.set_value(t_new)
+    # Using point_trace (uses current model values)
+    pred_toep = model_toep.posterior_predicative(model_toep.point_trace(), samples_per_step=10, progress_bar=False)
     assert pred_toep["y"].shape == (1, 10, 15)
 
     # Sparse GP with inducing points
@@ -183,5 +184,90 @@ def test_gp_posterior_predictive_toeplitz_and_sparse():
         f_sparse = ExactGP("f_sparse", x_data, RBF(ls_s, 1.0), inducing_points=z, noise_variance=noise_s, method="vfe")
         ObservedParameter("y_sparse", f_sparse, y_train)
 
-    pred_sparse = model_sparse.posterior_predicative(x=t_new, samples_per_step=8, progress_bar=False)
+    x_data.set_value(t_new)
+    pred_sparse = model_sparse.posterior_predicative(model_sparse.point_trace(), samples_per_step=8, progress_bar=False)
     assert pred_sparse["y_sparse"].shape == (1, 8, 15)
+
+
+def test_posterior_predicative_requires_trace():
+    from BayesianDLL import Data
+    with Model() as model:
+        x_data = Data("x", torch.ones(5))
+        p = RandomParameter("p", Normal(0.0, 1.0))
+        ObservedParameter("y", Normal(p, 1.0), torch.zeros(5))
+
+    with pytest.raises(ValueError, match="trace must be provided"):
+        model.posterior_predicative(None)
+
+    pt = model.point_trace()
+    assert "p" in pt
+    assert pt["p"].shape == (1, 1, *p.constrained_value.shape)
+    pred = model.posterior_predicative(pt, samples_per_step=3, progress_bar=False)
+    assert pred["y"].shape == (1, 3, 5)
+
+
+def test_map_result_and_predict():
+    from BayesianDLL import Data, MAPResult, Linear, predict
+    x_val = torch.linspace(-1.0, 1.0, 10)
+    with Model() as model:
+        x_data = Data("x", x_val)
+        slope = RandomParameter("slope", Normal(0.0, 2.0))
+        intercept = RandomParameter("intercept", Normal(0.0, 2.0))
+        line = Linear("line", x_data, coefficients=slope, intercept=intercept)
+        ObservedParameter("y", Normal(line, 0.1), 2.0 * x_val + 1.0)
+
+    res = model.find_MAP(lr=0.05, epochs=150, verbose=False)
+    assert isinstance(res, MAPResult)
+    assert "slope" in res.mode()
+    assert "intercept" in res.mode()
+    assert res["slope"].numel() == 1
+    assert len(res) == len(res.history)
+
+    # Predict with no arguments (current model params)
+    p1 = model.predict(samples_per_step=5)
+    assert p1["y"].shape == (1, 5, 10)
+
+    # Predict with MAPResult
+    p2 = model.predict(res, samples_per_step=5)
+    assert p2["y"].shape == (1, 5, 10)
+
+    # Predict with map_result.mode()
+    p3 = model.predict(res.mode(), samples_per_step=5)
+    assert p3["y"].shape == (1, 5, 10)
+
+    # Top-level predict
+    p4 = predict(res.mode(), samples_per_step=5, model=model)
+    assert p4["y"].shape == (1, 5, 10)
+
+
+def test_sampling_result_mode_median_mean_quantile():
+    from BayesianDLL import Data
+    with Model() as model:
+        x_data = Data("x", torch.linspace(-1.0, 1.0, 5))
+        w = RandomParameter("w", Normal(0.0, 1.0))
+        ObservedParameter("y", Normal(w, 0.1), torch.zeros(5))
+
+    trace = model.sample(20, 10, n_chains=2, progress_bar=False)
+    
+    # Check trace statistics
+    med = trace.median()
+    assert "w" in med
+    mn = trace.mean()
+    assert "w" in mn
+    q = trace.quantile(0.9)
+    assert "w" in q
+    mode_val = trace.mode()
+    assert "w" in mode_val
+
+    # Predict with trace point estimates
+    p_med = model.predict(med, samples_per_step=4)
+    assert p_med["y"].shape == (1, 4, 5)
+
+    p_mode = model.predict(mode_val, samples_per_step=4)
+    assert p_mode["y"].shape == (1, 4, 5)
+
+    # Set params on model
+    model.set_params(med)
+    torch.testing.assert_close(model.params["w"].constrained_value, med["w"])
+
+

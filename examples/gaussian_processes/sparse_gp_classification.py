@@ -230,9 +230,13 @@ print(f"NUTS: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-hat:
 
 
 def probabilities(model, draws, points):
-    pred = model.posterior_predicative(draws, x=points, samples_per_step=1, progress_bar=False)
-    latent = pred["f"].reshape(-1, points.shape[0])
-    return torch.sigmoid(latent)
+    model.data["x"].set_value(points)
+    try:
+        pred = model.posterior_predicative(draws, samples_per_step=1, progress_bar=False)
+        latent = pred["f"].reshape(-1, points.shape[0])
+        return torch.sigmoid(latent)
+    finally:
+        model.data["x"].set_value(x)
 
 
 def test_metrics(model, draws):
@@ -245,8 +249,12 @@ def test_metrics(model, draws):
 def usefulness(model, draws, z):
     """Fraction of ``Z`` near the data, and the partner (or ``-1``) of every inducing input."""
     near_data = (torch.cdist(z, x).min(dim=1).values < 0.25).double().mean().item()
-    pred = model.posterior_predicative(draws, x=z, samples_per_step=1, progress_bar=False)
-    f_at_z = pred["f"].reshape(-1, m).mean(0)
+    model.data["x"].set_value(z)
+    try:
+        pred = model.posterior_predicative(draws, samples_per_step=1, progress_bar=False)
+        f_at_z = pred["f"].reshape(-1, m).mean(0)
+    finally:
+        model.data["x"].set_value(x)
     lengthscale = draws["lengthscale"].mean().item()
     distance = torch.cdist(z, z).masked_fill(f_at_z[:, None] * f_at_z[None, :] >= 0, float("inf"))
     nearest = distance.min(dim=1)

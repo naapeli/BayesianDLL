@@ -93,8 +93,9 @@ for ax, name in zip(upper_axes[1:], ("lengthscale", "variance", "noise_variance"
 upper_axes[1].legend(fontsize="small")
 
 ax = top[1].subplots()
+inputs.set_value(x_new)
 for label, trace in predictive_traces.items():
-    draws = model.posterior_predicative(trace, inputs=x_new, samples_per_step=4, progress_bar=False)["y"].reshape(-1, x_new.numel())
+    draws = model.posterior_predicative(trace, samples_per_step=4, progress_bar=False)["y"].reshape(-1, x_new.numel())
     lower, upper = draws.quantile(torch.tensor([0.025, 0.975], dtype=torch.float64), dim=0)
     ax.plot(x_new, draws.mean(0), color=colors[label], label=f"{label} mean")
     ax.fill_between(x_new, lower, upper, color=colors[label], alpha=0.15, label=f"{label} 95% band")

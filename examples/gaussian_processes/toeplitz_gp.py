@@ -60,7 +60,7 @@ model, f = build(ToeplitzGP, t, y)
 # -------------------------------------------
 
 start = time.perf_counter()
-model.find_MAP(lr=0.1, epochs=35, verbose=False)
+map_result = model.find_MAP(lr=0.1, epochs=35, verbose=False)
 elapsed = time.perf_counter() - start
 fitted = {name: model.deterministic_params[name].constrained_value.reshape(1, 1, -1)
           for name in ("lengthscale", "variance", "noise")}
@@ -70,12 +70,13 @@ print(f"type-II MAP estimate in {elapsed:.1f} s: lengthscale {fitted['lengthscal
 # %%
 # Predictive distribution on a window and a forecast
 # --------------------------------------------------
-# ``model.posterior_predicative`` evaluates the GP posterior at arbitrary new
+# ``model.predict`` evaluates the GP posterior at arbitrary new
 # inputs via Levinson solves without forming dense matrices. The band widens
 # beyond the last reading.
 
 new_t = torch.linspace(45.0, 75.0, 60, dtype=torch.float64)
-draws = model.posterior_predicative(t=new_t, samples_per_step=300, progress_bar=False)["y"].squeeze(0)
+model.data["t"].set_value(new_t)
+draws = model.predict(map_result.mode(), samples_per_step=300)["y"].squeeze(0)
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
 # %%
