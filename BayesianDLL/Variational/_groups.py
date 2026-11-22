@@ -14,7 +14,7 @@ import torch
 from .._active_model._active_model import get_active_model
 from .._parameters import RandomParameter, VariationalParameter
 from ..Distributions import IdentityTransform, LogTransform
-from ._moments import GuideCovariance, mc_moments, transform_batch
+from ._moments import GuideMoments, mc_moments, transform_batch
 
 
 _LOG_2PI = math.log(2 * math.pi)
@@ -369,13 +369,17 @@ class Group:
         return L @ L.transpose(-2, -1)
 
     def mean(self, space="unconstrained", n_samples=4000, seed=0):
-        """``{latent: mean}`` of the group in ``space`` (see :meth:`covariance`)."""
-        return self.covariance(space, n_samples, seed)._means()
+        """``{latent: mean}`` of the group in ``space`` (see :meth:`moments`)."""
+        return self.moments(space, n_samples, seed).means()
 
     def covariance(self, space="unconstrained", n_samples=4000, seed=0):
+        """Covariance of the group in ``space`` (see :meth:`moments`)."""
+        return self.moments(space, n_samples, seed)
+
+    def moments(self, space="unconstrained", n_samples=4000, seed=0):
         """Mean and covariance of the group in ``"unconstrained"`` or ``"constrained"`` space.
 
-        Returns a :class:`GuideCovariance`. In the unconstrained space the
+        Returns a :class:`GuideMoments`. In the unconstrained space the
         moments are exact (``loc`` and ``diag(scale^2)`` or ``L L^T``). In the
         constrained space they are exact for latents whose transform is the
         identity or an elementwise ``log`` (log-normal moments; for a
@@ -393,7 +397,7 @@ class Group:
         loc = self.loc
         cov = self._unconstrained_covariance()
         if space == "unconstrained":
-            return GuideCovariance(space, self.names, dict(self.layout.shapes), loc, cov)
+            return GuideMoments(space, self.names, dict(self.layout.shapes), loc, cov)
 
         kinds = {latent: _elementwise_kind(self.model.params[latent].distribution.transform) for latent in self.names}
         exact = [latent for latent in self.names if kinds[latent][0] != "other"]
@@ -440,7 +444,7 @@ class Group:
                 shapes[latent] = tuple(self.model.params[latent].constrained_value.shape)
             else:
                 shapes[latent] = tuple(self.layout.shapes[latent])
-        result = GuideCovariance(space, self.names, shapes, dtype=loc.dtype, device=loc.device)
+        result = GuideMoments(space, self.names, shapes, dtype=loc.dtype, device=loc.device)
         if estimated:
             # Monte Carlo for the blocks that involve another transform, from
             # draws of this group only (a mean-field group's latents are

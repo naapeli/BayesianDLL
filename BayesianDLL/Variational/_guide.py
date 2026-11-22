@@ -12,7 +12,7 @@ from ..Samplers._result import SamplingResult
 from ._ELBO import HandWrittenEntries, estimate_elbo
 from ._groups import FAMILIES, Group, _discrete_message
 from ._structured import StructuredPiece
-from ._moments import GuideCovariance, mc_moments, transform_batch
+from ._moments import GuideMoments, mc_moments, transform_batch
 
 
 class BaseGuide(ABC):
@@ -547,17 +547,24 @@ class Guide(Model, BaseGuide):
         dict[str, Tensor]
             Mapping from latent parameter name to its mean tensor.
         """
-        return self.covariance(space, n_samples, seed)._means()
+        return self.moments(space, n_samples, seed).means()
 
     def covariance(self, space="unconstrained", n_samples=4000, seed=0):
         """Compute the joint moments (mean and block-diagonal covariance) of the guide.
 
+        Returns a :class:`~BayesianDLL.Variational.GuideMoments` object.
+        """
+        return self.moments(space, n_samples, seed)
+
+    def moments(self, space="unconstrained", n_samples=4000, seed=0):
+        """Compute the joint moments (mean and block-diagonal covariance) of the guide.
+
         Evaluates the first and second moments of the guide's parameters.
-        Returns a :class:`~BayesianDLL.Variational.GuideCovariance` containing
+        Returns a :class:`~BayesianDLL.Variational.GuideMoments` containing
         the full covariance matrix (``.matrix``), block accessors
-        (``.block(latent)``), per-latent variances (``.variances()``), and
-        covariances (``.covariance()`` or ``.covariances()``). For parameter
-        means, use :meth:`mean` on the guide or group directly.
+        (``.block(latent)``), per-latent variances (``.variances()``),
+        covariances (``.covariance()`` or ``.covariances()``), and means
+        (``.means()``).
 
         Parameters
         ----------
@@ -571,22 +578,10 @@ class Guide(Model, BaseGuide):
 
         Returns
         -------
-        GuideCovariance
+        GuideMoments
             A moment container holding the mean and covariance matrix.
         """
-        if space not in ("unconstrained", "constrained"):
-            raise ValueError(f"space must be 'unconstrained' or 'constrained', got {space!r}.")
-        parts = []
-        for piece in self.validate():
-            if isinstance(piece, Group):
-                parts.append(piece.covariance(space, n_samples, seed))
-            elif isinstance(piece, StructuredPiece):
-                parts.append(self._piece_moments(piece, space, n_samples, seed))
-            else:
-                parts.append(self._entry_moments(piece, space, n_samples, seed))
-        return GuideCovariance.combine(space, parts, list(self.model.params))
-
-    moments = covariance
+        return GuideMoments.compute(self, space=space, n_samples=n_samples, seed=seed)
 
     def _entry_moments(self, piece, space, n_samples, seed):
         model, plan = self.model, piece.plan
@@ -595,7 +590,7 @@ class Guide(Model, BaseGuide):
         shapes = {name: tuple(getattr(model.params[name], attribute).shape) for name in latents}
         reference = model.params[latents[0]].unconstrained_value
         dtype = reference.dtype if reference.is_floating_point() else torch.get_default_dtype()
-        result = GuideCovariance(space, latents, shapes, dtype=dtype, device=reference.device)
+        result = GuideMoments(space, latents, shapes, dtype=dtype, device=reference.device)
 
         estimated = []
         for name in latents:
@@ -656,7 +651,7 @@ class Guide(Model, BaseGuide):
         n = int(n_samples)
         draws = self._mc_draws(piece, latents, space, n, seed, shapes, dtype, reference.device)
         mean, matrix, standard_error = mc_moments(torch.cat([draws[name] for name in latents], dim=1))
-        result = GuideCovariance(space, latents, shapes, mean=mean, matrix=matrix)
+        result = GuideMoments(space, latents, shapes, mean=mean, matrix=matrix)
         result.set_standard_errors(latents, standard_error, latents, n)
         result.estimated = list(latents)
         return result

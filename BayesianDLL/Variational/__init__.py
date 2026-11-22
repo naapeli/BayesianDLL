@@ -3,7 +3,7 @@ from ._ELBO import elbo
 from ._Variational import BBVI
 from ._guide import BaseGuide, Guide
 from ._groups import Group
-from ._moments import GuideCovariance
+from ._moments import GuideMoments
 from ._laplace import laplace_approximation, LaplaceApproximation
 
 __all__ = [
@@ -13,7 +13,7 @@ __all__ = [
     "BaseGuide",
     "Guide",
     "Group",
-    "GuideCovariance",
+    "GuideMoments",
     "laplace_approximation",
     "LaplaceApproximation",
 ]

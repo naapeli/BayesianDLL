@@ -37,7 +37,7 @@ def _numel(shape):
     return count
 
 
-class GuideCovariance:
+class GuideMoments:
     """Mean and covariance of (part of) a guide over the concatenated flattened latents.
 
     Attributes:
@@ -100,9 +100,13 @@ class GuideCovariance:
             offset += size
         self.n_samples = int(n_samples)
 
-    def _means(self):
-        """``{latent: mean}`` with each latent's shape."""
-        return {name: self.mean[slice(*self.slices[name])].reshape(self.shapes[name]) for name in self.names}
+    def means(self, name=None):
+        """Dict of shaped means ``{latent: mean}``, or the shaped mean tensor for a single latent ``name``."""
+        if name is not None:
+            return self.mean[slice(*self.slices[name])].reshape(self.shapes[name])
+        return {n: self.mean[slice(*self.slices[n])].reshape(self.shapes[n]) for n in self.names}
+
+    _means = means
 
     def covariance(self, first=None, second=None):
         """The full covariance matrix if arguments are omitted, or the block between ``first`` and ``second``."""
@@ -122,10 +126,12 @@ class GuideCovariance:
     def __getitem__(self, name):
         return self.block(name)
 
-    def variances(self):
-        """``{latent: variance}`` with each latent's shape."""
+    def variances(self, name=None):
+        """Dict of shaped variances ``{latent: variance}``, or the shaped variance for a single latent ``name``."""
         diagonal = torch.diagonal(self.matrix)
-        return {name: diagonal[slice(*self.slices[name])].reshape(self.shapes[name]) for name in self.names}
+        if name is not None:
+            return diagonal[slice(*self.slices[name])].reshape(self.shapes[name])
+        return {n: diagonal[slice(*self.slices[n])].reshape(self.shapes[n]) for n in self.names}
 
     @property
     def exact(self):
@@ -153,8 +159,27 @@ class GuideCovariance:
                 result.n_samples = part.n_samples
         return result
 
+    @classmethod
+    def compute(cls, guide, space="unconstrained", n_samples=4000, seed=0):
+        """Compute the moments (mean and block-diagonal covariance) of a guide."""
+        if space not in ("unconstrained", "constrained"):
+            raise ValueError(f"space must be 'unconstrained' or 'constrained', got {space!r}.")
+        parts = []
+        for piece in guide.validate():
+            if hasattr(piece, "moments"):
+                parts.append(piece.moments(space, n_samples, seed))
+            elif hasattr(piece, "covariance"):
+                parts.append(piece.covariance(space, n_samples, seed))
+            elif piece.__class__.__name__ == "StructuredPiece":
+                parts.append(guide._piece_moments(piece, space, n_samples, seed))
+            else:
+                parts.append(guide._entry_moments(piece, space, n_samples, seed))
+        return cls.combine(space, parts, list(guide.model.params))
+
     def __repr__(self):
         return (
-            f"GuideCovariance(space={self.space!r}, dim={self.dim}, exact={self.exact}, "
+            f"GuideMoments(space={self.space!r}, dim={self.dim}, exact={self.exact}, "
             f"estimated={self.estimated}, n_samples={self.n_samples})"
         )
+
+
