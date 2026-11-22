@@ -163,36 +163,48 @@ plt.show()
 # hand-derived reverse-mode vector-Jacobian products (VJPs) for all weight
 # and bias parameters without relying on PyTorch autograd.
 #
-# Here a two-hidden-layer MLP (1 -> 12 -> 12 -> 1) is fitted with variational
-# inference:
+# Here a two-hidden-layer MLP (1 -> 16 -> 16 -> 1) is fitted to a more complex
+# composite signal :math:`\sin(1.5 x) + 0.5 \sin(3.5 x)` with variational inference,
+# initialized from a type-II MAP estimate:
 
-h1_dim, h2_dim = 12, 12
+h1_dim, h2_dim = 16, 16
+
+def complex_signal(t):
+    return torch.sin(1.5 * t) + 0.5 * torch.sin(3.5 * t)
 
 torch.manual_seed(42)
+y_deep_raw = complex_signal(x_raw) + 0.15 * torch.randn(n_observations, dtype=torch.float64)
+y_deep_mean, y_deep_std = y_deep_raw.mean(), y_deep_raw.std()
+y_deep = (y_deep_raw - y_deep_mean) / y_deep_std
+
 with Model() as deep_bnn:
     x_in = Data("x_in", x.unsqueeze(-1))
     w1 = RandomParameter("w1", Normal(0.0, 1.0), shape=(1, h1_dim),
-                         initial_value=torch.randn(1, h1_dim, dtype=torch.float64))
+                         initial_value=0.5 * torch.randn(1, h1_dim, dtype=torch.float64))
     b1 = RandomParameter("b1", Normal(0.0, 1.0), shape=(h1_dim,),
-                         initial_value=torch.randn(h1_dim, dtype=torch.float64))
+                         initial_value=0.1 * torch.randn(h1_dim, dtype=torch.float64))
     w2 = RandomParameter("w2", Normal(0.0, 1.0 / math.sqrt(h1_dim)), shape=(h1_dim, h2_dim),
-                         initial_value=torch.randn(h1_dim, h2_dim, dtype=torch.float64) / math.sqrt(h1_dim))
+                         initial_value=0.5 * torch.randn(h1_dim, h2_dim, dtype=torch.float64) / math.sqrt(h1_dim))
     b2 = RandomParameter("b2", Normal(0.0, 1.0), shape=(h2_dim,),
-                         initial_value=torch.randn(h2_dim, dtype=torch.float64))
+                         initial_value=0.1 * torch.randn(h2_dim, dtype=torch.float64))
     w3 = RandomParameter("w3", Normal(0.0, 1.0 / math.sqrt(h2_dim)), shape=(h2_dim,),
-                         initial_value=torch.randn(h2_dim, dtype=torch.float64) / math.sqrt(h2_dim))
+                         initial_value=0.5 * torch.randn(h2_dim, dtype=torch.float64) / math.sqrt(h2_dim))
     b3 = RandomParameter("b3", Normal(0.0, 1.0), initial_value=torch.zeros(1, dtype=torch.float64))
-    sigma_deep = Exp("sigma_deep", RandomParameter("log_sigma_deep", Normal(math.log(0.2), 0.3),
-                                                   initial_value=torch.tensor([math.log(0.2)], dtype=torch.float64)))
+    sigma_deep = Exp("sigma_deep", RandomParameter("log_sigma_deep", Normal(math.log(0.15), 0.3),
+                                                   initial_value=torch.tensor([math.log(0.15)], dtype=torch.float64)))
 
     h1 = Tanh("h1", Linear("h1_lin", x_in, coefficients=w1, intercept=b1))
     h2 = Tanh("h2", Linear("h2_lin", h1, coefficients=w2, intercept=b2))
     f_mlp = Linear("f_mlp", h2, coefficients=w3, intercept=b3)
     with plate("deep_obs", n_observations):
-        ObservedParameter("y_deep", Normal(f_mlp, sigma_deep), y)
+        ObservedParameter("y_deep", Normal(f_mlp, sigma_deep), y_deep)
 
-deep_guide = Guide(deep_bnn, default_family="mean_field", init_scale=0.05)
-deep_history = BBVI(deep_bnn, deep_guide, n_samples=4, epochs=2000, lr=0.02, lrd=0.999, verbose=False)
+# Initialise at the MAP mode to avoid symmetric saddle points and flat local optima
+deep_bnn.find_MAP(lr=0.03, epochs=400, verbose=False)
+print("Deep BNN: MAP initialization complete")
+
+deep_guide = Guide(deep_bnn, default_family="mean_field", init_scale=0.03)
+deep_history = BBVI(deep_bnn, deep_guide, n_samples=4, epochs=1500, lr=0.005, lrd=0.999, verbose=False)
 deep_trace = {k: v.squeeze(0) for k, v in deep_guide.sample(200).items()}
 print(f"Deep BNN (2 hidden layers): final ELBO {deep_history[-1]:.2f}")
 
@@ -202,7 +214,7 @@ pred_draws = []
 for i in range(len(deep_trace["w1"])):
     h1_val = torch.tanh(grid_tensor @ deep_trace["w1"][i] + deep_trace["b1"][i])
     h2_val = torch.tanh(h1_val @ deep_trace["w2"][i] + deep_trace["b2"][i])
-    f_val = (h2_val @ deep_trace["w3"][i] + deep_trace["b3"][i]) * y_std + y_mean
+    f_val = (h2_val @ deep_trace["w3"][i] + deep_trace["b3"][i]) * y_deep_std + y_deep_mean
     pred_draws.append(f_val)
 pred_tensor = torch.stack(pred_draws)
 pred_mean = pred_tensor.mean(0)
@@ -211,9 +223,9 @@ q05, q95 = pred_tensor.quantile(torch.tensor([0.05, 0.95], dtype=torch.float64),
 fig, ax = plt.subplots(figsize=(8, 4.5), layout="constrained")
 ax.fill_between(grid_raw, q05, q95, color="C4", alpha=0.25, label="90% credible band")
 ax.plot(grid_raw, pred_mean, color="C4", lw=2, label="deep BNN mean")
-ax.plot(grid_raw, torch.sin(1.3 * grid_raw), "k--", label="true function")
-ax.scatter(x_raw, y_raw, color="black", s=14, zorder=3, label="data")
-ax.set_ylim(-2.6, 2.6)
+ax.plot(grid_raw, complex_signal(grid_raw), "k--", label="true function")
+ax.scatter(x_raw, y_deep_raw, color="black", s=14, zorder=3, label="data")
+ax.set_ylim(-2.8, 2.8)
 ax.set_xlabel("x")
 ax.set_ylabel("f(x)")
 ax.set_title("Two-Hidden-Layer Bayesian Neural Network (Linear & Tanh Layers)")
