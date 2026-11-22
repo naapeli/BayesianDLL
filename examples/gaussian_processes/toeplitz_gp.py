@@ -1,40 +1,17 @@
-"""
+r"""
 Regularly Sampled Time Series with a Toeplitz GP
 ================================================
 
-A sensor reports a value every time step: 2000 equally spaced, noisy
-readings of a slowly drifting signal. With a *stationary* kernel the
-covariance between two readings depends only on how many steps apart they
-are, so ``K + σ² I`` is a symmetric Toeplitz matrix, fully described by its
-first column.
+A sensor reports a value every time step: equally spaced, noisy readings of a
+slowly drifting signal. With a *stationary* kernel the covariance between two
+readings depends only on their time separation, making the covariance matrix
+symmetric Toeplitz.
 
-``ToeplitzGP`` exploits this with Levinson's recursion: the exact
-marginal likelihood and the solve ``(K + σ² I)⁻¹ y`` take ``O(n²)`` time
-and ``O(n)`` memory instead of the ``O(n³)`` and ``O(n²)`` of a dense
-Cholesky factorisation. The hand-derived gradients reuse the recursion's
-solution ``T⁻¹ e_0`` (Gohberg-Semencul formula) and FFT correlations.
-
-The recursion is sequential (one Python-level step per observation), so a
-multi-threaded dense Cholesky factorisation stays competitive up to one or
-two thousand points; beyond that the recursion wins, and its memory use is
-linear throughout. With thousands of points a
-gradient still costs a noticeable fraction of a second, so this example
-computes a type-II MAP estimate of the hyperparameters instead of running
-MCMC: ``find_MAP`` maximises the exact marginal likelihood (``f``
-integrated out) times the log-normal priors of the hyperparameters, working
-on their log scale.
-
-The kernel is a Matérn-5/2 (twice differentiable sample paths).
-
-Note on Learnable Grids
------------------------
-``ToeplitzGP`` requires fixed, equally spaced 1-D inputs. A learnable uniform
-spacing ``Δt`` would be mathematically redundant with the kernel lengthscale
-``l`` (since stationary kernels depend only on ``|t_i - t_j| / l = |i - j| Δt / l``),
-while non-uniform or independently learnable grid locations destroy the Toeplitz
-Toeplitz structure. For models where grid coordinates are learnable parameters,
-use :class:`~BayesianDLL.GP.KroneckerGP` (which supports learnable axes on Cartesian
-grids) or :class:`~BayesianDLL.GP.ExactGP` / :class:`~BayesianDLL.GP.SparseGP`.
+``ToeplitzGP`` computes the exact marginal likelihood and solve via Levinson
+recursion in :math:`\mathcal{O}(N^2)` time and :math:`\mathcal{O}(N)` memory,
+compared to :math:`\mathcal{O}(N^3)` and :math:`\mathcal{O}(N^2)` for dense
+Cholesky factorisation. Beyond a few thousand points, the :math:`\mathcal{O}(N^2)`
+scaling becomes noticeably faster than dense factorisation while using minimal memory.
 """
 
 import time
@@ -55,9 +32,11 @@ def true_signal(t):
     return torch.sin(t / 8.0) + 0.5 * torch.sin(t / 3.0 + 1.0)
 
 
-n = 2000
-t = torch.arange(n, dtype=torch.float64) * 0.05  # one reading every 0.05 time units
-y = true_signal(t) + 0.3 * torch.randn(n, dtype=torch.float64)
+n_total = 4000
+n_train = 1200
+t_all = torch.arange(n_total, dtype=torch.float64) * 0.05
+y_all = true_signal(t_all) + 0.3 * torch.randn(n_total, dtype=torch.float64)
+t, y = t_all[:n_train], y_all[:n_train]
 
 
 def build(cls, inputs, observations):
@@ -81,7 +60,7 @@ model, f = build(ToeplitzGP, t, y)
 # -------------------------------------------
 
 start = time.perf_counter()
-model.find_MAP(lr=0.1, epochs=60, verbose=False)
+model.find_MAP(lr=0.1, epochs=35, verbose=False)
 elapsed = time.perf_counter() - start
 fitted = {name: model.deterministic_params[name].constrained_value.reshape(1, 1, -1)
           for name in ("lengthscale", "variance", "noise")}
@@ -95,7 +74,7 @@ print(f"type-II MAP estimate in {elapsed:.1f} s: lengthscale {fitted['lengthscal
 # per prediction point), so no ``n x n`` matrix is formed. The band widens
 # beyond the last reading.
 
-new_t = torch.linspace(80.0, 110.0, 150, dtype=torch.float64)
+new_t = torch.linspace(45.0, 75.0, 60, dtype=torch.float64)
 draws = toeplitz_gp_predictive(f, fitted, y, new_t, n_samples=300).reshape(-1, new_t.numel())
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
@@ -105,7 +84,7 @@ lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dty
 
 
 def time_once(cls, size):
-    timing_model, _ = build(cls, t[:size], y[:size])
+    timing_model, _ = build(cls, t_all[:size], y_all[:size])
     timing_model.joint_grad_log_prob()
     best = float("inf")
     for _ in range(1):
@@ -116,13 +95,13 @@ def time_once(cls, size):
     return best
 
 
-sizes = [250, 500, 1000, 2000]
+sizes = [1000, 2000, 4000]
 timings = {cls.__name__: [time_once(cls, s) for s in sizes] for cls in (ExactGP, ToeplitzGP)}
 for name, values in timings.items():
     print(name, ", ".join(f"n={s}: {1000 * v:.0f} ms" for s, v in zip(sizes, values)))
 
 fig, (ax, ax_time) = plt.subplots(1, 2, figsize=(13, 4.2), layout="constrained", gridspec_kw={"width_ratios": [2, 1]})
-window = t >= 80.0
+window = t >= 45.0
 ax.scatter(t[window], y[window], s=6, color="0.6", label="readings")
 ax.fill_between(new_t, lower, upper, color="tab:purple", alpha=0.3, label="90% band of f")
 ax.plot(new_t, median, color="tab:purple", label="median of f")
