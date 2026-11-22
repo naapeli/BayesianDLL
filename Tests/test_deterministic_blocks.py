@@ -11,10 +11,7 @@ from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, 
 from BayesianDLL.Deterministic import (
     Add,
     Affine,
-    CholeskyCovariance,
     Concat,
-    CovarianceFromCholesky,
-    Dense,
     Divide,
     Elementwise,
     Exp,
@@ -29,6 +26,7 @@ from BayesianDLL.Deterministic import (
     Sum,
     Tanh,
 )
+from BayesianDLL.Deterministic._blocks import CholeskyCovariance, CovarianceFromCholesky
 from BayesianDLL.Distributions import (
     Bernoulli,
     Categorical,
@@ -520,9 +518,8 @@ def test_batched_linear_matches_autograd(n_features, layout, coefficient_shape, 
         torch.testing.assert_close(grads[name], torch.stack(expected_grads[name]), msg=f"gradient of {name}")
 
 
-@pytest.mark.parametrize("activation", [None, "tanh", "relu", "sigmoid", "softplus"])
 @pytest.mark.parametrize("has_bias", [False, True])
-def test_dense_matches_autograd(activation, has_bias):
+def test_linear_matrix_coefficients_matches_autograd(has_bias):
     torch.manual_seed(42)
     x_val = torch.randn(6, 4, dtype=torch.float64)
     w_val = torch.randn(4, 5, dtype=torch.float64)
@@ -530,22 +527,21 @@ def test_dense_matches_autograd(activation, has_bias):
     with Model() as model:
         x = Data("x", x_val)
         w = RandomParameter("w", Normal(0.0, 1.0), shape=(4, 5), initial_value=w_val)
-        b = RandomParameter("b", Normal(0.0, 1.0), shape=(5,), initial_value=b_val) if has_bias else None
-        h = Dense("h", x, w, bias=b, activation=activation)
+        b = RandomParameter("b", Normal(0.0, 1.0), shape=(5,), initial_value=b_val) if has_bias else 0.0
+        h = Tanh("h", Linear("lin", x, w, intercept=b))
         with plate("obs", 6):
             ObservedParameter("y", Normal(h, 1.0), torch.zeros(6, 5, dtype=torch.float64))
     assert_grads_match(model)
 
 
-@pytest.mark.parametrize("activation", [None, "tanh", "relu"])
-def test_batched_dense_matches_autograd(activation):
+def test_batched_linear_matrix_coefficients_matches_autograd():
     torch.manual_seed(42)
     x_val = torch.randn(6, 4, dtype=torch.float64)
     with Model() as model:
         x = Data("x", x_val)
         w = RandomParameter("w", Normal(0.0, 1.0), shape=(4, 5), initial_value=torch.randn(4, 5, dtype=torch.float64))
         b = RandomParameter("b", Normal(0.0, 1.0), shape=(5,), initial_value=torch.randn(5, dtype=torch.float64))
-        h = Dense("h", x, w, bias=b, activation=activation)
+        h = Tanh("h", Linear("lin", x, w, intercept=b))
         with plate("obs", 6):
             ObservedParameter("y", Normal(h, 1.0), torch.zeros(6, 5, dtype=torch.float64))
     n_chains = 3

@@ -46,7 +46,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, plate
-from BayesianDLL.Deterministic import Add, Dense, Exp, Linear, MatMul, Tanh
+from BayesianDLL.Deterministic import Add, Exp, Linear, MatMul, Tanh
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.Variational import BBVI
 
@@ -155,11 +155,11 @@ fig.legend(handles, labels, loc="outside lower center", ncol=5, fontsize="small"
 plt.show()
 
 # %%
-# Deep Neural Network with Dense and Linear Layers
-# ------------------------------------------------
+# Deep Neural Network with Composed Linear and Tanh Layers
+# ---------------------------------------------------------
 # Arbitrary neural network architectures can be constructed using native
-# deterministic layer blocks such as :class:`~BayesianDLL.Deterministic.Dense`
-# and :class:`~BayesianDLL.Deterministic.Linear`. These blocks provide exact,
+# deterministic layer blocks by composing :class:`~BayesianDLL.Deterministic.Linear`
+# and :class:`~BayesianDLL.Deterministic.Tanh` blocks. These blocks provide exact,
 # hand-derived reverse-mode vector-Jacobian products (VJPs) for all weight
 # and bias parameters without relying on PyTorch autograd.
 #
@@ -185,8 +185,8 @@ with Model() as deep_bnn:
     sigma_deep = Exp("sigma_deep", RandomParameter("log_sigma_deep", Normal(math.log(0.2), 0.3),
                                                    initial_value=torch.tensor([math.log(0.2)], dtype=torch.float64)))
 
-    h1 = Dense("h1", x_in, w1, bias=b1, activation="tanh")
-    h2 = Dense("h2", h1, w2, bias=b2, activation="tanh")
+    h1 = Tanh("h1", Linear("h1_lin", x_in, coefficients=w1, intercept=b1))
+    h2 = Tanh("h2", Linear("h2_lin", h1, coefficients=w2, intercept=b2))
     f_mlp = Linear("f_mlp", h2, coefficients=w3, intercept=b3)
     with plate("deep_obs", n_observations):
         ObservedParameter("y_deep", Normal(f_mlp, sigma_deep), y)
@@ -216,6 +216,6 @@ ax.scatter(x_raw, y_raw, color="black", s=14, zorder=3, label="data")
 ax.set_ylim(-2.6, 2.6)
 ax.set_xlabel("x")
 ax.set_ylabel("f(x)")
-ax.set_title("Two-Hidden-Layer Bayesian Neural Network (Dense & Linear Layers)")
+ax.set_title("Two-Hidden-Layer Bayesian Neural Network (Linear & Tanh Layers)")
 ax.legend(fontsize="small", loc="lower right")
 plt.show()

@@ -36,7 +36,7 @@ def _is_scalar_slope(input_ndim, n_features, n_coefficients):
 
 
 def _linear_output(inputs, coefficients, intercept):
-    """Evaluate a scalar-output linear predictor."""
+    """Evaluate a linear predictor (scalar, vector, or matrix)."""
     inputs = _as_tensor(inputs)
     coefficients = _as_tensor(coefficients, dtype=inputs.dtype, device=inputs.device)
     intercept = _as_tensor(intercept, dtype=inputs.dtype, device=inputs.device)
@@ -44,6 +44,19 @@ def _linear_output(inputs, coefficients, intercept):
     n_features = inputs.shape[-1] if inputs.ndim else 1
     if _is_scalar_slope(inputs.ndim, n_features, coefficients.numel()):
         return inputs * coefficients.reshape(()) + intercept
+
+    if coefficients.ndim == 2:
+        if inputs.ndim < 2:
+            raise ValueError(
+                "A matrix of regression coefficients requires inputs with shape "
+                f"(..., n_features); got shape {tuple(inputs.shape)}."
+            )
+        if inputs.shape[-1] != coefficients.shape[0]:
+            raise ValueError(
+                f"The input feature count ({inputs.shape[-1]}) must match "
+                f"the coefficient input dimension ({coefficients.shape[0]})."
+            )
+        return inputs @ coefficients + intercept
 
     if inputs.ndim < 2:
         raise ValueError(
@@ -69,7 +82,8 @@ class Linear(DeterministicParameter):
     inputs : Parameter or Data or torch.Tensor
         Covariates :math:`X` of shape ``(N, D)`` or ``(N,)``.
     coefficients : Parameter or torch.Tensor
-        Coefficients :math:`\mathbf{w}` of shape ``(D,)`` or scalar.
+        Coefficients :math:`\mathbf{w}` of shape ``(D_{\text{in}}, D_{\text{out}})``,
+        ``(D,)``, or scalar.
     intercept : Parameter or torch.Tensor or float, default 0.0
         Intercept :math:`b`, scalar or broadcastable.
     """
@@ -149,6 +163,13 @@ class Linear(DeterministicParameter):
                     grads[coefficients.name] = (cotangent * inputs_value).sum().reshape(coefficient_value.shape)
                 if isinstance(inputs, (RandomParameter, DeterministicParameter)):
                     grads[inputs.name] = cotangent * coefficient_value.reshape(())
+            elif coefficient_value.ndim == 2:
+                if _is_named(coefficients):
+                    x_mat = inputs_value.reshape(-1, coefficient_value.shape[0])
+                    g_mat = cotangent.reshape(-1, coefficient_value.shape[1])
+                    grads[coefficients.name] = x_mat.transpose(-2, -1) @ g_mat
+                if isinstance(inputs, (RandomParameter, DeterministicParameter)):
+                    grads[inputs.name] = cotangent @ coefficient_value.transpose(-2, -1)
             else:
                 flat = coefficient_value.reshape(-1)
                 if _is_named(coefficients):
@@ -158,7 +179,12 @@ class Linear(DeterministicParameter):
                 if isinstance(inputs, (RandomParameter, DeterministicParameter)):
                     grads[inputs.name] = cotangent.unsqueeze(-1) * flat
             if _is_named(intercept):
-                grads[intercept.name] = cotangent
+                int_val = intercept.constrained_value if hasattr(intercept, "constrained_value") else intercept
+                if getattr(int_val, "ndim", 0) < cotangent.ndim:
+                    reduce_dims = tuple(range(cotangent.ndim - getattr(int_val, "ndim", 0)))
+                    grads[intercept.name] = cotangent.sum(reduce_dims).reshape(getattr(int_val, "shape", ()))
+                else:
+                    grads[intercept.name] = cotangent
             return grads
 
         super().__init__(name, forward, derivative, named_inputs, vjp_func=vjp)
@@ -183,6 +209,9 @@ class Linear(DeterministicParameter):
         else:
             intercept, intercept_batched = _as_tensor(self.intercept, dtype=inputs.dtype, device=inputs.device), False
         n_chains = self.owner_model.n_chains
+        is_matrix = (coefficients.ndim == 3 if coefficients_batched else coefficients.ndim == 2)
+        if is_matrix:
+            return (inputs, flags[0]), (coefficients, coefficients_batched), (intercept, intercept_batched), "matrix"
         per_chain = coefficients[0].numel() if coefficients_batched else coefficients.numel()
         input_ndim = inputs.ndim - 1 if flags[0] else inputs.ndim
         scalar = _is_scalar_slope(input_ndim, inputs.shape[-1] if input_ndim else 1, per_chain)
@@ -194,6 +223,16 @@ class Linear(DeterministicParameter):
 
     def _batched_terms(self, input_values):
         (x, fx), (w, fw), (b, fb), scalar = self._batched_parts(input_values)
+        if scalar == "matrix":
+            if fw and not fx:
+                product = x.unsqueeze(0) @ w
+            elif not fw and fx:
+                product = x @ w.unsqueeze(0)
+            else:
+                product = x @ w
+            if fb and product.ndim > b.ndim:
+                b = b.reshape(b.shape[0], *([1] * (product.ndim - b.ndim)), *b.shape[1:])
+            return x, w, product + b, scalar
         if scalar:
             (xa, wa), _ = self._align_batched([x, w], [fx, fw])
             product = xa * wa
@@ -208,9 +247,28 @@ class Linear(DeterministicParameter):
 
     def batched_vjp(self, cotangent, input_values):
         from .._batching import pad_to
-        xa, wa, out, scalar = self._batched_terms(input_values)
+        (x, fx), (w, fw), (b, fb), scalar = self._batched_parts(input_values)
+        xa, wa, out, _ = self._batched_terms(input_values)
         g = pad_to(cotangent, out.ndim)
         grads = {}
+        if scalar == "matrix":
+            if _is_named(self.coefficients):
+                if fw and not fx:
+                    grads[self.coefficients.name] = x.unsqueeze(0).transpose(-2, -1) @ g
+                elif not fw and fx:
+                    grads[self.coefficients.name] = (x.transpose(-2, -1) @ g).sum(0)
+                else:
+                    grads[self.coefficients.name] = x.transpose(-2, -1) @ g
+            if isinstance(self.regression_inputs, (RandomParameter, DeterministicParameter)):
+                if fw and not fx:
+                    grads[self.regression_inputs.name] = (g @ w.transpose(-2, -1)).sum(0)
+                elif not fw and fx:
+                    grads[self.regression_inputs.name] = g @ w.transpose(-2, -1)
+                else:
+                    grads[self.regression_inputs.name] = g @ w.transpose(-2, -1)
+            if _is_named(self.intercept):
+                grads[self.intercept.name] = g
+            return grads
         if scalar:
             if _is_named(self.coefficients):
                 grads[self.coefficients.name] = g * xa
