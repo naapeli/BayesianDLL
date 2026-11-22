@@ -47,7 +47,7 @@ import torch
 from BayesianDLL import Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import ExactGP, RBF, exact_gp_predictive
+from BayesianDLL.GP import ExactGP, RBF
 
 torch.manual_seed(0)
 dtype = torch.float64
@@ -156,21 +156,15 @@ plt.show()
 # %%
 # Reconstructed data
 # ------------------
-# The GP posterior at the learned coordinates (``exact_gp_predictive`` with
-# the MAP values as a one-draw trace; ``X`` and ``Z`` are read from it)
-# reconstructs every output dimension; with ``n_outputs`` the predictive
-# draws have shape ``(draws, samples, D, n_new)``. Plotted against the true
+# The GP posterior at the learned coordinates (``model.predict`` with
+# the MAP values) reconstructs every output dimension; with ``n_outputs`` the
+# predictive draws have shape ``(1, samples, D, n)``. Plotted against the true
 # angle, the GPLVM reconstruction follows the data, while the rank-2 PCA
 # reconstruction (the best linear map from two coordinates) misses the
 # second harmonics.
 
-trace = {
-    "variance": torch.tensor(variance, dtype=dtype).reshape(1, 1, 1),
-    "noise": torch.tensor(noise, dtype=dtype).reshape(1, 1, 1),
-    "x": x_learned.reshape(1, 1, n, latent_dim),
-    "z": z_learned.reshape(1, 1, m, latent_dim),
-}
-draws = exact_gp_predictive(gp, trace, y, x_learned, n_samples=200)[0]  # (samples, D, n)
+preds = model.predict(samples_per_step=200)
+draws = preds["y"].squeeze(0)  # (samples, D, n)
 reconstruction = draws.mean(dim=0)
 gplvm_error = (reconstruction - y).square().mean().sqrt().item()
 pca_error = (pca_reconstruction - y).square().mean().sqrt().item()

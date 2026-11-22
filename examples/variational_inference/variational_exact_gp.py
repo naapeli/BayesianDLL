@@ -66,7 +66,7 @@ print(f"NUTS: {sum(nuts.divergences)} divergences, largest R-hat {summary['r_hat
 # %%
 # Hyperparameters and predictions
 # -------------------------------
-# For every hyperparameter draw, ``exact_gp_predictive`` samples the latent
+# For every hyperparameter draw, ``model.posterior_predicative`` samples the latent
 # function on a grid from its Gaussian conditional given the data, so the
 # band combines the hyperparameter uncertainty and the GP's own uncertainty.
 # It widens outside the data range ``[0, 1]``.
