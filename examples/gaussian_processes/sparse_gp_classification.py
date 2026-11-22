@@ -14,7 +14,7 @@ with a Gaussian-process prior on ``f``. The Bernoulli likelihood is not
 Gaussian, so ``f`` cannot be integrated out and has to be inferred together
 with the hyperparameters.
 
-**A sparse latent GP.** ``SparseLatentGP`` summarises the function by its
+**A sparse latent GP.** ``LatentGP`` (with ``inducing_points``) summarises the function by its
 values ``u`` at ``m = 24`` *inducing inputs* ``Z`` and interpolates them with
 the kernel, ``f(X) = K_XZ K_ZZ⁻¹ u``. This is the DTC ("projected process")
 approximation: the prior covariance of ``f`` is
@@ -65,7 +65,7 @@ import torch
 from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Bernoulli, Normal
-from BayesianDLL.GP import RBF, SparseLatentGP, sparse_latent_gp_predictive
+from BayesianDLL.GP import LatentGP, RBF, gp_predictive
 from BayesianDLL.Variational import BBVI
 
 
@@ -101,7 +101,7 @@ def build(inducing):
             prior_loc = x.mean(0).expand(m, 2).clone()
             inducing = RandomParameter("z", Normal(prior_loc, 2.0), shape=(m, 2), initial_value=z_start.clone())
         v = RandomParameter("v", Normal(0.0, 1.0), shape=m, initial_value=torch.zeros(m, dtype=torch.float64))
-        f = SparseLatentGP("f", Data("x", x), kernel, inducing, v)
+        f = LatentGP("f", Data("x", x), kernel, latent=v, inducing_points=inducing)
         ObservedParameter("y", Bernoulli(logits=f), y)
     return model, f
 
@@ -230,7 +230,7 @@ print(f"NUTS: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-hat:
 
 
 def probabilities(f, draws, points):
-    latent = sparse_latent_gp_predictive(f, draws, points).reshape(-1, points.shape[0])
+    latent = gp_predictive(f, draws, points).reshape(-1, points.shape[0])
     return torch.sigmoid(latent)
 
 
@@ -244,7 +244,7 @@ def test_metrics(f, draws):
 def usefulness(f, draws, z):
     """Fraction of ``Z`` near the data, and the partner (or ``-1``) of every inducing input."""
     near_data = (torch.cdist(z, x).min(dim=1).values < 0.25).double().mean().item()
-    f_at_z = sparse_latent_gp_predictive(f, draws, z).reshape(-1, m).mean(0)
+    f_at_z = gp_predictive(f, draws, z).reshape(-1, m).mean(0)
     lengthscale = draws["lengthscale"].mean().item()
     distance = torch.cdist(z, z).masked_fill(f_at_z[:, None] * f_at_z[None, :] >= 0, float("inf"))
     nearest = distance.min(dim=1)
@@ -267,7 +267,7 @@ print(f"learned Z (NUTS): test accuracy {accuracy:.3f}, test log loss {log_loss:
 # %%
 # The predictive probability and its uncertainty
 # ----------------------------------------------
-# ``sparse_latent_gp_predictive`` evaluates ``f = K_*Z L⁻ᵀ v`` on a grid for
+# ``gp_predictive`` evaluates ``f = K_*Z L⁻ᵀ v`` on a grid for
 # every NUTS draw. The left panel shows the posterior mean of
 # ``P(y = 1) = sigmoid(f)`` with the 0.5 decision boundary; grey segments join
 # inducing inputs that are partners across the boundary. The right panel

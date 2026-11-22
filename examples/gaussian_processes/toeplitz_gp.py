@@ -32,7 +32,7 @@ def true_signal(t):
     return torch.sin(t / 8.0) + 0.5 * torch.sin(t / 3.0 + 1.0)
 
 
-n_total = 4000
+n_total = 5200
 n_train = 1200
 t_all = torch.arange(n_total, dtype=torch.float64) * 0.05
 y_all = true_signal(t_all) + 0.3 * torch.randn(n_total, dtype=torch.float64)
@@ -85,17 +85,12 @@ lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dty
 
 def time_once(cls, size):
     timing_model, _ = build(cls, t_all[:size], y_all[:size])
+    start = time.perf_counter()
     timing_model.joint_grad_log_prob()
-    best = float("inf")
-    for _ in range(1):
-        start = time.perf_counter()
-        timing_model.model_log_prob()
-        timing_model.joint_grad_log_prob()
-        best = min(best, time.perf_counter() - start)
-    return best
+    return time.perf_counter() - start
 
 
-sizes = [1000, 2000, 4000]
+sizes = [4000, 4600, 5200]
 timings = {cls.__name__: [time_once(cls, s) for s in sizes] for cls in (ExactGP, ToeplitzGP)}
 for name, values in timings.items():
     print(name, ", ".join(f"n={s}: {1000 * v:.0f} ms" for s, v in zip(sizes, values)))

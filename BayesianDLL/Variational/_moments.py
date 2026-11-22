@@ -226,6 +226,45 @@ class GuideMoments:
         """``{latent: covariance_block}`` for each latent."""
         return {name: self.covariance(name) for name in self.names}
 
+    def correlation(self, latent=None, group=None, second=None):
+        """The posterior correlation matrix.
+
+        Parameters
+        ----------
+        latent : str or list of str, optional
+            A single latent name or list of latent names. If a single name is
+            given, returns a 2-D correlation matrix for that parameter (a 1x1
+            matrix with value 1.0 for a scalar parameter). If a list is given,
+            returns the joint correlation submatrix for those parameters.
+        group : str, optional
+            A named group. If given, returns the joint 2-D correlation matrix for
+            all latents belonging to that group.
+        second : str, optional
+            If given alongside ``latent``, returns the cross-correlation block
+            between ``latent`` and ``second``.
+
+        Returns
+        -------
+        torch.Tensor
+            A 2-D correlation matrix with 1.0 on the diagonal.
+        """
+        if second is not None:
+            cov_block = self.block(latent, second)
+            s1 = torch.sqrt(torch.diagonal(self.covariance(latent)))
+            s2 = torch.sqrt(torch.diagonal(self.covariance(second)))
+            outer_s = s1.unsqueeze(-1) * s2.unsqueeze(0)
+            return torch.where(outer_s > 0, cov_block / outer_s, torch.zeros_like(cov_block))
+        cov = self.covariance(latent=latent, group=group)
+        std = torch.sqrt(torch.diagonal(cov))
+        outer_std = std.unsqueeze(-1) * std.unsqueeze(0)
+        corr = torch.where(outer_std > 0, cov / outer_std, torch.zeros_like(cov))
+        corr.fill_diagonal_(1.0)
+        return corr
+
+    def correlations(self):
+        """``{latent: correlation_block}`` for each latent."""
+        return {name: self.correlation(name) for name in self.names}
+
     def block(self, first, second=None):
         """The covariance block between the flattened latents ``first`` and ``second`` (default ``first``)."""
         second = first if second is None else second

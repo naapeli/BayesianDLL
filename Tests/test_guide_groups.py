@@ -236,6 +236,19 @@ def test_unconstrained_moments_are_exact():
     torch.testing.assert_close(result.covariance(), L @ L.T)
     torch.testing.assert_close(result.covariance("mean"), result.block("mean"))
     assert "mean" in result.covariances() and "sigma" in result.covariances()
+
+    # Test correlation
+    cov = L @ L.T
+    std = torch.sqrt(torch.diagonal(cov))
+    expected_corr = cov / (std.unsqueeze(-1) * std.unsqueeze(0))
+    expected_corr.fill_diagonal_(1.0)
+    torch.testing.assert_close(result.correlation(), expected_corr)
+    torch.testing.assert_close(result.correlation("mean"), torch.tensor([[1.0]]))
+    torch.testing.assert_close(result.correlation("sigma"), torch.tensor([[1.0]]))
+    torch.testing.assert_close(result.correlation(["mean", "sigma"]), expected_corr)
+    torch.testing.assert_close(result.correlation("mean", second="sigma"), expected_corr[:1, 1:])
+    assert "mean" in result.correlations() and "sigma" in result.correlations()
+
     torch.testing.assert_close(result.mean(), torch.tensor([0.7, -0.2]))
     torch.testing.assert_close(guide.moments().mean("sigma"), torch.tensor([-0.2]))
     torch.testing.assert_close(group.moments().matrix, L @ L.T)

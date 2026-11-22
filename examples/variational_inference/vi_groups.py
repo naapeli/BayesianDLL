@@ -208,9 +208,9 @@ plt.show()
 #
 # Specific parameters or groups can be accessed directly:
 #
-# * ``m.mean("mu")``, ``m.variance("mu")``, ``m.covariance("mu")``
-# * ``m.mean(group="line")``, ``m.covariance(group="line")``
-# * ``m.mean()``, ``m.variance()``, ``m.covariance()`` (full tensors)
+# * ``m.mean("mu")``, ``m.variance("mu")``, ``m.covariance("mu")``, ``m.correlation("mu")``
+# * ``m.mean(group="line")``, ``m.covariance(group="line")``, ``m.correlation(group="line")``
+# * ``m.mean()``, ``m.variance()``, ``m.covariance()``, ``m.correlation()`` (full tensors)
 
 for space in ("unconstrained", "constrained"):
     m = grouped.moments(space)
@@ -221,7 +221,8 @@ constrained = grouped.moments("constrained")
 
 line_mean = constrained.mean(group="line")
 line_cov = constrained.covariance(group="line")
-corr_mu_beta = line_cov[0, 1] / (line_cov[0, 0] * line_cov[1, 1]).sqrt()
+line_corr = constrained.correlation(group="line")
+corr_mu_beta = line_corr[0, 1]
 
 print(f"line group mean [mu, beta]: {line_mean.tolist()}")
 print(f"corr(mu, beta) inside line group: {corr_mu_beta.item():+.3f}")

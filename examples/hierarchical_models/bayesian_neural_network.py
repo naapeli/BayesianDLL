@@ -163,11 +163,11 @@ plt.show()
 # hand-derived reverse-mode vector-Jacobian products (VJPs) for all weight
 # and bias parameters without relying on PyTorch autograd.
 #
-# Here a two-hidden-layer MLP (1 -> 16 -> 16 -> 1) is fitted to a more complex
+# Here a two-hidden-layer MLP (1 -> 8 -> 8 -> 1) is fitted to a more complex
 # composite signal :math:`\sin(1.5 x) + 0.5 \sin(3.5 x)` with variational inference,
 # initialized from a type-II MAP estimate:
 
-h1_dim, h2_dim = 16, 16
+h1_dim, h2_dim = 8, 8
 
 def complex_signal(t):
     return torch.sin(1.5 * t) + 0.5 * torch.sin(3.5 * t)
@@ -180,17 +180,17 @@ y_deep = (y_deep_raw - y_deep_mean) / y_deep_std
 with Model() as deep_bnn:
     x_in = Data("x_in", x.unsqueeze(-1))
     w1 = RandomParameter("w1", Normal(0.0, 1.0), shape=(1, h1_dim),
-                         initial_value=0.5 * torch.randn(1, h1_dim, dtype=torch.float64))
+                         initial_value=1.5 * torch.randn(1, h1_dim, dtype=torch.float64))
     b1 = RandomParameter("b1", Normal(0.0, 1.0), shape=(h1_dim,),
-                         initial_value=0.1 * torch.randn(h1_dim, dtype=torch.float64))
+                         initial_value=torch.randn(h1_dim, dtype=torch.float64))
     w2 = RandomParameter("w2", Normal(0.0, 1.0 / math.sqrt(h1_dim)), shape=(h1_dim, h2_dim),
-                         initial_value=0.5 * torch.randn(h1_dim, h2_dim, dtype=torch.float64) / math.sqrt(h1_dim))
+                         initial_value=torch.randn(h1_dim, h2_dim, dtype=torch.float64) / math.sqrt(h1_dim))
     b2 = RandomParameter("b2", Normal(0.0, 1.0), shape=(h2_dim,),
-                         initial_value=0.1 * torch.randn(h2_dim, dtype=torch.float64))
+                         initial_value=torch.randn(h2_dim, dtype=torch.float64))
     w3 = RandomParameter("w3", Normal(0.0, 1.0 / math.sqrt(h2_dim)), shape=(h2_dim,),
-                         initial_value=0.5 * torch.randn(h2_dim, dtype=torch.float64) / math.sqrt(h2_dim))
+                         initial_value=torch.randn(h2_dim, dtype=torch.float64) / math.sqrt(h2_dim))
     b3 = RandomParameter("b3", Normal(0.0, 1.0), initial_value=torch.zeros(1, dtype=torch.float64))
-    sigma_deep = Exp("sigma_deep", RandomParameter("log_sigma_deep", Normal(math.log(0.15), 0.3),
+    sigma_deep = Exp("sigma_deep", RandomParameter("log_sigma_deep", Normal(math.log(0.15), 0.2),
                                                    initial_value=torch.tensor([math.log(0.15)], dtype=torch.float64)))
 
     h1 = Tanh("h1", Linear("h1_lin", x_in, coefficients=w1, intercept=b1))
@@ -200,11 +200,11 @@ with Model() as deep_bnn:
         ObservedParameter("y_deep", Normal(f_mlp, sigma_deep), y_deep)
 
 # Initialise at the MAP mode to avoid symmetric saddle points and flat local optima
-deep_bnn.find_MAP(lr=0.03, epochs=400, verbose=False)
+deep_bnn.find_MAP(lr=0.05, epochs=600, verbose=False)
 print("Deep BNN: MAP initialization complete")
 
-deep_guide = Guide(deep_bnn, default_family="mean_field", init_scale=0.03)
-deep_history = BBVI(deep_bnn, deep_guide, n_samples=4, epochs=1500, lr=0.005, lrd=0.999, verbose=False)
+deep_guide = Guide(deep_bnn, default_family="mean_field", init_scale=0.01)
+deep_history = BBVI(deep_bnn, deep_guide, n_samples=4, epochs=800, lr=0.001, lrd=0.999, verbose=False)
 deep_trace = {k: v.squeeze(0) for k, v in deep_guide.sample(200).items()}
 print(f"Deep BNN (2 hidden layers): final ELBO {deep_history[-1]:.2f}")
 

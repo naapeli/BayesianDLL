@@ -33,7 +33,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import ExactGP, LinearMean, Matern52, SparseGP, exact_gp_predictive, sparse_gp_predictive
+from BayesianDLL.GP import ExactGP, LinearMean, Matern52, exact_gp_predictive
 
 
 torch.manual_seed(0)
@@ -62,7 +62,7 @@ def build(method):
         if method == "exact":
             f = ExactGP("f", inputs, kernel, noise_variance=noise)
         else:
-            f = SparseGP("f", inputs, kernel, inducing_points=inducing, noise_variance=noise, method=method)
+            f = ExactGP("f", inputs, kernel, inducing_points=inducing, noise_variance=noise, method=method)
         ObservedParameter("y", f, y)
     return model, f
 
@@ -74,8 +74,7 @@ def point_trace(model):
 
 
 def band(f, trace, method):
-    predict = exact_gp_predictive if method == "exact" else sparse_gp_predictive
-    draws = predict(f, trace, y, grid, n_samples=300).reshape(-1, grid.numel())
+    draws = exact_gp_predictive(f, trace, y, grid, n_samples=300).reshape(-1, grid.numel())
     return torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
 
@@ -139,7 +138,7 @@ summary = trace.summary(include_deterministic=True)
 print(summary)
 print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-hat: {summary['r_hat'].max():.3f}")
 
-draws = sparse_gp_predictive(f, trace.thin(10), y, grid, n_samples=10).reshape(-1, grid.numel())
+draws = exact_gp_predictive(f, trace.thin(10), y, grid, n_samples=10).reshape(-1, grid.numel())
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 fig, (ax, ax_hist) = plt.subplots(1, 2, figsize=(12, 4), layout="constrained", gridspec_kw={"width_ratios": [2.2, 1]})
 ax.scatter(x, y, s=3, color="0.65", label="observations")
@@ -197,7 +196,7 @@ def build_trend(learned_mean):
             slope = RandomParameter("slope", Normal(0.0, 1.0))
             intercept = RandomParameter("intercept", Normal(0.0, 2.0))
             mean = LinearMean(slope, intercept)
-        f = SparseGP("f", Data("inputs", x), kernel, inducing_points=inducing,
+        f = ExactGP("f", Data("inputs", x), kernel, inducing_points=inducing,
                      noise_variance=Exp("noise", log_noise), mean=mean)
         ObservedParameter("y", f, y_trend)
     return model, f
@@ -213,7 +212,7 @@ for ax, learned_mean in zip(axes, (False, True)):
         for name in ("slope", "intercept"):
             trace[name] = model.params[name].constrained_value.reshape(1, 1, -1)
         title = f"LinearMean (slope {trace['slope'].item():.2f}, intercept {trace['intercept'].item():.2f})"
-    draws = sparse_gp_predictive(f, trace, y_trend, grid_far, n_samples=300).reshape(-1, grid_far.numel())
+    draws = exact_gp_predictive(f, trace, y_trend, grid_far, n_samples=300).reshape(-1, grid_far.numel())
     lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
     ax.scatter(x, y_trend, s=3, color="0.65", label="observations")
     ax.fill_between(grid_far, lower, upper, color="tab:purple", alpha=0.3, label="90% band of f")

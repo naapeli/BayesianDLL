@@ -35,7 +35,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import RBF, ExactGP, SparseGP, sparse_gp_predictive
+from BayesianDLL.GP import ExactGP, RBF, exact_gp_predictive
 
 
 torch.manual_seed(1)
@@ -61,7 +61,7 @@ def build(inducing):
         log_noise = RandomParameter("log_noise", Normal(-2.0, 1.0))
         if inducing is None:
             inducing = RandomParameter("z", Normal(z_start, 5.0), shape=(m, 1), initial_value=z_start.clone())
-        f = SparseGP(
+        f = ExactGP(
             "f", inputs, RBF(Exp("lengthscale", log_lengthscale), Exp("variance", log_variance)),
             inducing_points=inducing, noise_variance=Exp("noise", log_noise), method="vfe",
         )
@@ -120,7 +120,7 @@ for ax, model, f, z, title in [
     (axes[0], fixed_model, fixed_f, z_start, f"Fixed Z (bound {fixed_bound:.0f})"),
     (axes[1], learned_model, learned_f, z_learned, f"Learned Z (bound {bounds[-1]:.0f})"),
 ]:
-    draws = sparse_gp_predictive(f, point_trace(model, f), y, grid, n_samples=300).reshape(-1, grid.numel())
+    draws = exact_gp_predictive(f, point_trace(model, f), y, grid, n_samples=300).reshape(-1, grid.numel())
     lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
     ax.scatter(x, y, s=4, color="0.65", label="observations")
     ax.fill_between(grid, lower, upper, color="tab:blue", alpha=0.3, label="90% band of f")

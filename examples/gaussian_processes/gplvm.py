@@ -22,7 +22,7 @@ each output dimension is a different smooth function of an angle
 ``t ∈ [0, 2π)`` (first and second harmonics), plus noise. The angle is not
 given to the model. We infer a 2-D latent coordinate ``x_i`` per point
 (``X`` has shape ``(200, 2)`` with a ``N(0, 1)`` prior) through one
-``SparseGP`` with
+``ExactGP`` with
 
 * ``n_outputs=8``: eight independent GPs, one per output dimension, that
   share ``X``, the inducing inputs ``Z``, the kernel and the noise (the
@@ -47,7 +47,7 @@ import torch
 from BayesianDLL import Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import RBF, SparseGP, sparse_gp_predictive
+from BayesianDLL.GP import ExactGP, RBF, exact_gp_predictive
 
 torch.manual_seed(0)
 dtype = torch.float64
@@ -103,7 +103,7 @@ with Model() as model:
     log_variance = RandomParameter("log_variance", Normal(0.0, 2.0))
     log_noise = RandomParameter("log_noise", Normal(-2.0, 1.0))
     kernel = RBF(1.0, Exp("variance", log_variance))
-    gp = SparseGP("f", x, kernel, inducing_points=z, noise_variance=Exp("noise", log_noise),
+    gp = ExactGP("f", x, kernel, inducing_points=z, noise_variance=Exp("noise", log_noise),
                   method="vfe", n_outputs=n_outputs)
     ObservedParameter("y", gp, y)
 
@@ -156,7 +156,7 @@ plt.show()
 # %%
 # Reconstructed data
 # ------------------
-# The GP posterior at the learned coordinates (``sparse_gp_predictive`` with
+# The GP posterior at the learned coordinates (``exact_gp_predictive`` with
 # the MAP values as a one-draw trace; ``X`` and ``Z`` are read from it)
 # reconstructs every output dimension; with ``n_outputs`` the predictive
 # draws have shape ``(draws, samples, D, n_new)``. Plotted against the true
@@ -170,7 +170,7 @@ trace = {
     "x": x_learned.reshape(1, 1, n, latent_dim),
     "z": z_learned.reshape(1, 1, m, latent_dim),
 }
-draws = sparse_gp_predictive(gp, trace, y, x_learned, n_samples=200)[0]  # (samples, D, n)
+draws = exact_gp_predictive(gp, trace, y, x_learned, n_samples=200)[0]  # (samples, D, n)
 reconstruction = draws.mean(dim=0)
 gplvm_error = (reconstruction - y).square().mean().sqrt().item()
 pca_error = (pca_reconstruction - y).square().mean().sqrt().item()
