@@ -23,7 +23,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import RBF, ExactGP, exact_gp_predictive
+from BayesianDLL.GP import RBF, ExactGP
 
 
 torch.manual_seed(0)
@@ -87,7 +87,7 @@ for d in range(n_inputs):
     ax = axes[d + 1]
     points = torch.zeros(grid.numel(), n_inputs, dtype=torch.float64)
     points[:, d] = grid
-    draws = exact_gp_predictive(f, thinned, y, points, n_samples=5).reshape(-1, grid.numel())
+    draws = model.posterior_predicative(thinned, inputs=points, samples_per_step=5, progress_bar=False)["y"].reshape(-1, grid.numel())
     lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
     ax.fill_between(grid, lower, upper, color="tab:blue", alpha=0.25, label="90% band")
     ax.plot(grid, median, color="tab:blue", label="median")

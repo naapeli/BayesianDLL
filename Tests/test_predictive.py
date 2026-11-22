@@ -116,3 +116,72 @@ def test_predictive_with_enumerated_parameter(monkeypatch):
     trace = {"p": torch.full((1, 2, 1), 0.5), "z": torch.tensor([[[1.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 1.0]]])}
     result = posterior_predicative(trace, n_samples=2, samples_per_step=10, model=model, progress_bar=False)
     torch.testing.assert_close(result["y"].mean(dim=1) / 10, trace["z"][0], atol=0.02, rtol=0)
+
+
+def test_gp_posterior_predictive_with_exact_and_latent_gp():
+    from BayesianDLL import Data
+    from BayesianDLL.GP import ExactGP, LatentGP, RBF
+    from BayesianDLL.Distributions import Uniform
+
+    x_train = torch.linspace(0, 3, 10, dtype=torch.float64)
+    y_train = torch.sin(x_train)
+
+    with Model() as model:
+        inputs = Data("inputs", x_train)
+        ls = RandomParameter("ls", Uniform(0.5, 2.0))
+        noise = RandomParameter("noise", Uniform(0.001, 0.05))
+        f = ExactGP("f", inputs, RBF(ls, 1.0), noise_variance=noise)
+        ObservedParameter("y", f, y_train)
+
+    trace = {"ls": torch.full((1, 4, 1), 1.0), "noise": torch.full((1, 4, 1), 0.01)}
+    x_new = torch.linspace(-0.5, 3.5, 18, dtype=torch.float64)
+    inputs.set_value(x_new)
+    pred = model.posterior_predicative(trace, samples_per_step=5, progress_bar=False)
+    assert pred["y"].shape == (4, 5, 18)
+
+    # Latent GP
+    with Model() as model_lat:
+        inputs_lat = Data("inputs_lat", x_train)
+        ls_l = RandomParameter("ls_l", Uniform(0.5, 2.0))
+        f_lat = LatentGP("f_lat", inputs_lat, RBF(ls_l, 1.0))
+        ObservedParameter("y_lat", Bernoulli(logits=f_lat), (y_train > 0).double())
+
+    trace_lat = {"ls_l": torch.full((1, 3, 1), 1.0), "f_lat_white": torch.zeros(1, 3, 10)}
+    inputs_lat.set_value(x_new)
+    pred_lat = model_lat.posterior_predicative(trace_lat, samples_per_step=4, progress_bar=False)
+    assert pred_lat["y_lat"].shape == (3, 4, 18)
+    assert "f_lat" in pred_lat
+    assert pred_lat["f_lat"].shape == (3, 18)
+
+
+def test_gp_posterior_predictive_toeplitz_and_sparse():
+    from BayesianDLL import Data
+    from BayesianDLL.GP import ExactGP, ToeplitzGP, RBF
+    from BayesianDLL.Distributions import Uniform
+
+    t_train = torch.linspace(0, 5, 20, dtype=torch.float64)
+    y_train = torch.sin(t_train)
+
+    with Model() as model_toep:
+        t_data = Data("t", t_train)
+        ls = RandomParameter("ls", Uniform(0.5, 2.0))
+        noise = RandomParameter("noise", Uniform(0.001, 0.05))
+        f_toep = ToeplitzGP("f_toep", t_data, RBF(ls, 1.0), noise_variance=noise)
+        ObservedParameter("y", f_toep, y_train)
+
+    t_new = torch.linspace(4.0, 7.0, 15, dtype=torch.float64)
+    # Using trace=None (uses current model values)
+    pred_toep = model_toep.posterior_predicative(t=t_new, samples_per_step=10, progress_bar=False)
+    assert pred_toep["y"].shape == (1, 10, 15)
+
+    # Sparse GP with inducing points
+    z = torch.linspace(0.5, 4.5, 5, dtype=torch.float64)
+    with Model() as model_sparse:
+        x_data = Data("x", t_train)
+        ls_s = RandomParameter("ls_s", Uniform(0.5, 2.0))
+        noise_s = RandomParameter("noise_s", Uniform(0.001, 0.05))
+        f_sparse = ExactGP("f_sparse", x_data, RBF(ls_s, 1.0), inducing_points=z, noise_variance=noise_s, method="vfe")
+        ObservedParameter("y_sparse", f_sparse, y_train)
+
+    pred_sparse = model_sparse.posterior_predicative(x=t_new, samples_per_step=8, progress_bar=False)
+    assert pred_sparse["y_sparse"].shape == (1, 8, 15)

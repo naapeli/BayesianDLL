@@ -431,6 +431,9 @@ class LatentGP(DeterministicParameter):
         self.gp_kernel = kernel
         self.gp_mean = mean
         self.gp_jitter = jitter
+        self._in_posterior_predictive = False
+        if not _is_learnable(inputs):
+            self._training_inputs_data = _input_value(inputs).clone()
 
     def _context(self, values, flags):
         return _BatchContext({id(node): bool(flag) for node, flag in zip(self.inputs, flags)})
@@ -444,6 +447,27 @@ class LatentGP(DeterministicParameter):
         x = context.inputs(self.inputs[0], dtype, device, raw=values[0])
         raw = _raw_values(self.inputs, values)
         kernel_values = context.kernel_values(self.gp_kernel, dtype, device, raw)
+        if getattr(self, "_in_posterior_predictive", False) or x.shape[1] != z.shape[1]:
+            x_train = getattr(self, "_training_inputs_data", None)
+            if x_train is None:
+                x_train = x
+            if x_train.ndim == 1:
+                x_train = x_train.reshape(-1, 1)
+            x_train = x_train.to(dtype=dtype, device=device).unsqueeze(0)
+            k_train = self.gp_kernel.batch_evaluate(x_train, x_train, kernel_values)
+            factor_train, _ = batched_stable_cholesky(k_train, jitter=self.gp_jitter)
+            alpha = torch.linalg.solve_triangular(factor_train.transpose(-2, -1), z.unsqueeze(-1), upper=True).squeeze(-1)
+            k_cross = self.gp_kernel.batch_evaluate(x_train, x, kernel_values)
+            k_new = self.gp_kernel.batch_evaluate(x, x, kernel_values)
+            mean = _evaluate_mean(context, self.gp_mean, x, dtype, device, raw)
+            pred_mean = mean + (k_cross.transpose(-2, -1) @ alpha.unsqueeze(-1)).squeeze(-1)
+            v = torch.linalg.solve_triangular(factor_train, k_cross, upper=False)
+            pred_cov = k_new - v.transpose(-2, -1) @ v
+            pred_cov = (pred_cov + pred_cov.transpose(-2, -1)) / 2
+            pred_factor, _ = batched_stable_cholesky(pred_cov, jitter=self.gp_jitter)
+            eps = torch.randn_like(pred_mean)
+            f = pred_mean + (eps.unsqueeze(1) @ pred_factor.transpose(-2, -1)).squeeze(1)
+            return f, (context, x, z, kernel_values, pred_factor, None, raw)
         covariance = self.gp_kernel.batch_evaluate(x, x, kernel_values)
         size = max(covariance.shape[0], z.shape[0])
         factor, jitter_info = batched_stable_cholesky(_expand_batch(covariance, size), jitter=self.gp_jitter)
@@ -528,6 +552,18 @@ class _GPDistribution(Distribution):
     that the model's batching machinery sees them as arguments of the term
     (and marks the batched ones).
     """
+
+    _in_posterior_predictive: bool = False
+    predict_noise: bool = False
+
+    def _bind_observed(self, observed_node, observed_values):
+        self._observed_node = observed_node
+        val = observed_values.value if isinstance(observed_values, Data) else torch.as_tensor(observed_values)
+        self._training_observed_data = val.clone()
+        if hasattr(self, "inputs") and not _is_learnable(self.inputs):
+            self._training_inputs_data = _input_value(self.inputs).clone()
+        elif hasattr(self, "grid_inputs"):
+            self._training_grid_data = [_input_value(g).clone() for g in self.grid_inputs]
 
     def _register_kernel(self, kernel):
         self._kernel_parameter_nodes = list(kernel.parameters)
@@ -622,6 +658,9 @@ class ExactGP(_GPDistribution):
         self.kernel = kernel
         self.noise_variance = noise_variance
         self.jitter = jitter
+        self.predict_noise = kwargs.get("predict_noise", False)
+        if not _is_learnable(inputs):
+            self._training_inputs_data = _input_value(inputs).clone()
 
         self.add_dependency(inputs)
         self._register_kernel(kernel)
@@ -647,6 +686,10 @@ class ExactGP(_GPDistribution):
         x = context.inputs(self.inputs, dtype, device)
         n = x.shape[1]
         observed = torch.as_tensor(observed, dtype=dtype, device=device).reshape(-1)
+        if not getattr(self, "_in_posterior_predictive", False):
+            self._training_observed_data = observed.detach().clone()
+            if not _is_learnable(self.inputs):
+                self._training_inputs_data = x_value.detach().clone()
         if observed.numel() != n:
             raise ValueError(
                 f"Exact GP observations must contain one value per input ({n}); got {observed.numel()} values."
@@ -713,6 +756,11 @@ class ExactGP(_GPDistribution):
         return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
+        if getattr(self, "_in_posterior_predictive", False) and hasattr(self, "_training_inputs_data") and hasattr(self, "_training_observed_data"):
+            return self._sample_posterior(n_samples)
+        return self._sample_prior(n_samples)
+
+    def _sample_prior(self, n_samples=1):
         x = _input_value(self.inputs)
         zero = torch.zeros(_feature_count(x), dtype=x.dtype, device=x.device)
         factor = self._components(zero)["factor"][0]
@@ -720,6 +768,54 @@ class ExactGP(_GPDistribution):
         return mean + torch.randn(
             (n_samples, zero.numel()), dtype=zero.dtype, device=zero.device
         ) @ factor.transpose(-2, -1)
+
+    def _sample_posterior(self, n_samples=1):
+        x_new = _input_value(self.inputs)
+        if _is_learnable(self.inputs):
+            x_train = _input_value(self.inputs)
+        else:
+            x_train = self._training_inputs_data
+
+        if x_train.ndim == 0:
+            x_train = x_train.reshape(1)
+        if x_new.ndim == 0:
+            x_new = x_new.reshape(1)
+
+        y_train = torch.as_tensor(self._training_observed_data, dtype=x_train.dtype, device=x_train.device).reshape(-1)
+        n_train = _feature_count(x_train)
+        n_new = _feature_count(x_new)
+
+        dtype = x_train.dtype
+        device = x_train.device
+
+        kernel_values = self._named_parameter_values()
+        mean_values = {parameter.name: resolve(parameter) for parameter in self.mean.parameters if _is_named(parameter)}
+
+        K_train = self.kernel(x_train, x_train, parameter_values=kernel_values)
+        K_cross = self.kernel(x_train, x_new, parameter_values=kernel_values)
+        K_new = self.kernel(x_new, x_new, parameter_values=kernel_values)
+
+        noise = _resolved_value(self.noise_variance, dtype=dtype, device=device).reshape(-1)[0]
+        factor = stable_cholesky(
+            K_train + noise * torch.eye(n_train, dtype=dtype, device=device),
+            jitter=self.jitter,
+        )
+
+        mean_train = self.mean(x_train, parameter_values=mean_values)
+        mean_new = self.mean(x_new, parameter_values=mean_values)
+
+        alpha = torch.cholesky_solve((y_train - mean_train).reshape(-1, 1), factor).reshape(-1)
+        pred_mean = mean_new + K_cross.transpose(-2, -1) @ alpha
+        pred_cov = K_new - K_cross.transpose(-2, -1) @ torch.cholesky_solve(K_cross, factor)
+
+        if getattr(self, "predict_noise", False):
+            pred_cov = pred_cov + noise * torch.eye(n_new, dtype=dtype, device=device)
+
+        pred_cov = (pred_cov + pred_cov.transpose(-2, -1)) / 2
+        pred_factor = stable_cholesky(pred_cov, jitter=self.jitter)
+
+        noise_draws = torch.randn((n_samples, n_new), dtype=dtype, device=device)
+        return pred_mean + noise_draws @ pred_factor.transpose(-2, -1)
 
 
 # ----------------------------------------------------------------------------
@@ -1054,6 +1150,11 @@ class SparseGP(ExactGP):
         return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
+        if getattr(self, "_in_posterior_predictive", False) and hasattr(self, "_training_observed_data"):
+            return self._sample_posterior(n_samples)
+        return self._sample_prior(n_samples)
+
+    def _sample_prior(self, n_samples=1):
         """Draw from the approximate prior ``Normal(m(X), Q_nn + Λ)``.
 
         Uses ``Vᵀ ε₁ + sqrt(Λ) ε₂`` with ``V = L⁻¹ K_mn``, so no ``n x n``
@@ -1068,6 +1169,60 @@ class SparseGP(ExactGP):
         first = torch.randn((*shape, v.shape[0]), dtype=x.dtype, device=x.device) @ v
         second = torch.randn((*shape, lam.numel()), dtype=x.dtype, device=x.device) * lam.sqrt()
         return mean + first + second
+
+    def _sample_posterior(self, n_samples=1):
+        training_values = self._training_inputs_data if hasattr(self, "_training_inputs_data") else self._training_inputs()
+        dtype = training_values.dtype
+        device = training_values.device
+        inducing_values = self._inducing_inputs(dtype, device)
+        new_values = torch.as_tensor(_input_value(self.inputs)).to(dtype=dtype, device=device)
+        if new_values.ndim == 0:
+            new_values = new_values.reshape(1)
+        n_training = _feature_count(training_values)
+        n_new = _feature_count(new_values)
+        observed_values = torch.as_tensor(self._training_observed_data, dtype=dtype, device=device)
+        observed_values = self._observations(observed_values, n_training, dtype, device)
+
+        kernel_values = self._named_parameter_values()
+        mean_values = {p.name: resolve(p) for p in self.mean.parameters if _is_named(p)}
+        eye_m = torch.eye(_feature_count(inducing_values), dtype=dtype, device=device)
+        noise = _resolved_value(self.noise_variance, dtype=dtype, device=device).reshape(-1)
+
+        mean_train = self.mean(training_values, parameter_values=mean_values)
+        mean_new = self.mean(new_values, parameter_values=mean_values)
+
+        k_mm = self.kernel(inducing_values, inducing_values, parameter_values=kernel_values)
+        k_mn = self.kernel(inducing_values, training_values, parameter_values=kernel_values)
+        k_ms = self.kernel(inducing_values, new_values, parameter_values=kernel_values)
+        k_ss = self.kernel(new_values, new_values, parameter_values=kernel_values)
+        factor = stable_cholesky(k_mm, jitter=self.jitter)
+        v = torch.linalg.solve_triangular(factor, k_mn, upper=False)
+        v_new = torch.linalg.solve_triangular(factor, k_ms, upper=False)
+        if self.method == "fitc":
+            k_diag = self.kernel.diag(training_values, parameter_values=kernel_values)
+            lam = (k_diag - v.square().sum(dim=0)).clamp_min(0.0) + noise[0]
+        else:
+            lam = noise[0].expand(n_training)
+        factor_b = torch.linalg.cholesky(eye_m + (v / lam) @ v.transpose(-2, -1))
+        c = torch.linalg.solve_triangular(
+            factor_b, (v / lam) @ (observed_values - mean_train).transpose(-2, -1), upper=False
+        )
+        projected = torch.linalg.solve_triangular(factor_b, v_new, upper=False)
+        predictive_mean = mean_new + (projected.transpose(-2, -1) @ c).transpose(-2, -1)
+        if self.n_outputs is None:
+            predictive_mean = predictive_mean[0]
+        predictive_covariance = (
+            k_ss - v_new.transpose(-2, -1) @ v_new + projected.transpose(-2, -1) @ projected
+        )
+        if getattr(self, "predict_noise", False):
+            predictive_covariance = predictive_covariance + noise[0] * torch.eye(n_new, dtype=dtype, device=device)
+        predictive_covariance = (predictive_covariance + predictive_covariance.transpose(-2, -1)) / 2
+        prediction_factor = stable_cholesky(predictive_covariance, jitter=self.jitter)
+        shape = (n_samples, n_new) if self.n_outputs is None else (n_samples, self.n_outputs, n_new)
+        return (
+            predictive_mean
+            + (torch.randn(shape, dtype=dtype, device=device) @ prediction_factor.transpose(-2, -1))
+        )
 
 
 def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
@@ -1216,7 +1371,9 @@ def exact_gp_predictive(
     if n_samples < 1:
         raise ValueError("n_samples must be at least 1.")
 
-    training_values = _input_value(gp.inputs)
+    training_values = getattr(gp, "_training_inputs_data", None)
+    if training_values is None or _is_learnable(gp.inputs):
+        training_values = _input_value(gp.inputs)
     new_values = _input_value(inputs)
     if training_values.ndim == 0:
         training_values = training_values.reshape(1)

@@ -1196,10 +1196,10 @@ class Model:
         from .Variational import find_MAP as _find_MAP
         return _find_MAP(self, lr=lr, epochs=epochs, betas=betas, callback_frequency=callback_frequency, verbose=verbose)
     
-    def posterior_predicative(self, trace, n_samples=None, samples_per_step=20, warmup_per_sample=20, progress_bar=True):
+    def posterior_predicative(self, trace=None, n_samples=None, samples_per_step=20, warmup_per_sample=20, progress_bar=True, predict_noise=None, **data):
         """Posterior predictive draws for ``trace``; see :func:`BayesianDLL.posterior_predicative`."""
         from .Samplers import posterior_predicative as _pp
-        return _pp(trace, n_samples=n_samples, samples_per_step=samples_per_step, warmup_per_sample=warmup_per_sample, model=self, progress_bar=progress_bar)
+        return _pp(trace=trace, n_samples=n_samples, samples_per_step=samples_per_step, warmup_per_sample=warmup_per_sample, model=self, progress_bar=progress_bar, predict_noise=predict_noise, **data)
 
     def sample_prior_predicative(self, n_samples=20, samples_per_step=500, warmup_per_sample=100, progress_bar=True):
         """Prior predictive draws; see :func:`BayesianDLL.sample_prior_predicative`."""

@@ -22,7 +22,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import ExactGP, Matern52, ToeplitzGP, toeplitz_gp_predictive
+from BayesianDLL.GP import ExactGP, Matern52, ToeplitzGP
 
 
 torch.manual_seed(2)
@@ -70,12 +70,12 @@ print(f"type-II MAP estimate in {elapsed:.1f} s: lengthscale {fitted['lengthscal
 # %%
 # Predictive distribution on a window and a forecast
 # --------------------------------------------------
-# ``toeplitz_gp_predictive`` also uses Levinson solves (one right-hand side
-# per prediction point), so no ``n x n`` matrix is formed. The band widens
+# ``model.posterior_predicative`` evaluates the GP posterior at arbitrary new
+# inputs via Levinson solves without forming dense matrices. The band widens
 # beyond the last reading.
 
 new_t = torch.linspace(45.0, 75.0, 60, dtype=torch.float64)
-draws = toeplitz_gp_predictive(f, fitted, y, new_t, n_samples=300).reshape(-1, new_t.numel())
+draws = model.posterior_predicative(t=new_t, samples_per_step=300, progress_bar=False)["y"].squeeze(0)
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
 # %%

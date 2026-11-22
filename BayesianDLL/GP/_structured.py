@@ -200,6 +200,9 @@ class KroneckerGP(_GPDistribution):
         shape = tuple(x.shape[1] for x in xs)
         n = math.prod(shape)
         observed = torch.as_tensor(observed, dtype=dtype, device=device)
+        if not getattr(self, "_in_posterior_predictive", False):
+            self._training_observed_data = observed.detach().clone()
+            self._training_grid_data = [x.detach().clone() for x in self._factor_inputs()]
         if observed.numel() != n:
             raise ValueError(f"KroneckerGP observations must contain one value per grid point ({n}); got {observed.numel()}.")
         noise = context.value(self.noise_variance, dtype, device)
@@ -333,6 +336,11 @@ class KroneckerGP(_GPDistribution):
         return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
+        if getattr(self, "_in_posterior_predictive", False) and hasattr(self, "_training_observed_data"):
+            return self._sample_posterior(n_samples)
+        return self._sample_prior(n_samples)
+
+    def _sample_prior(self, n_samples=1):
         """Draws of shape ``(n_samples, n_1, …, n_P)``: ``m(X) + Q (sqrt(λ) ⊙ ε₁) + σ ε₂``."""
         xs = self._factor_inputs()
         dtype, device = xs[0].dtype, xs[0].device
@@ -346,6 +354,43 @@ class KroneckerGP(_GPDistribution):
         draws = draws + (noise + self.jitter).sqrt() * torch.randn_like(draws)
         points = _grid_points([x.unsqueeze(0) for x in xs])[0]
         return self._mean_at(points).reshape(shape) + draws
+
+    def _sample_posterior(self, n_samples=1):
+        xs = getattr(self, "_training_grid_data", None) or self._factor_inputs()
+        xs = [_feature_matrix(torch.as_tensor(x)) for x in xs]
+        dtype, device = xs[0].dtype, xs[0].device
+        new = _split_new_inputs(self, self.grid_inputs, xs)
+        n_new = new[0].shape[0]
+        observed_values = torch.as_tensor(self._training_observed_data, dtype=dtype, device=device)
+        values = self._named_parameter_values()
+        mean_values = {p.name: resolve(p) for p in self.mean.parameters if _is_named(p)}
+        noise = _resolved_value(self.noise_variance, dtype, device).reshape(-1)[0]
+        shape = tuple(x.shape[0] for x in xs)
+        training_points = _grid_points([x.unsqueeze(0) for x in xs])[0]
+        new_points = torch.cat(new, dim=1)
+        residual = observed_values.reshape(shape) - self.mean(training_points, parameter_values=mean_values).reshape(shape)
+        _, eigenvalues, eigenvectors = self._decompose(xs, values)
+        inverse = 1.0 / (_kronecker_eigenvalues(eigenvalues).clamp_min(0.0) + noise + self.jitter)
+        rotated = residual
+        for mode, vectors in enumerate(eigenvectors):
+            rotated = _mode_product(rotated, vectors.transpose(-2, -1), mode)
+        scaled = rotated * inverse
+        cross = [kernel(x_new, x, parameter_values=values) for kernel, x_new, x in zip(self.kernels, new, xs)]
+        projected = [k @ q for k, q in zip(cross, eigenvectors)]
+        predictive_mean = self.mean(new_points, parameter_values=mean_values) + _rowwise_contract(projected, scaled)
+        prior = torch.ones((n_new, n_new), dtype=dtype, device=device)
+        for kernel, x_new in zip(self.kernels, new):
+            prior = prior * kernel(x_new, x_new, parameter_values=values)
+        rows = projected[0]
+        for u in projected[1:]:
+            rows = (rows.unsqueeze(-1) * u.unsqueeze(1)).reshape(n_new, -1)
+        covariance = prior - (rows * inverse.reshape(1, -1)) @ rows.transpose(-2, -1)
+        if getattr(self, "predict_noise", False):
+            covariance = covariance + noise * torch.eye(n_new, dtype=dtype, device=device)
+        covariance = (covariance + covariance.transpose(-2, -1)) / 2
+        from ._process import stable_cholesky
+        factor = stable_cholesky(covariance, jitter=max(self.jitter, 1e-10))
+        return (predictive_mean.reshape(-1) + torch.randn((n_samples, n_new), dtype=dtype, device=device) @ factor.transpose(-2, -1)).reshape(n_samples, *self.event_shape)
 
 
 def _split_new_inputs(gp, inputs, xs):
@@ -676,6 +721,7 @@ class ToeplitzGP(_GPDistribution):
         self._register_kernel(kernel)
         self.add_dependency(noise_variance)
         self._register_mean(mean, "ToeplitzGP")
+        self._training_inputs_data = x.clone()
 
     def _training_inputs(self):
         x = _feature_matrix(torch.as_tensor(_input_value(self.inputs)))
@@ -685,7 +731,8 @@ class ToeplitzGP(_GPDistribution):
 
     @property
     def event_shape(self):
-        return (self._training_inputs().shape[0],)
+        new = _feature_matrix(torch.as_tensor(_input_value(self.inputs)))
+        return (new.shape[0],)
 
     def _named_parameter_values(self):
         return {parameter.name: resolve(parameter) for parameter in self.kernel.parameters}
@@ -717,6 +764,9 @@ class ToeplitzGP(_GPDistribution):
         x = context.inputs(self.inputs, dtype, device)
         n = x.shape[1]
         observed = torch.as_tensor(observed, dtype=dtype, device=device).reshape(-1)
+        if not getattr(self, "_in_posterior_predictive", False):
+            self._training_observed_data = observed.detach().clone()
+            self._training_inputs_data = reference.detach().clone()
         if observed.numel() != n:
             raise ValueError(f"ToeplitzGP observations must contain one value per input ({n}); got {observed.numel()}.")
         noise = context.value(self.noise_variance, dtype, device)
@@ -787,6 +837,11 @@ class ToeplitzGP(_GPDistribution):
         return _finish(gradients, parts["batched"])
 
     def sample(self, n_samples=1):
+        if getattr(self, "_in_posterior_predictive", False) and hasattr(self, "_training_inputs_data") and hasattr(self, "_training_observed_data"):
+            return self._sample_posterior(n_samples)
+        return self._sample_prior(n_samples)
+
+    def _sample_prior(self, n_samples=1):
         """Prior predictive draws (dense Cholesky; intended for small ``n``)."""
         x = self._training_inputs()
         noise = _resolved_value(self.noise_variance, x.dtype, x.device).reshape(())
@@ -795,6 +850,29 @@ class ToeplitzGP(_GPDistribution):
         factor = stable_cholesky(covariance, jitter=self.jitter)
         draws = torch.randn((n_samples, x.shape[0]), dtype=x.dtype, device=x.device) @ factor.transpose(-2, -1)
         return self._mean_at(x) + draws
+
+    def _sample_posterior(self, n_samples=1):
+        from ._process import stable_cholesky
+        x = self._training_inputs_data
+        dtype, device = x.dtype, x.device
+        n = x.shape[0]
+        new = _feature_matrix(torch.as_tensor(_input_value(self.inputs))).to(dtype=dtype, device=device)
+        n_new = new.shape[0]
+        observed_values = torch.as_tensor(self._training_observed_data, dtype=dtype, device=device).reshape(-1)
+        values = self._named_parameter_values()
+        mean_values = {p.name: resolve(p) for p in self.mean.parameters if _is_named(p)}
+        noise = _resolved_value(self.noise_variance, dtype, device).reshape(-1)[0]
+        column, _ = self._first_column(x, values, noise)
+        cross = self.kernel(x, new, parameter_values=values)
+        rhs = torch.cat([(observed_values - self.mean(x, parameter_values=mean_values)).reshape(n, 1), cross], dim=1)
+        solution, _ = levinson_solve(column, rhs)
+        predictive_mean = self.mean(new, parameter_values=mean_values) + cross.transpose(-2, -1) @ solution[:, 0]
+        covariance = self.kernel(new, new, parameter_values=values) - cross.transpose(-2, -1) @ solution[:, 1:]
+        if getattr(self, "predict_noise", False):
+            covariance = covariance + noise * torch.eye(n_new, dtype=dtype, device=device)
+        covariance = (covariance + covariance.transpose(-2, -1)) / 2
+        factor = stable_cholesky(covariance, jitter=max(self.jitter, 1e-10))
+        return predictive_mean + torch.randn((n_samples, n_new), dtype=dtype, device=device) @ factor.transpose(-2, -1)
 
 
 def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):

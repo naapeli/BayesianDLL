@@ -27,7 +27,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import ExactGP, LinearMean, Periodic, exact_gp_predictive
+from BayesianDLL.GP import ExactGP, LinearMean, Periodic
 
 
 torch.manual_seed(0)
@@ -88,13 +88,14 @@ print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-
 # %%
 # Posterior predictive fit
 # ------------------------
-# ``exact_gp_predictive`` conditions the GP on the observations for every
+# ``model.posterior_predicative`` conditions the GP on the observations for every
 # posterior draw of the hyperparameters, so the band includes both the
 # uncertainty about ``f`` and about the kernel. The right panels show what the
 # data taught us about the period and the noise level.
 
 grid = torch.linspace(-0.2, 5.5, 240, dtype=torch.float64)
-draws = exact_gp_predictive(f, trace.thin(10), y, grid, n_samples=5).reshape(-1, grid.numel())
+inputs.set_value(grid)
+draws = model.posterior_predicative(trace.thin(10), samples_per_step=5, progress_bar=False)["y"].reshape(-1, grid.numel())
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
 fig = plt.figure(figsize=(12, 5), layout="constrained")

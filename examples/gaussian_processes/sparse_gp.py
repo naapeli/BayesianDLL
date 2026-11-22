@@ -33,7 +33,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import ExactGP, LinearMean, Matern52, exact_gp_predictive
+from BayesianDLL.GP import ExactGP, LinearMean, Matern52
 
 
 torch.manual_seed(0)
@@ -67,14 +67,8 @@ def build(method):
     return model, f
 
 
-def point_trace(model):
-    """A one-draw 'trace' holding the current hyperparameter values."""
-    return {name: model.deterministic_params[name].constrained_value.reshape(1, 1, -1)
-            for name in ("lengthscale", "variance", "noise")}
-
-
-def band(f, trace, method):
-    draws = exact_gp_predictive(f, trace, y, grid, n_samples=300).reshape(-1, grid.numel())
+def band(model, method):
+    draws = model.posterior_predicative(inputs=grid, samples_per_step=300, progress_bar=False)["y"].squeeze(0)
     return torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
 
@@ -88,10 +82,11 @@ for method in ("exact", "vfe", "dtc", "fitc"):
     start = time.perf_counter()
     model.find_MAP(lr=0.05, epochs=250, verbose=False)
     elapsed = time.perf_counter() - start
-    fits[method] = (model, f, point_trace(model))
-    values = {k: v.item() for k, v in fits[method][2].items()}
-    print(f"{method:>5}: log p(y) = {f.log_pdf(y).item():8.2f}  lengthscale {values['lengthscale']:.2f}  "
-          f"noise sd {values['noise'] ** 0.5:.3f}  ({elapsed:.1f} s)")
+    fits[method] = (model, f)
+    l_val = model.deterministic_params["lengthscale"].constrained_value.item()
+    noise_val = model.deterministic_params["noise"].constrained_value.item()
+    print(f"{method:>5}: log p(y) = {f.log_pdf(y).item():8.2f}  lengthscale {l_val:.2f}  "
+          f"noise sd {noise_val ** 0.5:.3f}  ({elapsed:.1f} s)")
 
 # %%
 # Comparing the fits
@@ -104,8 +99,8 @@ for method in ("exact", "vfe", "dtc", "fitc"):
 titles = {"exact": "Exact GP", "vfe": "VFE", "dtc": "DTC", "fitc": "FITC"}
 fig, axes = plt.subplots(2, 2, figsize=(12, 7), sharex=True, sharey=True, layout="constrained")
 for ax, method in zip(axes.flat, titles):
-    _, f, trace = fits[method]
-    lower, median, upper = band(f, trace, method)
+    model, f = fits[method]
+    lower, median, upper = band(model, method)
     ax.scatter(x, y, s=3, color="0.65", label="observations")
     ax.fill_between(grid, lower, upper, color="tab:blue", alpha=0.3, label="90% band of f")
     ax.plot(grid, median, color="tab:blue", label="median of f")
@@ -130,7 +125,7 @@ plt.show()
 # misfit to noise: the noise posterior sits somewhat above the true value.
 # More (or learned, see the next example) inducing inputs close this gap.
 
-model, f, _ = fits["vfe"]
+model, f = fits["vfe"]
 start = time.perf_counter()
 trace = model.sample(300, 300, n_chains=2, max_depth=5, seed=2, progress_bar=False)
 elapsed = time.perf_counter() - start
@@ -138,7 +133,7 @@ summary = trace.summary(include_deterministic=True)
 print(summary)
 print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-hat: {summary['r_hat'].max():.3f}")
 
-draws = exact_gp_predictive(f, trace.thin(10), y, grid, n_samples=10).reshape(-1, grid.numel())
+draws = model.posterior_predicative(trace.thin(10), inputs=grid, samples_per_step=10, progress_bar=False)["y"].reshape(-1, grid.numel())
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 fig, (ax, ax_hist) = plt.subplots(1, 2, figsize=(12, 4), layout="constrained", gridspec_kw={"width_ratios": [2.2, 1]})
 ax.scatter(x, y, s=3, color="0.65", label="observations")
@@ -170,16 +165,6 @@ plt.show()
 # the prediction beyond the data (shaded, ``x > 10``) falls back to zero; with the learned
 # linear mean it continues the trend, and the kernel only describes the
 # wiggles around it.
-#
-# **Linear mean vs. linear kernel.** The ExactGP example models a trend with
-# a ``Linear`` *kernel*, ``k(x, x') = v x x'``. That is the covariance of
-# ``f(x) = β x`` with a *random* slope ``β ~ Normal(0, v)`` integrated out of
-# the likelihood: the slope's uncertainty is part of the GP, and the
-# predictive band widens linearly with ``|x|``. A ``LinearMean`` is a fixed
-# trend whose slope is a model parameter: it is learned (a point estimate
-# here, or a posterior with NUTS) rather than integrated out, the kernel
-# stays stationary (so it also works with ``ToeplitzGP``), and the band far
-# from the data is that of the stationary kernel alone.
 
 y_trend = y + 0.35 * x
 grid_far = torch.linspace(-0.5, 15.0, 250, dtype=torch.float64)
@@ -206,13 +191,12 @@ fig, axes = plt.subplots(1, 2, figsize=(12, 4), sharey=True, layout="constrained
 for ax, learned_mean in zip(axes, (False, True)):
     model, f = build_trend(learned_mean)
     model.find_MAP(lr=0.05, epochs=250, verbose=False)
-    trace = point_trace(model)
     title = "zero mean"
     if learned_mean:
-        for name in ("slope", "intercept"):
-            trace[name] = model.params[name].constrained_value.reshape(1, 1, -1)
-        title = f"LinearMean (slope {trace['slope'].item():.2f}, intercept {trace['intercept'].item():.2f})"
-    draws = exact_gp_predictive(f, trace, y_trend, grid_far, n_samples=300).reshape(-1, grid_far.numel())
+        s_val = model.params["slope"].constrained_value.item()
+        i_val = model.params["intercept"].constrained_value.item()
+        title = f"LinearMean (slope {s_val:.2f}, intercept {i_val:.2f})"
+    draws = model.posterior_predicative(inputs=grid_far, samples_per_step=300, progress_bar=False)["y"].squeeze(0)
     lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
     ax.scatter(x, y_trend, s=3, color="0.65", label="observations")
     ax.fill_between(grid_far, lower, upper, color="tab:purple", alpha=0.3, label="90% band of f")

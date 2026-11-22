@@ -65,7 +65,7 @@ import torch
 from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Bernoulli, Normal
-from BayesianDLL.GP import LatentGP, RBF, gp_predictive
+from BayesianDLL.GP import LatentGP, RBF
 from BayesianDLL.Variational import BBVI
 
 
@@ -229,22 +229,24 @@ print(f"NUTS: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-hat:
 # arm across the boundary.
 
 
-def probabilities(f, draws, points):
-    latent = gp_predictive(f, draws, points).reshape(-1, points.shape[0])
+def probabilities(model, draws, points):
+    pred = model.posterior_predicative(draws, x=points, samples_per_step=1, progress_bar=False)
+    latent = pred["f"].reshape(-1, points.shape[0])
     return torch.sigmoid(latent)
 
 
-def test_metrics(f, draws):
-    p = probabilities(f, draws, x_test).mean(0).clamp(1e-9, 1 - 1e-9)
+def test_metrics(model, draws):
+    p = probabilities(model, draws, x_test).mean(0).clamp(1e-9, 1 - 1e-9)
     accuracy = ((p > 0.5).to(y_test.dtype) == y_test).double().mean().item()
     log_loss = -(y_test * p.log() + (1 - y_test) * (1 - p).log()).mean().item()
     return accuracy, log_loss
 
 
-def usefulness(f, draws, z):
+def usefulness(model, draws, z):
     """Fraction of ``Z`` near the data, and the partner (or ``-1``) of every inducing input."""
     near_data = (torch.cdist(z, x).min(dim=1).values < 0.25).double().mean().item()
-    f_at_z = gp_predictive(f, draws, z).reshape(-1, m).mean(0)
+    pred = model.posterior_predicative(draws, x=z, samples_per_step=1, progress_bar=False)
+    f_at_z = pred["f"].reshape(-1, m).mean(0)
     lengthscale = draws["lengthscale"].mean().item()
     distance = torch.cdist(z, z).masked_fill(f_at_z[:, None] * f_at_z[None, :] >= 0, float("inf"))
     nearest = distance.min(dim=1)
@@ -256,25 +258,25 @@ nuts_draws = trace.thin(2)
 variational_draws = {label: guide.sample(300) for label, guide in guides.items()}
 partners = {}
 for label, z in (("random Z", z_start), ("learned Z", z_learned)):
-    near_data, partners[label] = usefulness(functions[label], variational_draws[label], z)
-    accuracy, log_loss = test_metrics(functions[label], variational_draws[label])
+    near_data, partners[label] = usefulness(models[label], variational_draws[label], z)
+    accuracy, log_loss = test_metrics(models[label], variational_draws[label])
     print(f"{label:>9} (VI): {100 * near_data:.0f}% within 0.25 of the data, "
           f"{int((partners[label] >= 0).sum())}/{m} with a partner across the boundary, "
           f"test accuracy {accuracy:.3f}, test log loss {log_loss:.3f}")
-accuracy, log_loss = test_metrics(nuts_f, nuts_draws)
+accuracy, log_loss = test_metrics(nuts_model, nuts_draws)
 print(f"learned Z (NUTS): test accuracy {accuracy:.3f}, test log loss {log_loss:.3f}")
 
 # %%
 # The predictive probability and its uncertainty
 # ----------------------------------------------
-# ``gp_predictive`` evaluates ``f = K_*Z L⁻ᵀ v`` on a grid for
+# ``model.posterior_predicative`` evaluates ``f = K_*Z L⁻ᵀ v`` on a grid for
 # every NUTS draw. The left panel shows the posterior mean of
 # ``P(y = 1) = sigmoid(f)`` with the 0.5 decision boundary; grey segments join
 # inducing inputs that are partners across the boundary. The right panel
 # shows the posterior standard deviation of the probability: it is largest
 # along the boundary and away from the data.
 
-grid_probability = probabilities(nuts_f, nuts_draws, grid)
+grid_probability = probabilities(nuts_model, nuts_draws, grid)
 mean_surface = grid_probability.mean(0).reshape(mesh_x.shape)
 sd_surface = grid_probability.std(0).reshape(mesh_x.shape)
 
@@ -305,8 +307,8 @@ plt.show()
 
 fig, axes = plt.subplots(1, 2, figsize=(13, 5.4), layout="constrained")
 for ax, label, z in zip(axes, ("random Z", "learned Z"), (z_start, z_learned)):
-    accuracy, log_loss = test_metrics(functions[label], variational_draws[label])
-    surface = probabilities(functions[label], variational_draws[label], grid).mean(0).reshape(mesh_x.shape)
+    accuracy, log_loss = test_metrics(models[label], variational_draws[label])
+    surface = probabilities(models[label], variational_draws[label], grid).mean(0).reshape(mesh_x.shape)
     image = ax.contourf(mesh_x, mesh_y, surface, levels=20, cmap="RdBu_r", vmin=0, vmax=1)
     ax.contour(mesh_x, mesh_y, surface, levels=[0.5], colors="black", linewidths=1.5)
     scatter_classes(ax, size=6)

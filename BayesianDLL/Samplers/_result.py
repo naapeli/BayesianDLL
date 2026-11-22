@@ -263,15 +263,20 @@ class PredicativeResult:
     ``sample_prior_predicative``, and is ``None`` otherwise.
     """
 
-    def __init__(self, samples: dict[str, torch.Tensor], prior=None):
+    def __init__(self, samples: dict[str, torch.Tensor], prior=None, deterministic_samples: dict[str, torch.Tensor] = None):
         self.samples = samples
         self.prior = prior
+        self.deterministic = {} if deterministic_samples is None else deterministic_samples
 
     def __getitem__(self, key):
-        return self.samples[key]
+        if key in self.samples:
+            return self.samples[key]
+        if key in self.deterministic:
+            return self.deterministic[key]
+        raise KeyError(key)
 
     def __contains__(self, key):
-        return key in self.samples
+        return key in self.samples or key in self.deterministic
 
     def keys(self):
         return self.samples.keys()
@@ -307,7 +312,12 @@ class PredicativeResult:
         prior = self.prior
         if prior is not None and dim != 1:
             prior = prior.thin(step)
-        return PredicativeResult(thinned, prior=prior)
+        thinned_det = {}
+        if self.deterministic and dim != 1:
+            thinned_det = {name: val[s] for name, val in self.deterministic.items()}
+        elif self.deterministic:
+            thinned_det = dict(self.deterministic)
+        return PredicativeResult(thinned, prior=prior, deterministic_samples=thinned_det)
 
     def __repr__(self):
         return f"PredicativeResult(samples={list(self.samples.keys())})"

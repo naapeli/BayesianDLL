@@ -157,15 +157,13 @@ plt.show()
 # %%
 # Deep Neural Network with Composed Linear and Tanh Layers
 # ---------------------------------------------------------
-# Arbitrary neural network architectures can be constructed using native
-# deterministic layer blocks by composing :class:`~BayesianDLL.Deterministic.Linear`
-# and :class:`~BayesianDLL.Deterministic.Tanh` blocks. These blocks provide exact,
-# hand-derived reverse-mode vector-Jacobian products (VJPs) for all weight
-# and bias parameters without relying on PyTorch autograd.
+# Neural network architectures can be constructed using deterministic layer
+# blocks by composing :class:`~BayesianDLL.Deterministic.Linear` and
+# :class:`~BayesianDLL.Deterministic.Tanh` blocks.
 #
-# Here a two-hidden-layer MLP (1 -> 8 -> 8 -> 1) is fitted to a more complex
-# composite signal :math:`\sin(1.5 x) + 0.5 \sin(3.5 x)` with variational inference,
-# initialized from a type-II MAP estimate:
+# Here a two-hidden-layer MLP (1 -> 8 -> 8 -> 1) is fitted to a composite
+# signal :math:`\sin(1.5 x) + 0.5 \sin(3.5 x)` with variational inference,
+# initialized from a MAP estimate:
 
 h1_dim, h2_dim = 8, 8
 

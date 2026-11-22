@@ -1,5 +1,5 @@
 import torch
-
+import math
 import copy
 
 from ._active_model._active_model import get_active_model
@@ -185,6 +185,8 @@ class ObservedParameter:
         self.sampler = sampler  # for predicative sampling
         self.sampler_params = sampler_params
         self.plates = get_active_plates()
+        if hasattr(distribution, "_bind_observed"):
+            distribution._bind_observed(self, self.observed_values)
 
         if get_active_model() is not None:
             get_active_model().observed_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
@@ -251,6 +253,16 @@ class ObservedParameter:
     @property
     def predictive_shape(self):
         """Shape of a generated value, with plate sizes resolved at runtime."""
+        if not self.plates:
+            dist = self.distribution
+            batch = getattr(dist, "batch_shape", ())
+            event = getattr(dist, "event_shape", ())
+            dist_shape = tuple(batch) + tuple(event)
+            obs_shape = tuple(self.observed_values.shape)
+            if dist_shape and dist_shape != obs_shape:
+                if math.prod(dist_shape) == 1 and math.prod(obs_shape) > 1:
+                    return torch.Size(obs_shape)
+                return torch.Size(dist_shape)
         shape = list(self.observed_values.shape)
         for index, plate_info in enumerate(self.plates):
             if index < len(shape):

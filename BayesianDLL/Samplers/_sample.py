@@ -838,12 +838,14 @@ def sample_prior_predicative(n_samples=20, samples_per_step=500, warmup_per_samp
     model = get_active_model() if model is None else model
     return _ancestral_predictive(model, n_samples, samples_per_step, None, progress_bar, warmup_per_sample)
 
-def posterior_predicative(trace, n_samples=None, samples_per_step=20, warmup_per_sample=20, model=None, progress_bar=True):
+def posterior_predicative(trace=None, n_samples=None, samples_per_step=20, warmup_per_sample=20, model=None, progress_bar=True, predict_noise=None, **data):
     """Posterior predictive samples by exact ancestral sampling.
 
     ``trace`` is a :class:`SamplingResult` (or a dict of constrained traces of
     shape ``(n_chains, n_samples, ...)``) holding every random parameter of
-    ``model`` (the active model by default). ``n_samples`` evenly spaced
+    ``model`` (the active model by default). When ``trace`` is ``None`` (or
+    after :meth:`~BayesianDLL.Model.find_MAP`), the model's current parameter
+    values are used as a single draw. ``n_samples`` evenly spaced
     draws are taken from the chains concatenated (all draws when ``None``;
     more than the trace holds raises a ``RuntimeError``). For each draw the model parameters are set to it, the graph is
     walked in topological order and every observed node is sampled
@@ -862,33 +864,62 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, warmup_per
     """
     model = get_active_model() if model is None else model
 
-    n_chains, trace_length = next(iter(trace.values())).shape[:2]
-    flattened_trace = {name: values.flatten(0, 1) for name, values in trace.items()}
-    total_samples = n_chains * trace_length
+    old_data = {}
+    for key, val in data.items():
+        if key in model.data:
+            old_data[key] = model.data[key].value
+            model.data[key].set_value(val)
 
-    if n_samples is None:
-        n_samples = total_samples
-        indices = torch.arange(total_samples)
-    else:
-        if total_samples < n_samples:
-            raise RuntimeError(f"n_samples ({n_samples}) must be less than or equal to the total trace length ({total_samples}).")
-        # Integer positions computed on the host (the traces live on the CPU by default).
-        indices = torch.linspace(0, total_samples - 1, steps=n_samples, dtype=torch.float64, device="cpu").long()
+    try:
+        if trace is None:
+            trace = {
+                name: param.constrained_value.unsqueeze(0).unsqueeze(0)
+                for name, param in {**model.params, **model.enumerated_params}.items()
+            }
+        elif isinstance(trace, dict):
+            norm_trace = {}
+            for name, val in trace.items():
+                t_val = torch.as_tensor(val)
+                p = model.params.get(name) or model.enumerated_params.get(name)
+                param_shape = p.constrained_value.shape if p is not None else ()
+                extra_dims = t_val.dim() - len(param_shape)
+                if extra_dims == 0:
+                    t_val = t_val.unsqueeze(0).unsqueeze(0)
+                elif extra_dims == 1:
+                    t_val = t_val.unsqueeze(0)
+                norm_trace[name] = t_val
+            trace = norm_trace
 
-    missing = [name for name in model.params if name not in flattened_trace]
-    if missing:
-        raise KeyError(f"The trace has no draws of the random parameter(s) {missing}.")
+        n_chains, trace_length = next(iter(trace.values())).shape[:2]
+        flattened_trace = {name: values.flatten(0, 1) for name, values in trace.items()}
+        total_samples = n_chains * trace_length
 
-    device = model.device
+        if n_samples is None:
+            n_samples = total_samples
+            indices = torch.arange(total_samples)
+        else:
+            if total_samples < n_samples:
+                raise RuntimeError(f"n_samples ({n_samples}) must be less than or equal to the total trace length ({total_samples}).")
+            # Integer positions computed on the host (the traces live on the CPU by default).
+            indices = torch.linspace(0, total_samples - 1, steps=n_samples, dtype=torch.float64, device="cpu").long()
 
-    def parameter_values(i):
-        return {
-            name: parameter.distribution.transform.forward(flattened_trace[name][indices[i]].to(device))
-            for name, parameter in {**model.params, **model.enumerated_params}.items()
-            if name in flattened_trace
-        }
+        missing = [name for name in model.params if name not in flattened_trace]
+        if missing:
+            raise KeyError(f"The trace has no draws of the random parameter(s) {missing}.")
 
-    return _ancestral_predictive(model, n_samples, samples_per_step, parameter_values, progress_bar, warmup_per_sample)
+        device = model.device
+
+        def parameter_values(i):
+            return {
+                name: parameter.distribution.transform.forward(flattened_trace[name][indices[i]].to(device))
+                for name, parameter in {**model.params, **model.enumerated_params}.items()
+                if name in flattened_trace
+            }
+
+        return _ancestral_predictive(model, n_samples, samples_per_step, parameter_values, progress_bar, warmup_per_sample, predict_noise=predict_noise)
+    finally:
+        for key, val in old_data.items():
+            model.data[key].set_value(val)
 
 
 def _observed_parents(model):
@@ -936,7 +967,7 @@ class _MCMCFallback:
         return torch.stack(draws, dim=0)
 
 
-def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, progress_bar, warmup_per_sample):
+def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, progress_bar, warmup_per_sample, predict_noise=None):
     """Prior (``parameter_values is None``) or posterior predictive draws by ancestral sampling.
 
     ``parameter_values(i)`` returns the unconstrained parameter values of the
@@ -955,6 +986,17 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
     observed_parents = _observed_parents(model)
     replicated_parents = set().union(set(), *observed_parents.values())
     chained = bool(replicated_parents)
+
+    if not prior:
+        model._in_posterior_predictive = True
+        for parameter in observed_order:
+            if hasattr(parameter.distribution, "_in_posterior_predictive"):
+                parameter.distribution._in_posterior_predictive = True
+            if predict_noise is not None and hasattr(parameter.distribution, "predict_noise"):
+                parameter.distribution.predict_noise = predict_noise
+        for parameter in model.deterministic_params.values():
+            if hasattr(parameter, "_in_posterior_predictive"):
+                parameter._in_posterior_predictive = True
 
     if prior:
         for parameter in random_order:
@@ -984,6 +1026,7 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
     }
     prior_trace = {parameter.name: [] for parameter in random_order}
     prior_det_trace = {name: [] for name in model.deterministic_params}
+    predicative_det_samples = {name: [] for name in model.deterministic_params}
 
     saved_values = {name: parameter.unconstrained_value for name, parameter in latents.items()}
     saved_observed = {parameter.name: parameter._observed_values for parameter in observed_order}
@@ -1006,6 +1049,8 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
             else:
                 for name, value in parameter_values(i).items():
                     latents[name].set_unconstrained_value(value)
+                for name, parameter in model.deterministic_params.items():
+                    predicative_det_samples[name].append(torch.as_tensor(parameter.constrained_value).detach().clone().cpu())
 
             if not chained:
                 for parameter in observed_order:
@@ -1028,12 +1073,30 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
                 for parameter in observed_order:
                     parameter._observed_values = saved_observed[parameter.name]
     finally:
+        if not prior:
+            model._in_posterior_predictive = False
+            for parameter in observed_order:
+                if hasattr(parameter.distribution, "_in_posterior_predictive"):
+                    parameter.distribution._in_posterior_predictive = False
+            for parameter in model.deterministic_params.values():
+                if hasattr(parameter, "_in_posterior_predictive"):
+                    parameter._in_posterior_predictive = False
         for name, value in saved_values.items():
             latents[name].set_unconstrained_value(value)
         for parameter in observed_order:
             parameter._observed_values = saved_observed[parameter.name]
 
-    result = PredicativeResult(predicative_samples)
+    det_samples = {}
+    if not prior and predicative_det_samples:
+        det_samples = {
+            name: torch.stack(values, dim=0) for name, values in predicative_det_samples.items() if values
+        }
+    result = PredicativeResult(predicative_samples, deterministic_samples=det_samples)
+    if prior:
+        trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_trace.items() if values}
+        det_trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_det_trace.items() if values}
+        result.prior = SamplingResult(trace, [0], [[]], [[]], deterministic_trace=det_trace)
+    return result
     if prior:
         trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_trace.items() if values}
         det_trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_det_trace.items() if values}

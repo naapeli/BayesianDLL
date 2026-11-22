@@ -26,7 +26,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Bernoulli, Normal
-from BayesianDLL.GP import ConstantMean, LatentGP, RBF, gp_predictive
+from BayesianDLL.GP import ConstantMean, LatentGP, RBF
 
 
 torch.manual_seed(3)
@@ -70,13 +70,15 @@ print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-
 # %%
 # Latent function and probabilities
 # ---------------------------------
-# ``gp_predictive`` extends every posterior draw of ``f`` to a fine grid by
+# ``model.posterior_predicative`` extends every posterior draw of ``f`` to a fine grid by
 # conditioning on the sampled training values. Pushing the draws through
 # the sigmoid gives the posterior of the success probability; the band is
 # wide where data are sparse and at the edges of the input range.
 
 grid = torch.linspace(-3.5, 3.5, 150, dtype=torch.float64)
-latent = gp_predictive(f, trace.thin(4), grid, n_samples=4).reshape(-1, grid.numel())
+inputs.set_value(grid)
+pred = model.posterior_predicative(trace.thin(4), samples_per_step=4, progress_bar=False)
+latent = pred["f"].reshape(-1, grid.numel())
 probability = torch.sigmoid(latent)
 levels = torch.tensor([0.05, 0.5, 0.95], dtype=latent.dtype)
 latent_q = torch.quantile(latent, levels, dim=0)
