@@ -254,24 +254,24 @@ class Guide(Model, BaseGuide):
     covariance is block diagonal: every block between two groups or entries
     is exactly zero. Within a block:
 
-    ==============================  =====================  =====================================
-    piece                           unconstrained space    constrained space
-    ==============================  =====================  =====================================
-    Gaussian group                  exact: ``loc``,        identity transform: exact;
-                                    ``diag(scale^2)`` or   elementwise ``log``: exact log-normal
-                                    ``L L^T``              moments (full-rank: exact
-                                                           cross-covariances too); any other
-                                                           transform (logit, stick-breaking,
-                                                           ...): Monte Carlo
-    real-line entry                 exact if the family    exact if the latent's transform is
-                                    has closed-form        the identity and the moments are
-                                    moments, else MC       closed-form, else MC
-    support-matched entry           exact if the           exact if the family has closed-form
-                                    transform is the       moments, else MC
-                                    identity, else MC
-    deterministic (auxiliary) entry Monte Carlo            Monte Carlo
-    structured group                Monte Carlo            Monte Carlo
-    ==============================  =====================  =====================================
+    =================================  =====================  =====================================
+    piece                              unconstrained space    constrained space
+    =================================  =====================  =====================================
+    Gaussian group                     exact: ``loc``,        identity transform: exact;
+                                       ``diag(scale^2)`` or   elementwise ``log``: exact log-normal
+                                       ``L L^T``              moments (full-rank: exact
+                                                              cross-covariances too); any other
+                                                              transform (logit, stick-breaking,
+                                                              ...): Monte Carlo
+    real-line entry                    exact if the family    exact if the latent's transform is
+                                       has closed-form        the identity and the moments are
+                                       moments, else MC       closed-form, else MC
+    support-matched entry              exact if the           exact if the family has closed-form
+                                       transform is the       moments, else MC
+                                       identity, else MC
+    deterministic (auxiliary) entry    Monte Carlo            Monte Carlo
+    structured group                   Monte Carlo            Monte Carlo
+    =================================  =====================  =====================================
 
     The result lists the Monte Carlo blocks in ``estimated`` and their
     standard errors in ``standard_error``.

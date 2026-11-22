@@ -27,7 +27,7 @@ def plot_predicative_distribution(
     predicative_distribution : PredicativeResult
         Predictive draws of shape ``(n_samples, samples_per_step, *obs_shape)``
         per observed node, e.g. from ``posterior_predicative`` or
-        ``sample_prior_predicative``. All its variables are drawn on the same axes.
+        ``prior_predicative``. All its variables are drawn on the same axes.
     data : Tensor, optional
         Observed data to overlay (flattened); the same tensor is used for
         every variable.

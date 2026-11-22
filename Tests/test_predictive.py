@@ -8,7 +8,7 @@ import torch
 
 from BayesianDLL import (
     DeterministicParameter, Model, ObservedParameter, RandomParameter, plate,
-    posterior_predicative, sample_prior_predicative,
+    posterior_predicative, prior_predicative,
 )
 from BayesianDLL.Distributions import Bernoulli, Beta, Exponential, HalfNormal, Normal, Poisson
 from BayesianDLL.Samplers import SamplingResult
@@ -47,7 +47,7 @@ def test_prior_predictive_needs_no_mcmc_and_returns_prior_draws(monkeypatch):
         with plate("data", 4):
             ObservedParameter("y", Normal(mean, sigma), torch.zeros(4))
     original = model.params["mean"].unconstrained_value.clone()
-    result = sample_prior_predicative(3000, samples_per_step=4, model=model, progress_bar=False)
+    result = prior_predicative(3000, samples_per_step=4, model=model, progress_bar=False)
     assert result["y"].shape == (3000, 4, 4)
     prior = result.prior
     assert isinstance(prior, SamplingResult)
@@ -61,7 +61,7 @@ def test_prior_predictive_needs_no_mcmc_and_returns_prior_draws(monkeypatch):
     assert result["y"].var().item() == pytest.approx(5.0, rel=0.05)
     torch.testing.assert_close(model.params["mean"].unconstrained_value, original)
     # The model method returns the same kind of result.
-    assert model.sample_prior_predicative(5, samples_per_step=2, progress_bar=False).prior["sigma"].shape == (1, 5, 1)
+    assert model.prior_predicative(5, samples_per_step=2, progress_bar=False).prior["sigma"].shape == (1, 5, 1)
 
 
 def test_predictive_broadcasts_scalar_parameters_over_plates_independently(monkeypatch):
@@ -108,7 +108,7 @@ def test_predictive_with_enumerated_parameter(monkeypatch):
             )
             ObservedParameter("y", Normal(mean, 0.1), torch.zeros(4))
     _forbid_mcmc(monkeypatch)
-    prior = sample_prior_predicative(2000, samples_per_step=1, model=model, progress_bar=False)
+    prior = prior_predicative(2000, samples_per_step=1, model=model, progress_bar=False)
     assert prior.prior["z"].shape == (1, 2000, 4)
     assert prior.prior["z"].mean().item() == pytest.approx(0.5, abs=0.05)
     torch.testing.assert_close(prior["y"][:, 0] / 10, prior.prior["z"][0], atol=0.1, rtol=0)

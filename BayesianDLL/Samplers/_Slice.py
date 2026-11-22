@@ -43,6 +43,8 @@ class Slice(_CachedTarget):
         observation), a running estimate of the scale of its conditional
         distribution.
 
+    Notes
+    -----
     :meth:`step` returns ``(theta, mean_width, 1.0, False)``. After each call,
     ``last_stats`` holds ``n_evals`` (target evaluations of the step),
     ``accept_stat`` (always 1), ``step_size`` (mean width) and ``lp`` (log

@@ -7,7 +7,7 @@ Normal measurements are modelled with an unknown mean and standard deviation,
 ``sigma ~ HalfNormal(5)``.
 
 The **prior predictive** distribution shows what data the model expects
-before seeing any: ``sample_prior_predicative`` draws parameters from their
+before seeing any: ``prior_predicative`` draws parameters from their
 priors and then data from the likelihood, by ancestral sampling and without
 MCMC. Weakly informative priors should give replicated data on a plausible
 scale that comfortably covers the observations; the prior draws themselves
@@ -40,7 +40,7 @@ with Model() as model:
     with plate("observations", n_obs):
         ObservedParameter("y", Normal(mean, sigma), y)
 
-prior_predictive = model.sample_prior_predicative(30, samples_per_step=5, progress_bar=False)
+prior_predictive = model.prior_predicative(30, samples_per_step=5, progress_bar=False)
 print("\nprior draws of the parameters")
 print(summary(prior_predictive.prior).to_string())
 

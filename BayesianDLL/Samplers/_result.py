@@ -21,6 +21,7 @@ class SampleStats:
     ----------
     blocks : list of dict, optional
         List of block diagnostics dictionaries. Each dictionary contains:
+
         - ``"params"``: list of parameter names updated by this block.
         - ``"sampler"``: name of the sampler (e.g. ``"nuts"``, ``"metropolis"``,
           ``"slice"``, or ``"gibbs"``).
@@ -372,7 +373,7 @@ class PredicativeResult:
 
     ``prior`` holds the prior draws of the model parameters (a
     :class:`SamplingResult` with one chain) for results of
-    ``sample_prior_predicative``, and is ``None`` otherwise.
+    ``prior_predicative``, and is ``None`` otherwise.
     """
 
     def __init__(self, samples: dict[str, torch.Tensor], prior=None, deterministic_samples: dict[str, torch.Tensor] = None):

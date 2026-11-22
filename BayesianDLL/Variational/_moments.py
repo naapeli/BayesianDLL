@@ -45,7 +45,6 @@ class GuideMoments:
         names: the latents, in the order of the flat vector.
         shapes: ``{latent: shape}`` of each latent in ``space``.
         slices: ``{latent: (start, end)}`` of each latent in the flat vector.
-        mean: the flat mean vector.
         matrix: the full covariance matrix. Blocks between independent parts
             of the guide (different groups or hand-written entries) are
             exactly zero.

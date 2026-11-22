@@ -78,8 +78,28 @@ def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_fre
 
     The model's latents are left at the final values. Every
     ``callback_frequency`` epochs the log joint is recorded (and printed if
-    ``verbose``). Returns a :class:`MAPResult` containing the mode and
-    convergence history.
+    ``verbose``).
+
+    Parameters
+    ----------
+    model : Model
+        The probabilistic model to optimize.
+    lr : float, default 1e-2
+        Learning rate (step size) for Adam optimization.
+    epochs : int, default 100
+        Number of optimization steps.
+    betas : tuple[float, float], default (0.9, 0.999)
+        Exponential decay rates for the first and second moment estimates in Adam.
+    callback_frequency : int, default 1
+        Frequency (in epochs) at which log joint probability is recorded and printed.
+    verbose : bool, default True
+        Whether to print log joint probability during optimization.
+
+    Returns
+    -------
+    MAPResult
+        Object containing the mode parameters, history of log joint probabilities,
+        and final log probability.
     """
     history = []
 

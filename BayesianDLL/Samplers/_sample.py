@@ -421,17 +421,17 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
         Warn when the rank-normalised R-hat of a parameter exceeds 1.01
         (needs ``n_chains > 1`` and ``n_samples >= 50``).
     seed : int, optional
-        See below.
+        Integer random seed for reproducible sampling across chains.
     log_likelihood : bool, default True
-        See below.
+        Whether to evaluate and store pointwise log-likelihood draws for observed parameters (required for LOO/WAIC).
     chain_method : {"parallel", "vectorized"}, optional
-        See below.
+        Chain execution strategy: ``"parallel"`` runs worker processes on CPU; ``"vectorized"`` batches chains together in one process (required on GPU).
     device : str or torch.device, optional
-        See below.
+        Device to execute sampling on (e.g. ``"cpu"`` or ``"cuda"``).
     trace_device : str or torch.device or None, default "cpu"
-        See below.
+        Device to store traces and sample statistics on.
     **sampler_params
-        Sampler settings for every block, see below.
+        Sampler settings passed to all blocks (e.g. ``delta=0.8``, ``max_depth=10``, or ``metric`` for NUTS).
 
     Returns
     -------
@@ -480,10 +480,9 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
 
     ``log_likelihood=True`` records the elementwise log-likelihood
     ``log p(y_i | theta)`` of every observed node for every kept draw in
-    ``result.log_likelihood[name]`` (shape ``(n_chains, n_samples,
-    *log_density_shape)``), which :func:`~BayesianDLL.Evaluation.loo` and
-    :func:`~BayesianDLL.Evaluation.waic` use. Pass ``False`` to save the
-    memory and time.
+    ``result.log_likelihood[name]`` (shape ``(n_chains, n_samples, *log_density_shape)``),
+    which :func:`~BayesianDLL.Evaluation.loo` and :func:`~BayesianDLL.Evaluation.waic` use.
+    Pass ``False`` to save the memory and time.
 
     Remaining keyword arguments are sampler settings for every block (each
     sampler takes the ones it understands), e.g. ``delta=0.9`` or
@@ -815,7 +814,7 @@ def _sample_single_chain(chain, n_chains, model, initial_values, init_scale, n_s
     max_depths = [getattr(block.sampler, "max_depth", None) for block in blocks]
     return chain_trace, chain_det_trace, divergences_count, acceptance_probabilities, step_sizes, stats, max_depths, chain_enum_trace, chain_enum_probs, chain_log_lik
 
-def sample_prior_predicative(n_samples=20, samples_per_step=500, warmup_per_sample=100, model=None, progress_bar=True):
+def prior_predicative(n_samples=20, samples_per_step=500, model=None, progress_bar=True):
     """Draw from the prior predictive distribution by ancestral sampling.
 
     For each of the ``n_samples`` prior draws, the random parameters are
@@ -823,43 +822,50 @@ def sample_prior_predicative(n_samples=20, samples_per_step=500, warmup_per_samp
     ``samples_per_step`` data sets are generated from the likelihoods given
     those parameters.
 
-    Returns a :class:`PredicativeResult` with samples of shape
-    ``(n_samples, samples_per_step, *predictive_shape)``. Its ``prior``
-    attribute is a :class:`SamplingResult` (one chain of ``n_samples`` draws)
-    with the prior draws of the random and deterministic parameters, so
-    ``summary`` and the posterior plots work on it.
+    Parameters
+    ----------
+    n_samples : int, default=20
+        Number of parameter draws from the prior.
+    samples_per_step : int, default=500
+        Number of simulated data sets drawn per parameter setting.
+    model : Model, optional
+        The model to sample from (defaults to the active model).
+    progress_bar : bool, default=True
+        Whether to display a progress bar during sampling.
 
-    ``warmup_per_sample`` is only used by the MCMC fallback for distributions
-    that cannot be sampled directly. ``model`` defaults to the active model;
-    ``progress_bar`` shows a progress bar over the draws. A warning is issued
-    when the prior of a parameter depends on an observed node, because its
-    draws then condition on the observed data.
+    Returns
+    -------
+    PredicativeResult
+        Object containing predictive draws with shape ``(n_samples, samples_per_step, *predictive_shape)``.
+        Its ``prior`` attribute holds a :class:`SamplingResult` of the prior parameter draws.
     """
     model = get_active_model() if model is None else model
-    return _ancestral_predictive(model, n_samples, samples_per_step, None, progress_bar, warmup_per_sample)
+    return _ancestral_predictive(model, n_samples, samples_per_step, None, progress_bar)
 
-def posterior_predicative(trace, n_samples=None, samples_per_step=20, warmup_per_sample=20, model=None, progress_bar=True, predict_noise=None):
-    """Posterior predictive samples by exact ancestral sampling.
 
-    ``trace`` is a :class:`SamplingResult` (or a dict of constrained traces of
-    shape ``(n_chains, n_samples, ...)``) holding every random parameter of
-    ``model`` (the active model by default). For MAP estimates or point parameters,
-    pass ``model.point_trace()``. ``n_samples`` evenly spaced
-    draws are taken from the chains concatenated (all draws when ``None``;
-    more than the trace holds raises a ``RuntimeError``). For each draw the model parameters are set to it, the graph is
-    walked in topological order and every observed node is sampled
-    ``samples_per_step`` times with its distribution's ``sample`` method,
-    shaped like the node's ``predictive_shape`` (plate sizes, including
-    plates sized by mutable ``Data``, are resolved at call time). When an
-    observed node is a parent of another observed node, the child conditions
-    on the *replicated* value of the parent.
+def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, predict_noise=None):
+    """Draw posterior predictive samples by exact ancestral sampling.
 
-    A likelihood without a sampler (``sample`` raising ``NotImplementedError``
-    or missing) falls back to MCMC for that node only, with a warning; the
-    fallback uses ``warmup_per_sample`` warmup steps.
+    Parameters
+    ----------
+    trace : SamplingResult or dict[str, Tensor]
+        Posterior samples of model parameters (from :func:`~BayesianDLL.sample`).
+    n_samples : int or None, default=None
+        Number of posterior draws to evaluate (evenly spaced across the trace).
+        If ``None``, uses all draws in ``trace``.
+    samples_per_step : int, default=20
+        Number of observation draws per posterior parameter setting.
+    model : Model, optional
+        The model to sample from (defaults to the active model).
+    progress_bar : bool, default=True
+        Whether to display a progress bar during sampling.
+    predict_noise : bool or None, optional
+        Whether to include observation noise (for GPs).
 
-    Returns a :class:`PredicativeResult` of tensors with shape
-    ``(n_samples, samples_per_step, *predictive_shape)``.
+    Returns
+    -------
+    PredicativeResult
+        Object containing predictive draws with shape ``(n_samples, samples_per_step, *predictive_shape)``.
     """
     if trace is None:
         raise ValueError(
@@ -908,7 +914,7 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, warmup_per
             if name in flattened_trace
         }
 
-    return _ancestral_predictive(model, n_samples, samples_per_step, parameter_values, progress_bar, warmup_per_sample, predict_noise=predict_noise)
+    return _ancestral_predictive(model, n_samples, samples_per_step, parameter_values, progress_bar, predict_noise=predict_noise)
 
 
 def _observed_parents(model):
@@ -934,7 +940,7 @@ def _observed_parents(model):
 class _MCMCFallback:
     """MCMC draws for a node whose distribution cannot be sampled directly."""
 
-    def __init__(self, parameter, warmup):
+    def __init__(self, parameter, warmup=20):
         self.parameter = parameter
         self.warmup = warmup
         self.sampler = _decide_predicative_step(parameter)
@@ -956,7 +962,7 @@ class _MCMCFallback:
         return torch.stack(draws, dim=0)
 
 
-def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, progress_bar, warmup_per_sample, predict_noise=None):
+def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, progress_bar, predict_noise=None):
     """Prior (``parameter_values is None``) or posterior predictive draws by ancestral sampling.
 
     ``parameter_values(i)`` returns the unconstrained parameter values of the
@@ -1003,9 +1009,9 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
         if parameter.name not in fallbacks:
             warn(
                 f"{type(parameter.distribution).__name__} of '{parameter.name}' cannot be sampled directly; "
-                f"falling back to MCMC for this node ({warmup_per_sample} warmup steps per draw)."
+                f"falling back to MCMC for this node."
             )
-            fallbacks[parameter.name] = _MCMCFallback(parameter, warmup_per_sample)
+            fallbacks[parameter.name] = _MCMCFallback(parameter)
         return fallbacks[parameter.name].draw(n, shape, dtype).to(dtype)
 
     predicative_samples = {

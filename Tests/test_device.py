@@ -149,7 +149,7 @@ def scenario_predictive(device, dtype):
     model = regression_model().to(device, dtype)
     result = _sample(model)
     predictive = model.posterior_predicative(result, n_samples=5, samples_per_step=2, progress_bar=False)
-    prior = model.sample_prior_predicative(n_samples=5, samples_per_step=2, progress_bar=False)
+    prior = model.prior_predicative(n_samples=5, samples_per_step=2, progress_bar=False)
     return [predictive["y"], prior["y"]]
 
 

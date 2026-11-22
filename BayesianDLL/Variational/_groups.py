@@ -175,12 +175,6 @@ class Group:
     ----------
     names : list of str
         Names of the latents in the group.
-    loc : Tensor
-        Mean of the group in unconstrained space.
-    scale : Tensor
-        Standard deviations (mean-field groups).
-    scale_tril : Tensor
-        Lower Cholesky factor :math:`L` (full-rank groups).
     """
 
     def __init__(self, params, family=None, init_scale=0.1, name=None):

@@ -142,7 +142,7 @@ class _BatchedMutation:
             cholesky = torch.diag(variance.sqrt())
         self._cholesky = cholesky
         if self.kernel == "nuts":
-            self._sampler = VectorizedNUTS(self._continuous_log_target, self._continuous_gradient, self.n, delta=0.8, max_depth=8)
+            self._sampler = VectorizedNUTS(self._continuous_log_target, self._continuous_gradient, self.n, delta=0.8, max_depth=8, metric="diag")
             self._sampler.inv_metric = variance.expand(self.n, self.dim_c).clone()
         elif self.kernel == "slice":
             self._sampler = VectorizedSlice(self._continuous_log_target, _real_space(), self.n, adapt_width=False)

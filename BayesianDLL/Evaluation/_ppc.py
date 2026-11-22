@@ -88,21 +88,27 @@ def ppc_pvalue(predictive_result, observed, statistic="mean", var_name=None):
 
     Parameters
     ----------
-    predictive_result : PredicativeResult (e.g. from
-        :func:`~BayesianDLL.posterior_predicative`), whose samples have shape
-        ``(n_samples, samples_per_step, *obs_shape)``. Every replication is
-        treated as one replicated dataset.
-    observed : the observed data ``y`` (a tensor, or a dict by variable name).
-    statistic : a callable mapping one dataset (tensor of the observation
-        shape) to a scalar, or one of ``"mean"``, ``"std"`` (with Bessel's
-        correction), ``"min"``, ``"max"``, ``"median"``, ``"n_zeros"``,
-        ``"skew"`` (moment coefficient of skewness), ``"q05"``, ``"q95"``.
-    var_name : the predicted variable; required when there are several.
+    predictive_result : PredicativeResult
+        Posterior predictive result (e.g. from :func:`~BayesianDLL.posterior_predicative`),
+        whose samples have shape ``(n_samples, samples_per_step, *obs_shape)``. Every
+        replication is treated as one replicated dataset.
+    observed : torch.Tensor or dict[str, torch.Tensor]
+        The observed data ``y`` against which the test statistic is evaluated.
+    statistic : str or callable, default "mean"
+        Test statistic function. Can be a callable mapping a dataset tensor to a
+        scalar, or one of ``"mean"``, ``"std"`` (with Bessel's correction), ``"min"``,
+        ``"max"``, ``"median"``, ``"n_zeros"``, ``"skew"`` (moment coefficient of
+        skewness), ``"q05"``, ``"q95"``.
+    var_name : str, optional
+        Name of the predicted variable to test. Required if the predictive result
+        contains multiple observed nodes.
 
     Returns
     -------
-    PPCResult with ``p_value``, ``t_observed`` and ``t_rep``. P-values close
-    to 0 or 1 indicate that the model does not reproduce the statistic.
+    PPCResult
+        Object containing ``p_value``, ``t_observed``, and ``t_rep``. Extreme p-values
+        close to 0 or 1 indicate that the model systematically fails to reproduce the
+        test statistic.
     """
     var_name, replicated, observed = _replicated_datasets(predictive_result, observed, var_name)
     if isinstance(statistic, str):

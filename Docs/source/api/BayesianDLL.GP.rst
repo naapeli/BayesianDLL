@@ -1,8 +1,13 @@
 Gaussian Processes
 ==================
 
-.. automodule:: BayesianDLL.GP
-   :members:
-   :show-inheritance:
-   :imported-members:
-   :exclude-members: stable_cholesky, batched_stable_cholesky, levinson_solve, SparseGP, SparseLatentGP, sparse_gp_predictive, sparse_latent_gp_predictive
+BayesianDLL provides Gaussian process priors with exact marginal likelihoods, latent GPs,
+sparse inducing-point approximations, and structured Kronecker and Toeplitz linear algebra.
+Kernels and mean functions support automatic relevance determination (ARD) and composable operations.
+
+.. toctree::
+   :maxdepth: 2
+
+   gp/models
+   gp/kernels
+   gp/means

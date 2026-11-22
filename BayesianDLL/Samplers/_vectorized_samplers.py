@@ -467,6 +467,8 @@ class VectorizedNUTS:
         if self.inv_metric is None:
             return z
         if self.metric == "dense":
+            if self._inv_metric_chol is None:
+                self._inv_metric_chol = torch.linalg.cholesky(self.inv_metric)
             # With M^-1 = L L^T, r = L^-T z has covariance M.
             return torch.linalg.solve_triangular(self._inv_metric_chol.transpose(-2, -1), z.unsqueeze(-1), upper=True).squeeze(-1)
         return z / torch.sqrt(self.inv_metric)

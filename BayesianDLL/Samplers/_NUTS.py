@@ -116,6 +116,8 @@ class NUTS:
         full covariance (dense), or the marginal variances (diag).
         A dense metric accounts for correlations between parameters.
 
+    Notes
+    -----
     After each call of :meth:`step`, ``last_stats`` holds the iteration's
     statistics: ``step_size`` (used for the trajectory), ``accept_stat``
     (``alpha``), ``tree_depth`` (number of doublings), ``n_leapfrog``,

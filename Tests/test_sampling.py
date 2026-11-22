@@ -136,7 +136,7 @@ def test_predictive_sampling_shapes_and_restoration(normal_model):
     normal_model.observed_params["data"].sampler = "metropolis"
     original = normal_model.params["mean"].constrained_value.clone()
     trace = {"mean": torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]])}
-    result = posterior_predicative(trace, n_samples=3, samples_per_step=6, warmup_per_sample=3, model=normal_model, progress_bar=False)
+    result = posterior_predicative(trace, n_samples=3, samples_per_step=6, model=normal_model, progress_bar=False)
     assert isinstance(result, PredicativeResult)
     assert result["data"].shape == (3, 6, 3)
     assert torch.isfinite(result["data"]).all()
@@ -145,7 +145,7 @@ def test_predictive_sampling_shapes_and_restoration(normal_model):
 
 def test_predictive_default_uses_all_trace_draws(normal_model):
     normal_model.observed_params["data"].sampler = "metropolis"
-    result = posterior_predicative({"mean": torch.zeros(2, 3, 1)}, samples_per_step=2, warmup_per_sample=1, model=normal_model, progress_bar=False)
+    result = posterior_predicative({"mean": torch.zeros(2, 3, 1)}, samples_per_step=2, model=normal_model, progress_bar=False)
     assert result["data"].shape == (6, 2, 3)
 
 
@@ -173,7 +173,7 @@ def test_predictive_sampling_resolves_data_backed_plate_at_runtime():
 
     trace = {"mean": torch.zeros(1, 2, 1)}
     result = model.posterior_predicative(
-        trace, n_samples=2, samples_per_step=3, warmup_per_sample=1,
+        trace, n_samples=2, samples_per_step=3,
         progress_bar=False,
     )
     assert result["likelihood"].shape == (2, 3, 2)
@@ -190,7 +190,7 @@ def test_prior_predictive_runs_no_mcmc(normal_model, monkeypatch):
     calls = []
     monkeypatch.setattr(module, "sample", lambda *args, **kwargs: calls.append(args))
     normal_model.observed_params["data"].sampler = "metropolis"
-    result = normal_model.sample_prior_predicative(n_samples=2, samples_per_step=2, warmup_per_sample=1, progress_bar=False)
+    result = normal_model.prior_predicative(n_samples=2, samples_per_step=2, progress_bar=False)
     # The prior predictive is drawn by ancestral sampling and runs no MCMC.
     assert calls == []
     assert normal_model.observed_params is original
@@ -204,7 +204,7 @@ def test_prior_predictive_restores_parameters_on_failure(normal_model, monkeypat
         raise ValueError("sampling failed")
     monkeypatch.setattr(distribution, "sample", fail)
     with pytest.raises(ValueError, match="sampling failed"):
-        normal_model.sample_prior_predicative(progress_bar=False)
+        normal_model.prior_predicative(progress_bar=False)
     torch.testing.assert_close(normal_model.params["mean"].unconstrained_value, original)
 
 
@@ -234,7 +234,7 @@ def test_predictive_falls_back_to_mcmc_without_sampler(normal_model, monkeypatch
     monkeypatch.setattr(module, "_decide_predicative_step", spy)
     trace = {"mean": torch.full((1, 4, 1), 2.0)}
     with pytest.warns(UserWarning, match="falling back to MCMC"):
-        result = posterior_predicative(trace, n_samples=2, samples_per_step=30, warmup_per_sample=30, model=normal_model, progress_bar=False)
+        result = posterior_predicative(trace, n_samples=2, samples_per_step=30, model=normal_model, progress_bar=False)
     assert calls == ["data"]
     assert result["data"].shape == (2, 30, 3)
     assert abs(result["data"].mean().item() - 2.0) < 0.6
@@ -245,7 +245,7 @@ def test_predictive_transforms_constrained_priors_and_observations():
         rate = RandomParameter("rate", Exponential(1.0))
         ObservedParameter("data", Exponential(rate), torch.ones(1), sampler="metropolis")
     trace = SamplingResult({"rate": torch.tensor([[[2.0], [3.0]]])}, [], [], [], {"twice": torch.tensor([[[4.0], [6.0]]])})
-    result = posterior_predicative(trace, n_samples=2, samples_per_step=8, warmup_per_sample=5, model=model, progress_bar=False)
+    result = posterior_predicative(trace, n_samples=2, samples_per_step=8, model=model, progress_bar=False)
     assert (result["data"] > 0).all()
     assert rate.constrained_value.item() == 1
 

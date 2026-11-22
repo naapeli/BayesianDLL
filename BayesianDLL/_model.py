@@ -1183,16 +1183,56 @@ class Model:
 
 
     def sample(self, n_samples, warmup_length, n_chains=4, progress_bar=True, init_scale=1, blocks=None, seed=None, **sampler_params):
-        """Sample the posterior; see :func:`BayesianDLL.sample` (e.g. ``chain_method="vectorized"``, ``device="cuda"``).
+        """Draw posterior samples from this model using MCMC.
 
-        ``init_scale`` is the standard deviation of the Gaussian jitter added to the initial
-        unconstrained values of each chain.
+        Parameters
+        ----------
+        n_samples : int
+            Number of recorded posterior draws per chain.
+        warmup_length : int
+            Number of warmup (adaptation) steps per chain.
+        n_chains : int, default 4
+            Number of MCMC chains to run.
+        progress_bar : bool, default True
+            Whether to show progress bars during sampling.
+        init_scale : float, default 1
+            Standard deviation of the Gaussian jitter added to the initial parameter values.
+        blocks : list, optional
+            Custom Gibbs sampling blocks (default creates standard NUTS/Gibbs blocks).
+        seed : int, optional
+            Integer seed for reproducible sampling across chains.
+        **sampler_params
+            Additional settings passed to the underlying samplers (e.g. ``delta=0.8`` for NUTS).
+
+        Returns
+        -------
+        SamplingResult
+            Object containing parameter traces, diagnostics, and sample statistics.
         """
         from .Samplers import sample as _sample
         return _sample(n_samples, warmup_length, n_chains=n_chains, model=self, progress_bar=progress_bar, init_scale=init_scale, blocks=blocks, seed=seed, **sampler_params)
 
     def find_MAP(self, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
-        """Maximum a posteriori estimate of this model; see :func:`BayesianDLL.find_MAP`."""
+        """Find the maximum a posteriori (MAP) estimate using Adam.
+
+        Parameters
+        ----------
+        lr : float, default 1e-2
+            Learning rate (step size) for Adam optimization.
+        epochs : int, default 100
+            Number of optimization steps.
+        betas : tuple[float, float], default (0.9, 0.999)
+            Exponential decay rates for moment estimates.
+        callback_frequency : int, default 1
+            Frequency (in epochs) at which log joint probability is recorded.
+        verbose : bool, default True
+            Whether to print optimization progress.
+
+        Returns
+        -------
+        MAPResult
+            Object containing mode parameters and convergence history.
+        """
         from .Variational import find_MAP as _find_MAP
         return _find_MAP(self, lr=lr, epochs=epochs, betas=betas, callback_frequency=callback_frequency, verbose=verbose)
     
@@ -1294,22 +1334,80 @@ class Model:
                 device = getattr(p.constrained_value, "device", None)
                 p.set_constrained_value(torch.as_tensor(val, device=device))
 
-    def posterior_predicative(self, trace, n_samples=None, samples_per_step=20, warmup_per_sample=20, progress_bar=True, predict_noise=None):
-        """Posterior predictive draws for ``trace``; see :func:`BayesianDLL.posterior_predicative`."""
-        from .Samplers import posterior_predicative as _pp
-        return _pp(trace=trace, n_samples=n_samples, samples_per_step=samples_per_step, warmup_per_sample=warmup_per_sample, model=self, progress_bar=progress_bar, predict_noise=predict_noise)
+    def posterior_predicative(self, trace, n_samples=None, samples_per_step=20, progress_bar=True, predict_noise=None):
+        """Draw posterior predictive samples conditional on observed data.
 
-    def sample_prior_predicative(self, n_samples=20, samples_per_step=500, warmup_per_sample=100, progress_bar=True):
-        """Prior predictive draws; see :func:`BayesianDLL.sample_prior_predicative`."""
-        from .Samplers import sample_prior_predicative as _spp
-        return _spp(n_samples, samples_per_step, warmup_per_sample, model=self, progress_bar=progress_bar)
+        Parameters
+        ----------
+        trace : SamplingResult or dict[str, torch.Tensor]
+            Posterior parameter draws (e.g. from :meth:`sample`).
+        n_samples : int, optional
+            Number of posterior draws to evaluate (evenly spaced across the trace). If None, uses all.
+        samples_per_step : int, default 20
+            Number of simulated datasets per parameter setting.
+        progress_bar : bool, default True
+            Whether to show a progress bar.
+        predict_noise : bool or None, optional
+            Whether to include observation noise (for GP likelihoods).
+
+        Returns
+        -------
+        PredicativeResult
+            Predictive draws of observed variables.
+        """
+        from .Samplers import posterior_predicative as _pp
+        return _pp(trace=trace, n_samples=n_samples, samples_per_step=samples_per_step, model=self, progress_bar=progress_bar, predict_noise=predict_noise)
+
+    def prior_predicative(self, n_samples=20, samples_per_step=500, progress_bar=True):
+        """Draw samples from the prior predictive distribution by ancestral sampling.
+
+        Parameters
+        ----------
+        n_samples : int, default 20
+            Number of parameter draws from the prior.
+        samples_per_step : int, default 500
+            Number of simulated datasets per parameter setting.
+        progress_bar : bool, default True
+            Whether to show a progress bar.
+
+        Returns
+        -------
+        PredicativeResult
+            Predictive draws of observed variables, with prior parameter draws in ``.prior``.
+        """
+        from .Samplers import prior_predicative as _pp
+        return _pp(n_samples=n_samples, samples_per_step=samples_per_step, model=self, progress_bar=progress_bar)
 
     def condition(self, random_variable_names_and_values=None, **kwargs):
-        """A conditioned copy of this model; see :func:`BayesianDLL.condition`."""
+        """Return a copy of this model with variables fixed to given values.
+
+        Parameters
+        ----------
+        random_variable_names_and_values : dict, optional
+            Mapping from variable names (or objects) to fixed values.
+        **kwargs
+            Additional variables and values as keyword arguments.
+
+        Returns
+        -------
+        Model
+            A new compiled model with conditioned variables.
+        """
         return condition(self, random_variable_names_and_values, **kwargs)
 
     def marginalize(self, names):
-        """A copy of this model with ``names`` summed out; see :func:`BayesianDLL.marginalize`."""
+        """Return a copy of this model with discrete parameters summed out.
+
+        Parameters
+        ----------
+        names : str, RandomParameter, or list of str/RandomParameter
+            Name(s) of finite discrete parameters to sum out.
+
+        Returns
+        -------
+        Model
+            A new compiled model with the parameters marginalized out.
+        """
         return marginalize(self, names)
 
 
@@ -1336,6 +1434,20 @@ def condition(model: Model, random_variable_names_and_values: dict = None, **kwa
     ``Data`` node a new value. Values are reshaped (or broadcast) to the
     node's shape and must lie in its distribution's state space. The
     original model is not modified.
+
+    Parameters
+    ----------
+    model : Model
+        The probabilistic model to condition.
+    random_variable_names_and_values : dict, optional
+        Mapping from variable names (or objects) to fixed values.
+    **kwargs
+        Additional variables and values as keyword arguments.
+
+    Returns
+    -------
+    Model
+        A new compiled model with the specified variables conditioned.
 
     Raises
     ------
@@ -1450,6 +1562,18 @@ def marginalize(model: Model, names) -> Model:
     they are no longer sampled, every log density and gradient of the new
     model is that of the marginal model, and :func:`~BayesianDLL.sample`
     adds exact posterior draws of them to the result.
+
+    Parameters
+    ----------
+    model : Model
+        The probabilistic model to marginalize.
+    names : str, RandomParameter, or list of str/RandomParameter
+        Name(s) of finite discrete parameters to sum out.
+
+    Returns
+    -------
+    Model
+        A new compiled model with the specified parameters marginalized out.
     """
     from ._parameters import _check_enumerable
     if not isinstance(model, Model):
@@ -1499,7 +1623,25 @@ def point_trace(model=None):
 def predict(parameters=None, samples_per_step=20, model=None, progress_bar=False, predict_noise=None):
     """Draw predictive samples using a single point setting of parameters.
 
-    See :meth:`~BayesianDLL.Model.predict`.
+    Parameters
+    ----------
+    parameters : dict[str, torch.Tensor] or MAPResult, optional
+        Parameter dictionary mapping parameter names to point values, or a
+        :class:`~BayesianDLL.Variational.MAPResult`. If ``None``, uses the model's
+        current parameter values.
+    samples_per_step : int, default 20
+        Number of observation draws per parameter setting.
+    model : Model, optional
+        The model to sample predictions from (defaults to the active model).
+    progress_bar : bool, default False
+        Whether to show a progress bar.
+    predict_noise : bool or None, optional
+        Whether to include observation noise (for GP likelihoods).
+
+    Returns
+    -------
+    PredicativeResult
+        Predictive samples of observed nodes.
     """
     model = get_active_model() if model is None else model
     return model.predict(
@@ -1508,5 +1650,68 @@ def predict(parameters=None, samples_per_step=20, model=None, progress_bar=False
         progress_bar=progress_bar,
         predict_noise=predict_noise,
     )
+
+
+def prior_predicative(n_samples=20, samples_per_step=500, model=None, progress_bar=True):
+    """Draw from the prior predictive distribution by ancestral sampling.
+
+    Parameters
+    ----------
+    n_samples : int, default 20
+        Number of parameter draws from the prior.
+    samples_per_step : int, default 500
+        Number of simulated data sets drawn per parameter setting.
+    model : Model, optional
+        The model to sample from (defaults to the active model).
+    progress_bar : bool, default True
+        Whether to display a progress bar during sampling.
+
+    Returns
+    -------
+    PredicativeResult
+        Object containing predictive draws with shape ``(n_samples, samples_per_step, *predictive_shape)``.
+        Its ``prior`` attribute holds a :class:`SamplingResult` of the prior parameter draws.
+    """
+    model = get_active_model() if model is None else model
+    return model.prior_predicative(
+        n_samples=n_samples,
+        samples_per_step=samples_per_step,
+        progress_bar=progress_bar,
+    )
+
+
+def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, predict_noise=None):
+    """Draw posterior predictive samples by exact ancestral sampling.
+
+    Parameters
+    ----------
+    trace : SamplingResult or dict[str, torch.Tensor]
+        Posterior samples of model parameters (e.g. from :func:`~BayesianDLL.sample`).
+    n_samples : int or None, default None
+        Number of posterior draws to evaluate (evenly spaced across the trace).
+        If ``None``, uses all draws in ``trace``.
+    samples_per_step : int, default 20
+        Number of observation draws per posterior parameter setting.
+    model : Model, optional
+        The model to sample from (defaults to the active model).
+    progress_bar : bool, default True
+        Whether to display a progress bar during sampling.
+    predict_noise : bool or None, optional
+        Whether to include observation noise (for GP likelihoods).
+
+    Returns
+    -------
+    PredicativeResult
+        Object containing predictive draws with shape ``(n_samples, samples_per_step, *predictive_shape)``.
+    """
+    model = get_active_model() if model is None else model
+    return model.posterior_predicative(
+        trace=trace,
+        n_samples=n_samples,
+        samples_per_step=samples_per_step,
+        progress_bar=progress_bar,
+        predict_noise=predict_noise,
+    )
+
 
 

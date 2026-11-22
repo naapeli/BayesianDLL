@@ -27,16 +27,21 @@ def bfmi(result, block=None):
     indicate that the momentum resampling explores the energy distribution
     poorly, which usually points to heavy tails or a poor parametrisation.
 
-    Args:
-        result: A :class:`SamplingResult` (or its ``sample_stats``) of a run
-            with a NUTS block, or an energy tensor of shape
-            ``(n_chains, n_draws)`` (a 1-d tensor is read as a single chain).
-        block: Index of the sampling block whose ``"energy"`` statistics to
-            use. Default ``None`` picks the only block that records energies
-            and raises a ``ValueError`` if there are none or several.
+    Parameters
+    ----------
+    result : SamplingResult or torch.Tensor
+        A :class:`SamplingResult` (or its ``sample_stats``) of a run
+        with a NUTS block, or an energy tensor of shape
+        ``(n_chains, n_draws)`` (a 1D tensor is read as a single chain).
+    block : int or None, optional
+        Index of the sampling block whose ``"energy"`` statistics to
+        use. Default ``None`` picks the only block that records energies
+        and raises a ``ValueError`` if there are none or several.
 
-    Returns:
-        A tensor of shape ``(n_chains,)``.
+    Returns
+    -------
+    torch.Tensor
+        A tensor of shape ``(n_chains,)`` containing the E-BFMI diagnostic for each chain.
     """
     energy = _energy_from(result, block)
     energy = torch.as_tensor(energy)
