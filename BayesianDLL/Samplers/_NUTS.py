@@ -111,10 +111,10 @@ class NUTS:
     adapt_mass_matrix : bool, default True
         Whether to adapt the metric during warmup; it is only adapted after
         :meth:`set_warmup_length` and for at least 20 warmup steps.
-    metric : {"diag", "dense"}, default "diag"
+    metric : {"diag", "dense"}, default "dense"
         The adapted inverse metric (posterior covariance estimate): the
-        marginal variances, or the full covariance, which helps with strongly
-        correlated posteriors.
+        full covariance (dense), or the marginal variances (diag).
+        A dense metric accounts for correlations between parameters.
 
     After each call of :meth:`step`, ``last_stats`` holds the iteration's
     statistics: ``step_size`` (used for the trajectory), ``accept_stat``
@@ -123,7 +123,7 @@ class NUTS:
     selected point) and ``lp`` (log density at the selected point).
     """
 
-    def __init__(self, log_target, gradient, inverse_transformation, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True, metric="diag"):
+    def __init__(self, log_target, gradient, inverse_transformation, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True, metric="dense"):
         if metric not in ("diag", "dense"):
             raise ValueError(f"metric must be 'diag' or 'dense', got {metric!r}.")
         self.log_target = log_target

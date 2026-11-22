@@ -373,8 +373,8 @@ class VectorizedNUTS:
     ``chain_method="parallel"`` is the slice-sampling variant of Hoffman and
     Gelman (2014). Both leave the posterior invariant.
 
-    Step sizes (dual averaging), the inverse metric (``"diag"`` or
-    ``"dense"``, Stan's windowed adaptation with per-chain Welford
+    Step sizes (dual averaging), the inverse metric (``"dense"`` or
+    ``"diag"``, Stan's windowed adaptation with per-chain Welford
     estimates) and all statistics are per chain. The statistics match those
     of :class:`~BayesianDLL.Samplers.NUTS`: ``step_size``, ``accept_stat``,
     ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` and ``lp``,
@@ -388,7 +388,7 @@ class VectorizedNUTS:
 
     def __init__(self, log_target, gradient, n_chains, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10,
                  kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0,
-                 adapt_mass_matrix=True, metric="diag"):
+                 adapt_mass_matrix=True, metric="dense"):
         from ._NUTS import _adaptation_windows
         if metric not in ("diag", "dense"):
             raise ValueError(f"metric must be 'diag' or 'dense', got {metric!r}.")
