@@ -34,12 +34,12 @@ with Model() as model:
     with plate("flips", n_flips):
         ObservedParameter("flips", Bernoulli(p), flips)
 
-result = model.sample(1000, 500, n_chains=4, seed=0, delta=0.85, progress_bar=False, chain_method="vectorized")
+result = model.sample(2000, 500, n_chains=4, seed=0, delta=0.85, progress_bar=False, chain_method="vectorized")
 print(summary(result).to_string())
 a_post, b_post = a_prior + successes, b_prior + n_flips - successes
 print(f"exact posterior mean {a_post / (a_post + b_post):.3f}")
 
-predictive = model.posterior_predicative(result, n_samples=2000, samples_per_step=10, progress_bar=False)
+predictive = model.posterior_predicative(result, n_samples=3000, samples_per_step=10, progress_bar=False)
 new_successes = predictive["flips"].reshape(-1, n_flips).sum(1).long()
 
 
