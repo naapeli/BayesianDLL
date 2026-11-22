@@ -5,3 +5,4 @@ Gaussian Processes
    :members:
    :show-inheritance:
    :imported-members:
+   :exclude-members: stable_cholesky, batched_stable_cholesky, levinson_solve

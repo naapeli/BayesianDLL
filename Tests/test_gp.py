@@ -939,3 +939,56 @@ def test_gp_classes_reject_a_per_input_vector_mean():
             SparseGP("sparse", inputs, RBF(0.4, 1.3), x[:2].clone(), noise_variance=0.1, mean=train_mean)
         with pytest.raises(ValueError, match="MeanFunction"):
             LatentGP("latent", inputs, RBF(0.4, 1.3), mean=vector_node)
+
+
+def test_exact_gp_and_latent_gp_sparse_merging():
+    """ExactGP and LatentGP construct sparse variants when inducing_points is provided."""
+    x = torch.linspace(0.0, 1.0, 10, dtype=torch.float64)
+    z = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    kernel = RBF(0.5, 1.0)
+
+    with Model():
+        inputs = Data("x", x)
+        # ExactGP without inducing_points is dense ExactGP
+        dense_gp = ExactGP("dense", inputs, kernel, noise_variance=0.1)
+        assert type(dense_gp) is ExactGP
+        assert isinstance(dense_gp, ExactGP)
+        assert not isinstance(dense_gp, SparseGP)
+
+        # ExactGP with inducing_points is SparseGP
+        sparse_gp = ExactGP("sparse", inputs, kernel, noise_variance=0.1, inducing_points=z)
+        assert isinstance(sparse_gp, ExactGP)
+        assert isinstance(sparse_gp, SparseGP)
+        assert sparse_gp.inducing_points is z
+
+        # LatentGP without inducing_points is dense LatentGP
+        dense_latent = LatentGP("dense_lat", inputs, kernel)
+        assert type(dense_latent) is LatentGP
+        assert isinstance(dense_latent, LatentGP)
+
+        # LatentGP with inducing_points is SparseLatentGP
+        sparse_latent = LatentGP("sparse_lat", inputs, kernel, inducing_points=z)
+        assert isinstance(sparse_latent, LatentGP)
+        assert hasattr(sparse_latent, "gp_inducing_points")
+
+        # exact_gp_predictive dispatching on sparse GP
+        trace = {
+            "rbf_lengthscale": torch.tensor([[0.5]]),
+            "rbf_variance": torch.tensor([[1.0]]),
+            "noise": torch.tensor([[0.1]]),
+        }
+        y_obs = torch.sin(x)
+        x_new = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
+        pred = exact_gp_predictive(sparse_gp, trace, y_obs, x_new, n_samples=2)
+        assert pred.shape == (1, 2, 5)
+
+        # gp_predictive dispatching on sparse latent GP
+        trace_lat = {
+            "sparse_lat_white": torch.randn(1, 1, 4, dtype=torch.float64),
+            "rbf_lengthscale": torch.tensor([[0.5]]),
+            "rbf_variance": torch.tensor([[1.0]]),
+        }
+        pred_lat = gp_predictive(sparse_latent, trace_lat, x_new, n_samples=3)
+        assert pred_lat.shape == (1, 3, 5)
+
+

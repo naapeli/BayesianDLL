@@ -69,11 +69,8 @@ __all__ = [
     "exact_gp_predictive",
     "SparseGP",
     "sparse_gp_predictive",
-    "stable_cholesky",
-    "batched_stable_cholesky",
     "KroneckerGP",
     "kronecker_gp_predictive",
     "ToeplitzGP",
     "toeplitz_gp_predictive",
-    "levinson_solve",
 ]

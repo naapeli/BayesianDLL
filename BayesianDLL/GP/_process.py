@@ -351,6 +351,8 @@ class LatentGP(DeterministicParameter):
         \mathbf{f} = \mathbf{m}(X) + \mathbf{L} \mathbf{z}, \quad \mathbf{z} \sim \mathcal{N}(\mathbf{0}, \mathbf{I})
 
     where :math:`\mathbf{L}` is the Cholesky factor of :math:`\mathbf{K}(X, X) + \text{jitter} \cdot \mathbf{I}`.
+    If ``inducing_points`` is provided, constructs a sparse latent GP approximation
+    using :class:`SparseLatentGP`.
 
     Parameters
     ----------
@@ -370,7 +372,14 @@ class LatentGP(DeterministicParameter):
     latent_name : str, optional
         Name of the latent parameter created when ``latent`` is not provided.
         Defaults to ``f"{name}_white"``.
+    inducing_points : torch.Tensor or Data or Parameter, optional
+        Inducing locations :math:`Z`. If provided, dispatches to :class:`SparseLatentGP`.
     """
+
+    def __new__(cls, *args, inducing_points=None, **kwargs):
+        if cls is LatentGP and (inducing_points is not None or kwargs.get("inducing_points") is not None):
+            return super().__new__(SparseLatentGP)
+        return super().__new__(cls)
 
     def __init__(
         self,
@@ -381,6 +390,9 @@ class LatentGP(DeterministicParameter):
         mean=None,
         jitter=1e-6,
         latent_name=None,
+        inducing_points=None,
+        whitened_values=None,
+        **kwargs,
     ):
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
@@ -555,6 +567,9 @@ class ExactGP(_GPDistribution):
 
         \mathbf{y} \sim \mathcal{N}\left(\mathbf{m}(X), \mathbf{K}(X, X) + \sigma^2 \mathbf{I}\right)
 
+    If ``inducing_points`` is provided, constructs a sparse GP approximation
+    using :class:`SparseGP`.
+
     Parameters
     ----------
     name : str
@@ -571,9 +586,32 @@ class ExactGP(_GPDistribution):
         A constant or scalar node is automatically wrapped in :class:`~BayesianDLL.GP.ConstantMean`.
     jitter : float, default 1e-6
         Relative diagonal jitter added to :math:`\mathbf{K} + \sigma^2 \mathbf{I}` for numerical stability.
+    inducing_points : torch.Tensor or Data or Parameter, optional
+        Inducing locations :math:`Z`. If provided, dispatches to :class:`SparseGP`.
+    method : {"vfe", "dtc", "fitc"}, default "vfe"
+        Approximation method when ``inducing_points`` is provided.
+    n_outputs : int, optional
+        Number of independent outputs sharing the inputs when ``inducing_points`` is provided.
     """
 
-    def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=None, jitter=1e-6):
+    def __new__(cls, *args, inducing_points=None, **kwargs):
+        if cls is ExactGP and (inducing_points is not None or kwargs.get("inducing_points") is not None):
+            return super().__new__(SparseGP)
+        return super().__new__(cls)
+
+    def __init__(
+        self,
+        name,
+        inputs,
+        kernel: Kernel,
+        noise_variance=1e-6,
+        mean=None,
+        jitter=1e-6,
+        inducing_points=None,
+        method="vfe",
+        n_outputs=None,
+        **kwargs,
+    ):
         super().__init__()
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
@@ -692,7 +730,7 @@ class ExactGP(_GPDistribution):
 _SPARSE_METHODS = ("vfe", "dtc", "fitc")
 
 
-class SparseGP(_GPDistribution):
+class SparseGP(ExactGP):
     r"""Sparse inducing-point Gaussian Process marginal likelihood approximation.
 
     Uses the deterministic training conditional (DTC) / projected process approximation
@@ -722,9 +760,45 @@ class SparseGP(_GPDistribution):
         Relative diagonal jitter added to :math:`\mathbf{K}_{mm}` for numerical stability.
     """
 
-    def __init__(self, name, inputs, kernel: Kernel, inducing_points, noise_variance=1e-6, mean=None, method="vfe", jitter=1e-6,
-                 n_outputs=None):
-        super().__init__()
+    def __new__(cls, *args, **kwargs):
+        return super(ExactGP, cls).__new__(cls)
+
+    def __init__(
+        self,
+        name,
+        inputs,
+        kernel: Kernel,
+        *args,
+        inducing_points=None,
+        noise_variance=1e-6,
+        mean=None,
+        method="vfe",
+        jitter=1e-6,
+        n_outputs=None,
+        **kwargs,
+    ):
+        if inducing_points is None and len(args) > 0:
+            inducing_points = args[0]
+            args = args[1:]
+        if len(args) > 0:
+            noise_variance = args[0]
+            args = args[1:]
+        if len(args) > 0:
+            mean = args[0]
+            args = args[1:]
+        if len(args) > 0:
+            method = args[0]
+            args = args[1:]
+        if len(args) > 0:
+            jitter = args[0]
+            args = args[1:]
+        if len(args) > 0:
+            n_outputs = args[0]
+            args = args[1:]
+        if inducing_points is None:
+            raise TypeError("SparseGP requires inducing_points.")
+
+        _GPDistribution.__init__(self)
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
         if not _is_named(inputs):
@@ -999,8 +1073,8 @@ class SparseGP(_GPDistribution):
 def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
     """Sample latent GP values at new inputs from posterior latent traces.
 
-    ``gp`` is a :class:`LatentGP`. ``trace`` may be a ``SamplingResult`` or
-    a mapping with values of shape ``(n_chains, n_draws, *shape)``
+    ``gp`` is a :class:`LatentGP` (or :class:`SparseLatentGP`). ``trace`` may be a
+    ``SamplingResult`` or a mapping with values of shape ``(n_chains, n_draws, *shape)``
     containing the GP's deterministic trace (``trace[gp.name]``). Kernel
     parameters, the parameters of the mean function and learnable training
     inputs are read from the trace draw by draw; a node missing from the
@@ -1011,6 +1085,17 @@ def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
     inputs for that draw; a given ``observation_noise`` variance is added to
     the diagonal. The result has shape ``(n_parameter_draws, n_samples, n_new)``.
     """
+    if isinstance(gp, SparseLatentGP):
+        samples = sparse_latent_gp_predictive(
+            gp,
+            trace,
+            inputs,
+            n_samples=n_samples,
+        )
+        if observation_noise is not None:
+            noise_std = _input_value(observation_noise).to(dtype=samples.dtype, device=samples.device).sqrt()
+            samples = samples + noise_std * torch.randn_like(samples)
+        return samples
     if not hasattr(gp, "gp_kernel"):
         raise TypeError("gp must be a LatentGP function returned by BayesianDLL.GP.LatentGP.")
     if not hasattr(trace, "__getitem__"):
@@ -1098,8 +1183,8 @@ def exact_gp_predictive(
 ):
     """Sample exact-GP predictions conditional on observed training values.
 
-    ``gp`` is an :class:`ExactGP`, ``observed_values`` the training
-    observations ``y`` (``(N,)``) and ``inputs`` the new inputs. ``trace``
+    ``gp`` is an :class:`ExactGP` (or :class:`SparseGP`), ``observed_values`` the
+    training observations ``y`` (``(N,)``) and ``inputs`` the new inputs. ``trace``
     (values of shape ``(n_chains, n_draws, *shape)``) contains only
     hyperparameter draws; the latent function is integrated out during
     inference and is sampled here from the GP posterior
@@ -1113,6 +1198,15 @@ def exact_gp_predictive(
     noisy observations. The returned tensor has shape
     ``(n_parameter_draws, n_samples, n_new)``.
     """
+    if isinstance(gp, SparseGP):
+        return sparse_gp_predictive(
+            gp,
+            trace,
+            observed_values,
+            inputs,
+            n_samples=n_samples,
+            observation_noise=observation_noise,
+        )
     if not isinstance(gp, ExactGP):
         raise TypeError(
             "gp must be an ExactGP distribution returned by BayesianDLL.GP.ExactGP."
@@ -1335,7 +1429,7 @@ def sparse_gp_predictive(
 # ----------------------------------------------------------------------------
 
 
-class SparseLatentGP(DeterministicParameter):
+class SparseLatentGP(LatentGP):
     r"""Whitened sparse inducing-point latent Gaussian Process function node.
 
     Represents the approximate GP function values :math:`\mathbf{f}` at inputs :math:`X`
@@ -1368,16 +1462,40 @@ class SparseLatentGP(DeterministicParameter):
         Name of the latent parameter created if ``latent`` is omitted. Defaults to ``f"{name}_white"``.
     """
 
+    def __new__(cls, *args, **kwargs):
+        return super(LatentGP, cls).__new__(cls)
+
     def __init__(
         self,
         name,
         inputs,
         kernel: Kernel,
-        inducing_points,
+        *args,
+        inducing_points=None,
         whitened_values=None,
+        latent=None,
         mean=None,
         jitter=1e-6,
+        latent_name=None,
+        **kwargs,
     ):
+        if inducing_points is None and len(args) > 0:
+            inducing_points = args[0]
+            args = args[1:]
+        if whitened_values is None and latent is not None:
+            whitened_values = latent
+        elif whitened_values is None and len(args) > 0:
+            whitened_values = args[0]
+            args = args[1:]
+        if mean is None and len(args) > 0:
+            mean = args[0]
+            args = args[1:]
+        if jitter == 1e-6 and len(args) > 0:
+            jitter = args[0]
+            args = args[1:]
+
+        if inducing_points is None:
+            raise TypeError("SparseLatentGP requires inducing_points.")
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
         if not _is_named(inputs):
@@ -1389,7 +1507,7 @@ class SparseLatentGP(DeterministicParameter):
         mean = as_mean_function(mean, "SparseLatentGP")
         m = _feature_count(inducing_points)
         if whitened_values is None:
-            whitened_values = RandomParameter(f"{name}_white", Normal(0.0, 1.0), shape=m)
+            whitened_values = RandomParameter(latent_name or f"{name}_white", Normal(0.0, 1.0), shape=m)
         if not _is_named(whitened_values) or isinstance(whitened_values, Data):
             raise TypeError("whitened_values must be a named model parameter node.")
         if whitened_values.constrained_value.numel() != m:
@@ -1416,7 +1534,7 @@ class SparseLatentGP(DeterministicParameter):
             flags = [False] * len(values)
             return _finish(self._batched_vjp(_as_tensor(cotangent).unsqueeze(0), values, flags), False)
 
-        super().__init__(name, forward, None, model_inputs, vjp_func=vjp)
+        DeterministicParameter.__init__(self, name, forward, None, model_inputs, vjp_func=vjp)
         self.gp_inputs = inputs
         self.gp_inducing_points = inducing_points
         self.gp_latent = whitened_values
