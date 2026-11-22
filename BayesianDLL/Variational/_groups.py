@@ -368,14 +368,6 @@ class Group:
         L = self.scale_tril
         return L @ L.transpose(-2, -1)
 
-    def mean(self, space="unconstrained", n_samples=4000, seed=0):
-        """``{latent: mean}`` of the group in ``space`` (see :meth:`moments`)."""
-        return self.moments(space, n_samples, seed).means()
-
-    def covariance(self, space="unconstrained", n_samples=4000, seed=0):
-        """Covariance of the group in ``space`` (see :meth:`moments`)."""
-        return self.moments(space, n_samples, seed)
-
     def moments(self, space="unconstrained", n_samples=4000, seed=0):
         """Mean and covariance of the group in ``"unconstrained"`` or ``"constrained"`` space.
 
@@ -396,8 +388,9 @@ class Group:
             return self.guide._piece_moments(self._structured_piece(), space, n_samples, seed)
         loc = self.loc
         cov = self._unconstrained_covariance()
+        groups = {self.name: list(self.names)} if self.name is not None else {}
         if space == "unconstrained":
-            return GuideMoments(space, self.names, dict(self.layout.shapes), loc, cov)
+            return GuideMoments(space, self.names, dict(self.layout.shapes), loc, cov, groups=groups)
 
         kinds = {latent: _elementwise_kind(self.model.params[latent].distribution.transform) for latent in self.names}
         exact = [latent for latent in self.names if kinds[latent][0] != "other"]
@@ -444,7 +437,7 @@ class Group:
                 shapes[latent] = tuple(self.model.params[latent].constrained_value.shape)
             else:
                 shapes[latent] = tuple(self.layout.shapes[latent])
-        result = GuideMoments(space, self.names, shapes, dtype=loc.dtype, device=loc.device)
+        result = GuideMoments(space, self.names, shapes, dtype=loc.dtype, device=loc.device, groups=groups)
         if estimated:
             # Monte Carlo for the blocks that involve another transform, from
             # draws of this group only (a mean-field group's latents are

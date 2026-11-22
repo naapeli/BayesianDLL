@@ -163,18 +163,18 @@ def test_full_rank_group_recovers_the_correlated_block():
     torch.manual_seed(0)
     grouped = Guide(model, default_family="full_rank")
     BBVI(model, grouped, n_samples=4, epochs=1000, lr=0.03, lrd=0.999, verbose=False)
-    fitted = grouped.covariance()
-    torch.testing.assert_close(fitted.mean, mean, atol=0.05, rtol=0)
+    fitted = grouped.moments()
+    torch.testing.assert_close(fitted.mean(), mean, atol=0.05, rtol=0)
     torch.testing.assert_close(fitted.matrix, covariance, atol=0.2 * covariance.abs().max().item(), rtol=0)
 
     torch.manual_seed(0)
     mean_field = Guide(model, default_family="mean_field")
     BBVI(model, mean_field, n_samples=4, epochs=1000, lr=0.03, lrd=0.999, verbose=False)
-    diagonal = mean_field.covariance().matrix.diagonal()
+    diagonal = mean_field.moments().matrix.diagonal()
     # Mean-field matches the conditional variances 1 / precision_ii, far below the marginal ones.
     torch.testing.assert_close(diagonal, 1 / precision.diagonal(), rtol=0.25, atol=0)
     assert (diagonal < 0.5 * covariance.diagonal()).all()
-    assert mean_field.covariance().matrix[0, 1].item() == 0.0
+    assert mean_field.moments().matrix[0, 1].item() == 0.0
 
 
 # Reference values computed with the removed AutoNormal / AutoMultivariateNormal
@@ -230,20 +230,19 @@ def test_unconstrained_moments_are_exact():
     group.loc_parameter.set_new_value(torch.tensor([0.7, -0.2]))
     L = torch.tensor([[0.3, 0.0], [0.1, 0.5]])
     group.scale_tril_parameter.set_new_value(L)
-    result = guide.covariance()
+    result = guide.moments()
     assert result.estimated == [] and result.n_samples is None
     torch.testing.assert_close(result.matrix, L @ L.T)
     torch.testing.assert_close(result.covariance(), L @ L.T)
     torch.testing.assert_close(result.covariance("mean"), result.block("mean"))
     assert "mean" in result.covariances() and "sigma" in result.covariances()
-    torch.testing.assert_close(result.mean, torch.tensor([0.7, -0.2]))
-    means = guide.mean()
-    torch.testing.assert_close(means["sigma"], torch.tensor([-0.2]))
-    torch.testing.assert_close(group.covariance().matrix, L @ L.T)
+    torch.testing.assert_close(result.mean(), torch.tensor([0.7, -0.2]))
+    torch.testing.assert_close(guide.moments().mean("sigma"), torch.tensor([-0.2]))
+    torch.testing.assert_close(group.moments().matrix, L @ L.T)
 
     guide = Guide(model, default_family="mean_field")
     guide.groups[0].scales["sigma"].set_new_value(torch.tensor([0.4]))
-    torch.testing.assert_close(guide.covariance().matrix, torch.diag(torch.tensor([0.01, 0.16])))
+    torch.testing.assert_close(guide.moments().matrix, torch.diag(torch.tensor([0.01, 0.16])))
 
 
 @pytest.mark.parametrize("family", ["mean_field", "full_rank"])
@@ -258,11 +257,11 @@ def test_constrained_log_normal_moments_match_monte_carlo(family):
     else:
         group.loc_parameter.set_new_value(torch.tensor([0.3, 0.1]))
         group.scale_tril_parameter.set_new_value(torch.tensor([[0.6, 0.0], [0.3, 0.4]]))
-    result = guide.covariance("constrained")
+    result = guide.moments("constrained")
     assert result.estimated == []
     z = group.sample_unconstrained(400000, torch.Generator().manual_seed(0))
     draws = torch.stack([z[:, 0], torch.exp(z[:, 1])], dim=1)
-    torch.testing.assert_close(result.mean, draws.mean(0), rtol=0.01, atol=0.005)
+    torch.testing.assert_close(result.mean(), draws.mean(0), rtol=0.01, atol=0.005)
     torch.testing.assert_close(result.matrix, torch.cov(draws.T), rtol=0.03, atol=0.003)
     if family == "full_rank":
         assert result.matrix[0, 1].abs() > 0.05
@@ -280,20 +279,20 @@ def test_monte_carlo_blocks_are_flagged_and_reproducible():
     group.loc_parameter.set_new_value(torch.tensor([0.2, -0.1]))
     group.scale_tril_parameter.set_new_value(torch.tensor([[0.5, 0.0], [0.4, 0.3]]))
     state = torch.random.get_rng_state()
-    result = guide.covariance("constrained", n_samples=4000, seed=3)
+    result = guide.moments("constrained", n_samples=4000, seed=3)
     assert torch.equal(torch.random.get_rng_state(), state)  # the global generator is untouched
     assert result.estimated == ["p"] and result.exact == ["a"] and result.n_samples == 4000
     assert set(result.standard_error) == {"p"}
     # The identity block is exact even inside a group with an estimated latent.
     torch.testing.assert_close(result.block("a"), torch.tensor([[0.25]]))
-    torch.testing.assert_close(result.mean[1:], torch.tensor([-0.1]))
+    torch.testing.assert_close(result.mean()[1:], torch.tensor([-0.1]))
     z = group.sample_unconstrained(400000, torch.Generator().manual_seed(1))
     p_draws = torch.sigmoid(z[:, 0])
-    assert result.mean[0].item() == pytest.approx(p_draws.mean().item(), abs=4 * result.standard_error["p"].item())
+    assert result.mean()[0].item() == pytest.approx(p_draws.mean().item(), abs=4 * result.standard_error["p"].item())
     assert result.standard_error["p"].item() == pytest.approx(p_draws.std().item() / math.sqrt(4000), rel=0.1)
     cross = torch.cov(torch.stack([p_draws, z[:, 1]]))[0, 1]
     assert result.block("p", "a").item() == pytest.approx(cross.item(), abs=0.01)
-    again = guide.covariance("constrained", n_samples=4000, seed=3)
+    again = guide.moments("constrained", n_samples=4000, seed=3)
     torch.testing.assert_close(again.matrix, result.matrix)
 
 
@@ -303,25 +302,25 @@ def test_cross_group_blocks_are_zero_and_entries_use_closed_forms():
         Group(["a", "b"], family="full_rank")
         RandomParameter("sigma", LogNormal(VariationalParameter("m", torch.tensor([-0.2])), VariationalParameter("s", torch.tensor([0.4]))))
     for space in ("unconstrained", "constrained"):
-        result = guide.covariance(space)
+        result = guide.moments(space)
         assert result.names == ["a", "b", "c", "sigma"]
         for first, second in (("a", "c"), ("b", "sigma"), ("c", "sigma")):
             assert torch.count_nonzero(result.block(first, second)) == 0
     # A support-matched LogNormal entry is exact in the constrained space ...
-    constrained = guide.covariance("constrained")
+    constrained = guide.moments("constrained")
     assert constrained.estimated == []
     reference = LogNormal(torch.tensor([-0.2]), torch.tensor([0.4]))
     torch.testing.assert_close(constrained.block("sigma"), torch.diag(reference.variance()))
-    torch.testing.assert_close(guide.mean("constrained")["sigma"], reference.mean())
+    torch.testing.assert_close(guide.moments("constrained").mean("sigma"), reference.mean())
     # ... and Monte Carlo in the unconstrained space, where it is a Normal(-0.2, 0.4).
-    unconstrained = guide.covariance("unconstrained", n_samples=20000)
+    unconstrained = guide.moments("unconstrained", n_samples=20000)
     assert unconstrained.estimated == ["sigma"]
-    assert unconstrained.mean[-1].item() == pytest.approx(-0.2, abs=0.02)
+    assert unconstrained.mean()[-1].item() == pytest.approx(-0.2, abs=0.02)
     assert unconstrained.block("sigma").item() == pytest.approx(0.16, rel=0.05)
     # A real-line entry is exact in the unconstrained space.
     with Guide(model, default_family="mean_field") as guide:
         RandomParameter("sigma", Normal(VariationalParameter("m", torch.tensor([-0.2])), VariationalParameter("s", torch.tensor([0.4]))))
-    result = guide.covariance()
+    result = guide.moments()
     assert result.estimated == []
     assert result.block("sigma").item() == pytest.approx(0.16)
 
@@ -435,9 +434,9 @@ def test_entry_without_an_exact_sampler_raises():
     with pytest.raises(NotImplementedError, match="no exact sampler"):
         elbo(model, guide, n_samples=2)
     # Closed-form moments need no sampler; Monte Carlo ones do.
-    assert guide.covariance().estimated == []
+    assert guide.moments().estimated == []
     with pytest.raises(NotImplementedError, match="no exact sampler"):
-        guide.covariance("constrained")
+        guide.moments("constrained")
 
 
 def test_minibatch_bbvi_with_a_grouped_guide():
@@ -542,12 +541,12 @@ def test_structured_group_recovers_the_conditional_posterior():
     precision[1:, 0] = -1.0
     precision[1:, 1:] = torch.eye(J) * (1 + 4)
     exact = torch.linalg.inv(precision)
-    fitted = guide.covariance(n_samples=20000)
+    fitted = guide.moments(n_samples=20000)
     assert fitted.estimated == ["mu", "theta"]
     torch.testing.assert_close(fitted.block("mu", "theta"), exact[:1, 1:], atol=0.02, rtol=0)
     # A mean-field guide has no cross-covariance at all.
     mean_field = Guide(model, default_family="mean_field")
-    assert torch.count_nonzero(mean_field.covariance().block("mu", "theta")) == 0
+    assert torch.count_nonzero(mean_field.moments().block("mu", "theta")) == 0
 
 
 def test_structured_group_errors():
@@ -589,7 +588,7 @@ def test_structured_group_samples_exactly():
     torch.testing.assert_close(draws.mean(0), mean, atol=0.04, rtol=0)
     torch.testing.assert_close(torch.cov(draws.T), covariance, atol=0.04, rtol=0)
     for space in ("unconstrained", "constrained"):
-        result = guide.covariance(space, n_samples=2000)
+        result = guide.moments(space, n_samples=2000)
         assert result.estimated == ["mu", "theta"] and set(result.standard_error) == {"mu", "theta"}
         torch.testing.assert_close(result.matrix, covariance, atol=0.08, rtol=0)
 

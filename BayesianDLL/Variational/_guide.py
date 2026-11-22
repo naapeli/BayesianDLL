@@ -526,36 +526,6 @@ class Guide(Model, BaseGuide):
         return trace_from_values(self.model, values, n_chains, n_samples)
 
     # --- moments --------------------------------------------------------------
-    def mean(self, space="unconstrained", n_samples=4000, seed=0):
-        """Return posterior means ``{latent: mean}`` under the guide.
-
-        Convenience shortcut that evaluates the guide's joint moments via
-        :meth:`covariance` and returns the reshaped means per latent parameter.
-
-        Parameters
-        ----------
-        space : {"unconstrained", "constrained"}, default "unconstrained"
-            Coordinate space in which the moments are computed.
-        n_samples : int, default 4000
-            Number of Monte Carlo draws for latents whose moments have no closed
-            form.
-        seed : int, default 0
-            Seed for Monte Carlo moment estimates.
-
-        Returns
-        -------
-        dict[str, Tensor]
-            Mapping from latent parameter name to its mean tensor.
-        """
-        return self.moments(space, n_samples, seed).means()
-
-    def covariance(self, space="unconstrained", n_samples=4000, seed=0):
-        """Compute the joint moments (mean and block-diagonal covariance) of the guide.
-
-        Returns a :class:`~BayesianDLL.Variational.GuideMoments` object.
-        """
-        return self.moments(space, n_samples, seed)
-
     def moments(self, space="unconstrained", n_samples=4000, seed=0):
         """Compute the joint moments (mean and block-diagonal covariance) of the guide.
 
@@ -651,7 +621,9 @@ class Guide(Model, BaseGuide):
         n = int(n_samples)
         draws = self._mc_draws(piece, latents, space, n, seed, shapes, dtype, reference.device)
         mean, matrix, standard_error = mc_moments(torch.cat([draws[name] for name in latents], dim=1))
-        result = GuideMoments(space, latents, shapes, mean=mean, matrix=matrix)
+        group_name = getattr(piece, "name", None) or getattr(getattr(piece, "group", None), "name", None)
+        groups = {group_name: list(latents)} if group_name is not None else {}
+        result = GuideMoments(space, latents, shapes, mean=mean, matrix=matrix, groups=groups)
         result.set_standard_errors(latents, standard_error, latents, n)
         result.estimated = list(latents)
         return result

@@ -148,12 +148,11 @@ plt.show()
 # %%
 # Moments of a structured group
 # -----------------------------
-# Inside a structured group the latents depend on each other through
-# arbitrary blocks, so ``guide.covariance(...)`` estimates its moments by
-# Monte Carlo in both spaces, from exact ancestral draws, and lists them in
-# ``estimated``.
+# ``guide.moments(...)`` returns a :class:`~BayesianDLL.Variational.GuideMoments`
+# object. Inside a structured group where latents depend on each other,
+# moments are estimated by Monte Carlo from exact ancestral draws.
 
-mean = structured.mean("constrained", n_samples=2000)
-result = structured.covariance("constrained", n_samples=2000)
-print(f"estimated: {result.estimated}, n = {result.n_samples}")
-print(f"E[tau] = {mean['tau'].item():.2f} +- {result.standard_error['tau'].item():.2f}")
+m = structured.moments("constrained", n_samples=2000)
+print(f"estimated: {m.estimated}, n = {m.n_samples}")
+print(f"E[tau] = {m.mean('tau').item():.2f} +- {m.standard_error['tau'].item():.2f}")
+print(f"E[mu] = {m.mean('mu').item():.2f}, var(mu) = {m.variance('mu').item():.2f}")

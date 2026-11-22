@@ -58,10 +58,11 @@ class GuideMoments:
             everything is exact).
     """
 
-    def __init__(self, space, names, shapes, mean=None, matrix=None, dtype=None, device=None):
+    def __init__(self, space, names, shapes, mean=None, matrix=None, dtype=None, device=None, groups=None):
         self.space = space
         self.names = list(names)
         self.shapes = {name: tuple(shapes[name]) for name in self.names}
+        self.groups = dict(groups) if groups is not None else {}
         self.slices = {}
         offset = 0
         for name in self.names:
@@ -73,21 +74,21 @@ class GuideMoments:
             mean = torch.zeros(self.dim, dtype=dtype, device=device)
         if matrix is None:
             matrix = torch.zeros(self.dim, self.dim, dtype=mean.dtype, device=mean.device)
-        self.mean = mean
+        self._mean_vector = mean
         self.matrix = matrix
         self.estimated = []
         self.standard_error = {}
         self.n_samples = None
 
     def _index(self, names):
-        return torch.cat([torch.arange(*self.slices[name], device=self.mean.device) for name in names])
+        return torch.cat([torch.arange(*self.slices[name], device=self._mean_vector.device) for name in names])
 
     def set_block(self, names, mean, matrix):
         """Write the moments of the latents ``names`` (flat, in that order)."""
         index = self._index(names)
-        self.mean = self.mean.clone()
+        self._mean_vector = self._mean_vector.clone()
         self.matrix = self.matrix.clone()
-        self.mean[index] = mean.to(self.mean.dtype)
+        self._mean_vector[index] = mean.to(self._mean_vector.dtype)
         self.matrix[index.unsqueeze(-1), index.unsqueeze(0)] = matrix.to(self.matrix.dtype)
 
     def set_standard_errors(self, names, standard_error, keep, n_samples):
@@ -100,23 +101,130 @@ class GuideMoments:
             offset += size
         self.n_samples = int(n_samples)
 
-    def means(self, name=None):
-        """Dict of shaped means ``{latent: mean}``, or the shaped mean tensor for a single latent ``name``."""
-        if name is not None:
-            return self.mean[slice(*self.slices[name])].reshape(self.shapes[name])
-        return {n: self.mean[slice(*self.slices[n])].reshape(self.shapes[n]) for n in self.names}
+    def mean(self, latent=None, group=None):
+        """The posterior mean tensor.
 
-    _means = means
+        Parameters
+        ----------
+        latent : str or list of str, optional
+            A single latent name or list of latent names. If a single name is
+            given, returns the mean tensor reshaped to that parameter's shape.
+            If a list is given, returns the 1-D concatenated mean vector.
+        group : str, optional
+            A named group. If given, returns the 1-D concatenated mean vector
+            for all latents belonging to that group.
 
-    def covariance(self, first=None, second=None):
-        """The full covariance matrix if arguments are omitted, or the block between ``first`` and ``second``."""
-        if first is None and second is None:
-            return self.matrix
-        return self.block(first, second)
+        Returns
+        -------
+        torch.Tensor
+            The mean tensor. When neither ``latent`` nor ``group`` is given,
+            returns the full 1-D mean vector of all parameters.
+        """
+        if group is not None:
+            if latent is not None:
+                raise ValueError("Specify either 'latent' or 'group', not both.")
+            if group not in self.groups:
+                raise KeyError(f"Group '{group}' not found in guide groups: {list(self.groups.keys())}")
+            index = self._index(self.groups[group])
+            return self._mean_vector[index]
+        if latent is not None:
+            if isinstance(latent, str):
+                if latent not in self.slices:
+                    raise KeyError(f"Latent '{latent}' not found in moments latents: {self.names}")
+                return self._mean_vector[slice(*self.slices[latent])].reshape(self.shapes[latent])
+            index = self._index(latent)
+            return self._mean_vector[index]
+        return self._mean_vector
+
+    def means(self, latent=None, group=None):
+        """Alias for :meth:`mean`."""
+        return self.mean(latent=latent, group=group)
+
+    _means = mean
+
+    def variance(self, latent=None, group=None):
+        """The posterior marginal variance tensor.
+
+        Parameters
+        ----------
+        latent : str or list of str, optional
+            A single latent name or list of latent names. If a single name is
+            given, returns the variance tensor reshaped to that parameter's shape.
+            If a list is given, returns the 1-D concatenated variance vector.
+        group : str, optional
+            A named group. If given, returns the 1-D concatenated variance vector
+            for all latents belonging to that group.
+
+        Returns
+        -------
+        torch.Tensor
+            The variance tensor. When neither ``latent`` nor ``group`` is given,
+            returns the full 1-D marginal variance vector of all parameters.
+        """
+        diagonal = torch.diagonal(self.matrix)
+        if group is not None:
+            if latent is not None:
+                raise ValueError("Specify either 'latent' or 'group', not both.")
+            if group not in self.groups:
+                raise KeyError(f"Group '{group}' not found in guide groups: {list(self.groups.keys())}")
+            index = self._index(self.groups[group])
+            return diagonal[index]
+        if latent is not None:
+            if isinstance(latent, str):
+                if latent not in self.slices:
+                    raise KeyError(f"Latent '{latent}' not found in moments latents: {self.names}")
+                return diagonal[slice(*self.slices[latent])].reshape(self.shapes[latent])
+            index = self._index(latent)
+            return diagonal[index]
+        return diagonal
+
+    def variances(self, latent=None, group=None):
+        """Alias for :meth:`variance`."""
+        return self.variance(latent=latent, group=group)
+
+    def covariance(self, latent=None, group=None, second=None):
+        """The posterior covariance matrix.
+
+        Parameters
+        ----------
+        latent : str or list of str, optional
+            A single latent name or list of latent names. If a single name is
+            given, returns a 2-D covariance matrix for that parameter (a 1x1
+            matrix for a scalar parameter). If a list is given, returns the
+            joint covariance submatrix for those parameters.
+        group : str, optional
+            A named group. If given, returns the joint 2-D covariance matrix for
+            all latents belonging to that group.
+        second : str, optional
+            If given alongside ``latent``, returns the cross-covariance block
+            between ``latent`` and ``second``.
+
+        Returns
+        -------
+        torch.Tensor
+            A 2-D covariance matrix. When neither ``latent`` nor ``group`` is given,
+            returns the full joint covariance matrix.
+        """
+        if second is not None:
+            return self.block(latent, second)
+        if group is not None:
+            if latent is not None:
+                raise ValueError("Specify either 'latent' or 'group', not both.")
+            if group not in self.groups:
+                raise KeyError(f"Group '{group}' not found in guide groups: {list(self.groups.keys())}")
+            index = self._index(self.groups[group])
+            return self.matrix[index.unsqueeze(-1), index.unsqueeze(0)]
+        if latent is not None:
+            if isinstance(latent, str):
+                index = self._index([latent])
+                return self.matrix[index.unsqueeze(-1), index.unsqueeze(0)]
+            index = self._index(latent)
+            return self.matrix[index.unsqueeze(-1), index.unsqueeze(0)]
+        return self.matrix
 
     def covariances(self):
         """``{latent: covariance_block}`` for each latent."""
-        return {name: self.block(name) for name in self.names}
+        return {name: self.covariance(name) for name in self.names}
 
     def block(self, first, second=None):
         """The covariance block between the flattened latents ``first`` and ``second`` (default ``first``)."""
@@ -126,20 +234,13 @@ class GuideMoments:
     def __getitem__(self, name):
         return self.block(name)
 
-    def variances(self, name=None):
-        """Dict of shaped variances ``{latent: variance}``, or the shaped variance for a single latent ``name``."""
-        diagonal = torch.diagonal(self.matrix)
-        if name is not None:
-            return diagonal[slice(*self.slices[name])].reshape(self.shapes[name])
-        return {n: diagonal[slice(*self.slices[n])].reshape(self.shapes[n]) for n in self.names}
-
     @property
     def exact(self):
         """The latents whose moments are exact."""
         return [name for name in self.names if name not in self.estimated]
 
     @classmethod
-    def combine(cls, space, parts, order):
+    def combine(cls, space, parts, order, groups=None):
         """The block-diagonal result of independent ``parts``, with the latents in ``order``."""
         shapes, owner = {}, {}
         for part in parts:
@@ -147,12 +248,18 @@ class GuideMoments:
                 shapes[name] = part.shapes[name]
                 owner[name] = part
         names = [name for name in order if name in owner]
-        reference = parts[0].mean
-        result = cls(space, names, shapes, dtype=reference.dtype, device=reference.device)
+        reference = parts[0]._mean_vector
+        result_groups = {}
+        for part in parts:
+            if hasattr(part, "groups"):
+                result_groups.update(part.groups)
+        if groups:
+            result_groups.update(groups)
+        result = cls(space, names, shapes, dtype=reference.dtype, device=reference.device, groups=result_groups)
         for part in parts:
             members = [name for name in names if owner[name] is part]
             index = part._index(members)
-            result.set_block(members, part.mean[index], part.matrix[index.unsqueeze(-1), index.unsqueeze(0)])
+            result.set_block(members, part._mean_vector[index], part.matrix[index.unsqueeze(-1), index.unsqueeze(0)])
             result.estimated += [name for name in members if name in part.estimated]
             result.standard_error.update({name: part.standard_error[name] for name in members if name in part.standard_error})
             if part.n_samples is not None:
@@ -168,13 +275,15 @@ class GuideMoments:
         for piece in guide.validate():
             if hasattr(piece, "moments"):
                 parts.append(piece.moments(space, n_samples, seed))
-            elif hasattr(piece, "covariance"):
-                parts.append(piece.covariance(space, n_samples, seed))
             elif piece.__class__.__name__ == "StructuredPiece":
                 parts.append(guide._piece_moments(piece, space, n_samples, seed))
             else:
                 parts.append(guide._entry_moments(piece, space, n_samples, seed))
-        return cls.combine(space, parts, list(guide.model.params))
+        groups = {}
+        for group in guide.groups:
+            if getattr(group, "name", None) is not None:
+                groups[group.name] = list(group.names)
+        return cls.combine(space, parts, list(guide.model.params), groups=groups)
 
     def __repr__(self):
         return (
