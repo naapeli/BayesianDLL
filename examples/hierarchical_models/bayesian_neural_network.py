@@ -173,12 +173,17 @@ def complex_signal(t):
     return torch.sin(1.5 * t) + 0.5 * torch.sin(3.5 * t)
 
 torch.manual_seed(42)
-y_deep_raw = complex_signal(x_raw) + 0.15 * torch.randn(n_observations, dtype=torch.float64)
+n_deep = 100
+x_deep_raw = torch.linspace(-3.0, 3.0, n_deep, dtype=torch.float64)
+y_deep_raw = complex_signal(x_deep_raw) + 0.15 * torch.randn(n_deep, dtype=torch.float64)
+
+x_deep_mean, x_deep_std = x_deep_raw.mean(), x_deep_raw.std()
 y_deep_mean, y_deep_std = y_deep_raw.mean(), y_deep_raw.std()
+x_deep = (x_deep_raw - x_deep_mean) / x_deep_std
 y_deep = (y_deep_raw - y_deep_mean) / y_deep_std
 
 with Model() as deep_bnn:
-    x_in = Data("x_in", x.unsqueeze(-1))
+    x_in = Data("x_in", x_deep.unsqueeze(-1))
     w1 = RandomParameter("w1", Normal(0.0, 1.0), shape=(1, h1_dim),
                          initial_value=1.5 * torch.randn(1, h1_dim, dtype=torch.float64))
     b1 = RandomParameter("b1", Normal(0.0, 1.0), shape=(h1_dim,),
@@ -196,7 +201,7 @@ with Model() as deep_bnn:
     h1 = Tanh("h1", Linear("h1_lin", x_in, coefficients=w1, intercept=b1))
     h2 = Tanh("h2", Linear("h2_lin", h1, coefficients=w2, intercept=b2))
     f_mlp = Linear("f_mlp", h2, coefficients=w3, intercept=b3)
-    with plate("deep_obs", n_observations):
+    with plate("deep_obs", n_deep):
         ObservedParameter("y_deep", Normal(f_mlp, sigma_deep), y_deep)
 
 # Initialise at the MAP mode to avoid symmetric saddle points and flat local optima
@@ -209,7 +214,8 @@ deep_trace = {k: v.squeeze(0) for k, v in deep_guide.sample(200).items()}
 print(f"Deep BNN (2 hidden layers): final ELBO {deep_history[-1]:.2f}")
 
 # Predict on the grid using trace draws
-grid_tensor = grid.unsqueeze(-1)
+grid_deep = (grid_raw - x_deep_mean) / x_deep_std
+grid_tensor = grid_deep.unsqueeze(-1)
 pred_draws = []
 for i in range(len(deep_trace["w1"])):
     h1_val = torch.tanh(grid_tensor @ deep_trace["w1"][i] + deep_trace["b1"][i])
@@ -224,7 +230,7 @@ fig, ax = plt.subplots(figsize=(8, 4.5), layout="constrained")
 ax.fill_between(grid_raw, q05, q95, color="C4", alpha=0.25, label="90% credible band")
 ax.plot(grid_raw, pred_mean, color="C4", lw=2, label="deep BNN mean")
 ax.plot(grid_raw, complex_signal(grid_raw), "k--", label="true function")
-ax.scatter(x_raw, y_deep_raw, color="black", s=14, zorder=3, label="data")
+ax.scatter(x_deep_raw, y_deep_raw, color="black", s=14, zorder=3, label="data")
 ax.set_ylim(-2.8, 2.8)
 ax.set_xlabel("x")
 ax.set_ylabel("f(x)")

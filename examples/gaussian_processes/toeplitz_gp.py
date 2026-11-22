@@ -32,7 +32,7 @@ def true_signal(t):
     return torch.sin(t / 8.0) + 0.5 * torch.sin(t / 3.0 + 1.0)
 
 
-n_total = 5200
+n_total = 4800
 n_train = 1200
 t_all = torch.arange(n_total, dtype=torch.float64) * 0.05
 y_all = true_signal(t_all) + 0.3 * torch.randn(n_total, dtype=torch.float64)
@@ -90,7 +90,7 @@ def time_once(cls, size):
     return time.perf_counter() - start
 
 
-sizes = [4000, 4600, 5200]
+sizes = [1000, 2000, 4000, 4800]
 timings = {cls.__name__: [time_once(cls, s) for s in sizes] for cls in (ExactGP, ToeplitzGP)}
 for name, values in timings.items():
     print(name, ", ".join(f"n={s}: {1000 * v:.0f} ms" for s, v in zip(sizes, values)))
