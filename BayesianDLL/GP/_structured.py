@@ -351,9 +351,11 @@ class KroneckerGP(_GPDistribution):
         draws = torch.randn((n_samples, *shape), dtype=dtype, device=device) * scale
         for mode, vectors in enumerate(eigenvectors):
             draws = _mode_product(draws, vectors, mode + 1)
-        draws = draws + (noise + self.jitter).sqrt() * torch.randn_like(draws)
         points = _grid_points([x.unsqueeze(0) for x in xs])[0]
-        return self._mean_at(points).reshape(shape) + draws
+        latent = self._mean_at(points).reshape(shape) + draws
+        self._last_latent_samples = latent
+        obs_noise = (noise + self.jitter).sqrt() * torch.randn_like(draws)
+        return latent + obs_noise
 
     def _sample_posterior(self, n_samples=1):
         xs = getattr(self, "_training_grid_data", None) or self._factor_inputs()
@@ -385,12 +387,13 @@ class KroneckerGP(_GPDistribution):
         for u in projected[1:]:
             rows = (rows.unsqueeze(-1) * u.unsqueeze(1)).reshape(n_new, -1)
         covariance = prior - (rows * inverse.reshape(1, -1)) @ rows.transpose(-2, -1)
-        if getattr(self, "predict_noise", False):
-            covariance = covariance + noise * torch.eye(n_new, dtype=dtype, device=device)
         covariance = (covariance + covariance.transpose(-2, -1)) / 2
         from ._process import stable_cholesky
         factor = stable_cholesky(covariance, jitter=max(self.jitter, 1e-10))
-        return (predictive_mean.reshape(-1) + torch.randn((n_samples, n_new), dtype=dtype, device=device) @ factor.transpose(-2, -1)).reshape(n_samples, *self.event_shape)
+        latent = (predictive_mean.reshape(-1) + torch.randn((n_samples, n_new), dtype=dtype, device=device) @ factor.transpose(-2, -1)).reshape(n_samples, *self.event_shape)
+        self._last_latent_samples = latent
+        obs_noise = torch.randn_like(latent) * torch.sqrt(noise)
+        return latent + obs_noise
 
 
 def _split_new_inputs(gp, inputs, xs):
@@ -703,7 +706,7 @@ class ToeplitzGP(_GPDistribution):
             raise TypeError(
                 "ToeplitzGP needs fixed, equally spaced inputs (a Data node or a tensor); a learnable spacing would be "
                 "redundant with the kernel's lengthscale, so inputs cannot be a RandomParameter or "
-                "DeterministicParameter. Use ExactGP or SparseGP for learnable inputs."
+                "DeterministicParameter. Use ExactGP for learnable inputs."
             )
         self.name = name
         self.inputs = inputs
@@ -843,13 +846,15 @@ class ToeplitzGP(_GPDistribution):
 
     def _sample_prior(self, n_samples=1):
         """Prior predictive draws (dense Cholesky; intended for small ``n``)."""
+        from ._process import stable_cholesky
         x = self._training_inputs()
         noise = _resolved_value(self.noise_variance, x.dtype, x.device).reshape(())
         covariance = self.kernel(x, x, parameter_values=self._named_parameter_values())
-        covariance = covariance + noise * torch.eye(x.shape[0], dtype=x.dtype, device=x.device)
         factor = stable_cholesky(covariance, jitter=self.jitter)
-        draws = torch.randn((n_samples, x.shape[0]), dtype=x.dtype, device=x.device) @ factor.transpose(-2, -1)
-        return self._mean_at(x) + draws
+        latent = self._mean_at(x) + torch.randn((n_samples, x.shape[0]), dtype=x.dtype, device=x.device) @ factor.transpose(-2, -1)
+        self._last_latent_samples = latent
+        obs_noise = torch.randn_like(latent) * torch.sqrt(noise)
+        return latent + obs_noise
 
     def _sample_posterior(self, n_samples=1):
         from ._process import stable_cholesky
@@ -868,11 +873,12 @@ class ToeplitzGP(_GPDistribution):
         solution, _ = levinson_solve(column, rhs)
         predictive_mean = self.mean(new, parameter_values=mean_values) + cross.transpose(-2, -1) @ solution[:, 0]
         covariance = self.kernel(new, new, parameter_values=values) - cross.transpose(-2, -1) @ solution[:, 1:]
-        if getattr(self, "predict_noise", False):
-            covariance = covariance + noise * torch.eye(n_new, dtype=dtype, device=device)
         covariance = (covariance + covariance.transpose(-2, -1)) / 2
         factor = stable_cholesky(covariance, jitter=max(self.jitter, 1e-10))
-        return predictive_mean + torch.randn((n_samples, n_new), dtype=dtype, device=device) @ factor.transpose(-2, -1)
+        latent = predictive_mean + torch.randn((n_samples, n_new), dtype=dtype, device=device) @ factor.transpose(-2, -1)
+        self._last_latent_samples = latent
+        obs_noise = torch.randn_like(latent) * torch.sqrt(noise)
+        return latent + obs_noise
 
 
 def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):

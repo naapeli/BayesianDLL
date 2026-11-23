@@ -1253,7 +1253,7 @@ class Model:
                 trace[name] = val.detach().clone().unsqueeze(0).unsqueeze(0)
         return trace
 
-    def predict(self, parameters=None, samples_per_step=20, progress_bar=False, predict_noise=None):
+    def predict(self, parameters=None, samples_per_step=20, progress_bar=False):
         """Draw predictive samples using a single point setting of parameters.
 
         Useful for predictions after MAP estimation (e.g. ``model.predict()`` or
@@ -1270,8 +1270,6 @@ class Model:
             Number of observation draws per parameter setting.
         progress_bar : bool, default=False
             Whether to show a progress bar.
-        predict_noise : bool or None, optional
-            Whether to include observation noise (for GPs).
 
         Returns
         -------
@@ -1306,7 +1304,6 @@ class Model:
             n_samples=1,
             samples_per_step=samples_per_step,
             progress_bar=progress_bar,
-            predict_noise=predict_noise,
         )
 
     def set_params(self, parameters):
@@ -1334,7 +1331,7 @@ class Model:
                 device = getattr(p.constrained_value, "device", None)
                 p.set_constrained_value(torch.as_tensor(val, device=device))
 
-    def posterior_predicative(self, trace, n_samples=None, samples_per_step=20, progress_bar=True, predict_noise=None):
+    def posterior_predicative(self, trace, n_samples=None, samples_per_step=20, progress_bar=True):
         """Draw posterior predictive samples conditional on observed data.
 
         Parameters
@@ -1347,8 +1344,6 @@ class Model:
             Number of simulated datasets per parameter setting.
         progress_bar : bool, default True
             Whether to show a progress bar.
-        predict_noise : bool or None, optional
-            Whether to include observation noise (for GP likelihoods).
 
         Returns
         -------
@@ -1356,7 +1351,7 @@ class Model:
             Predictive draws of observed variables.
         """
         from .Samplers import posterior_predicative as _pp
-        return _pp(trace=trace, n_samples=n_samples, samples_per_step=samples_per_step, model=self, progress_bar=progress_bar, predict_noise=predict_noise)
+        return _pp(trace=trace, n_samples=n_samples, samples_per_step=samples_per_step, model=self, progress_bar=progress_bar)
 
     def prior_predicative(self, n_samples=20, samples_per_step=500, progress_bar=True):
         """Draw samples from the prior predictive distribution by ancestral sampling.
@@ -1620,7 +1615,7 @@ def point_trace(model=None):
     return model.point_trace()
 
 
-def predict(parameters=None, samples_per_step=20, model=None, progress_bar=False, predict_noise=None):
+def predict(parameters=None, samples_per_step=20, model=None, progress_bar=False):
     """Draw predictive samples using a single point setting of parameters.
 
     Parameters
@@ -1635,8 +1630,6 @@ def predict(parameters=None, samples_per_step=20, model=None, progress_bar=False
         The model to sample predictions from (defaults to the active model).
     progress_bar : bool, default False
         Whether to show a progress bar.
-    predict_noise : bool or None, optional
-        Whether to include observation noise (for GP likelihoods).
 
     Returns
     -------
@@ -1648,7 +1641,6 @@ def predict(parameters=None, samples_per_step=20, model=None, progress_bar=False
         parameters=parameters,
         samples_per_step=samples_per_step,
         progress_bar=progress_bar,
-        predict_noise=predict_noise,
     )
 
 
@@ -1680,7 +1672,7 @@ def prior_predicative(n_samples=20, samples_per_step=500, model=None, progress_b
     )
 
 
-def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, predict_noise=None):
+def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True):
     """Draw posterior predictive samples by exact ancestral sampling.
 
     Parameters
@@ -1696,8 +1688,6 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None
         The model to sample from (defaults to the active model).
     progress_bar : bool, default True
         Whether to display a progress bar during sampling.
-    predict_noise : bool or None, optional
-        Whether to include observation noise (for GP likelihoods).
 
     Returns
     -------
@@ -1710,7 +1700,6 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None
         n_samples=n_samples,
         samples_per_step=samples_per_step,
         progress_bar=progress_bar,
-        predict_noise=predict_noise,
     )
 
 

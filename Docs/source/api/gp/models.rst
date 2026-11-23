@@ -22,6 +22,4 @@ sparse inducing-point approximations, and structured Kronecker/Toeplitz grids.
    :members:
    :show-inheritance:
 
-.. autoclass:: SparseGP
-   :members:
-   :show-inheritance:
+

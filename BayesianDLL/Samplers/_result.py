@@ -426,10 +426,23 @@ class PredicativeResult:
         if prior is not None and dim != 1:
             prior = prior.thin(step)
         thinned_det = {}
-        if self.deterministic and dim != 1:
-            thinned_det = {name: val[s] for name, val in self.deterministic.items()}
-        elif self.deterministic:
-            thinned_det = dict(self.deterministic)
+        if self.deterministic:
+            first_sample = next(iter(self.samples.values())) if self.samples else None
+            n_draws = first_sample.shape[0] if first_sample is not None else None
+            n_reps = first_sample.shape[1] if first_sample is not None else None
+            for name, val in self.deterministic.items():
+                is_replicated = (
+                    first_sample is not None
+                    and val.ndim >= 2
+                    and val.shape[0] == n_draws
+                    and val.shape[1] == n_reps
+                )
+                if dim == 0:
+                    thinned_det[name] = val[s]
+                elif dim == 1:
+                    thinned_det[name] = val[:, s] if is_replicated else val
+                elif dim in ((0, 1), (1, 0)):
+                    thinned_det[name] = val[s, s] if is_replicated else val[s]
         return PredicativeResult(thinned, prior=prior, deterministic_samples=thinned_det)
 
     def __repr__(self):

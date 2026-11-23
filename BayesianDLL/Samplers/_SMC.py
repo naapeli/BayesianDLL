@@ -271,9 +271,10 @@ class _Mutation:
         self._cholesky = cholesky
         if self.kernel == "nuts":
             if self._nuts is None:
-                self._nuts = NUTS(self._continuous_log_target, self._continuous_gradient, lambda x: x, delta=0.8, max_depth=8)
+                self._nuts = NUTS(self._continuous_log_target, self._continuous_gradient, lambda x: x, delta=0.8, max_depth=8, metric="dense")
             self._nuts.reset()
-            self._nuts.inv_metric = variance
+            self._nuts.inv_metric = covariance
+            self._nuts._inv_metric_chol = cholesky
         elif self.kernel == "slice":
             if self._slice is None:
                 self._slice = Slice(self._continuous_log_target, ContinuousReal(), adapt_width=False)
@@ -360,7 +361,7 @@ def sample_smc(model=None, n_particles=1000, kernel="metropolis", n_mutation_ste
     scale ``2.38 / sqrt(d)`` is multiplied by ``exp(rate - 0.234)``, i.e.
     adapted towards an acceptance rate of 0.234), ``"nuts"`` (tempered log density and gradient
     ``grad log p(theta) + beta grad log p(y | theta)``, with the particle
-    variances as diagonal metric and a maximal tree depth of 8) or
+    covariance as dense metric and a maximal tree depth of 8) or
     ``"slice"`` (coordinate-wise slice sampling with widths of twice the
     particle standard deviations). The NUTS step size is adapted across the
     particles of a stage towards a mean acceptance statistic of 0.8: by dual

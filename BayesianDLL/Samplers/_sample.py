@@ -843,7 +843,7 @@ def prior_predicative(n_samples=20, samples_per_step=500, model=None, progress_b
     return _ancestral_predictive(model, n_samples, samples_per_step, None, progress_bar)
 
 
-def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True, predict_noise=None):
+def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True):
     """Draw posterior predictive samples by exact ancestral sampling.
 
     Parameters
@@ -859,8 +859,6 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None
         The model to sample from (defaults to the active model).
     progress_bar : bool, default=True
         Whether to display a progress bar during sampling.
-    predict_noise : bool or None, optional
-        Whether to include observation noise (for GPs).
 
     Returns
     -------
@@ -914,7 +912,7 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None
             if name in flattened_trace
         }
 
-    return _ancestral_predictive(model, n_samples, samples_per_step, parameter_values, progress_bar, predict_noise=predict_noise)
+    return _ancestral_predictive(model, n_samples, samples_per_step, parameter_values, progress_bar)
 
 
 def _observed_parents(model):
@@ -962,7 +960,7 @@ class _MCMCFallback:
         return torch.stack(draws, dim=0)
 
 
-def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, progress_bar, predict_noise=None):
+def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, progress_bar):
     """Prior (``parameter_values is None``) or posterior predictive draws by ancestral sampling.
 
     ``parameter_values(i)`` returns the unconstrained parameter values of the
@@ -987,8 +985,6 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
         for parameter in observed_order:
             if hasattr(parameter.distribution, "_in_posterior_predictive"):
                 parameter.distribution._in_posterior_predictive = True
-            if predict_noise is not None and hasattr(parameter.distribution, "predict_noise"):
-                parameter.distribution.predict_noise = predict_noise
         for parameter in model.deterministic_params.values():
             if hasattr(parameter, "_in_posterior_predictive"):
                 parameter._in_posterior_predictive = True
@@ -1018,6 +1014,18 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
         # Predictive draws are collected on the CPU, like the traces of sample().
         parameter.name: torch.empty(size=(n_draws, samples_per_step, *parameter.predictive_shape), dtype=parameter.observed_values.dtype, device="cpu")
         for parameter in observed_order
+    }
+    gp_observed = [
+        parameter for parameter in observed_order
+        if hasattr(parameter.distribution, "name") and parameter.distribution.name
+    ]
+    predicative_gp_samples = {
+        parameter.distribution.name: torch.empty(
+            size=(n_draws, samples_per_step, *parameter.predictive_shape),
+            dtype=parameter.observed_values.dtype,
+            device="cpu",
+        )
+        for parameter in gp_observed
     }
     prior_trace = {parameter.name: [] for parameter in random_order}
     prior_det_trace = {name: [] for name in model.deterministic_params}
@@ -1051,6 +1059,10 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
                 for parameter in observed_order:
                     samples = predicative_samples[parameter.name]
                     samples[i] = draw(parameter, samples_per_step, parameter.predictive_shape, samples.dtype)
+                    if parameter in gp_observed:
+                        latent = getattr(parameter.distribution, "_last_latent_samples", None)
+                        if latent is not None:
+                            predicative_gp_samples[parameter.distribution.name][i] = latent.detach().to(device="cpu", dtype=samples.dtype)
                 continue
 
             # An observed node feeds another node: draw the replicated data
@@ -1062,6 +1074,10 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
                         samples = predicative_samples[parameter.name]
                         value = draw(parameter, 1, parameter.predictive_shape, samples.dtype)[0]
                         samples[i, j] = value
+                        if parameter in gp_observed:
+                            latent = getattr(parameter.distribution, "_last_latent_samples", None)
+                            if latent is not None:
+                                predicative_gp_samples[parameter.distribution.name][i, j] = latent[0].detach().to(device="cpu", dtype=samples.dtype)
                         if parameter.name in replicated_parents:
                             parameter.observed_values = value
             finally:
@@ -1086,12 +1102,15 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
         det_samples = {
             name: torch.stack(values, dim=0) for name, values in predicative_det_samples.items() if values
         }
+    elif prior and prior_det_trace:
+        det_samples = {
+            name: torch.stack(values, dim=0) for name, values in prior_det_trace.items() if values
+        }
+    for gp_name, tensor in predicative_gp_samples.items():
+        target_name = gp_name if gp_name not in predicative_samples else f"{gp_name}_latent"
+        if target_name not in det_samples:
+            det_samples[target_name] = tensor
     result = PredicativeResult(predicative_samples, deterministic_samples=det_samples)
-    if prior:
-        trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_trace.items() if values}
-        det_trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_det_trace.items() if values}
-        result.prior = SamplingResult(trace, [0], [[]], [[]], deterministic_trace=det_trace)
-    return result
     if prior:
         trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_trace.items() if values}
         det_trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_det_trace.items() if values}

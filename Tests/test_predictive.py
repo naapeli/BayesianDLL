@@ -138,6 +138,13 @@ def test_gp_posterior_predictive_with_exact_and_latent_gp():
     inputs.set_value(x_new)
     pred = model.posterior_predicative(trace, samples_per_step=5, progress_bar=False)
     assert pred["y"].shape == (4, 5, 18)
+    assert "f" in pred
+    assert pred["f"].shape == (4, 5, 18)
+    assert "f" in pred.deterministic
+    assert "y" in pred.samples
+    assert not torch.allclose(pred["y"], pred["f"])
+    residuals = pred["y"] - pred["f"]
+    assert torch.isclose(residuals.var(), torch.tensor(0.01, dtype=torch.float64), atol=0.005)
 
     # Latent GP
     with Model() as model_lat:
@@ -174,6 +181,8 @@ def test_gp_posterior_predictive_toeplitz_and_sparse():
     # Using point_trace (uses current model values)
     pred_toep = model_toep.posterior_predicative(model_toep.point_trace(), samples_per_step=10, progress_bar=False)
     assert pred_toep["y"].shape == (1, 10, 15)
+    assert "f_toep" in pred_toep
+    assert pred_toep["f_toep"].shape == (1, 10, 15)
 
     # Sparse GP with inducing points
     z = torch.linspace(0.5, 4.5, 5, dtype=torch.float64)
@@ -187,6 +196,8 @@ def test_gp_posterior_predictive_toeplitz_and_sparse():
     x_data.set_value(t_new)
     pred_sparse = model_sparse.posterior_predicative(model_sparse.point_trace(), samples_per_step=8, progress_bar=False)
     assert pred_sparse["y_sparse"].shape == (1, 8, 15)
+    assert "f_sparse" in pred_sparse
+    assert pred_sparse["f_sparse"].shape == (1, 8, 15)
 
 
 def test_posterior_predicative_requires_trace():

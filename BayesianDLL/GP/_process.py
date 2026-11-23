@@ -352,7 +352,7 @@ class LatentGP(DeterministicParameter):
 
     where :math:`\mathbf{L}` is the Cholesky factor of :math:`\mathbf{K}(X, X) + \text{jitter} \cdot \mathbf{I}`.
     If ``inducing_points`` is provided, constructs a sparse latent GP approximation
-    using :class:`SparseLatentGP`.
+    evaluated at inducing locations :math:`Z`.
 
     Parameters
     ----------
@@ -373,7 +373,8 @@ class LatentGP(DeterministicParameter):
         Name of the latent parameter created when ``latent`` is not provided.
         Defaults to ``f"{name}_white"``.
     inducing_points : torch.Tensor or Data or Parameter, optional
-        Inducing locations :math:`Z`. If provided, dispatches to :class:`SparseLatentGP`.
+        Inducing locations :math:`Z` of shape ``(M, D)`` or ``(M,)``. If provided, constructs
+        a sparse latent GP approximation.
     """
 
     def __new__(cls, *args, inducing_points=None, **kwargs):
@@ -554,7 +555,6 @@ class _GPDistribution(Distribution):
     """
 
     _in_posterior_predictive: bool = False
-    predict_noise: bool = False
 
     def _bind_observed(self, observed_node, observed_values):
         self._observed_node = observed_node
@@ -603,13 +603,13 @@ class ExactGP(_GPDistribution):
 
         \mathbf{y} \sim \mathcal{N}\left(\mathbf{m}(X), \mathbf{K}(X, X) + \sigma^2 \mathbf{I}\right)
 
-    If ``inducing_points`` is provided, constructs a sparse GP approximation
-    using :class:`SparseGP`.
+    If ``inducing_points`` is provided, constructs a sparse inducing-point GP approximation
+    using the specified approximation method (VFE, DTC, or FITC).
 
     Parameters
     ----------
     name : str
-        Name of the GP node.
+        Name of the GP node representing the latent function.
     inputs : torch.Tensor or Data or Parameter
         Input covariates :math:`X` of shape ``(N, D)`` or ``(N,)``. May be a
         fixed ``Data`` node or a learnable ``RandomParameter`` / ``DeterministicParameter``.
@@ -623,9 +623,12 @@ class ExactGP(_GPDistribution):
     jitter : float, default 1e-6
         Relative diagonal jitter added to :math:`\mathbf{K} + \sigma^2 \mathbf{I}` for numerical stability.
     inducing_points : torch.Tensor or Data or Parameter, optional
-        Inducing locations :math:`Z`. If provided, dispatches to :class:`SparseGP`.
+        Inducing locations :math:`Z` of shape ``(M, D)`` or ``(M,)``. If provided, constructs
+        a sparse GP approximation rather than computing the full :math:`N \times N` kernel matrix.
     method : {"vfe", "dtc", "fitc"}, default "vfe"
-        Approximation method when ``inducing_points`` is provided.
+        Approximation method when ``inducing_points`` is provided:
+        Variational Free Energy (``"vfe"``), Deterministic Training Conditional (``"dtc"``),
+        or Fully Independent Training Conditional (``"fitc"``).
     n_outputs : int, optional
         Number of independent outputs sharing the inputs when ``inducing_points`` is provided.
     """
@@ -658,7 +661,6 @@ class ExactGP(_GPDistribution):
         self.kernel = kernel
         self.noise_variance = noise_variance
         self.jitter = jitter
-        self.predict_noise = kwargs.get("predict_noise", False)
         if not _is_learnable(inputs):
             self._training_inputs_data = _input_value(inputs).clone()
 
@@ -762,12 +764,21 @@ class ExactGP(_GPDistribution):
 
     def _sample_prior(self, n_samples=1):
         x = _input_value(self.inputs)
-        zero = torch.zeros(_feature_count(x), dtype=x.dtype, device=x.device)
-        factor = self._components(zero)["factor"][0]
-        mean = self._mean_at(x)
-        return mean + torch.randn(
-            (n_samples, zero.numel()), dtype=zero.dtype, device=zero.device
-        ) @ factor.transpose(-2, -1)
+        if x.ndim == 0:
+            x = x.reshape(1)
+        dtype = x.dtype
+        device = x.device
+        n = _feature_count(x)
+        kernel_values = self._named_parameter_values()
+        mean_values = {parameter.name: resolve(parameter) for parameter in self.mean.parameters if _is_named(parameter)}
+        k_xx = self.kernel(x, x, parameter_values=kernel_values)
+        k_factor = stable_cholesky(k_xx, jitter=self.jitter)
+        mean = self.mean(x, parameter_values=mean_values)
+        noise = _resolved_value(self.noise_variance, dtype=dtype, device=device).reshape(-1)[0]
+        latent = mean + torch.randn((n_samples, n), dtype=dtype, device=device) @ k_factor.transpose(-2, -1)
+        self._last_latent_samples = latent
+        obs_noise = torch.randn_like(latent) * torch.sqrt(noise)
+        return latent + obs_noise
 
     def _sample_posterior(self, n_samples=1):
         x_new = _input_value(self.inputs)
@@ -808,14 +819,14 @@ class ExactGP(_GPDistribution):
         pred_mean = mean_new + K_cross.transpose(-2, -1) @ alpha
         pred_cov = K_new - K_cross.transpose(-2, -1) @ torch.cholesky_solve(K_cross, factor)
 
-        if getattr(self, "predict_noise", False):
-            pred_cov = pred_cov + noise * torch.eye(n_new, dtype=dtype, device=device)
-
         pred_cov = (pred_cov + pred_cov.transpose(-2, -1)) / 2
         pred_factor = stable_cholesky(pred_cov, jitter=self.jitter)
 
         noise_draws = torch.randn((n_samples, n_new), dtype=dtype, device=device)
-        return pred_mean + noise_draws @ pred_factor.transpose(-2, -1)
+        latent = pred_mean + noise_draws @ pred_factor.transpose(-2, -1)
+        self._last_latent_samples = latent
+        obs_noise = torch.randn_like(latent) * torch.sqrt(noise)
+        return latent + obs_noise
 
 
 # ----------------------------------------------------------------------------
@@ -1167,8 +1178,12 @@ class SparseGP(ExactGP):
         mean = self._mean_at(x)
         shape = (n_samples,) if self.n_outputs is None else (n_samples, self.n_outputs)
         first = torch.randn((*shape, v.shape[0]), dtype=x.dtype, device=x.device) @ v
-        second = torch.randn((*shape, lam.numel()), dtype=x.dtype, device=x.device) * lam.sqrt()
-        return mean + first + second
+        noise = _resolved_value(self.noise_variance, dtype=x.dtype, device=x.device).reshape(-1)[0]
+        latent_var = (lam - noise).clamp_min(0.0)
+        latent = mean + first + torch.randn((*shape, lam.numel()), dtype=x.dtype, device=x.device) * latent_var.sqrt()
+        self._last_latent_samples = latent
+        obs_noise = torch.randn_like(latent) * torch.sqrt(noise)
+        return latent + obs_noise
 
     def _sample_posterior(self, n_samples=1):
         training_values = self._training_inputs_data if hasattr(self, "_training_inputs_data") else self._training_inputs()
@@ -1214,21 +1229,22 @@ class SparseGP(ExactGP):
         predictive_covariance = (
             k_ss - v_new.transpose(-2, -1) @ v_new + projected.transpose(-2, -1) @ projected
         )
-        if getattr(self, "predict_noise", False):
-            predictive_covariance = predictive_covariance + noise[0] * torch.eye(n_new, dtype=dtype, device=device)
         predictive_covariance = (predictive_covariance + predictive_covariance.transpose(-2, -1)) / 2
         prediction_factor = stable_cholesky(predictive_covariance, jitter=self.jitter)
         shape = (n_samples, n_new) if self.n_outputs is None else (n_samples, self.n_outputs, n_new)
-        return (
+        latent = (
             predictive_mean
             + (torch.randn(shape, dtype=dtype, device=device) @ prediction_factor.transpose(-2, -1))
         )
+        self._last_latent_samples = latent
+        obs_noise = torch.randn_like(latent) * torch.sqrt(noise[0])
+        return latent + obs_noise
 
 
 def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
     """Sample latent GP values at new inputs from posterior latent traces.
 
-    ``gp`` is a :class:`LatentGP` (or :class:`SparseLatentGP`). ``trace`` may be a
+    ``gp`` is a :class:`LatentGP` (including latent GPs with inducing points). ``trace`` may be a
     ``SamplingResult`` or a mapping with values of shape ``(n_chains, n_draws, *shape)``
     containing the GP's deterministic trace (``trace[gp.name]``). Kernel
     parameters, the parameters of the mean function and learnable training
@@ -1338,7 +1354,7 @@ def exact_gp_predictive(
 ):
     """Sample exact-GP predictions conditional on observed training values.
 
-    ``gp`` is an :class:`ExactGP` (or :class:`SparseGP`), ``observed_values`` the
+    ``gp`` is an :class:`ExactGP` (including exact GPs with inducing points), ``observed_values`` the
     training observations ``y`` (``(N,)``) and ``inputs`` the new inputs. ``trace``
     (values of shape ``(n_chains, n_draws, *shape)``) contains only
     hyperparameter draws; the latent function is integrated out during
@@ -1811,7 +1827,7 @@ def _draws_of(trace, node, n_draws, dtype, device):
 
 
 def sparse_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, conditional_variance=False, chunk_size=64):
-    r"""Values of a :class:`SparseLatentGP` at new inputs for every draw of ``trace``.
+    r"""Values of a latent GP with inducing points at new inputs for every draw of ``trace``.
 
     Under the DTC approximation the function is deterministic given the
     whitened values ``v``, the inducing inputs and the hyperparameters:
