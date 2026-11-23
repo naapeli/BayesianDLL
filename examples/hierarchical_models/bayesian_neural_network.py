@@ -161,11 +161,11 @@ plt.show()
 # blocks by composing :class:`~BayesianDLL.Deterministic.Linear` and
 # :class:`~BayesianDLL.Deterministic.Tanh` blocks.
 #
-# Here a two-hidden-layer MLP (1 -> 8 -> 8 -> 1) is fitted to a composite
+# Here a four-hidden-layer MLP (1 -> 8 -> 8 -> 8 -> 8 -> 1) is fitted to a composite
 # signal :math:`\sin(1.5 x) + 0.5 \sin(3.5 x)` with variational inference,
 # initialized from a MAP estimate:
 
-h1_dim, h2_dim = 8, 8
+h1_dim, h2_dim, h3_dim, h4_dim = 8, 8, 8, 8
 
 def complex_signal(t):
     return torch.sin(1.5 * t) + 0.5 * torch.sin(3.5 * t)
@@ -190,26 +190,36 @@ with Model() as deep_bnn:
                          initial_value=torch.randn(h1_dim, h2_dim, dtype=torch.float64) / math.sqrt(h1_dim))
     b2 = RandomParameter("b2", Normal(0.0, 1.0), shape=(h2_dim,),
                          initial_value=torch.randn(h2_dim, dtype=torch.float64))
-    w3 = RandomParameter("w3", Normal(0.0, 1.0 / math.sqrt(h2_dim)), shape=(h2_dim,),
-                         initial_value=torch.randn(h2_dim, dtype=torch.float64) / math.sqrt(h2_dim))
-    b3 = RandomParameter("b3", Normal(0.0, 1.0), initial_value=torch.zeros(1, dtype=torch.float64))
+    w3 = RandomParameter("w3", Normal(0.0, 1.0 / math.sqrt(h2_dim)), shape=(h2_dim, h3_dim),
+                         initial_value=torch.randn(h2_dim, h3_dim, dtype=torch.float64) / math.sqrt(h2_dim))
+    b3 = RandomParameter("b3", Normal(0.0, 1.0), shape=(h3_dim,),
+                         initial_value=torch.randn(h3_dim, dtype=torch.float64))
+    w4 = RandomParameter("w4", Normal(0.0, 1.0 / math.sqrt(h3_dim)), shape=(h3_dim, h4_dim),
+                         initial_value=torch.randn(h3_dim, h4_dim, dtype=torch.float64) / math.sqrt(h3_dim))
+    b4 = RandomParameter("b4", Normal(0.0, 1.0), shape=(h4_dim,),
+                         initial_value=torch.randn(h4_dim, dtype=torch.float64))
+    w5 = RandomParameter("w5", Normal(0.0, 1.0 / math.sqrt(h4_dim)), shape=(h4_dim,),
+                         initial_value=torch.randn(h4_dim, dtype=torch.float64) / math.sqrt(h4_dim))
+    b5 = RandomParameter("b5", Normal(0.0, 1.0), initial_value=torch.zeros(1, dtype=torch.float64))
     sigma_deep = Exp("sigma_deep", RandomParameter("log_sigma_deep", Normal(math.log(0.15), 0.2),
                                                    initial_value=torch.tensor([math.log(0.15)], dtype=torch.float64)))
 
     h1 = Tanh("h1", Linear("h1_lin", x_in, coefficients=w1, intercept=b1))
     h2 = Tanh("h2", Linear("h2_lin", h1, coefficients=w2, intercept=b2))
-    f_mlp = Linear("f_mlp", h2, coefficients=w3, intercept=b3)
+    h3 = Tanh("h3", Linear("h3_lin", h2, coefficients=w3, intercept=b3))
+    h4 = Tanh("h4", Linear("h4_lin", h3, coefficients=w4, intercept=b4))
+    f_mlp = Linear("f_mlp", h4, coefficients=w5, intercept=b5)
     with plate("deep_obs", n_deep):
         ObservedParameter("y_deep", Normal(f_mlp, sigma_deep), y_deep)
 
 # Initialise at the MAP mode to avoid symmetric saddle points and flat local optima
-deep_bnn.find_MAP(lr=0.05, epochs=600, verbose=False)
+deep_bnn.find_MAP(lr=0.03, epochs=1500, verbose=False)
 print("Deep BNN: MAP initialization complete")
 
 deep_guide = Guide(deep_bnn, default_family="mean_field", init_scale=0.01)
 deep_history = BBVI(deep_bnn, deep_guide, n_samples=4, epochs=800, lr=0.001, lrd=0.999, verbose=False)
 deep_trace = {k: v.squeeze(0) for k, v in deep_guide.sample(200).items()}
-print(f"Deep BNN (2 hidden layers): final ELBO {deep_history[-1]:.2f}")
+print(f"Deep BNN (4 hidden layers): final ELBO {deep_history[-1]:.2f}")
 
 # Predict on the grid using trace draws
 grid_deep = (grid_raw - x_deep_mean) / x_deep_std
@@ -218,7 +228,9 @@ pred_draws = []
 for i in range(len(deep_trace["w1"])):
     h1_val = torch.tanh(grid_tensor @ deep_trace["w1"][i] + deep_trace["b1"][i])
     h2_val = torch.tanh(h1_val @ deep_trace["w2"][i] + deep_trace["b2"][i])
-    f_val = (h2_val @ deep_trace["w3"][i] + deep_trace["b3"][i]) * y_deep_std + y_deep_mean
+    h3_val = torch.tanh(h2_val @ deep_trace["w3"][i] + deep_trace["b3"][i])
+    h4_val = torch.tanh(h3_val @ deep_trace["w4"][i] + deep_trace["b4"][i])
+    f_val = (h4_val @ deep_trace["w5"][i] + deep_trace["b5"][i]) * y_deep_std + y_deep_mean
     pred_draws.append(f_val)
 pred_tensor = torch.stack(pred_draws)
 pred_mean = pred_tensor.mean(0)
@@ -232,6 +244,6 @@ ax.scatter(x_deep_raw, y_deep_raw, color="black", s=14, zorder=3, label="data")
 ax.set_ylim(-2.8, 2.8)
 ax.set_xlabel("x")
 ax.set_ylabel("f(x)")
-ax.set_title("Two-Hidden-Layer Bayesian Neural Network (Linear & Tanh Layers)")
+ax.set_title("Four-Hidden-Layer Bayesian Neural Network (Linear & Tanh Layers)")
 ax.legend(fontsize="small", loc="lower right")
 plt.show()
