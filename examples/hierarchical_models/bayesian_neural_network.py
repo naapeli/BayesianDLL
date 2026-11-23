@@ -163,7 +163,9 @@ plt.show()
 #
 # Here a four-hidden-layer MLP (1 -> 8 -> 8 -> 8 -> 8 -> 1) is fitted to a composite
 # signal :math:`\sin(1.5 x) + 0.5 \sin(3.5 x)` with variational inference,
-# initialized from a MAP estimate:
+# initialized from a MAP estimate. The weights use fan-in priors with scale
+# :math:`2 / \sqrt{H}` so the network has sufficient expressive range to capture
+# the higher-frequency harmonic:
 
 h1_dim, h2_dim, h3_dim, h4_dim = 8, 8, 8, 8
 
@@ -182,26 +184,26 @@ y_deep = (y_deep_raw - y_deep_mean) / y_deep_std
 
 with Model() as deep_bnn:
     x_in = Data("x_in", x_deep.unsqueeze(-1))
-    w1 = RandomParameter("w1", Normal(0.0, 1.0), shape=(1, h1_dim),
-                         initial_value=1.5 * torch.randn(1, h1_dim, dtype=torch.float64))
-    b1 = RandomParameter("b1", Normal(0.0, 1.0), shape=(h1_dim,),
-                         initial_value=torch.randn(h1_dim, dtype=torch.float64))
-    w2 = RandomParameter("w2", Normal(0.0, 1.0 / math.sqrt(h1_dim)), shape=(h1_dim, h2_dim),
-                         initial_value=torch.randn(h1_dim, h2_dim, dtype=torch.float64) / math.sqrt(h1_dim))
-    b2 = RandomParameter("b2", Normal(0.0, 1.0), shape=(h2_dim,),
-                         initial_value=torch.randn(h2_dim, dtype=torch.float64))
-    w3 = RandomParameter("w3", Normal(0.0, 1.0 / math.sqrt(h2_dim)), shape=(h2_dim, h3_dim),
-                         initial_value=torch.randn(h2_dim, h3_dim, dtype=torch.float64) / math.sqrt(h2_dim))
-    b3 = RandomParameter("b3", Normal(0.0, 1.0), shape=(h3_dim,),
-                         initial_value=torch.randn(h3_dim, dtype=torch.float64))
-    w4 = RandomParameter("w4", Normal(0.0, 1.0 / math.sqrt(h3_dim)), shape=(h3_dim, h4_dim),
-                         initial_value=torch.randn(h3_dim, h4_dim, dtype=torch.float64) / math.sqrt(h3_dim))
-    b4 = RandomParameter("b4", Normal(0.0, 1.0), shape=(h4_dim,),
-                         initial_value=torch.randn(h4_dim, dtype=torch.float64))
-    w5 = RandomParameter("w5", Normal(0.0, 1.0 / math.sqrt(h4_dim)), shape=(h4_dim,),
-                         initial_value=torch.randn(h4_dim, dtype=torch.float64) / math.sqrt(h4_dim))
-    b5 = RandomParameter("b5", Normal(0.0, 1.0), initial_value=torch.zeros(1, dtype=torch.float64))
-    sigma_deep = Exp("sigma_deep", RandomParameter("log_sigma_deep", Normal(math.log(0.15), 0.2),
+    w1 = RandomParameter("w1", Normal(0.0, 2.0), shape=(1, h1_dim),
+                         initial_value=2.0 * torch.randn(1, h1_dim, dtype=torch.float64))
+    b1 = RandomParameter("b1", Normal(0.0, 2.0), shape=(h1_dim,),
+                         initial_value=torch.randn(h1_dim, dtype=torch.float64) * 0.1)
+    w2 = RandomParameter("w2", Normal(0.0, 2.0 / math.sqrt(h1_dim)), shape=(h1_dim, h2_dim),
+                         initial_value=2.0 * torch.randn(h1_dim, h2_dim, dtype=torch.float64) / math.sqrt(h1_dim))
+    b2 = RandomParameter("b2", Normal(0.0, 2.0), shape=(h2_dim,),
+                         initial_value=torch.randn(h2_dim, dtype=torch.float64) * 0.1)
+    w3 = RandomParameter("w3", Normal(0.0, 2.0 / math.sqrt(h2_dim)), shape=(h2_dim, h3_dim),
+                         initial_value=2.0 * torch.randn(h2_dim, h3_dim, dtype=torch.float64) / math.sqrt(h2_dim))
+    b3 = RandomParameter("b3", Normal(0.0, 2.0), shape=(h3_dim,),
+                         initial_value=torch.randn(h3_dim, dtype=torch.float64) * 0.1)
+    w4 = RandomParameter("w4", Normal(0.0, 2.0 / math.sqrt(h3_dim)), shape=(h3_dim, h4_dim),
+                         initial_value=2.0 * torch.randn(h3_dim, h4_dim, dtype=torch.float64) / math.sqrt(h3_dim))
+    b4 = RandomParameter("b4", Normal(0.0, 2.0), shape=(h4_dim,),
+                         initial_value=torch.randn(h4_dim, dtype=torch.float64) * 0.1)
+    w5 = RandomParameter("w5", Normal(0.0, 2.0 / math.sqrt(h4_dim)), shape=(h4_dim,),
+                         initial_value=2.0 * torch.randn(h4_dim, dtype=torch.float64) / math.sqrt(h4_dim))
+    b5 = RandomParameter("b5", Normal(0.0, 2.0), initial_value=torch.zeros(1, dtype=torch.float64))
+    sigma_deep = Exp("sigma_deep", RandomParameter("log_sigma_deep", Normal(math.log(0.15), 0.3),
                                                    initial_value=torch.tensor([math.log(0.15)], dtype=torch.float64)))
 
     h1 = Tanh("h1", Linear("h1_lin", x_in, coefficients=w1, intercept=b1))
