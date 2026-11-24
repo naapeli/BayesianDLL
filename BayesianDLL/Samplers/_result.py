@@ -34,7 +34,8 @@ class SampleStats:
           ``"slice"``, or ``"gibbs"``).
         - ``"stats"``: mapping from statistic name (e.g. ``"step_size"``,
           ``"accept_stat"``, ``"diverging"``, ``"energy"``, ``"lp"``) to
-          a tensor of shape ``(n_chains, n_samples)``.
+          a tensor of shape ``(n_chains, n_samples)``. With several blocks the
+          last one also holds ``"joint_lp"``, the joint log density after each sweep.
 
     Attributes
     ----------
@@ -263,23 +264,25 @@ class SamplingResult:
         """The joint log density ``(n_chains, n_samples)`` of each draw, or ``None`` if it was not recorded.
 
         It is the log density of the unconstrained parameters that the sampler
-        targets (including the transforms' Jacobians), recorded only when a
-        single sampling block covers every parameter: a block of a Gibbs sweep
-        records the log density terms of its own parameters only.
+        targets (including the transforms' Jacobians and with marginalized
+        parameters summed out). A single sampling block records it as ``lp``.
+        With several blocks each block's ``lp`` only covers the terms of its own
+        parameters, so the joint value after every sweep is recorded as
+        ``joint_lp`` with the last block.
         """
-        if self.sample_stats is None:
+        if self.sample_stats is None or not self.sample_stats.blocks:
             return None
-        blocks = [block for block in self.sample_stats.blocks if "lp" in block["stats"]]
-        if len(blocks) != 1 or len(self.sample_stats.blocks) != 1:
-            return None
-        return blocks[0]["stats"]["lp"]
+        blocks = self.sample_stats.blocks
+        if len(blocks) == 1:
+            return blocks[0]["stats"].get("lp")
+        return blocks[-1]["stats"].get("joint_lp")
 
     def mode(self, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
-        """Return the parameter values of the draw with the highest log density (see :attr:`lp`).
+        """Return the parameter values of the draw with the highest joint log density (see :attr:`lp`).
 
-        When :attr:`lp` is not available (several sampling blocks), a warning is
-        issued and the coordinate-wise median (most frequent value for discrete
-        parameters) is returned instead.
+        When :attr:`lp` is not available (e.g. a result built from draws without
+        sampler statistics), a warning is issued and the coordinate-wise median
+        (most frequent value for discrete parameters) is returned instead.
 
         Parameters
         ----------
@@ -299,8 +302,8 @@ class SamplingResult:
             return {name: val[chain_idx, sample_idx].clone() for name, val in traces.items()}
 
         warn(
-            "The joint log density of the draws was not recorded (several sampling blocks); "
-            "mode() returns the coordinate-wise median (most frequent value for discrete parameters) instead."
+            "The joint log density of the draws was not recorded; mode() returns the coordinate-wise "
+            "median (most frequent value for discrete parameters) instead."
         )
         res = {}
         for name, val in traces.items():

@@ -9,6 +9,26 @@ def _dot(a, b):
     """Dot product that works for any-shape tensors (flattened)."""
     return (a * b).sum()
 
+def _dense_inverse_metric(covariance, n):
+    """Regularised dense inverse metric from the sample covariance ``(..., d, d)`` of ``n`` warmup draws.
+
+    A window with fewer than ``4 d`` draws gives a rank-deficient or very noisy
+    covariance, and directions it has not seen would otherwise get a (near)
+    zero variance, along which the sampler then barely moves. Its off-diagonal
+    terms are therefore kept with weight ``n / (4 d)`` and the rest is taken
+    from the diagonal; larger windows use the sample covariance as it is. The
+    result is then regularised towards a small multiple of the identity, as
+    in Stan.
+    """
+    d = covariance.shape[-1]
+    weight = min(1.0, n / (4.0 * d))
+    diagonal = torch.diag_embed(torch.diagonal(covariance, dim1=-2, dim2=-1))
+    covariance = weight * covariance + (1.0 - weight) * diagonal
+    identity = torch.eye(d, dtype=covariance.dtype, device=covariance.device)
+    inv_metric = (n / (n + 5.0)) * covariance + 1e-3 * (5.0 / (n + 5.0)) * identity
+    return 0.5 * (inv_metric + inv_metric.transpose(-2, -1))
+
+
 def _adaptation_windows(warmup_length, init_buffer=75, term_buffer=50, base_window=25):
     """Return the iterations that end a metric-adaptation window.
 
@@ -114,7 +134,9 @@ class NUTS:
     metric : {"diag", "dense"}, default "dense"
         The adapted inverse metric (posterior covariance estimate): the
         full covariance (dense), or the marginal variances (diag).
-        A dense metric accounts for correlations between parameters.
+        A dense metric accounts for correlations between parameters; its
+        estimate is shrunk towards the diagonal when a window has few draws
+        per dimension.
 
     Notes
     -----
@@ -243,9 +265,7 @@ class NUTS:
             covariance = self._welford_m2 / (n - 1)
             # Regularize towards a small multiple of the identity (as in Stan).
             if self.metric == "dense":
-                identity = torch.eye(covariance.shape[0], dtype=covariance.dtype, device=covariance.device)
-                inv_metric = (n / (n + 5.0)) * covariance + 1e-3 * (5.0 / (n + 5.0)) * identity
-                inv_metric = 0.5 * (inv_metric + inv_metric.T)
+                inv_metric = _dense_inverse_metric(covariance, n)
                 chol, info = torch.linalg.cholesky_ex(inv_metric)
                 if int(info) == 0:
                     self.inv_metric = inv_metric

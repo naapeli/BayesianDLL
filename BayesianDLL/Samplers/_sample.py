@@ -780,6 +780,11 @@ def _sample_single_chain(chain, n_chains, model, initial_values, init_scale, n_s
                 for stat_name, value in block.last_stats.items():
                     block_stats[i].setdefault(stat_name, []).append(value)
 
+        if m > warmup_length and len(blocks) > 1:
+            # Each block records the log density terms of its own parameters
+            # only; the joint log density after the sweep goes with the last block.
+            block_stats[-1].setdefault("joint_lp", []).append(float(model.model_log_prob()))
+
         if m > warmup_length:
             if chain_enum_trace:
                 # Sets the drawn values on the parameters, so deterministic

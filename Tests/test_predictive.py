@@ -348,17 +348,26 @@ def test_latent_gp_prediction_shares_one_function_draw_and_rejects_other_inputs_
     torch.testing.assert_close(at_training[0], f.constrained_value)
 
 
-def test_mode_warns_without_a_joint_log_density_and_means_of_discrete_parameters_are_fractional():
+@pytest.mark.parametrize("chain_method", ["vectorized", "parallel"])
+def test_mode_uses_the_joint_log_density_of_multi_block_runs(chain_method):
     torch.manual_seed(0)
+    data = torch.randn(10) + 0.5
     with Model() as model:
         p = RandomParameter("p", Beta(2.0, 2.0))
         k = RandomParameter("k", Bernoulli(0.7))
         with plate("data", 10):
-            ObservedParameter("y", Normal(p, 1.0), torch.randn(10) + 0.5)
-    trace = model.sample(100, 50, n_chains=2, progress_bar=False, chain_method="vectorized", check_convergence=False)
-    assert trace.lp is None  # NUTS for p and Gibbs for k record their own log density terms only
-    with pytest.warns(UserWarning, match="coordinate-wise median"):
-        trace.mode()
+            ObservedParameter("y", Normal(p, 1.0), data)
+    trace = model.sample(60, 150, n_chains=2, progress_bar=False, chain_method=chain_method, check_convergence=False, seed=1)
+    assert len(trace.sample_stats.blocks) == 2  # NUTS for p, Gibbs for k
+    assert trace.lp.shape == (2, 60)
+    # The recorded value is the joint log density of the stored draw.
+    model.params["p"].set_constrained_value(trace.trace["p"][1, 7])
+    model.params["k"].set_constrained_value(trace.trace["k"][1, 7])
+    torch.testing.assert_close(trace.lp[1, 7], model.model_log_prob().to(torch.float64), atol=1e-5, rtol=1e-5)
+    best = trace.lp.flatten().argmax()
+    mode = trace.mode()
+    torch.testing.assert_close(mode["p"], trace.trace["p"].flatten(0, 1)[best])
+    torch.testing.assert_close(mode["k"], trace.trace["k"].flatten(0, 1)[best])
     mean = trace.mean()["k"]
     assert mean.is_floating_point() and 0.0 < mean.item() < 1.0
     assert trace.quantile(0.5)["k"].is_floating_point()

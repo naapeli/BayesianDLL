@@ -478,9 +478,9 @@ class VectorizedNUTS:
         if n >= 2:
             covariance = self._welford_m2 / (n - 1)
             if self.metric == "dense":
+                from ._NUTS import _dense_inverse_metric
                 identity = torch.eye(covariance.shape[-1], dtype=covariance.dtype, device=covariance.device)
-                inv_metric = (n / (n + 5.0)) * covariance + 1e-3 * (5.0 / (n + 5.0)) * identity
-                inv_metric = 0.5 * (inv_metric + inv_metric.transpose(-2, -1))
+                inv_metric = _dense_inverse_metric(covariance, n)
                 chol, info = torch.linalg.cholesky_ex(inv_metric)
                 ok = info == 0
                 previous = self.inv_metric if self.inv_metric is not None else identity.expand_as(inv_metric)
