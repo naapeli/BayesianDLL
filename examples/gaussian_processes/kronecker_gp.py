@@ -161,79 +161,89 @@ ax.grid(True, which="both", alpha=0.3)
 plt.show()
 
 # %%
-# Learnable vs Fixed Grid Comparison
-# -----------------------------------
-# While stationary Toeplitz models require rigid, equally spaced coordinates,
-# ``KroneckerGP`` supports arbitrary and learnable coordinate grids along any axis.
+# Learnable grid coordinates
+# --------------------------
+# ``ToeplitzGP`` needs fixed, equally spaced inputs, but the axes of a
+# ``KroneckerGP`` can be learned: an axis given as a ``RandomParameter`` gets
+# exact gradients of the marginal likelihood, and the grid stays a Cartesian
+# product whose points can move along that axis.
 #
-# When observations are measured on non-uniform or distorted grids, assuming
-# fixed equispaced coordinates leads to model misspecification. Because
-# ``KroneckerGP`` evaluates exact reverse-mode vector-Jacobian products with
-# respect to each coordinate, the grid coordinates can be treated as
-# :class:`~BayesianDLL.RandomParameter` or :class:`~BayesianDLL.DeterministicParameter`
-# nodes and estimated jointly with the kernel parameters.
+# Here the rows of a 25 x 25 grid are read at warped positions
+# ``a_i = (i / (n - 1))^2.5`` along axis ``a``, but the model is only told the
+# row index. On a uniform axis the readings look like a chirp, oscillating
+# faster towards the end, which a stationary kernel can only fit with a
+# compromise lengthscale. The comparison:
 #
-# Here, data is generated on a warped axis :math:`a_i = (i / (N - 1))^{1.4}`.
-# We compare:
+# 1. **Fixed axis**: the rows sit on a uniform ``Data`` axis; ``find_MAP``
+#    fits the lengthscales, the variance and the noise.
+# 2. **Learned axis**: the row positions are a ``RandomParameter`` (prior
+#    around the uniform grid) and are fitted jointly with the kernel and noise
+#    parameters, starting from the fixed-axis fit.
 #
-# 1. **Fixed Grid Model**: coordinates along axis A are fixed :class:`~BayesianDLL.Data`
-#    nodes placed on a uniform grid;
-# 2. **Learnable Grid Model**: coordinates along axis A are a :class:`~BayesianDLL.RandomParameter`
-#    initialized at the uniform grid, receiving exact gradient feedback from the marginal likelihood.
+# With a stationary kernel the positions are only identified up to a shift and
+# a scale shared with the lengthscale, so the learned axis is compared with the
+# truth after rescaling both to ``[0, 1]``.
 
-n_compare = 25
-axis_a_true = torch.linspace(0.0, 1.0, n_compare, dtype=torch.float64) ** 1.4
-b_axis = torch.linspace(0.0, 1.0, n_compare, dtype=torch.float64)
-y_warped = true_surface(axis_a_true[:, None], b_axis[None, :]) + 0.05 * torch.randn(n_compare, n_compare, dtype=torch.float64)
-axis_a_init = torch.linspace(0.0, 1.0, n_compare, dtype=torch.float64)
+torch.manual_seed(1)
+n_grid = 25
+uniform = torch.linspace(0.0, 1.0, n_grid, dtype=torch.float64)
+warped = uniform ** 2.5
 
-with Model() as fixed_model:
-    gp_fixed = KroneckerGP(
-        "gp_fixed",
-        [Data("axis_a_fixed", axis_a_init), Data("axis_b", b_axis)],
-        [RBF(0.3, 1.0), RBF(0.6, 1.0)],
-        noise_variance=0.01,
-    )
-    ObservedParameter("y_fixed", gp_fixed, y_warped)
 
-with Model() as learnable_model:
-    axis_a_param = RandomParameter("axis_a_learned", Normal(0.5, 0.5), shape=n_compare, initial_value=axis_a_init.clone())
-    gp_learnable = KroneckerGP(
-        "gp_learnable",
-        [axis_a_param, Data("axis_b", b_axis)],
-        [RBF(0.3, 1.0), RBF(0.6, 1.0)],
-        noise_variance=0.01,
-    )
-    ObservedParameter("y_learned", gp_learnable, y_warped)
+def chirp_surface(a, b):
+    return torch.sin(10.0 * a) * torch.cos(3.0 * b) + 0.5 * a
 
-grads = learnable_model.joint_grad_log_prob()
-grad_a = grads["axis_a_learned"]
 
-# Optimize coordinates along the exact likelihood gradient
-axis_val = axis_a_init.clone()
-for _ in range(40):
-    axis_a_param.set_unconstrained_value(axis_val)
-    g = learnable_model.joint_grad_log_prob()["axis_a_learned"]
-    axis_val = axis_val + 0.005 * (g / (g.abs().max() + 1e-8))
-axis_a_param.set_unconstrained_value(axis_val)
+y_warped = chirp_surface(warped[:, None], uniform[None, :]) + 0.05 * torch.randn(n_grid, n_grid, dtype=torch.float64)
+hyperparameters = (("log_l_a", -1.5), ("log_l_b", -1.5), ("log_v", 0.0), ("log_noise", -3.0))
 
-mse_initial = (axis_a_init - axis_a_true).square().mean().item()
-mse_learned = (axis_val - axis_a_true).square().mean().item()
 
-print(f"Fixed grid parameters:     {list(fixed_model.params.keys())} (coordinates are immutable Data nodes)")
-print(f"Learnable grid parameters: {list(learnable_model.params.keys())} (coordinates are RandomParameters)")
-print(f"Axis A coordinate MSE to truth: initial (fixed) {mse_initial:.5f} -> learned {mse_learned:.5f}")
+def grid_model(learn_axis, start=None):
+    with Model() as grid_fit:
+        log = {
+            name: RandomParameter(name, Normal(prior_mean, 1.0), initial_value=None if start is None else start[name])
+            for name, prior_mean in hyperparameters
+        }
+        if learn_axis:
+            axis = RandomParameter("axis_a", Normal(uniform, 0.3), shape=n_grid, initial_value=uniform.clone())
+        else:
+            axis = Data("axis_a", uniform)
+        gp = KroneckerGP(
+            "f", [axis, Data("axis_b", uniform)],
+            [RBF(Exp("l_a", log["log_l_a"]), Exp("v", log["log_v"])), RBF(Exp("l_b", log["log_l_b"]), 1.0)],
+            noise_variance=Exp("noise", log["log_noise"]),
+        )
+        ObservedParameter("y", gp, y_warped)
+    return grid_fit, gp
 
+
+fixed_fit, fixed_gp = grid_model(learn_axis=False)
+find_MAP(fixed_fit, lr=0.03, epochs=400, verbose=False)
+start_values = {name: fixed_fit.params[name].constrained_value.clone() for name, _ in hyperparameters}
+learned_fit, learned_gp = grid_model(learn_axis=True, start=start_values)
+find_MAP(learned_fit, lr=0.01, epochs=600, verbose=False)
+
+for label, grid_fit, gp in (("fixed axis", fixed_fit, fixed_gp), ("learned axis", learned_fit, learned_gp)):
+    noise_sd = grid_fit.deterministic_params["noise"].constrained_value.sqrt().item()
+    print(f"{label:>12}: log marginal likelihood {gp.log_pdf(y_warped).item():7.1f}, noise sd {noise_sd:.3f} (true 0.05)")
+
+
+def rescaled(values):
+    return (values - values.min()) / (values.max() - values.min())
+
+
+learned_axis = rescaled(learned_fit.params["axis_a"].constrained_value.detach())
+print(f"mean absolute error of the learned (rescaled) positions: {(learned_axis - warped).abs().mean():.3f}")
+
+column = n_grid // 2
 fig, axes = plt.subplots(1, 2, figsize=(11, 4.2), layout="constrained")
-axes[0].plot(range(n_compare), axis_a_true.numpy(), "k--", lw=2, label="True warped coordinates")
-axes[0].plot(range(n_compare), axis_a_init.numpy(), "s:", color="C1", alpha=0.8, label="Fixed / Initial (uniform)")
-axes[0].plot(range(n_compare), axis_val.detach().numpy(), "o-", color="C0", lw=2, label="Learned coordinates")
-axes[0].set(xlabel="Grid index i", ylabel="Coordinate value $a_i$", title="Axis A: Fixed vs Learned Grid Coordinates")
+axes[0].plot(warped, "k--", lw=2, label="true positions")
+axes[0].plot(uniform, ":", color="C1", label="fixed uniform axis")
+axes[0].plot(learned_axis, "o-", color="C0", ms=4, label="learned axis (rescaled)")
+axes[0].set(xlabel="row index i", ylabel="position a_i", title="Axis a: positions of the rows")
 axes[0].legend(fontsize="small")
-axes[0].grid(True, alpha=0.3)
-
-axes[1].plot(range(n_compare), grad_a.numpy(), "D-", color="C2", lw=1.5)
-axes[1].axhline(0, color="black", linestyle="--", lw=0.8)
-axes[1].set(xlabel="Grid index i", ylabel=r"$\partial \log p(y) / \partial a_i$", title="Marginal Likelihood Gradient w.r.t. Coordinates")
-axes[1].grid(True, alpha=0.3)
+axes[1].plot(uniform, y_warped[:, column], "s:", color="C1", ms=4, label="against the uniform axis")
+axes[1].plot(learned_axis, y_warped[:, column], "o-", color="C0", ms=4, label="against the learned axis")
+axes[1].set(xlabel="position along a", ylabel="reading", title=f"One column of readings (b = {uniform[column]:.2f})")
+axes[1].legend(fontsize="small")
 plt.show()

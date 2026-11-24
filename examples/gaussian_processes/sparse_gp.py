@@ -70,7 +70,7 @@ def build(method):
 def band(model, method):
     model.data["inputs"].set_value(grid)
     try:
-        draws = model.predict(samples_per_step=300)["y"].squeeze(0)
+        draws = model.predict(samples_per_step=300)["f"].squeeze(0)
         return torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
     finally:
         model.data["inputs"].set_value(x)
@@ -138,7 +138,7 @@ print(summary)
 print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-hat: {summary['r_hat'].max():.3f}")
 
 model.data["inputs"].set_value(grid)
-draws = model.posterior_predicative(trace.thin(10), samples_per_step=10, progress_bar=False)["y"].reshape(-1, grid.numel())
+draws = model.posterior_predicative(trace.thin(10), samples_per_step=10, progress_bar=False)["f"].reshape(-1, grid.numel())
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 fig, (ax, ax_hist) = plt.subplots(1, 2, figsize=(12, 4), layout="constrained", gridspec_kw={"width_ratios": [2.2, 1]})
 ax.scatter(x, y, s=3, color="0.65", label="observations")
@@ -187,7 +187,7 @@ def build_trend(learned_mean):
             intercept = RandomParameter("intercept", Normal(0.0, 2.0))
             mean = LinearMean(slope, intercept)
         f = ExactGP("f", Data("inputs", x), kernel, inducing_points=inducing,
-                     noise_variance=Exp("noise", log_noise), mean=mean)
+                    noise_variance=Exp("noise", log_noise), mean=mean)
         ObservedParameter("y", f, y_trend)
     return model, f
 
@@ -202,7 +202,7 @@ for ax, learned_mean in zip(axes, (False, True)):
         i_val = model.params["intercept"].constrained_value.item()
         title = f"LinearMean (slope {s_val:.2f}, intercept {i_val:.2f})"
     model.data["inputs"].set_value(grid_far)
-    draws = model.predict(samples_per_step=300)["y"].squeeze(0)
+    draws = model.predict(samples_per_step=300)["f"].squeeze(0)
     lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
     ax.scatter(x, y_trend, s=3, color="0.65", label="observations")
     ax.fill_between(grid_far, lower, upper, color="tab:purple", alpha=0.3, label="90% band of f")

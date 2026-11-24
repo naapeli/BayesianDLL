@@ -41,6 +41,7 @@ uncertainty of the full posterior away from the data.
 """
 
 import math
+import time
 
 import matplotlib.pyplot as plt
 import torch
@@ -155,17 +156,26 @@ fig.legend(handles, labels, loc="outside lower center", ncol=5, fontsize="small"
 plt.show()
 
 # %%
-# Deep Neural Network with Composed Linear and Tanh Layers
-# ---------------------------------------------------------
+# A deeper network: where mean-field VI breaks down
+# -------------------------------------------------
 # Neural network architectures can be constructed using deterministic layer
 # blocks by composing :class:`~BayesianDLL.Deterministic.Linear` and
 # :class:`~BayesianDLL.Deterministic.Tanh` blocks.
 #
 # Here a four-hidden-layer MLP (1 -> 8 -> 8 -> 8 -> 8 -> 1) is fitted to a composite
-# signal :math:`\sin(1.5 x) + 0.5 \sin(3.5 x)` with variational inference,
-# initialized from a MAP estimate. The weights use fan-in priors with scale
+# signal :math:`\sin(1.5 x) + 0.5 \sin(3.5 x)`. The weights use fan-in priors with scale
 # :math:`2 / \sqrt{H}` so the network has sufficient expressive range to capture
-# the higher-frequency harmonic:
+# the higher-frequency harmonic. Both methods start from a MAP estimate:
+#
+# * **Mean-field VI**, run until the ELBO levels off. With 241 weights the
+#   ELBO-optimal factorised guide prunes hidden units (their weights revert
+#   to the prior) and smooths the harmonic away, so its band is wide but
+#   misses the signal. Stopping it early with a tiny initial scale instead
+#   leaves every standard deviation near its starting value, and the band
+#   then reflects the optimiser, not the posterior.
+# * **NUTS from the MAP estimate**, two chains. Each chain explores one of the
+#   equivalent modes (see above), but the predicted functions agree, and the
+#   band is narrow where the data are and widens beyond them.
 
 h1_dim, h2_dim, h3_dim, h4_dim = 8, 8, 8, 8
 
@@ -214,38 +224,48 @@ with Model() as deep_bnn:
     with plate("deep_obs", n_deep):
         ObservedParameter("y_deep", Normal(f_mlp, sigma_deep), y_deep)
 
-# Initialise at the MAP mode to avoid symmetric saddle points and flat local optima
+# Start at the MAP mode: random initial weights are far from the posterior mass.
 deep_bnn.find_MAP(lr=0.03, epochs=1500, verbose=False)
-print("Deep BNN: MAP initialization complete")
+map_values = {name: parameter.constrained_value.clone() for name, parameter in deep_bnn.params.items()}
 
-deep_guide = Guide(deep_bnn, default_family="mean_field", init_scale=0.01)
-deep_history = BBVI(deep_bnn, deep_guide, n_samples=4, epochs=800, lr=0.001, lrd=0.999, verbose=False)
-deep_trace = {k: v.squeeze(0) for k, v in deep_guide.sample(200).items()}
-print(f"Deep BNN (4 hidden layers): final ELBO {deep_history[-1]:.2f}")
+deep_guide = Guide(deep_bnn, default_family="mean_field", init_scale=0.05)
+deep_history = BBVI(deep_bnn, deep_guide, n_samples=4, epochs=800, lr=0.01, lrd=0.999, verbose=False)
+deep_draws = {"mean-field VI": {k: v.squeeze(0) for k, v in deep_guide.sample(200).items()}}
+print(f"Deep BNN mean-field VI: final ELBO {sum(deep_history[-20:]) / 20:.1f}")
 
-# Predict on the grid using trace draws
-grid_deep = (grid_raw - x_deep_mean) / x_deep_std
-grid_tensor = grid_deep.unsqueeze(-1)
-pred_draws = []
-for i in range(len(deep_trace["w1"])):
-    h1_val = torch.tanh(grid_tensor @ deep_trace["w1"][i] + deep_trace["b1"][i])
-    h2_val = torch.tanh(h1_val @ deep_trace["w2"][i] + deep_trace["b2"][i])
-    h3_val = torch.tanh(h2_val @ deep_trace["w3"][i] + deep_trace["b3"][i])
-    h4_val = torch.tanh(h3_val @ deep_trace["w4"][i] + deep_trace["b4"][i])
-    f_val = (h4_val @ deep_trace["w5"][i] + deep_trace["b5"][i]) * y_deep_std + y_deep_mean
-    pred_draws.append(f_val)
-pred_tensor = torch.stack(pred_draws)
-pred_mean = pred_tensor.mean(0)
-q05, q95 = pred_tensor.quantile(torch.tensor([0.05, 0.95], dtype=torch.float64), dim=0)
+deep_bnn.set_params(map_values)
+start = time.perf_counter()
+deep_nuts = deep_bnn.sample(100, 100, n_chains=2, init_scale=0.0, max_depth=6, seed=0, progress_bar=False,
+                            chain_method="vectorized", check_convergence=False)
+deep_draws["NUTS from the MAP"] = {k: v.flatten(0, 1) for k, v in deep_nuts.trace.items()}
+print(f"Deep BNN NUTS: {time.perf_counter() - start:.1f} s, divergences: {sum(deep_nuts.divergences)}")
 
-fig, ax = plt.subplots(figsize=(8, 4.5), layout="constrained")
-ax.fill_between(grid_raw, q05, q95, color="C4", alpha=0.25, label="90% credible band")
-ax.plot(grid_raw, pred_mean, color="C4", lw=2, label="deep BNN mean")
-ax.plot(grid_raw, complex_signal(grid_raw), "k--", label="true function")
-ax.scatter(x_deep_raw, y_deep_raw, color="black", s=14, zorder=3, label="data")
-ax.set_ylim(-2.8, 2.8)
-ax.set_xlabel("x")
-ax.set_ylabel("f(x)")
-ax.set_title("Four-Hidden-Layer Bayesian Neural Network (Linear & Tanh Layers)")
-ax.legend(fontsize="small", loc="lower right")
+
+def network_outputs(draws):
+    """The network on the grid (original scale) for every draw of the weights."""
+    inputs = ((grid_raw - x_deep_mean) / x_deep_std).unsqueeze(-1)
+    outputs = []
+    for i in range(draws["w1"].shape[0]):
+        h = inputs
+        for layer in (1, 2, 3, 4):
+            h = torch.tanh(h @ draws[f"w{layer}"][i] + draws[f"b{layer}"][i])
+        outputs.append((h @ draws["w5"][i] + draws["b5"][i]) * y_deep_std + y_deep_mean)
+    return torch.stack(outputs)
+
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), sharey=True, layout="constrained")
+in_range = grid_raw.abs() <= 3.0
+for ax, (label, draws), color in zip(axes, deep_draws.items(), ("C1", "C4")):
+    f = network_outputs(draws)
+    q05, q95 = f.quantile(torch.tensor([0.05, 0.95], dtype=torch.float64), dim=0)
+    error = (f.mean(0) - complex_signal(grid_raw))[in_range].square().mean().sqrt()
+    print(f"{label:>18}: RMS error of the predictive mean in the data range {error:.3f}")
+    ax.fill_between(grid_raw, q05, q95, color=color, alpha=0.25, label="90% band")
+    ax.plot(grid_raw, f.mean(0), color=color, lw=2, label="predictive mean")
+    ax.plot(grid_raw, complex_signal(grid_raw), "k--", label="true function")
+    ax.scatter(x_deep_raw, y_deep_raw, color="black", s=10, zorder=3, label="data")
+    ax.set(title=label, xlabel="x", ylim=(-2.8, 2.8))
+axes[0].set_ylabel("f(x)")
+axes[1].legend(fontsize="small", loc="lower right")
+fig.suptitle("Four-hidden-layer Bayesian neural network (Linear & Tanh layers)")
 plt.show()

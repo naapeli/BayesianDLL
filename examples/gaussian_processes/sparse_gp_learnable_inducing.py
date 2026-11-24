@@ -113,7 +113,7 @@ for ax, model, f, z, title in [
     (axes[1], learned_model, learned_f, z_learned, f"Learned Z (bound {bounds[-1]:.0f})"),
 ]:
     model.data["inputs"].set_value(grid)
-    draws = model.predict(samples_per_step=300)["y"].squeeze(0)
+    draws = model.predict(samples_per_step=300)["f"].squeeze(0)
     lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
     ax.scatter(x, y, s=4, color="0.65", label="observations")
     ax.fill_between(grid, lower, upper, color="tab:blue", alpha=0.3, label="90% band of f")

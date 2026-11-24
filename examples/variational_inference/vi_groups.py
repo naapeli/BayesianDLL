@@ -103,12 +103,12 @@ histories, traces, seconds = {}, {}, {}
 for label, guide in guides.items():
     torch.manual_seed(1)
     start = time.perf_counter()
-    histories[label] = BBVI(model, guide, n_samples=2, epochs=4500, lr=0.03, lrd=0.999, callback_frequency=5, verbose=False)
+    histories[label] = BBVI(model, guide, n_samples=2, epochs=1500, lr=0.03, lrd=0.999, callback_frequency=5, verbose=False)
     seconds[label] = time.perf_counter() - start
     traces[label] = guide.sample(1500)
 
 start = time.perf_counter()
-traces["NUTS"] = model.sample(n_samples=50, warmup_length=50, n_chains=2, progress_bar=False, seed=0,
+traces["NUTS"] = model.sample(n_samples=300, warmup_length=300, n_chains=4, progress_bar=False, seed=0,
                               metric="dense", chain_method="vectorized")
 seconds["NUTS"] = time.perf_counter() - start
 print(f"NUTS: {sum(traces['NUTS'].divergences)} divergences")
@@ -192,7 +192,7 @@ fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), layout="constrained")
 labels = list(traces)
 axes[0].bar(labels, [seconds[label] for label in labels], color=[colors[label] for label in labels])
 axes[0].set_ylabel("seconds")
-axes[0].set_title("Run time (BBVI 1500 steps; NUTS 4 x 800 iterations)")
+axes[0].set_title("Run time (BBVI 1500 steps; NUTS 4 x 600 iterations)")
 axes[1].bar(list(guides), [n_variational_parameters(guide) for guide in guides.values()], color=[colors[label] for label in guides])
 axes[1].set_ylabel("count")
 axes[1].set_title("Variational parameters")
@@ -204,13 +204,26 @@ plt.show()
 # Mean and covariance of a guide
 # ------------------------------
 # ``guide.moments(space)`` returns a :class:`~BayesianDLL.Variational.GuideMoments`
-# container holding posterior means, marginal variances, and covariance matrices.
-#
-# Specific parameters or groups can be accessed directly:
+# with the mean and the block-diagonal covariance of the guide (pieces of a
+# guide are independent). Specific latents or groups can be accessed directly:
 #
 # * ``m.mean("mu")``, ``m.variance("mu")``, ``m.covariance("mu")``, ``m.correlation("mu")``
 # * ``m.mean(group="line")``, ``m.covariance(group="line")``, ``m.correlation(group="line")``
 # * ``m.mean()``, ``m.variance()``, ``m.covariance()``, ``m.correlation()`` (full tensors)
+#
+# Each block is exact where a closed form exists and a Monte Carlo estimate
+# otherwise (listed in ``estimated``, with ``standard_error`` = sd / sqrt(n)).
+# In the **unconstrained** space every Gaussian block is exact, but the
+# ``LogNormal`` entry describes ``sigma`` itself, so the moments of
+# ``log sigma`` are estimated from independent draws. In the **constrained**
+# space ``tau`` (log scale in the mean-field group) gets the exact log-normal
+# moments and the ``LogNormal`` entry its closed form, so nothing is sampled.
+# These are moments of the approximation ``q``, not of the posterior.
+#
+# Constrained moments are not the transformed unconstrained ones:
+# ``exp(E[log tau])`` is the median of the log-normal, smaller than ``E[tau]``
+# by the factor ``exp(-s^2 / 2)``. Use the unconstrained moments to inspect the
+# optimisation and the constrained ones to report results.
 
 for space in ("unconstrained", "constrained"):
     m = grouped.moments(space)
@@ -229,5 +242,5 @@ print(f"corr(mu, beta) inside line group: {corr_mu_beta.item():+.3f}")
 print(f"tau: exp(E[log tau]) = {unconstrained.mean('tau').exp().item():.4f}, "
       f"E[tau] = {constrained.mean('tau').item():.4f}, "
       f"Monte Carlo from guide.sample: {traces['grouped']['tau'].mean().item():.4f}")
-print(f"sigma: E[sigma] = {constrained.mean('sigma').item():.4f}, "
-      f"variance(sigma) = {constrained.variance('sigma').item():.4f}")
+print(f"sigma: E[sigma] = {constrained.mean('sigma').item():.4f} (closed form of the LogNormal entry), "
+      f"E[log sigma] = {unconstrained.mean('sigma').item():.4f} +- {unconstrained.standard_error['sigma'].item():.4f} (Monte Carlo)")

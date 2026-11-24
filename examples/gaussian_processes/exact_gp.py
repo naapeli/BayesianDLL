@@ -95,7 +95,7 @@ print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-
 
 grid = torch.linspace(-0.2, 5.5, 240, dtype=torch.float64)
 inputs.set_value(grid)
-draws = model.posterior_predicative(trace.thin(10), samples_per_step=5, progress_bar=False)["y"].reshape(-1, grid.numel())
+draws = model.posterior_predicative(trace.thin(10), samples_per_step=5, progress_bar=False)["f"].reshape(-1, grid.numel())
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
 fig = plt.figure(figsize=(12, 5), layout="constrained")

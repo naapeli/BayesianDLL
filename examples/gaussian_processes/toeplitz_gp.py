@@ -10,8 +10,12 @@ symmetric Toeplitz.
 ``ToeplitzGP`` computes the exact marginal likelihood and solve via Levinson
 recursion in :math:`\mathcal{O}(N^2)` time and :math:`\mathcal{O}(N)` memory,
 compared to :math:`\mathcal{O}(N^3)` and :math:`\mathcal{O}(N^2)` for dense
-Cholesky factorisation. Beyond a few thousand points, the :math:`\mathcal{O}(N^2)`
-scaling becomes noticeably faster than dense factorisation while using minimal memory.
+Cholesky factorisation. The recursion is sequential (one Python-level step per
+observation), so a multi-threaded dense factorisation stays competitive up to one
+or two thousand points; beyond that the recursion wins, and its memory use stays
+linear. With thousands of points a gradient still takes a noticeable fraction of
+a second, so this example computes a type-II MAP estimate of the hyperparameters
+instead of running MCMC.
 """
 
 import time
@@ -70,29 +74,39 @@ print(f"type-II MAP estimate in {elapsed:.1f} s: lengthscale {fitted['lengthscal
 # %%
 # Predictive distribution on a window and a forecast
 # --------------------------------------------------
-# ``model.predict`` evaluates the GP posterior at arbitrary new
-# inputs via Levinson solves without forming dense matrices. The band widens
-# beyond the last reading.
+# ``model.predict`` conditions on the training readings with Levinson solves
+# (one right-hand side per new input, so no ``n x n`` matrix is formed) and
+# draws the function from its posterior at the new inputs. The predictive
+# covariance over the new inputs is dense, so predict on a window. The band
+# widens beyond the last reading.
 
 new_t = torch.linspace(45.0, 75.0, 60, dtype=torch.float64)
 model.data["t"].set_value(new_t)
-draws = model.predict(map_result.mode(), samples_per_step=300)["y"].squeeze(0)
+draws = model.predict(map_result.mode(), samples_per_step=300)["f"].squeeze(0)
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
 
 # %%
 # Timing against ExactGP
 # ----------------------
+# One log density and gradient evaluation per size, after a warm-up call (best
+# of two runs). Where the two curves cross depends on the machine: a dense
+# Cholesky factorisation uses all cores, the recursion is one sequential loop.
 
 
-def time_once(cls, size):
+def time_evaluation(cls, size):
     timing_model, _ = build(cls, t_all[:size], y_all[:size])
-    start = time.perf_counter()
     timing_model.joint_grad_log_prob()
-    return time.perf_counter() - start
+    best = float("inf")
+    for _ in range(2):
+        start = time.perf_counter()
+        timing_model.model_log_prob()
+        timing_model.joint_grad_log_prob()
+        best = min(best, time.perf_counter() - start)
+    return best
 
 
-sizes = [1000, 2000, 4000, 4800]
-timings = {cls.__name__: [time_once(cls, s) for s in sizes] for cls in (ExactGP, ToeplitzGP)}
+sizes = [600, 1200, 2400, 4800]
+timings = {cls.__name__: [time_evaluation(cls, s) for s in sizes] for cls in (ExactGP, ToeplitzGP)}
 for name, values in timings.items():
     print(name, ", ".join(f"n={s}: {1000 * v:.0f} ms" for s, v in zip(sizes, values)))
 

@@ -94,12 +94,12 @@ histories, traces, seconds = {}, {}, {}
 for label, guide in (("mean-field", mean_field), ("structured", structured)):
     torch.manual_seed(1)
     start = time.perf_counter()
-    histories[label] = BBVI(model, guide, n_samples=2, epochs=4500, lr=0.02, lrd=0.999, callback_frequency=5, verbose=False)
+    histories[label] = BBVI(model, guide, n_samples=2, epochs=2500, lr=0.02, lrd=0.999, callback_frequency=5, verbose=False)
     seconds[label] = time.perf_counter() - start
     traces[label] = guide.sample(2000)
     print(f"{label:>10}: {seconds[label]:4.1f} s, final ELBO {sum(histories[label][-100:]) / 100:.2f}")
 
-traces["NUTS"] = non_centered.sample(n_samples=80, warmup_length=80, n_chains=2, progress_bar=False, seed=0, delta=0.9,
+traces["NUTS"] = non_centered.sample(n_samples=300, warmup_length=300, n_chains=4, progress_bar=False, seed=0, delta=0.9,
                                      chain_method="vectorized")
 print(f"NUTS (non-centered): {sum(traces['NUTS'].divergences)} divergences")
 for label, trace in traces.items():

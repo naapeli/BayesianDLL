@@ -10,8 +10,8 @@ NUTS:
 * ``ExactGP`` integrates the function out for Gaussian noise, and
   ``LatentGP`` samples it in whitened form for any likelihood
   (e.g. classification).
-* ``SparseGP`` scales to many observations with inducing inputs (VFE, DTC,
-  FITC), which can themselves be learned.
+* With ``inducing_points`` both scale to many observations (VFE, DTC or
+  FITC for ``ExactGP``), and the inducing inputs can themselves be learned.
 * The training inputs can be learned too (every class but ``ToeplitzGP``):
   a GP latent variable model infers the inputs of high-dimensional data.
 * ``KroneckerGP`` and ``ToeplitzGP`` stay exact but exploit grid and

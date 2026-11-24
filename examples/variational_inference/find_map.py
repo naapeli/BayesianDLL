@@ -72,7 +72,8 @@ for name in estimate:
 # ----------------------------------
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), layout="constrained")
-axes[0].plot(range(10, 10 * len(map_result) + 1, 10), map_result.history)
+# The log density is recorded after Adam steps 1, 11, 21, ... (every 10 epochs).
+axes[0].plot(range(1, 10 * len(map_result.history) + 1, 10), map_result.history)
 axes[0].set_xlabel("Adam step")
 axes[0].set_ylabel("log posterior density")
 axes[0].set_ylim(map_result.log_prob - 200, map_result.log_prob + 20)

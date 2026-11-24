@@ -104,7 +104,7 @@ with Model() as model:
     log_noise = RandomParameter("log_noise", Normal(-2.0, 1.0))
     kernel = RBF(1.0, Exp("variance", log_variance))
     gp = ExactGP("f", x, kernel, inducing_points=z, noise_variance=Exp("noise", log_noise),
-                  method="vfe", n_outputs=n_outputs)
+                 method="vfe", n_outputs=n_outputs)
     ObservedParameter("y", gp, y)
 
 # %%
@@ -164,7 +164,7 @@ plt.show()
 # second harmonics.
 
 preds = model.predict(samples_per_step=200)
-draws = preds["y"].squeeze(0)  # (samples, D, n)
+draws = preds["f"].squeeze(0)  # (samples, D, n)
 reconstruction = draws.mean(dim=0)
 gplvm_error = (reconstruction - y).square().mean().sqrt().item()
 pca_error = (pca_reconstruction - y).square().mean().sqrt().item()
