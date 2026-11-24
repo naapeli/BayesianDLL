@@ -34,8 +34,8 @@ import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
-from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import RBF, LatentGP, gp_predictive
+from BayesianDLL.Distributions import LogTransform, Normal
+from BayesianDLL.GP import RBF, LatentGP
 from BayesianDLL.Variational import BBVI
 
 
@@ -49,12 +49,12 @@ y = torch.sin(2 * torch.pi * x) + 0.08 * torch.randn_like(x)
 with Model() as model:
     inputs = Data("inputs", x)
     f = LatentGP("f", inputs, RBF(lengthscale, variance))  # creates the latent "f_white" ~ N(0, I)
-    with plate("observations", x):
+    with plate("observations", inputs):
         ObservedParameter("y", Normal(f, noise_std), y)
 
 with Guide(model) as guide:
     z_loc = VariationalParameter("z_loc", torch.zeros(n_observations, dtype=torch.float64))
-    z_scale = VariationalParameter("z_scale", torch.ones(n_observations, dtype=torch.float64), log_scale=True)
+    z_scale = VariationalParameter("z_scale", torch.ones(n_observations, dtype=torch.float64), transform=LogTransform())
     RandomParameter("f_white", Normal(z_loc, z_scale), shape=(n_observations,))
 
 # %%
@@ -126,8 +126,9 @@ sd_ax.legend(fontsize="small")
 ax = lower_ax.subplots()
 ax.fill_between(x_new, exact_mean - 1.96 * exact_sd, exact_mean + 1.96 * exact_sd, color="grey", alpha=0.25, label="exact 95% band")
 ax.plot(x_new, exact_mean, color="black", label="exact mean")
+inputs.set_value(x_new)
 for label, trace in traces.items():
-    draws = gp_predictive(model.deterministic_params["f"], trace, x_new).reshape(-1, x_new.numel())
+    draws = model.posterior_predicative(trace, samples_per_step=1, progress_bar=False)["f"].reshape(-1, x_new.numel())
     lower, upper_band = draws.quantile(torch.tensor([0.025, 0.975], dtype=torch.float64), dim=0)
     ax.plot(x_new, lower, color=colors[label], linestyle="--", lw=1.2, label=f"{label} 95% band")
     ax.plot(x_new, upper_band, color=colors[label], linestyle="--", lw=1.2)

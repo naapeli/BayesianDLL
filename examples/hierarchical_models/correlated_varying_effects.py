@@ -15,7 +15,7 @@ be correlated:
 The correlation matrix ``R`` gets an LKJ prior on its Cholesky factor,
 ``L_R ~ LKJCholesky(2, 2)``, which mildly favours weak correlations, and the
 group scales ``tau`` get ``HalfNormal(1.5)`` priors. The
-``CholeskyCovariance`` block combines them into the Cholesky factor
+``Multiply`` block combines them into the Cholesky factor
 ``L = diag(tau) L_R`` of ``Sigma``, which ``MultivariateNormal`` takes as
 ``scale_tril`` without ever forming or factorising ``Sigma``.
 
@@ -42,7 +42,7 @@ import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, plate
-from BayesianDLL.Deterministic import CholeskyCovariance, Index, Multiply, Sum
+from BayesianDLL.Deterministic import Index, Multiply, Sum
 from BayesianDLL.Distributions import HalfNormal, LKJCholesky, MultivariateNormal, Normal
 
 
@@ -65,9 +65,9 @@ with Model() as model:
     design = Data("design", torch.stack([torch.ones_like(x), x], dim=-1))  # rows (1, x_i)
 
     mu = RandomParameter("mu", Normal(0.0, 2.0), shape=(2,))
-    tau = RandomParameter("tau", HalfNormal(1.5), shape=(2,))
+    tau = RandomParameter("tau", HalfNormal(1.5), shape=(2, 1))
     L_corr = RandomParameter("L_corr", LKJCholesky(2, 2.0))
-    L = CholeskyCovariance("L", L_corr, tau)
+    L = Multiply("L", tau, L_corr)
     effects = RandomParameter("effects", MultivariateNormal(mu, scale_tril=L), shape=(n_groups, 2))  # (alpha_j, beta_j)
     sigma_y = RandomParameter("sigma_y", HalfNormal(1.0))
 
@@ -108,7 +108,7 @@ axes[0].legend(fontsize="small")
 
 angles = torch.linspace(0, 2 * torch.pi, 200, dtype=torch.float64)
 mean_R = torch.tensor([[1.0, rho.mean()], [rho.mean(), 1.0]], dtype=torch.float64)
-mean_tau = trace["tau"].flatten(0, 1).mean(0)
+mean_tau = trace["tau"].flatten(0, 1).mean(0).squeeze()
 population_cov = torch.diag(mean_tau) @ mean_R @ torch.diag(mean_tau)
 ellipse = trace["mu"].flatten(0, 1).mean(0).unsqueeze(-1) + 2.146 * torch.linalg.cholesky(population_cov) @ torch.stack([angles.cos(), angles.sin()])
 axes[1].plot(ellipse[0], ellipse[1], color="grey", linestyle="--", label="population (90%)")

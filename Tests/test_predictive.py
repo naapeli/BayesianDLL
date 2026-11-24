@@ -8,7 +8,7 @@ import torch
 
 from BayesianDLL import (
     DeterministicParameter, Model, ObservedParameter, RandomParameter, plate,
-    posterior_predicative, sample_prior_predicative,
+    posterior_predicative, prior_predicative,
 )
 from BayesianDLL.Distributions import Bernoulli, Beta, Exponential, HalfNormal, Normal, Poisson
 from BayesianDLL.Samplers import SamplingResult
@@ -47,7 +47,7 @@ def test_prior_predictive_needs_no_mcmc_and_returns_prior_draws(monkeypatch):
         with plate("data", 4):
             ObservedParameter("y", Normal(mean, sigma), torch.zeros(4))
     original = model.params["mean"].unconstrained_value.clone()
-    result = sample_prior_predicative(3000, samples_per_step=4, model=model, progress_bar=False)
+    result = prior_predicative(3000, samples_per_step=4, model=model, progress_bar=False)
     assert result["y"].shape == (3000, 4, 4)
     prior = result.prior
     assert isinstance(prior, SamplingResult)
@@ -61,7 +61,7 @@ def test_prior_predictive_needs_no_mcmc_and_returns_prior_draws(monkeypatch):
     assert result["y"].var().item() == pytest.approx(5.0, rel=0.05)
     torch.testing.assert_close(model.params["mean"].unconstrained_value, original)
     # The model method returns the same kind of result.
-    assert model.sample_prior_predicative(5, samples_per_step=2, progress_bar=False).prior["sigma"].shape == (1, 5, 1)
+    assert model.prior_predicative(5, samples_per_step=2, progress_bar=False).prior["sigma"].shape == (1, 5, 1)
 
 
 def test_predictive_broadcasts_scalar_parameters_over_plates_independently(monkeypatch):
@@ -102,13 +102,13 @@ def test_predictive_with_enumerated_parameter(monkeypatch):
     with Model() as model:
         p = RandomParameter("p", Beta(2.0, 2.0))
         with plate("n", 4):
-            z = RandomParameter("z", Bernoulli(p), shape=(), enumerate=True)
+            z = RandomParameter("z", Bernoulli(p), shape=(), marginalize=True)
             mean = DeterministicParameter(
                 "mean", lambda z: 10 * z, lambda z: {}, [z],
             )
             ObservedParameter("y", Normal(mean, 0.1), torch.zeros(4))
     _forbid_mcmc(monkeypatch)
-    prior = sample_prior_predicative(2000, samples_per_step=1, model=model, progress_bar=False)
+    prior = prior_predicative(2000, samples_per_step=1, model=model, progress_bar=False)
     assert prior.prior["z"].shape == (1, 2000, 4)
     assert prior.prior["z"].mean().item() == pytest.approx(0.5, abs=0.05)
     torch.testing.assert_close(prior["y"][:, 0] / 10, prior.prior["z"][0], atol=0.1, rtol=0)
@@ -116,3 +116,266 @@ def test_predictive_with_enumerated_parameter(monkeypatch):
     trace = {"p": torch.full((1, 2, 1), 0.5), "z": torch.tensor([[[1.0, 0.0, 1.0, 0.0], [0.0, 0.0, 1.0, 1.0]]])}
     result = posterior_predicative(trace, n_samples=2, samples_per_step=10, model=model, progress_bar=False)
     torch.testing.assert_close(result["y"].mean(dim=1) / 10, trace["z"][0], atol=0.02, rtol=0)
+
+
+def test_gp_posterior_predictive_with_exact_and_latent_gp():
+    from BayesianDLL import Data
+    from BayesianDLL.GP import ExactGP, LatentGP, RBF
+    from BayesianDLL.Distributions import Uniform
+
+    x_train = torch.linspace(0, 3, 10, dtype=torch.float64)
+    y_train = torch.sin(x_train)
+
+    with Model() as model:
+        inputs = Data("inputs", x_train)
+        ls = RandomParameter("ls", Uniform(0.5, 2.0))
+        noise = RandomParameter("noise", Uniform(0.001, 0.05))
+        f = ExactGP("f", inputs, RBF(ls, 1.0), noise_variance=noise)
+        ObservedParameter("y", f, y_train)
+
+    trace = {"ls": torch.full((1, 4, 1), 1.0), "noise": torch.full((1, 4, 1), 0.01)}
+    x_new = torch.linspace(-0.5, 3.5, 18, dtype=torch.float64)
+    inputs.set_value(x_new)
+    pred = model.posterior_predicative(trace, samples_per_step=5, progress_bar=False)
+    assert pred["y"].shape == (4, 5, 18)
+    assert "f" in pred
+    assert pred["f"].shape == (4, 5, 18)
+    assert "f" in pred.deterministic
+    assert "y" in pred.samples
+    assert not torch.allclose(pred["y"], pred["f"])
+    residuals = pred["y"] - pred["f"]
+    assert torch.isclose(residuals.var(), torch.tensor(0.01, dtype=torch.float64), atol=0.005)
+
+    # Latent GP
+    with Model() as model_lat:
+        inputs_lat = Data("inputs_lat", x_train)
+        ls_l = RandomParameter("ls_l", Uniform(0.5, 2.0))
+        f_lat = LatentGP("f_lat", inputs_lat, RBF(ls_l, 1.0))
+        ObservedParameter("y_lat", Bernoulli(logits=f_lat), (y_train > 0).double())
+
+    trace_lat = {"ls_l": torch.full((1, 3, 1), 1.0), "f_lat_white": torch.zeros(1, 3, 10)}
+    inputs_lat.set_value(x_new)
+    pred_lat = model_lat.posterior_predicative(trace_lat, samples_per_step=4, progress_bar=False)
+    assert pred_lat["y_lat"].shape == (3, 4, 18)
+    assert "f_lat" in pred_lat
+    assert pred_lat["f_lat"].shape == (3, 18)
+
+
+def test_gp_posterior_predictive_toeplitz_and_sparse():
+    from BayesianDLL import Data
+    from BayesianDLL.GP import ExactGP, ToeplitzGP, RBF
+    from BayesianDLL.Distributions import Uniform
+
+    t_train = torch.linspace(0, 5, 20, dtype=torch.float64)
+    y_train = torch.sin(t_train)
+
+    with Model() as model_toep:
+        t_data = Data("t", t_train)
+        ls = RandomParameter("ls", Uniform(0.5, 2.0))
+        noise = RandomParameter("noise", Uniform(0.001, 0.05))
+        f_toep = ToeplitzGP("f_toep", t_data, RBF(ls, 1.0), noise_variance=noise)
+        ObservedParameter("y", f_toep, y_train)
+
+    t_new = torch.linspace(4.0, 7.0, 15, dtype=torch.float64)
+    t_data.set_value(t_new)
+    # Using point_trace (uses current model values)
+    pred_toep = model_toep.posterior_predicative(model_toep.point_trace(), samples_per_step=10, progress_bar=False)
+    assert pred_toep["y"].shape == (1, 10, 15)
+    assert "f_toep" in pred_toep
+    assert pred_toep["f_toep"].shape == (1, 10, 15)
+
+    # Sparse GP with inducing points
+    z = torch.linspace(0.5, 4.5, 5, dtype=torch.float64)
+    with Model() as model_sparse:
+        x_data = Data("x", t_train)
+        ls_s = RandomParameter("ls_s", Uniform(0.5, 2.0))
+        noise_s = RandomParameter("noise_s", Uniform(0.001, 0.05))
+        f_sparse = ExactGP("f_sparse", x_data, RBF(ls_s, 1.0), inducing_points=z, noise_variance=noise_s, method="vfe")
+        ObservedParameter("y_sparse", f_sparse, y_train)
+
+    x_data.set_value(t_new)
+    pred_sparse = model_sparse.posterior_predicative(model_sparse.point_trace(), samples_per_step=8, progress_bar=False)
+    assert pred_sparse["y_sparse"].shape == (1, 8, 15)
+    assert "f_sparse" in pred_sparse
+    assert pred_sparse["f_sparse"].shape == (1, 8, 15)
+
+
+def test_posterior_predicative_requires_trace():
+    from BayesianDLL import Data
+    with Model() as model:
+        x_data = Data("x", torch.ones(5))
+        p = RandomParameter("p", Normal(0.0, 1.0))
+        ObservedParameter("y", Normal(p, 1.0), torch.zeros(5))
+
+    with pytest.raises(ValueError, match="trace must be provided"):
+        model.posterior_predicative(None)
+
+    pt = model.point_trace()
+    assert "p" in pt
+    assert pt["p"].shape == (1, 1, *p.constrained_value.shape)
+    pred = model.posterior_predicative(pt, samples_per_step=3, progress_bar=False)
+    assert pred["y"].shape == (1, 3, 5)
+
+
+def test_map_result_and_predict():
+    from BayesianDLL import Data, MAPResult, Linear, predict
+    x_val = torch.linspace(-1.0, 1.0, 10)
+    with Model() as model:
+        x_data = Data("x", x_val)
+        slope = RandomParameter("slope", Normal(0.0, 2.0))
+        intercept = RandomParameter("intercept", Normal(0.0, 2.0))
+        line = Linear("line", x_data, coefficients=slope, intercept=intercept)
+        ObservedParameter("y", Normal(line, 0.1), 2.0 * x_val + 1.0)
+
+    res = model.find_MAP(lr=0.05, epochs=150, verbose=False)
+    assert isinstance(res, MAPResult)
+    assert "slope" in res.mode()
+    assert "intercept" in res.mode()
+    assert res["slope"].numel() == 1
+    # MAPResult is a read-only mapping of the parameter values; the history is separate.
+    assert set(res) == set(res.keys()) == {"slope", "intercept", "line"}
+    assert dict(res.items())["slope"] is res["slope"]
+    assert len(res.history) == 150
+    assert res.log_prob == model.model_log_prob().item()
+
+    # Predict with no arguments (current model params)
+    p1 = model.predict(samples_per_step=5)
+    assert p1["y"].shape == (1, 5, 10)
+
+    # Predict with MAPResult
+    p2 = model.predict(res, samples_per_step=5)
+    assert p2["y"].shape == (1, 5, 10)
+
+    # Predict with map_result.mode()
+    p3 = model.predict(res.mode(), samples_per_step=5)
+    assert p3["y"].shape == (1, 5, 10)
+
+    # Top-level predict
+    p4 = predict(res.mode(), samples_per_step=5, model=model)
+    assert p4["y"].shape == (1, 5, 10)
+
+
+def test_sampling_result_mode_median_mean_quantile():
+    from BayesianDLL import Data
+    with Model() as model:
+        x_data = Data("x", torch.linspace(-1.0, 1.0, 5))
+        w = RandomParameter("w", Normal(0.0, 1.0))
+        ObservedParameter("y", Normal(w, 0.1), torch.zeros(5))
+
+    trace = model.sample(20, 10, n_chains=2, progress_bar=False)
+    
+    # Check trace statistics
+    med = trace.median()
+    assert "w" in med
+    mn = trace.mean()
+    assert "w" in mn
+    q = trace.quantile(0.9)
+    assert "w" in q
+    mode_val = trace.mode()
+    assert "w" in mode_val
+
+    # Predict with trace point estimates
+    p_med = model.predict(med, samples_per_step=4)
+    assert p_med["y"].shape == (1, 4, 5)
+
+    p_mode = model.predict(mode_val, samples_per_step=4)
+    assert p_mode["y"].shape == (1, 4, 5)
+
+    # Set params on model
+    model.set_params(med)
+    torch.testing.assert_close(model.params["w"].constrained_value, med["w"])
+
+
+
+
+def test_predictive_shape_of_a_broadcasting_likelihood_without_plates():
+    """A likelihood that broadcasts to the observations keeps their shape (no plate needed)."""
+    y = torch.randn(30, 3)
+    with Model() as model:
+        alpha = RandomParameter("alpha", Normal(0.0, 5.0), shape=3)
+        sigma = RandomParameter("sigma", HalfNormal(2.0))
+        observed = ObservedParameter("y", Normal(alpha, sigma), y)
+    assert observed.predictive_shape == (30, 3)
+    trace = {"alpha": torch.zeros(1, 2, 3), "sigma": torch.ones(1, 2, 1)}
+    assert model.posterior_predicative(trace, samples_per_step=4, progress_bar=False)["y"].shape == (2, 4, 30, 3)
+
+
+def test_gp_predictions_condition_on_the_training_data_after_new_inputs():
+    """Evaluating the log density after Data.set_value does not replace the training data."""
+    from BayesianDLL import Data
+    from BayesianDLL.GP import ExactGP, RBF, exact_gp_predictive
+
+    x_train = torch.linspace(0.0, 3.0, 12, dtype=torch.float64)
+    y_train = torch.sin(x_train)
+    x_new = torch.linspace(-1.0, 4.0, 12, dtype=torch.float64)  # same length as the training inputs
+    with Model() as model:
+        inputs = Data("inputs", x_train)
+        f = ExactGP("f", inputs, RBF(0.8, 1.0), noise_variance=0.01)
+        ObservedParameter("y", f, y_train)
+    inputs.set_value(x_new)
+    model.model_log_prob()  # evaluates the likelihood at the new inputs
+    torch.testing.assert_close(f._training_inputs_data, x_train)
+
+    torch.manual_seed(0)
+    predicted = model.predict(samples_per_step=4000)["f"][0].mean(0)
+    with Model():
+        reference = ExactGP("r", Data("reference_inputs", x_train), RBF(0.8, 1.0), noise_variance=0.01)
+    expected = exact_gp_predictive(reference, {}, y_train, x_new, n_samples=4000)[0].mean(0)
+    torch.testing.assert_close(predicted, expected, atol=0.05, rtol=0.0)
+
+
+def test_latent_gp_prediction_shares_one_function_draw_and_rejects_other_inputs_outside_prediction():
+    from BayesianDLL import Data
+    from BayesianDLL.GP import LatentGP, RBF
+
+    x_train = torch.linspace(0.0, 3.0, 8, dtype=torch.float64)
+    with Model() as model:
+        inputs = Data("inputs", x_train)
+        f = LatentGP("f", inputs, RBF(0.7, 1.0))
+        ObservedParameter("y", Normal(f, 1e-4), torch.sin(x_train))
+    inputs.set_value(torch.linspace(-1.0, 4.0, 15, dtype=torch.float64))
+    with pytest.raises(ValueError, match="only supported for prediction"):
+        model.model_log_prob()
+    trace = {"f_white": torch.randn(1, 5, 8, dtype=torch.float64)}
+    prediction = model.posterior_predicative(trace, samples_per_step=3, progress_bar=False)
+    assert prediction["y"].shape == (5, 3, 15) and prediction["f"].shape == (5, 15)
+    # Every reader of the node sees the same conditional draw of f.
+    torch.testing.assert_close(prediction["y"], prediction["f"].unsqueeze(1).expand(5, 3, 15), atol=1e-3, rtol=0.0)
+    # At the training inputs the function is the deterministic value m + L z.
+    inputs.set_value(x_train)
+    at_training = model.posterior_predicative(trace, samples_per_step=1, progress_bar=False)["f"]
+    model.params["f_white"].set_constrained_value(trace["f_white"][0, 0])
+    torch.testing.assert_close(at_training[0], f.constrained_value)
+
+
+@pytest.mark.parametrize("chain_method", ["vectorized", "parallel"])
+def test_mode_uses_the_joint_log_density_of_multi_block_runs(chain_method):
+    torch.manual_seed(0)
+    data = torch.randn(10) + 0.5
+    with Model() as model:
+        p = RandomParameter("p", Beta(2.0, 2.0))
+        k = RandomParameter("k", Bernoulli(0.7))
+        with plate("data", 10):
+            ObservedParameter("y", Normal(p, 1.0), data)
+    trace = model.sample(60, 150, n_chains=2, progress_bar=False, chain_method=chain_method, check_convergence=False, seed=1)
+    assert len(trace.sample_stats.blocks) == 2  # NUTS for p, Gibbs for k
+    assert trace.lp.shape == (2, 60)
+    # The recorded value is the joint log density of the stored draw.
+    model.params["p"].set_constrained_value(trace.trace["p"][1, 7])
+    model.params["k"].set_constrained_value(trace.trace["k"][1, 7])
+    torch.testing.assert_close(trace.lp[1, 7], model.model_log_prob().to(torch.float64), atol=1e-5, rtol=1e-5)
+    best = trace.lp.flatten().argmax()
+    mode = trace.mode()
+    torch.testing.assert_close(mode["p"], trace.trace["p"].flatten(0, 1)[best])
+    torch.testing.assert_close(mode["k"], trace.trace["k"].flatten(0, 1)[best])
+    mean = trace.mean()["k"]
+    assert mean.is_floating_point() and 0.0 < mean.item() < 1.0
+    assert trace.quantile(0.5)["k"].is_floating_point()
+
+    with Model() as single_block:
+        w = RandomParameter("w", Normal(0.0, 1.0))
+        ObservedParameter("y", Normal(w, 0.1), torch.zeros(5))
+    single = single_block.sample(30, 20, n_chains=2, progress_bar=False, chain_method="vectorized")
+    assert single.lp.shape == (2, 30)
+    best = single.lp.flatten().argmax()
+    torch.testing.assert_close(single.mode()["w"], single.trace["w"].flatten(0, 1)[best])

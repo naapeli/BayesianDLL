@@ -373,8 +373,8 @@ class VectorizedNUTS:
     ``chain_method="parallel"`` is the slice-sampling variant of Hoffman and
     Gelman (2014). Both leave the posterior invariant.
 
-    Step sizes (dual averaging), the inverse metric (``"diag"`` or
-    ``"dense"``, Stan's windowed adaptation with per-chain Welford
+    Step sizes (dual averaging), the inverse metric (``"dense"`` or
+    ``"diag"``, Stan's windowed adaptation with per-chain Welford
     estimates) and all statistics are per chain. The statistics match those
     of :class:`~BayesianDLL.Samplers.NUTS`: ``step_size``, ``accept_stat``,
     ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` and ``lp``,
@@ -388,7 +388,7 @@ class VectorizedNUTS:
 
     def __init__(self, log_target, gradient, n_chains, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10,
                  kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0,
-                 adapt_mass_matrix=True, metric="diag"):
+                 adapt_mass_matrix=True, metric="dense"):
         from ._NUTS import _adaptation_windows
         if metric not in ("diag", "dense"):
             raise ValueError(f"metric must be 'diag' or 'dense', got {metric!r}.")
@@ -467,6 +467,8 @@ class VectorizedNUTS:
         if self.inv_metric is None:
             return z
         if self.metric == "dense":
+            if self._inv_metric_chol is None:
+                self._inv_metric_chol = torch.linalg.cholesky(self.inv_metric)
             # With M^-1 = L L^T, r = L^-T z has covariance M.
             return torch.linalg.solve_triangular(self._inv_metric_chol.transpose(-2, -1), z.unsqueeze(-1), upper=True).squeeze(-1)
         return z / torch.sqrt(self.inv_metric)
@@ -476,9 +478,9 @@ class VectorizedNUTS:
         if n >= 2:
             covariance = self._welford_m2 / (n - 1)
             if self.metric == "dense":
+                from ._NUTS import _dense_inverse_metric
                 identity = torch.eye(covariance.shape[-1], dtype=covariance.dtype, device=covariance.device)
-                inv_metric = (n / (n + 5.0)) * covariance + 1e-3 * (5.0 / (n + 5.0)) * identity
-                inv_metric = 0.5 * (inv_metric + inv_metric.transpose(-2, -1))
+                inv_metric = _dense_inverse_metric(covariance, n)
                 chol, info = torch.linalg.cholesky_ex(inv_metric)
                 ok = info == 0
                 previous = self.inv_metric if self.inv_metric is not None else identity.expand_as(inv_metric)

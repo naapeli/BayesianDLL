@@ -1,5 +1,4 @@
 import torch
-
 import copy
 
 from ._active_model._active_model import get_active_model
@@ -10,11 +9,11 @@ from ._data import Data
 class RandomParameter:
     """A latent random variable of the active model.
 
-    With ``enumerate=True`` the parameter is not sampled but summed out of the
+    With ``marginalize=True`` the parameter is not sampled but summed out of the
     joint density exactly. This requires a finite discrete support (a
     ``DiscreteRange``, e.g. ``Bernoulli`` or ``DiscreteUniform``). The other
     parameters are then sampled from the marginal posterior and posterior
-    draws of the enumerated parameter are added to the sampling result
+    draws of the marginalized parameter are added to the sampling result
     afterwards (see :func:`BayesianDLL.marginalize`).
 
     Parameters
@@ -36,8 +35,8 @@ class RandomParameter:
     sampler : {"auto", "nuts", "metropolis", "slice", "gibbs"}, default "auto"
         The sampler requested for this parameter's block in
         :func:`~BayesianDLL.sample`.
-    enumerate : bool, default False
-        Sum the parameter out instead of sampling it, see above.
+    marginalize : bool, default False
+        Sum (marginalize) the parameter out instead of sampling it.
     **sampler_params
         Settings for the sampler of this parameter's block (e.g. ``delta=0.9``).
 
@@ -47,11 +46,11 @@ class RandomParameter:
         Outside an active model, or if the distribution refers to a node not
         in the model.
     ValueError
-        With ``enumerate=True`` for a distribution without finite support.
+        With ``marginalize=True`` for a distribution without finite support.
     """
 
-    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", enumerate=False, **sampler_params):
-        if enumerate:
+    def __init__(self, name, distribution, initial_value=None, shape=None, sampler="auto", marginalize=False, **sampler_params):
+        if marginalize:
             _check_enumerable(name, distribution)
         # Capture active plates at creation time
         self.plates = get_active_plates()
@@ -94,7 +93,8 @@ class RandomParameter:
         self.state_space = self.distribution.state_space
         self.transformed_state_space = self.distribution.transformed_state_space
 
-        self.enumerated = bool(enumerate)
+        self.marginalized = bool(marginalize)
+        self.enumerated = self.marginalized
 
         if get_active_model() is not None:
             if self.enumerated:
@@ -184,6 +184,8 @@ class ObservedParameter:
         self.sampler = sampler  # for predicative sampling
         self.sampler_params = sampler_params
         self.plates = get_active_plates()
+        if hasattr(distribution, "_bind_observed"):
+            distribution._bind_observed(self, self.observed_values)
 
         if get_active_model() is not None:
             get_active_model().observed_params[name] = self  # TODO: remove this once nodes of the graph are objects and not strings
@@ -249,7 +251,30 @@ class ObservedParameter:
 
     @property
     def predictive_shape(self):
-        """Shape of a generated value, with plate sizes resolved at runtime."""
+        """Shape of a generated value, with plate sizes resolved at runtime.
+
+        Without plates it is the shape of the observations, unless the
+        likelihood no longer broadcasts to them (its parameters now follow
+        new inputs, e.g. a GP after ``Data.set_value``): then it is the
+        likelihood's own batch and event shape. A GP likelihood always gives
+        its own shape.
+        """
+        if not self.plates:
+            distribution = self.distribution
+            try:
+                own_shape = torch.Size(tuple(distribution.batch_shape) + tuple(distribution.event_shape))
+            except (RuntimeError, ValueError, TypeError, AttributeError, NotImplementedError):
+                own_shape = None  # the shape cannot be derived from the parameters: use the observations
+            if own_shape is not None and getattr(distribution, "_shape_follows_inputs", False):
+                return own_shape
+            if own_shape is not None:
+                observed_shape = torch.Size(self.observed_values.shape)
+                try:
+                    broadcasts = torch.broadcast_shapes(own_shape, observed_shape) == observed_shape
+                except RuntimeError:
+                    broadcasts = False
+                if not broadcasts:
+                    return own_shape
         shape = list(self.observed_values.shape)
         for index, plate_info in enumerate(self.plates):
             if index < len(shape):
@@ -486,39 +511,55 @@ class DeterministicParameter:
 class VariationalParameter:
     """A parameter of a variational distribution that is optimized by BBVI.
 
-    With ``log_scale=True`` the optimizer works on ``log(value)`` instead of
-    ``value``. This is recommended for positive parameters such as variances:
-    Adam then takes multiplicative steps, so small variances can be reached
-    without overshooting the lower bound.
+    Parameters
+    ----------
+    name : str
+        Unique parameter name.
+    value : float or Tensor
+        Initial value of the parameter.
+    min : float, default -inf
+        Lower clamp bound for updates in constrained space.
+    max : float, default inf
+        Upper clamp bound for updates in constrained space.
+    transform : Transform, optional
+        Bijection whose ``forward`` maps the value to the unconstrained coordinate
+        in which the optimizer takes its steps; ``IdentityTransform()`` by default.
+        For a constrained value, choose a transform onto its support (e.g.
+        :class:`~BayesianDLL.Distributions.LogTransform` for a scale).
 
-    ``value`` is converted to a tensor (float32 unless it already is a
-    tensor) of at least one dimension; every update is clamped to
-    ``[min, max]``. With ``log_scale=True`` the value must be positive.
+    Notes
+    -----
+    ``value`` is converted to a tensor (float32 unless it already is a tensor)
+    of at least one dimension.
     """
 
-    def __init__(self, name, value, min=-float("inf"), max=float("inf"), log_scale=False):
+    def __init__(self, name, value, min=-float("inf"), max=float("inf"), transform=None):
         self.name = name
-        self.log_scale = log_scale
         self.min = min
         self.max = max
         value = torch.as_tensor(value, dtype=value.dtype if torch.is_tensor(value) else torch.float32)
         if value.ndim == 0:
             value = value.unsqueeze(0)
-        if log_scale and not bool((value > 0).all()):
-            raise ValueError(f"VariationalParameter '{name}' uses log_scale=True and must be positive.")
+
+        if transform is None:
+            from .Distributions._transforms import IdentityTransform
+            self.transform = IdentityTransform()
+        else:
+            self.transform = transform
+
         self.value = value
 
     @property
     def unconstrained_value(self):
         """The coordinate in which the optimizer takes its steps."""
-        return torch.log(self.value) if self.log_scale else self.value
+        return self.transform.forward(self.value)
 
     def unconstrained_grad(self, grad):
         """Convert a gradient w.r.t. ``value`` into one w.r.t. ``unconstrained_value``."""
-        return grad * self.value if self.log_scale else grad
+        return grad * self.transform.derivative(self.unconstrained_value)
 
     def set_unconstrained_value(self, unconstrained_value):
-        value = torch.exp(unconstrained_value) if self.log_scale else unconstrained_value
+        value = self.transform.inverse(unconstrained_value)
         self.set_new_value(value)
 
     def __repr__(self):

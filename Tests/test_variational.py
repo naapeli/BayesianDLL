@@ -19,15 +19,18 @@ def test_map_recovers_conjugate_normal_mode(normal_model, use_method):
 
 
 def test_map_history_and_reporting(normal_model, capsys):
-    history = normal_model.find_MAP(epochs=5, callback_frequency=2)
+    result = normal_model.find_MAP(epochs=5, callback_frequency=2)
+    history = result.history
     assert len(history) == 3
     assert capsys.readouterr().out.count("Epoch:") == 3
     assert history[-1] > history[0]
 
 
 def test_map_records_history_when_silent(normal_model, capsys):
-    history = find_MAP(normal_model, epochs=5, callback_frequency=2, verbose=False)
-    assert len(history) == 3
+    result = find_MAP(normal_model, epochs=5, callback_frequency=2, verbose=False)
+    assert len(result.history) == 3
+    # log_prob is the log density at the returned values, not the last recorded one.
+    assert result.log_prob == normal_model.model_log_prob().item()
     assert capsys.readouterr().out == ""
 
 
@@ -146,8 +149,9 @@ def test_lognormal_guide_elbo_is_zero_for_the_exact_posterior():
 def test_bbvi_lognormal_guide_reaches_known_optimum():
     """For p = Exp(1) the best LogNormal(m, s) has s = 1 and m = -1/2."""
     model = _exponential_model()
+    from BayesianDLL.Distributions import LogTransform
     with Guide(model) as guide:
-        RandomParameter("x", LogNormal(VariationalParameter("m", torch.tensor([1.0])), VariationalParameter("s", torch.tensor([0.4]), log_scale=True)))
+        RandomParameter("x", LogNormal(VariationalParameter("m", torch.tensor([1.0])), VariationalParameter("s", torch.tensor([0.4]), transform=LogTransform())))
     BBVI(model, guide, n_samples=16, epochs=1500, lr=0.02, verbose=False)
     distribution = guide.params["x"].distribution
     assert distribution.mu.value.item() == pytest.approx(-0.5, abs=0.12)
@@ -313,10 +317,10 @@ def test_guide_must_be_mean_field(normal_model):
 
 def test_guide_rejects_enumerated_latents():
     with Model() as model:
-        RandomParameter("z", Bernoulli(0.3), enumerate=True)
+        RandomParameter("z", Bernoulli(0.3), marginalize=True)
         RandomParameter("x", Normal(0.0, 1.0))
     with Guide(model) as guide:
-        RandomParameter("z", Bernoulli(VariationalParameter("p", torch.tensor([0.5]))), enumerate=True)
+        RandomParameter("z", Bernoulli(VariationalParameter("p", torch.tensor([0.5]))), marginalize=True)
         RandomParameter("x", Normal(VariationalParameter("m", torch.zeros(1)), VariationalParameter("s", torch.ones(1))))
     with pytest.raises(ValueError, match="enumerated"):
         guide.validate(model)

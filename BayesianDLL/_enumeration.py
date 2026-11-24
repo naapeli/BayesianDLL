@@ -1,6 +1,6 @@
 """Exact marginalisation of finite-support discrete latent variables.
 
-A :class:`RandomParameter` created with ``enumerate=True`` (or moved with
+A :class:`RandomParameter` created with ``marginalize=True`` (or moved with
 :func:`BayesianDLL.marginalize`) is summed out of the joint density. The
 continuous parameters are then sampled from the marginal posterior and the
 discrete values are drawn exactly from their conditional posterior afterwards.

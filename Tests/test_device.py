@@ -72,7 +72,7 @@ def enumerated_mixture():
     with Model() as model:
         means = RandomParameter("means", Normal(torch.tensor([-2.0, 2.0]), 1.0), shape=2)
         with plate("data", len(y)):
-            z = RandomParameter("z", Bernoulli(0.4), shape=(), enumerate=True)
+            z = RandomParameter("z", Bernoulli(0.4), shape=(), marginalize=True)
         ObservedParameter("y", Normal(Index("mean", means, z), 0.7), y)
     return model
 
@@ -149,7 +149,7 @@ def scenario_predictive(device, dtype):
     model = regression_model().to(device, dtype)
     result = _sample(model)
     predictive = model.posterior_predicative(result, n_samples=5, samples_per_step=2, progress_bar=False)
-    prior = model.sample_prior_predicative(n_samples=5, samples_per_step=2, progress_bar=False)
+    prior = model.prior_predicative(n_samples=5, samples_per_step=2, progress_bar=False)
     return [predictive["y"], prior["y"]]
 
 
@@ -259,7 +259,7 @@ def test_model_to_moves_every_tensor():
         a = RandomParameter("a", Normal(torch.zeros(1), 1.0))
         from BayesianDLL import DeterministicParameter
         mean = DeterministicParameter("mean", lambda a, x: a * x + offset, lambda a, x: {"a": x}, inputs=[a, X])
-        z = RandomParameter("z", Bernoulli(0.3), enumerate=True)
+        z = RandomParameter("z", Bernoulli(0.3), marginalize=True)
         ObservedParameter("y", Normal(Affine("m", mean, loc=z), 1.0), torch.ones(4))
     model.to(dtype=torch.float32)
     assert model.data["x"].value.dtype == torch.float32

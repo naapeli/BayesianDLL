@@ -27,7 +27,6 @@ from BayesianDLL.GP import (
     Matern52,
     Periodic,
     RationalQuadratic,
-    SparseGP,
     ToeplitzGP,
     WhiteNoise,
     batched_stable_cholesky,
@@ -237,8 +236,8 @@ def test_sparse_gp_batched_with_learnable_inducing_points(method, kernel_name):
         lengthscale, variance, noise = _hyperparameters(shape=2)
         z = RandomParameter("z", Normal(z0, 0.5), shape=(5, 2), initial_value=z0)
         mean = RandomParameter("mean", Normal(0.0, 1.0))
-        f = SparseGP("f", Data("x", x), _KERNELS[kernel_name](lengthscale, variance), inducing_points=z,
-                     noise_variance=noise, mean=mean, method=method)
+        f = ExactGP("f", Data("x", x), _KERNELS[kernel_name](lengthscale, variance), inducing_points=z,
+                    noise_variance=noise, mean=mean, method=method)
         ObservedParameter("y", f, y)
     _assert_batched_equals_loop(model, scale=0.1)
 
@@ -250,7 +249,7 @@ def test_sparse_gp_batched_with_fixed_one_dimensional_inducing_points():
         lengthscale, variance, noise = _hyperparameters()
         z = RandomParameter("z", Normal(torch.linspace(0, 3, 6, dtype=DTYPE), 0.3), shape=6,
                             initial_value=torch.linspace(0, 3, 6, dtype=DTYPE))
-        f = SparseGP("f", Data("x", x), Matern52(lengthscale, variance), inducing_points=z, noise_variance=noise)
+        f = ExactGP("f", Data("x", x), Matern52(lengthscale, variance), inducing_points=z, noise_variance=noise)
         ObservedParameter("y", f, y)
     _assert_batched_equals_loop(model, scale=0.1)
 
@@ -350,7 +349,7 @@ def test_plain_callable_with_batched_inducing_points_falls_back_to_the_loop_mode
     with Model() as model:
         z = RandomParameter("z", Normal(z0, 0.3), shape=3, initial_value=z0)
         kernel = RBF(0.4, 1.0) + (lambda a, b: 0.1 * torch.ones(a.shape[0], b.shape[0], dtype=DTYPE))
-        ObservedParameter("y", SparseGP("f", Data("x", x), kernel, inducing_points=z, noise_variance=0.1), y)
+        ObservedParameter("y", ExactGP("f", Data("x", x), kernel, inducing_points=z, noise_variance=0.1), y)
     with pytest.warns(UserWarning, match="chain by chain"):
         with model.batched(3, mode="auto"):
             assert model._batch_mode == "loop"

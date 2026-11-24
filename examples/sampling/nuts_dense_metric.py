@@ -2,10 +2,11 @@
 NUTS With a Dense Mass Matrix
 =============================
 
-NUTS adapts a mass matrix (``metric``) during warmup. The default
-``metric="diag"`` learns one scale per coordinate; ``metric="dense"`` learns
-the full posterior covariance and therefore also removes linear correlations
-between coordinates.
+NUTS adapts a mass matrix (``metric``) during warmup. ``metric="diag"`` learns
+one scale per coordinate; the default ``metric="dense"`` learns the full
+posterior covariance and therefore also removes linear correlations between
+coordinates. With few warmup draws per dimension the dense estimate is shrunk
+towards its diagonal, so it also works for models with many parameters.
 
 The test case is a straight-line fit ``y = a + b x`` with a covariate that is
 away from zero (``x`` between 2 and 6) and a known noise level. Without

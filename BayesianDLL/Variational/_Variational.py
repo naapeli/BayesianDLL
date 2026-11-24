@@ -43,6 +43,7 @@ def BBVI(model: Model, guide, n_samples=1, epochs=100, lr=1e-2, betas=(0.9, 0.99
     if not isinstance(guide, BaseGuide):
         raise TypeError(f"guide must be a Guide, got {type(guide).__name__}.")
     guide.validate(model)
+    model._capture_training_data()
     table = guide.variational_parameters()
     m = {key: torch.zeros_like(parameter.unconstrained_value) for key, parameter in table.items()}
     v = {key: torch.zeros_like(parameter.unconstrained_value) for key, parameter in table.items()}

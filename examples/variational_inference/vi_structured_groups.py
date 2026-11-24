@@ -43,7 +43,7 @@ import torch
 
 from BayesianDLL import Group, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter
 from BayesianDLL.Deterministic import Add, Affine, Multiply
-from BayesianDLL.Distributions import HalfCauchy, LogNormal, Normal
+from BayesianDLL.Distributions import HalfCauchy, LogNormal, LogTransform, Normal
 from BayesianDLL.Variational import BBVI
 
 torch.manual_seed(0)
@@ -75,17 +75,17 @@ with Model() as non_centered:
 # everything outside it. Here it covers the whole model.
 
 
-def vp(name, value, shape=(1,), log_scale=False):
-    return VariationalParameter(name, torch.full(shape, value, dtype=torch.float64), log_scale=log_scale)
+def vp(name, value, shape=(1,), transform=None):
+    return VariationalParameter(name, torch.full(shape, value, dtype=torch.float64), transform=transform)
 
 
 with Guide(model) as structured:
     with Group(["mu", "tau", "theta"]):
-        q_mu = RandomParameter("mu", Normal(vp("mu_loc", 0.0), vp("mu_scale", 2.0, log_scale=True)))
-        q_tau = RandomParameter("tau", LogNormal(vp("tau_loc", 1.0), vp("tau_scale", 0.5, log_scale=True)))
+        q_mu = RandomParameter("mu", Normal(vp("mu_loc", 0.0), vp("mu_scale", 2.0, transform=LogTransform())))
+        q_tau = RandomParameter("tau", LogNormal(vp("tau_loc", 1.0), vp("tau_scale", 0.5, transform=LogTransform())))
         shift = Multiply("theta_shift", q_tau, vp("a", 0.0, (n_schools,)))
         loc = Add("theta_loc", q_mu, shift)
-        scale = Multiply("theta_scale", q_tau, vp("b", 1.0, (n_schools,), log_scale=True))
+        scale = Multiply("theta_scale", q_tau, vp("b", 1.0, (n_schools,), transform=LogTransform()))
         RandomParameter("theta", Normal(loc, scale), shape=(n_schools,))
 
 mean_field = Guide(model, default_family="mean_field", init_scale=1.0)
@@ -99,7 +99,7 @@ for label, guide in (("mean-field", mean_field), ("structured", structured)):
     traces[label] = guide.sample(2000)
     print(f"{label:>10}: {seconds[label]:4.1f} s, final ELBO {sum(histories[label][-100:]) / 100:.2f}")
 
-traces["NUTS"] = non_centered.sample(n_samples=500, warmup_length=500, n_chains=4, progress_bar=False, seed=0, delta=0.9,
+traces["NUTS"] = non_centered.sample(n_samples=300, warmup_length=300, n_chains=4, progress_bar=False, seed=0, delta=0.9,
                                      chain_method="vectorized")
 print(f"NUTS (non-centered): {sum(traces['NUTS'].divergences)} divergences")
 for label, trace in traces.items():
@@ -148,11 +148,11 @@ plt.show()
 # %%
 # Moments of a structured group
 # -----------------------------
-# Inside a structured group the latents depend on each other through
-# arbitrary blocks, so ``guide.covariance(...)`` estimates its moments by
-# Monte Carlo in both spaces, from exact ancestral draws, and lists them in
-# ``estimated``.
+# ``guide.moments(...)`` returns a :class:`~BayesianDLL.Variational.GuideMoments`
+# object. Inside a structured group where latents depend on each other,
+# moments are estimated by Monte Carlo from exact ancestral draws.
 
-result = structured.covariance("constrained", n_samples=2000)
-print(f"estimated: {result.estimated}, n = {result.n_samples}")
-print(f"E[tau] = {result.means()['tau'].item():.2f} +- {result.standard_error['tau'].item():.2f}")
+m = structured.moments("constrained", n_samples=2000)
+print(f"estimated: {m.estimated}, n = {m.n_samples}")
+print(f"E[tau] = {m.mean('tau').item():.2f} +- {m.standard_error['tau'].item():.2f}")
+print(f"E[mu] = {m.mean('mu').item():.2f}, var(mu) = {m.variance('mu').item():.2f}")

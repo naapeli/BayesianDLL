@@ -258,6 +258,11 @@ def _run(model, blocks, n_samples, warmup_length, n_chains, progress_bar, log_li
                 if m > warmup_length:
                     for stat, value in block.last_stats.items():
                         stats[i].setdefault(stat, []).append(torch.as_tensor(value, device=device).to(dtype).expand(n_chains))
+            if m > warmup_length and len(blocks) > 1:
+                # Each block records the log density terms of its own parameters
+                # only; the joint log density after the sweep goes with the last block.
+                joint = torch.as_tensor(model.model_log_prob(), device=device).to(dtype)
+                stats[-1].setdefault("joint_lp", []).append(joint.reshape(-1).expand(n_chains))
             if m > warmup_length:
                 index = m - warmup_length - 1
                 if model.enumerated_params:

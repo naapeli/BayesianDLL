@@ -53,8 +53,8 @@ with Model() as model:
         line = Linear("line", x_data, coefficients=slope, intercept=intercept)
         ObservedParameter("y", Normal(line, sigma), y)
 
-history = find_MAP(model, lr=0.05, epochs=300, callback_frequency=10, verbose=False)
-estimate = {name: model.params[name].constrained_value.item() for name in ("intercept", "slope", "sigma")}
+map_result = find_MAP(model, lr=0.05, epochs=300, callback_frequency=10, verbose=False)
+estimate = {name: map_result[name].item() for name in ("intercept", "slope", "sigma")}
 
 # Closed-form least-squares reference.
 design = torch.stack([torch.ones_like(x), x], dim=1)
@@ -72,10 +72,11 @@ for name in estimate:
 # ----------------------------------
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), layout="constrained")
-axes[0].plot(range(10, 10 * len(history) + 1, 10), history)
+# The log density is recorded after Adam steps 1, 11, 21, ... (every 10 epochs).
+axes[0].plot(range(1, 10 * len(map_result.history) + 1, 10), map_result.history)
 axes[0].set_xlabel("Adam step")
 axes[0].set_ylabel("log posterior density")
-axes[0].set_ylim(history[-1] - 200, history[-1] + 20)
+axes[0].set_ylim(map_result.log_prob - 200, map_result.log_prob + 20)
 axes[0].set_title("Convergence of find_MAP")
 
 grid = torch.linspace(0.0, 1.0, 100, dtype=torch.float64)

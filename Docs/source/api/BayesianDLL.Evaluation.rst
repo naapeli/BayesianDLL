@@ -1,13 +1,11 @@
-Evaluation
-==========
+Evaluation and Diagnostics
+==========================
 
-.. automodule:: BayesianDLL.Evaluation
-   :members:
-   :undoc-members:
-   :show-inheritance:
-   :imported-members:
+Convergence diagnostics, posterior summaries, model comparison criteria, and predictive check visualization.
 
 .. toctree::
    :maxdepth: 2
 
+   evaluation/diagnostics
+   evaluation/model_selection
    BayesianDLL.Evaluation.Graphics

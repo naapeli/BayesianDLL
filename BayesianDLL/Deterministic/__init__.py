@@ -2,9 +2,7 @@ from ._transforms import Exp, Linear, Log, Sigmoid
 from ._blocks import (
     Add,
     Affine,
-    CholeskyCovariance,
     Concat,
-    CovarianceFromCholesky,
     Divide,
     Elementwise,
     Index,
@@ -37,6 +35,4 @@ __all__ = [
     "Concat",
     "Stack",
     "Elementwise",
-    "CholeskyCovariance",
-    "CovarianceFromCholesky",
 ]

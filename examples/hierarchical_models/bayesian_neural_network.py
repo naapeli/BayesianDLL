@@ -41,12 +41,13 @@ uncertainty of the full posterior away from the data.
 """
 
 import math
+import time
 
 import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, plate
-from BayesianDLL.Deterministic import Add, Exp, MatMul, Tanh
+from BayesianDLL.Deterministic import Add, Exp, Linear, MatMul, Tanh
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.Variational import BBVI
 
@@ -152,4 +153,119 @@ for ax, (label, (trace, history)) in zip(axes[1:], fits.items()):
     ax.set_title(f"{label} (thin lines: 5 networks)")
 handles, labels = axes[1].get_legend_handles_labels()
 fig.legend(handles, labels, loc="outside lower center", ncol=5, fontsize="small")
+plt.show()
+
+# %%
+# A deeper network: where mean-field VI breaks down
+# -------------------------------------------------
+# Neural network architectures can be constructed using deterministic layer
+# blocks by composing :class:`~BayesianDLL.Deterministic.Linear` and
+# :class:`~BayesianDLL.Deterministic.Tanh` blocks.
+#
+# Here a four-hidden-layer MLP (1 -> 8 -> 8 -> 8 -> 8 -> 1) is fitted to a composite
+# signal :math:`\sin(1.5 x) + 0.5 \sin(3.5 x)`. The weights use fan-in priors with scale
+# :math:`2 / \sqrt{H}` so the network has sufficient expressive range to capture
+# the higher-frequency harmonic. Both methods start from a MAP estimate:
+#
+# * **Mean-field VI**, run until the ELBO levels off. With 241 weights the
+#   ELBO-optimal factorised guide prunes hidden units (their weights revert
+#   to the prior) and smooths the harmonic away, so its band is wide but
+#   misses the signal. Stopping it early with a tiny initial scale instead
+#   leaves every standard deviation near its starting value, and the band
+#   then reflects the optimiser, not the posterior.
+# * **NUTS from the MAP estimate**, two chains. Each chain explores one of the
+#   equivalent modes (see above), but the predicted functions agree, and the
+#   band is narrow where the data are and widens beyond them.
+
+h1_dim, h2_dim, h3_dim, h4_dim = 8, 8, 8, 8
+
+def complex_signal(t):
+    return torch.sin(1.5 * t) + 0.5 * torch.sin(3.5 * t)
+
+torch.manual_seed(42)
+n_deep = 100
+x_deep_raw = torch.linspace(-3.0, 3.0, n_deep, dtype=torch.float64)
+y_deep_raw = complex_signal(x_deep_raw) + 0.15 * torch.randn(n_deep, dtype=torch.float64)
+
+x_deep_mean, x_deep_std = x_deep_raw.mean(), x_deep_raw.std()
+y_deep_mean, y_deep_std = y_deep_raw.mean(), y_deep_raw.std()
+x_deep = (x_deep_raw - x_deep_mean) / x_deep_std
+y_deep = (y_deep_raw - y_deep_mean) / y_deep_std
+
+with Model() as deep_bnn:
+    x_in = Data("x_in", x_deep.unsqueeze(-1))
+    w1 = RandomParameter("w1", Normal(0.0, 2.0), shape=(1, h1_dim),
+                         initial_value=2.0 * torch.randn(1, h1_dim, dtype=torch.float64))
+    b1 = RandomParameter("b1", Normal(0.0, 2.0), shape=(h1_dim,),
+                         initial_value=torch.randn(h1_dim, dtype=torch.float64) * 0.1)
+    w2 = RandomParameter("w2", Normal(0.0, 2.0 / math.sqrt(h1_dim)), shape=(h1_dim, h2_dim),
+                         initial_value=2.0 * torch.randn(h1_dim, h2_dim, dtype=torch.float64) / math.sqrt(h1_dim))
+    b2 = RandomParameter("b2", Normal(0.0, 2.0), shape=(h2_dim,),
+                         initial_value=torch.randn(h2_dim, dtype=torch.float64) * 0.1)
+    w3 = RandomParameter("w3", Normal(0.0, 2.0 / math.sqrt(h2_dim)), shape=(h2_dim, h3_dim),
+                         initial_value=2.0 * torch.randn(h2_dim, h3_dim, dtype=torch.float64) / math.sqrt(h2_dim))
+    b3 = RandomParameter("b3", Normal(0.0, 2.0), shape=(h3_dim,),
+                         initial_value=torch.randn(h3_dim, dtype=torch.float64) * 0.1)
+    w4 = RandomParameter("w4", Normal(0.0, 2.0 / math.sqrt(h3_dim)), shape=(h3_dim, h4_dim),
+                         initial_value=2.0 * torch.randn(h3_dim, h4_dim, dtype=torch.float64) / math.sqrt(h3_dim))
+    b4 = RandomParameter("b4", Normal(0.0, 2.0), shape=(h4_dim,),
+                         initial_value=torch.randn(h4_dim, dtype=torch.float64) * 0.1)
+    w5 = RandomParameter("w5", Normal(0.0, 2.0 / math.sqrt(h4_dim)), shape=(h4_dim,),
+                         initial_value=2.0 * torch.randn(h4_dim, dtype=torch.float64) / math.sqrt(h4_dim))
+    b5 = RandomParameter("b5", Normal(0.0, 2.0), initial_value=torch.zeros(1, dtype=torch.float64))
+    sigma_deep = Exp("sigma_deep", RandomParameter("log_sigma_deep", Normal(math.log(0.15), 0.3),
+                                                   initial_value=torch.tensor([math.log(0.15)], dtype=torch.float64)))
+
+    h1 = Tanh("h1", Linear("h1_lin", x_in, coefficients=w1, intercept=b1))
+    h2 = Tanh("h2", Linear("h2_lin", h1, coefficients=w2, intercept=b2))
+    h3 = Tanh("h3", Linear("h3_lin", h2, coefficients=w3, intercept=b3))
+    h4 = Tanh("h4", Linear("h4_lin", h3, coefficients=w4, intercept=b4))
+    f_mlp = Linear("f_mlp", h4, coefficients=w5, intercept=b5)
+    with plate("deep_obs", n_deep):
+        ObservedParameter("y_deep", Normal(f_mlp, sigma_deep), y_deep)
+
+# Start at the MAP mode: random initial weights are far from the posterior mass.
+deep_bnn.find_MAP(lr=0.03, epochs=1500, verbose=False)
+map_values = {name: parameter.constrained_value.clone() for name, parameter in deep_bnn.params.items()}
+
+deep_guide = Guide(deep_bnn, default_family="mean_field", init_scale=0.05)
+deep_history = BBVI(deep_bnn, deep_guide, n_samples=4, epochs=800, lr=0.01, lrd=0.999, verbose=False)
+deep_draws = {"mean-field VI": {k: v.squeeze(0) for k, v in deep_guide.sample(200).items()}}
+print(f"Deep BNN mean-field VI: final ELBO {sum(deep_history[-20:]) / 20:.1f}")
+
+deep_bnn.set_params(map_values)
+start = time.perf_counter()
+deep_nuts = deep_bnn.sample(100, 100, n_chains=2, init_scale=0.0, max_depth=6, seed=0, progress_bar=False,
+                            chain_method="vectorized", check_convergence=False)
+deep_draws["NUTS from the MAP"] = {k: v.flatten(0, 1) for k, v in deep_nuts.trace.items()}
+print(f"Deep BNN NUTS: {time.perf_counter() - start:.1f} s, divergences: {sum(deep_nuts.divergences)}")
+
+
+def network_outputs(draws):
+    """The network on the grid (original scale) for every draw of the weights."""
+    inputs = ((grid_raw - x_deep_mean) / x_deep_std).unsqueeze(-1)
+    outputs = []
+    for i in range(draws["w1"].shape[0]):
+        h = inputs
+        for layer in (1, 2, 3, 4):
+            h = torch.tanh(h @ draws[f"w{layer}"][i] + draws[f"b{layer}"][i])
+        outputs.append((h @ draws["w5"][i] + draws["b5"][i]) * y_deep_std + y_deep_mean)
+    return torch.stack(outputs)
+
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), sharey=True, layout="constrained")
+in_range = grid_raw.abs() <= 3.0
+for ax, (label, draws), color in zip(axes, deep_draws.items(), ("C1", "C4")):
+    f = network_outputs(draws)
+    q05, q95 = f.quantile(torch.tensor([0.05, 0.95], dtype=torch.float64), dim=0)
+    error = (f.mean(0) - complex_signal(grid_raw))[in_range].square().mean().sqrt()
+    print(f"{label:>18}: RMS error of the predictive mean in the data range {error:.3f}")
+    ax.fill_between(grid_raw, q05, q95, color=color, alpha=0.25, label="90% band")
+    ax.plot(grid_raw, f.mean(0), color=color, lw=2, label="predictive mean")
+    ax.plot(grid_raw, complex_signal(grid_raw), "k--", label="true function")
+    ax.scatter(x_deep_raw, y_deep_raw, color="black", s=10, zorder=3, label="data")
+    ax.set(title=label, xlabel="x", ylim=(-2.8, 2.8))
+axes[0].set_ylabel("f(x)")
+axes[1].legend(fontsize="small", loc="lower right")
+fig.suptitle("Four-hidden-layer Bayesian neural network (Linear & Tanh layers)")
 plt.show()

@@ -1,3 +1,5 @@
+from warnings import warn
+
 import torch
 
 
@@ -14,21 +16,52 @@ def _normalize_slice(s):
         raise TypeError(f"Expected int or slice for thinning, got {type(s).__name__}.")
 
 
+def _as_floating(values):
+    """``values`` as a floating-point tensor (float64 for integer or boolean draws)."""
+    return values if values.is_floating_point() else values.to(torch.float64)
+
+
 class SampleStats:
-    """Per-iteration sampler statistics of the post-warmup draws, one entry per sampling block.
+    """Per-iteration sampler diagnostic statistics for post-warmup draws.
 
-    Each block entry is a dict with the block's ``"params"`` (parameter
-    names), its ``"sampler"`` (``"nuts"``, ``"metropolis"``, ``"slice"``
-    or ``"gibbs"``) and ``"stats"``, a dict mapping a statistic name to a tensor of shape
-    ``(n_chains, n_samples)``. NUTS records ``step_size``, ``accept_stat``,
-    ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` and ``lp``;
-    Metropolis records ``accept_stat``, ``accepted``, ``step_size`` (the
-    proposal scale) and ``lp``; the slice sampler ``n_evals``,
-    ``accept_stat``, ``step_size`` (the mean width) and ``lp``; the finite
-    Gibbs sampler ``accept_stat``, ``step_size`` and ``lp``.
+    Parameters
+    ----------
+    blocks : list of dict, optional
+        List of block diagnostics dictionaries. Each dictionary contains:
 
-    ``stats[i]`` returns the statistics of block ``i`` and ``stats["energy"]``
-    the statistic of the only block that records it.
+        - ``"params"``: list of parameter names updated by this block.
+        - ``"sampler"``: name of the sampler (e.g. ``"nuts"``, ``"metropolis"``,
+          ``"slice"``, or ``"gibbs"``).
+        - ``"stats"``: mapping from statistic name (e.g. ``"step_size"``,
+          ``"accept_stat"``, ``"diverging"``, ``"energy"``, ``"lp"``) to
+          a tensor of shape ``(n_chains, n_samples)``. With several blocks the
+          last one also holds ``"joint_lp"``, the joint log density after each sweep.
+
+    Attributes
+    ----------
+    blocks : list of dict
+        Internal list of sampling block dictionaries.
+    params : list of list of str
+        Parameter names updated by each block.
+    samplers : list of str
+        The sampler type for each block.
+
+    Notes
+    -----
+    Indexing behavior (``sample_stats[key]``):
+
+    * **Integer index** ``sample_stats[i]``:
+      Returns the ``dict`` of statistics for block ``i``, where each value is
+      a tensor of shape ``(n_chains, n_samples)``.
+    * **String key** ``sample_stats["stat_name"]``:
+      If a statistic is unique across blocks (such as ``"energy"`` or
+      ``"tree_depth"`` in a NUTS block, or when there is only a single sampling
+      block), indexing directly by its name returns the statistic tensor of
+      shape ``(n_chains, n_samples)``.
+      If multiple blocks record the same statistic (for instance ``"step_size"``
+      or ``"accept_stat"`` in a multi-block model), direct string indexing raises
+      a :class:`KeyError` instructing to index the desired block first, e.g.:
+      ``sample_stats[0]["step_size"]``.
     """
 
     def __init__(self, blocks=None):
@@ -49,6 +82,32 @@ class SampleStats:
         return (block["stats"] for block in self.blocks)
 
     def __getitem__(self, key):
+        """Access sampler statistics by block index or unique statistic name.
+
+        Parameters
+        ----------
+        key : int or str
+            - If an integer ``i``: returns the statistics dictionary
+              ``dict[str, Tensor]`` for the ``i``-th sampling block.
+            - If a string ``name``: returns the tensor of shape
+              ``(n_chains, n_samples)`` for that statistic, provided exactly
+              one sampling block recorded it.
+
+        Returns
+        -------
+        dict[str, Tensor] or Tensor
+            The block dictionary if ``key`` is an ``int``, or the statistic
+            tensor if ``key`` is a unique ``str``.
+
+        Raises
+        ------
+        IndexError
+            If an integer block index is out of bounds.
+        KeyError
+            If a string key is not recorded by any block, or if it is recorded
+            by multiple blocks (in which case index by block first, e.g.
+            ``sample_stats[0][key]``).
+        """
         if isinstance(key, int):
             return self.blocks[key]["stats"]
         matches = [block["stats"][key] for block in self.blocks if key in block["stats"]]
@@ -200,6 +259,119 @@ class SamplingResult:
         from ..Evaluation._summary import summary as _summary
         return _summary(self, hdi_prob=hdi_prob, ci_kind=ci_kind, round_to=round_to, include_deterministic=include_deterministic)
 
+    @property
+    def lp(self) -> torch.Tensor | None:
+        """The joint log density ``(n_chains, n_samples)`` of each draw, or ``None`` if it was not recorded.
+
+        It is the log density of the unconstrained parameters that the sampler
+        targets (including the transforms' Jacobians and with marginalized
+        parameters summed out). A single sampling block records it as ``lp``.
+        With several blocks each block's ``lp`` only covers the terms of its own
+        parameters, so the joint value after every sweep is recorded as
+        ``joint_lp`` with the last block.
+        """
+        if self.sample_stats is None or not self.sample_stats.blocks:
+            return None
+        blocks = self.sample_stats.blocks
+        if len(blocks) == 1:
+            return blocks[0]["stats"].get("lp")
+        return blocks[-1]["stats"].get("joint_lp")
+
+    def mode(self, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
+        """Return the parameter values of the draw with the highest joint log density (see :attr:`lp`).
+
+        When :attr:`lp` is not available (e.g. a result built from draws without
+        sampler statistics), a warning is issued and the coordinate-wise median
+        (most frequent value for discrete parameters) is returned instead.
+
+        Parameters
+        ----------
+        include_deterministic : bool, default=False
+            Whether to include deterministic parameters in the returned dictionary.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary mapping parameter names to tensors of shape ``(*param_shape)``.
+        """
+        traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
+        lp = self.lp
+        if lp is not None and lp.numel() > 0:
+            best_idx = torch.argmax(lp.flatten(0, 1)).item()
+            chain_idx, sample_idx = divmod(best_idx, lp.shape[1])
+            return {name: val[chain_idx, sample_idx].clone() for name, val in traces.items()}
+
+        warn(
+            "The joint log density of the draws was not recorded; mode() returns the coordinate-wise "
+            "median (most frequent value for discrete parameters) instead."
+        )
+        res = {}
+        for name, val in traces.items():
+            flat = val.flatten(0, 1)
+            if not flat.is_floating_point():
+                res[name] = torch.mode(flat, dim=0).values.clone()
+            else:
+                res[name] = torch.median(flat, dim=0).values.clone()
+        return res
+
+    def median(self, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
+        """Return the coordinate-wise posterior median for each parameter.
+
+        Parameters
+        ----------
+        include_deterministic : bool, default=False
+            Whether to include deterministic parameters in the returned dictionary.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary mapping parameter names to tensors of shape ``(*param_shape)``.
+        """
+        traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
+        res = {}
+        for name, val in traces.items():
+            flat = val.flatten(0, 1)
+            res[name] = torch.median(flat, dim=0).values.clone()
+        return res
+
+    def mean(self, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
+        """Return the coordinate-wise posterior mean for each parameter (as float64 for discrete parameters).
+
+        Parameters
+        ----------
+        include_deterministic : bool, default=False
+            Whether to include deterministic parameters in the returned dictionary.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary mapping parameter names to tensors of shape ``(*param_shape)``.
+        """
+        traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
+        return {name: torch.mean(_as_floating(val.flatten(0, 1)), dim=0) for name, val in traces.items()}
+
+    def quantile(self, q: float | torch.Tensor, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
+        """Return the coordinate-wise posterior quantile for each parameter (as float64 for discrete parameters).
+
+        Parameters
+        ----------
+        q : float or Tensor
+            Quantile to compute, e.g. 0.05 or 0.95.
+        include_deterministic : bool, default=False
+            Whether to include deterministic parameters in the returned dictionary.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Dictionary mapping parameter names to tensors of shape ``(*param_shape)``.
+        """
+        traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
+        res = {}
+        for name, val in traces.items():
+            flat = _as_floating(val.flatten(0, 1))
+            res[name] = torch.quantile(flat, q=torch.as_tensor(q, dtype=flat.dtype, device=flat.device), dim=0)
+        return res
+
     def __repr__(self):
         params = list(self.trace.keys()) + list(self.deterministic_trace.keys())
         return f"SamplingResult(params={params}, divergences={self.divergences})"
@@ -208,20 +380,37 @@ class SamplingResult:
 class PredicativeResult:
     """Predictive draws of shape ``(n_samples, samples_per_step, *predictive_shape)`` per observed node.
 
-    ``prior`` holds the prior draws of the model parameters (a
-    :class:`SamplingResult` with one chain) for results of
-    ``sample_prior_predicative``, and is ``None`` otherwise.
+    Attributes
+    ----------
+    samples : dict[str, torch.Tensor]
+        The predictive draws of the observed nodes; ``keys()``, ``values()``
+        and ``items()`` iterate over these.
+    deterministic : dict[str, torch.Tensor]
+        The deterministic nodes for every parameter draw (``(n_samples, *shape)``)
+        and the latent function draws of GP likelihoods, stored under the GP's
+        name (``(n_samples, samples_per_step, *predictive_shape)``).
+    prior : SamplingResult or None
+        The prior draws of the model parameters (one chain) for results of
+        ``prior_predicative``.
+
+    Indexing (``result[name]``) and ``name in result`` cover both ``samples``
+    and ``deterministic``.
     """
 
-    def __init__(self, samples: dict[str, torch.Tensor], prior=None):
+    def __init__(self, samples: dict[str, torch.Tensor], prior=None, deterministic_samples: dict[str, torch.Tensor] = None):
         self.samples = samples
         self.prior = prior
+        self.deterministic = {} if deterministic_samples is None else deterministic_samples
 
     def __getitem__(self, key):
-        return self.samples[key]
+        if key in self.samples:
+            return self.samples[key]
+        if key in self.deterministic:
+            return self.deterministic[key]
+        raise KeyError(key)
 
     def __contains__(self, key):
-        return key in self.samples
+        return key in self.samples or key in self.deterministic
 
     def keys(self):
         return self.samples.keys()
@@ -257,7 +446,25 @@ class PredicativeResult:
         prior = self.prior
         if prior is not None and dim != 1:
             prior = prior.thin(step)
-        return PredicativeResult(thinned, prior=prior)
+        thinned_det = {}
+        if self.deterministic:
+            first_sample = next(iter(self.samples.values())) if self.samples else None
+            n_draws = first_sample.shape[0] if first_sample is not None else None
+            n_reps = first_sample.shape[1] if first_sample is not None else None
+            for name, val in self.deterministic.items():
+                is_replicated = (
+                    first_sample is not None
+                    and val.ndim >= 2
+                    and val.shape[0] == n_draws
+                    and val.shape[1] == n_reps
+                )
+                if dim == 0:
+                    thinned_det[name] = val[s]
+                elif dim == 1:
+                    thinned_det[name] = val[:, s] if is_replicated else val
+                elif dim in ((0, 1), (1, 0)):
+                    thinned_det[name] = val[s, s] if is_replicated else val[s]
+        return PredicativeResult(thinned, prior=prior, deterministic_samples=thinned_det)
 
     def __repr__(self):
         return f"PredicativeResult(samples={list(self.samples.keys())})"

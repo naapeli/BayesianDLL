@@ -59,26 +59,47 @@ def _stable_cholesky(matrix, jitter):
 
 
 class LaplaceApproximation:
-    """Gaussian approximation ``N(mean, cov)`` of the posterior over the unconstrained latents.
+    r"""Gaussian approximation :math:`\mathcal{N}(\mu, \Sigma)` of the posterior in unconstrained space.
 
-    "MAP" here is the mode ``eta*`` of the posterior of the unconstrained
-    latents ``eta`` (the log joint includes the transforms' ``log|det J|``).
+    Approximates the posterior distribution by a multivariate normal centered at the
+    maximum a posteriori (MAP) estimate :math:`\eta^*` with covariance equal to the
+    inverse of the negative Hessian of the unconstrained log-joint density.
 
-    Attributes:
-        mean: the mode ``eta*`` (flat unconstrained vector).
-        cov: ``(-H)^-1`` with ``H`` the Hessian of the unconstrained log
-            joint at ``eta*`` (``-H`` plus ``jitter`` I if it was not
-            positive definite).
-        scale_tril: Cholesky factor of ``cov``.
-        hessian: ``H``.
-        jitter: the diagonal jitter added to ``-H`` (``0.0`` if none).
-        log_joint_at_mode: ``log p(eta*, y)``, the unconstrained log joint at the mode.
-        log_marginal_likelihood: the Laplace estimate of the evidence
-            ``log p(y)``, ``log p(eta*, y) + d/2 log(2 pi) - 1/2 log det(-H)``
-            with ``d`` the number of unconstrained values. Because
-            ``p(eta, y)`` includes the Jacobian, it integrates to ``p(y)``
-            over ``eta``.
-        names: latent names, in the order of the flat vector.
+    Parameters
+    ----------
+    model : Model
+        The probabilistic model.
+    layout : LatentLayout
+        Layout of the latents in the flat unconstrained vector.
+    mean : Tensor
+        Mode :math:`\eta^*` in unconstrained space.
+    hessian : Tensor
+        Hessian matrix :math:`H` of the unconstrained log-joint density at the mode.
+    log_joint : Tensor or float
+        Unconstrained log-joint density :math:`\log p(\eta^*, y)` evaluated at the mode.
+    jitter : float
+        Diagonal jitter added to ensure positive definiteness of :math:`-H`.
+
+    Attributes
+    ----------
+    mean : Tensor
+        The posterior mode in unconstrained space.
+    cov : Tensor
+        Covariance matrix :math:`\Sigma = (-H)^{-1}` (with the jitter added to :math:`-H`).
+    scale_tril : Tensor
+        Lower Cholesky factor :math:`L` of the covariance matrix :math:`\Sigma = L L^T`.
+    hessian : Tensor
+        The Hessian matrix at the mode.
+    jitter : float
+        Jitter added to the negative Hessian.
+    log_joint_at_mode : float or Tensor
+        Log-joint density at the mode :math:`\log p(\eta^*, y)`.
+    log_marginal_likelihood : Tensor
+        Laplace approximation of the log marginal likelihood (evidence),
+        :math:`\log p(\eta^*, y) + \frac{d}{2} \log(2\pi) - \frac{1}{2} \log\det(-H)` with
+        :math:`d` the number of unconstrained values.
+    names : list of str
+        Names of the latent parameters in order.
     """
 
     def __init__(self, model, layout, mean, hessian, log_joint, jitter):
@@ -124,27 +145,57 @@ class LaplaceApproximation:
         return f"LaplaceApproximation(params={self.names}, log_marginal_likelihood={float(self.log_marginal_likelihood):.4f})"
 
 
-def laplace_approximation(model, map_epochs=1000, lr=1e-2, betas=(0.9, 0.999), newton_steps=20, hessian="fd", fd_step=None, jitter=1e-10, tolerance=1e-9, verbose=False):
-    """Laplace approximation of the posterior of ``model``.
+def laplace_approximation(
+    model,
+    map_epochs=1000,
+    lr=1e-2,
+    betas=(0.9, 0.999),
+    newton_steps=20,
+    hessian="fd",
+    fd_step=None,
+    jitter=1e-10,
+    tolerance=1e-9,
+    verbose=False,
+):
+    r"""Compute the Laplace approximation of the model posterior.
 
-    1. The mode is found in the unconstrained space with :func:`find_MAP`
-       (``map_epochs`` Adam steps from the current values, learning rate
-       ``lr`` and ``betas``; ``map_epochs=0`` skips it) and refined with up
-       to ``newton_steps`` Newton steps with a backtracking line search.
-       Newton stops when the largest gradient entry or step is below
-       ``tolerance``, or when ``-H`` is not positive definite.
-    2. The Hessian ``H`` of the unconstrained log joint is computed by
-       central finite differences of the hand-written gradient
-       ``model.joint_grad_log_prob`` (``hessian="fd"``, the only option;
-       relative step ``fd_step``, default ``eps^(1/3)``) and symmetrised.
-    3. The posterior is approximated by ``N(mode, (-H)^-1)``; a warning is
-       issued (and jitter, at least ``jitter`` times the mean absolute
-       diagonal of ``-H``, added) when ``-H`` is not positive definite.
+    Finds the maximum a posteriori (MAP) mode in unconstrained space (Adam steps from the
+    current values, refined by Newton steps with a backtracking line search) and approximates
+    the posterior distribution by a Gaussian :math:`\mathcal{N}(\eta^*, (-H)^{-1})`, where
+    :math:`H` is the Hessian of the unconstrained log joint (central finite differences of
+    the hand-written gradient, symmetrised). The model's parameters are left at the mode.
 
-    ``verbose`` prints the progress of both stages. The model's parameters
-    are left at the mode, like :func:`find_MAP`. Returns a
-    :class:`LaplaceApproximation`.
+    Parameters
+    ----------
+    model : Model
+        The probabilistic model to approximate.
+    map_epochs : int, default 1000
+        Number of Adam optimization steps to locate the mode. If 0, initial optimization is skipped.
+    lr : float, default 1e-2
+        Learning rate for Adam optimization.
+    betas : tuple of float, default (0.9, 0.999)
+        Betas momentum hyperparameters for Adam optimizer.
+    newton_steps : int, default 20
+        Maximum number of Newton refinement steps; Newton stops early when :math:`-H`
+        is not positive definite.
+    hessian : {"fd"}, default "fd"
+        Method used to evaluate the Hessian matrix.
+    fd_step : float, optional
+        Relative finite-difference step (default :math:`\epsilon^{1/3}` of the dtype).
+    jitter : float, default 1e-10
+        If :math:`-H` is not positive definite, a warning is issued and at least
+        ``jitter`` times the mean absolute diagonal of :math:`-H` is added to it.
+    tolerance : float, default 1e-9
+        Newton stops when the largest absolute gradient entry or step is below ``tolerance``.
+    verbose : bool, default False
+        Whether to display progress information during optimization.
+
+    Returns
+    -------
+    LaplaceApproximation
+        The fitted Gaussian approximation with sampling methods and marginal likelihood estimate.
     """
+    model._capture_training_data()
     if hessian != "fd":
         raise ValueError(f"Unknown hessian method '{hessian}'; only 'fd' (finite differences of the gradient) is available.")
     layout = LatentLayout(model, purpose="The Laplace approximation")

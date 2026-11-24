@@ -68,6 +68,8 @@ class Metropolis(_CachedTarget):
     target_accept_rate : float, default 0.234
         The acceptance rate the warmup adaptation aims for.
 
+    Notes
+    -----
     :meth:`step` returns ``(theta, proposal_scale, rolling_acceptance_rate,
     False)`` and sets ``last_stats`` (``accept_stat``, the acceptance
     probability of this step or the mean over the coordinates of a discrete
@@ -254,6 +256,8 @@ class FiniteGibbs(_CachedTarget):
     elementwise_log_target : callable, optional
         Per-coordinate log probabilities, see above.
 
+    Notes
+    -----
     :meth:`step` returns ``(theta, 1.0, 1.0, False)``: every Gibbs update is
     accepted.
     """

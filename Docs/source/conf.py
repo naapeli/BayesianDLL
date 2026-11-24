@@ -35,7 +35,7 @@ html_css_files = ["custom.css"]
 html_theme_options = {
     "collapse_navigation": False,
     "sticky_navigation": True,
-    "navigation_depth": 2,
+    "navigation_depth": 4,
 }
 
 # -- Sphinx-Gallery configuration --

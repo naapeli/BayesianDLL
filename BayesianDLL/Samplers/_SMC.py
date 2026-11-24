@@ -267,13 +267,16 @@ class _Mutation:
         covariance = covariance + 1e-8 * variance.mean() * identity
         cholesky, info = torch.linalg.cholesky_ex(covariance)
         if int(info) != 0:
+            # Fall back to the diagonal; the NUTS metric and its factor must agree.
+            covariance = torch.diag(variance)
             cholesky = torch.diag(variance.sqrt())
         self._cholesky = cholesky
         if self.kernel == "nuts":
             if self._nuts is None:
-                self._nuts = NUTS(self._continuous_log_target, self._continuous_gradient, lambda x: x, delta=0.8, max_depth=8)
+                self._nuts = NUTS(self._continuous_log_target, self._continuous_gradient, lambda x: x, delta=0.8, max_depth=8, metric="dense")
             self._nuts.reset()
-            self._nuts.inv_metric = variance
+            self._nuts.inv_metric = covariance
+            self._nuts._inv_metric_chol = cholesky
         elif self.kernel == "slice":
             if self._slice is None:
                 self._slice = Slice(self._continuous_log_target, ContinuousReal(), adapt_width=False)
@@ -360,7 +363,7 @@ def sample_smc(model=None, n_particles=1000, kernel="metropolis", n_mutation_ste
     scale ``2.38 / sqrt(d)`` is multiplied by ``exp(rate - 0.234)``, i.e.
     adapted towards an acceptance rate of 0.234), ``"nuts"`` (tempered log density and gradient
     ``grad log p(theta) + beta grad log p(y | theta)``, with the particle
-    variances as diagonal metric and a maximal tree depth of 8) or
+    covariance as dense metric and a maximal tree depth of 8) or
     ``"slice"`` (coordinate-wise slice sampling with widths of twice the
     particle standard deviations). The NUTS step size is adapted across the
     particles of a stage towards a mean acceptance statistic of 0.8: by dual
@@ -424,6 +427,7 @@ def sample_smc(model=None, n_particles=1000, kernel="metropolis", n_mutation_ste
         parameter, or a prior cannot be sampled.
     """
     model = get_active_model() if model is None else model
+    model._capture_training_data()
     if kernel not in _KERNELS:
         raise ValueError(f"kernel must be one of {_KERNELS}, got {kernel!r}.")
     if not 0.0 < target_ess < 1.0:

@@ -69,7 +69,7 @@ with Model() as model:
     with plate("observations", n_obs):
         ObservedParameter("y", Normal(mu, sigma), y)
 
-prior_predictive = model.sample_prior_predicative(30, samples_per_step=10, progress_bar=False)
+prior_predictive = model.prior_predicative(30, samples_per_step=10, progress_bar=False)
 result = model.sample(1000, 500, n_chains=4, seed=2, delta=0.85, progress_bar=False)
 posterior_predictive = model.posterior_predicative(result, n_samples=30, samples_per_step=10, progress_bar=False)
 

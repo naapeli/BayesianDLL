@@ -44,6 +44,7 @@ from ._process import (
     _contract,
     _contract_diagonal,
     _draw,
+    _draw_count,
     _evaluate_mean,
     _expand_batch,
     _finish,
@@ -71,11 +72,6 @@ def _kronecker_eigenvalues(eigenvalues):
     for values in eigenvalues[1:]:
         result = result.unsqueeze(-1) * values
     return result
-
-
-def _draw_count(trace):
-    first_value = next(iter(trace.values()))
-    return first_value.shape[0] * first_value.shape[1] if first_value.ndim >= 2 else first_value.shape[0]
 
 
 def _batched_mode_product(tensor, matrix, mode):
@@ -109,68 +105,40 @@ def _batched_kronecker_eigenvalues(eigenvalues):
 
 
 class KroneckerGP(_GPDistribution):
-    r"""Exact GP marginal likelihood for inputs on a complete Cartesian grid.
+    r"""Exact Gaussian Process marginal likelihood for inputs on a Cartesian product grid.
 
-    The inputs are ``X = X_1 × … × X_P`` (``grid_inputs[p]`` has shape
-    ``(n_p,)`` or ``(n_p, D_p)``) and the kernel is the product
-    ``k(x, x') = Π_p k_p(x_p, x'_p)`` of one kernel per grid factor, so the
-    covariance of the ``N = Π_p n_p`` grid points is
-    ``K = K_1 ⊗ … ⊗ K_P``. With the eigendecompositions
-    ``K_p = Q_p Λ_p Q_pᵀ`` (``torch.linalg.eigh`` on each ``n_p x n_p``
-    factor) and ``Q = Q_1 ⊗ … ⊗ Q_P``, ``λ = λ_1 ⊗ … ⊗ λ_P``:
+    Exploits the Kronecker structure of the covariance matrix across grid axes:
 
-    * ``ỹ = Qᵀ (y - m(X))`` via sequential mode products,
-    * ``log det(K + σ² I) = Σ log(λ + σ²)``,
-    * ``α = Q (ỹ / (λ + σ²))`` and
-      ``log p(y) = -½ (Σ ỹ² / (λ + σ²) + log det + N log 2π)``.
+    .. math::
 
-    The cost is ``O(Σ_p n_p³ + N Σ_p n_p)`` time and ``O(N + Σ_p n_p²)``
-    memory: a 100 x 100 grid (``N = 10⁴``) needs two 100 x 100
-    eigendecompositions instead of a 10⁴ x 10⁴ Cholesky factor. With
-    vectorized chains the factors of all chains are decomposed as one batch
-    and the mode products carry the chain dimension.
+        \mathbf{K} = \mathbf{K}_1 \otimes \mathbf{K}_2 \otimes \dots \otimes \mathbf{K}_P
 
-    **Observations.** ``y`` has shape ``(n_1, …, n_P)`` or is flattened in
-    row-major (C) order, i.e. the grid point ``(i_1, …, i_P)`` is entry
-    ``i_1 n_2 ⋯ n_P + … + i_P``, the order of
-    ``torch.cartesian_prod(x_1, …, x_P)`` and of ``torch.kron``. The grid
-    must be complete: missing observations are not supported (they break the
-    Kronecker structure; an exact treatment needs iterative solvers).
+    The kernel is the product :math:`k(\mathbf{x}, \mathbf{x}') = \prod_p k_p(\mathbf{x}_p, \mathbf{x}'_p)`
+    of one kernel per axis, and eigendecompositions of the factors give the likelihood in
+    :math:`\mathcal{O}\left(\sum_{p} n_p^3 + N \sum_p n_p\right)` time
+    instead of :math:`\mathcal{O}(N^3)` where :math:`N = \prod_{p=1}^P n_p`.
 
-    **Gradients** (hand-derived). With ``A = α`` as an ``(n_1, …, n_P)``
-    tensor, a hyperparameter of ``k_p`` changes ``K`` by
-    ``dK = K_1 ⊗ … ⊗ dK_p ⊗ … ⊗ K_P`` and
-    ``d log p = ½ αᵀ dK α - ½ tr((K + σ²I)⁻¹ dK) = ⟨G_p, dK_p⟩`` with
+    Parameters
+    ----------
+    name : str
+        Name of the GP. Posterior predictive results store the latent function draws under this name.
+    grid_inputs : list of torch.Tensor or Data or Parameter
+        Coordinates along each grid axis :math:`p = 1, \dots, P`, shape ``(n_p,)`` or
+        ``(n_p, D_p)``; an axis may be learnable.
+    kernels : list of Kernel
+        Kernel function for each corresponding grid axis.
+    noise_variance : float or torch.Tensor or Parameter, default 1e-6
+        Scalar observation noise variance :math:`\sigma^2 > 0`.
+    mean : MeanFunction, optional
+        GP mean function :math:`m(X)`. Default is :class:`~BayesianDLL.GP.ZeroMean`.
+    jitter : float, default 1e-8
+        Additive jitter on the noise variance for numerical stability.
 
-    * ``½ αᵀ dK α = ½ ⟨dK_p, A_(p) B_(p)ᵀ⟩``, ``B = A ×_{q≠p} K_q``
-      (``A_(p)`` is the mode-``p`` unfolding),
-    * ``tr((K + σ²I)⁻¹ dK) = Σ diag(Q_pᵀ dK_p Q_p) ⊗ (⊗_{q≠p} λ_q) / (λ + σ²)
-      = ⟨dK_p, Q_p diag(s_p) Q_pᵀ⟩`` where ``s_p`` sums
-      ``Π_{q≠p} λ_q / (λ + σ²)`` over all modes but ``p``,
-
-    so ``G_p = ½ A_(p) B_(p)ᵀ - ½ Q_p diag(s_p) Q_pᵀ``. The noise variance
-    gets ``½ (αᵀα - Σ 1/(λ + σ²))``; the mean function, evaluated at the
-    ``N`` grid points (the factors' features concatenated, in row-major
-    order), gets the cotangent ``α`` for its parameters.
-
-    **Learnable inputs (grid axes).** Supported: each ``grid_inputs[p]`` may be a
-    ``RandomParameter`` or ``DeterministicParameter`` of shape ``(n_p,)`` or
-    ``(n_p, D_p)`` (the grid stays a Cartesian product, but its points along
-    every axis can move). The axis gets ``kernels[p].input_vjp_symmetric(X_p, G_p)``
-    (the same ``G_p`` as the hyperparameters) plus the mean's input VJP of
-    ``α`` at the grid points, whose columns of factor ``p`` are summed over
-    all other axes. :func:`kronecker_gp_predictive` reads learnable axes from
-    the trace draw by draw. Learnable inputs are supported by ``ExactGP``,
-    ``LatentGP``, ``SparseGP``, ``SparseLatentGP`` and ``KroneckerGP`` (per
-    grid axis), not by :class:`ToeplitzGP`.
-
-    ``noise_variance`` is the scalar noise variance ``σ²`` (default
-    ``1e-6``), ``mean`` a :class:`~BayesianDLL.GP.MeanFunction` (defaults to
-    ``ZeroMean()``; a number or named scalar node is a ``ConstantMean``) and
-    ``jitter`` (default ``1e-8``) a constant added to the noise variance. Use it as the distribution of an ``ObservedParameter``::
-
-        gp = KroneckerGP("f", grid_inputs=[x1, x2], kernels=[RBF(l1, v), RBF(l2)], noise_variance=s2)
-        ObservedParameter("y", gp, y_grid)  # y_grid: (len(x1), len(x2))
+    Notes
+    -----
+    The observations have shape ``(n_1, ..., n_P)`` or are flattened in row-major
+    order (the order of ``torch.cartesian_prod``). The grid must be complete:
+    missing observations break the Kronecker structure.
     """
 
     def __init__(self, name, grid_inputs, kernels, noise_variance=1e-6, mean=None, jitter=1e-8):
@@ -201,6 +169,18 @@ class KroneckerGP(_GPDistribution):
         dtype = factors[0].dtype if factors[0].is_floating_point() else torch.get_default_dtype()
         device = factors[0].device
         return [factor.to(dtype=dtype, device=device) for factor in factors]
+
+    def _capture_training_inputs(self):
+        self._training_inputs_data = [
+            None if _is_learnable(grid) else _feature_matrix(torch.as_tensor(_input_value(grid))).detach().clone()
+            for grid in self.grid_inputs
+        ]
+
+    def _training_axes(self):
+        """The training grid axes: the captured fixed axes, or the current value of learnable axes."""
+        current = self._factor_inputs()
+        stored = self._training_inputs_data or [None] * len(current)
+        return [axis if fixed is None else fixed.to(dtype=axis.dtype, device=axis.device) for axis, fixed in zip(current, stored)]
 
     @property
     def grid_shape(self):
@@ -369,20 +349,65 @@ class KroneckerGP(_GPDistribution):
             )
         return _finish(gradients, parts["batched"])
 
-    def sample(self, n_samples=1):
-        """Draws of shape ``(n_samples, n_1, …, n_P)``: ``m(X) + Q (sqrt(λ) ⊙ ε₁) + σ ε₂``."""
-        xs = self._factor_inputs()
-        dtype, device = xs[0].dtype, xs[0].device
-        shape = tuple(x.shape[0] for x in xs)
-        _, eigenvalues, eigenvectors = self._decompose(xs, self._named_parameter_values())
-        noise = _resolved_value(self.noise_variance, dtype, device).reshape(())
-        scale = (_kronecker_eigenvalues(eigenvalues).clamp_min(0.0)).sqrt()
-        draws = torch.randn((n_samples, *shape), dtype=dtype, device=device) * scale
+    def _prior_draws(self, axes, eigenvalues, eigenvectors, n_samples):
+        """Zero-mean prior draws ``(n_samples, n_1, …, n_P)`` on a grid: ``Q (sqrt(λ) ⊙ ε)``."""
+        reference = axes[0]
+        shape = tuple(axis.shape[0] for axis in axes)
+        scale = _kronecker_eigenvalues(eigenvalues).clamp_min(0.0).sqrt()
+        draws = torch.randn((n_samples, *shape), dtype=reference.dtype, device=reference.device) * scale
         for mode, vectors in enumerate(eigenvectors):
             draws = _mode_product(draws, vectors, mode + 1)
-        draws = draws + (noise + self.jitter).sqrt() * torch.randn_like(draws)
-        points = _grid_points([x.unsqueeze(0) for x in xs])[0]
-        return self._mean_at(points).reshape(shape) + draws
+        return draws
+
+    def _grid_mean(self, axes, parameter_values=None):
+        points = _grid_points([axis.unsqueeze(0) for axis in axes])[0]
+        return self._mean_at(points, parameter_values).reshape(tuple(axis.shape[0] for axis in axes))
+
+    def _prior_latent(self, n_samples):
+        """Prior draws ``(n_samples, n_1, …, n_P)`` of the latent function on the current grid."""
+        xs = self._factor_inputs()
+        _, eigenvalues, eigenvectors = self._decompose(xs, self._named_parameter_values())
+        return self._grid_mean(xs) + self._prior_draws(xs, eigenvalues, eigenvectors, n_samples)
+
+    def _posterior_latent(self, n_samples):
+        r"""Posterior draws of the latent function on the current grid given the training data.
+
+        Matheron's rule: with joint prior draws ``(f*, f)`` on the union of the
+        new and training grids and ``ε ~ N(0, σ² I)``,
+        ``f* + K_*X (K + σ² I)⁻¹ (y - m(X) - f - ε)`` (plus ``m(X*)``) is an
+        exact posterior draw. The union grid is again a Cartesian product, so
+        every step uses the factors' eigendecompositions and mode products and
+        no ``N x N`` matrix is formed.
+        """
+        values = self._named_parameter_values()
+        train = self._training_axes()
+        dtype, device = train[0].dtype, train[0].device
+        new = [axis.to(dtype=dtype, device=device) for axis in self._factor_inputs()]
+        shape = tuple(axis.shape[0] for axis in train)
+        new_shape = tuple(axis.shape[0] for axis in new)
+        noise = _resolved_value(self.noise_variance, dtype, device).reshape(-1)[0] + self.jitter
+        observed = torch.as_tensor(self._training_observed_data, dtype=dtype, device=device).reshape(shape)
+
+        same_grid = all(a.shape == b.shape and torch.equal(a, b) for a, b in zip(new, train))
+        union = train if same_grid else [torch.cat([a, b]) for a, b in zip(new, train)]
+        _, eigenvalues, eigenvectors = self._decompose(union, values)
+        draws = self._prior_draws(union, eigenvalues, eigenvectors, n_samples)
+        if same_grid:
+            prior_new = prior_train = draws
+        else:
+            prior_new = draws[(slice(None), *(slice(0, n) for n in new_shape))]
+            prior_train = draws[(slice(None), *(slice(n, None) for n in new_shape))]
+            _, eigenvalues, eigenvectors = self._decompose(train, values)
+
+        residual = observed - self._grid_mean(train) - prior_train - noise.sqrt() * torch.randn_like(prior_train)
+        for mode, vectors in enumerate(eigenvectors):
+            residual = _mode_product(residual, vectors.transpose(-2, -1), mode + 1)
+        residual = residual / (_kronecker_eigenvalues(eigenvalues).clamp_min(0.0) + noise)
+        for mode, vectors in enumerate(eigenvectors):
+            residual = _mode_product(residual, vectors, mode + 1)  # (K + σ² I)⁻¹ r
+        for mode, (kernel, a, b) in enumerate(zip(self.kernels, new, train)):
+            residual = _mode_product(residual, kernel(a, b, parameter_values=values), mode + 1)  # K_*X
+        return self._grid_mean(new) + prior_new + residual
 
 
 def _split_new_inputs(gp, inputs, xs):
@@ -442,7 +467,7 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
         raise TypeError("gp must be a KroneckerGP.")
     if n_samples < 1:
         raise ValueError("n_samples must be at least 1.")
-    xs = gp._factor_inputs()
+    xs = gp._training_axes()
     dtype, device = xs[0].dtype, xs[0].device
     new = _split_new_inputs(gp, inputs, xs)
     n_new = new[0].shape[0]
@@ -661,61 +686,40 @@ def _check_stationary(kernel):
 
 
 class ToeplitzGP(_GPDistribution):
-    r"""Exact GP marginal likelihood for equally spaced 1-D inputs (Toeplitz covariance).
+    r"""Exact Gaussian Process marginal likelihood for equally spaced 1-D inputs.
 
-    For a stationary kernel on ``x_i = x_0 + i h`` the covariance
-    ``K + σ² I`` is symmetric Toeplitz, determined by its first column
-    ``t_k = k(0, k h) + σ² δ_k0``. :func:`levinson_solve` gives
-    ``α = (K + σ² I)⁻¹ (y - m(X))`` and the log determinant in ``O(n²)``
-    time and ``O(n)`` memory (a dense Cholesky needs ``O(n³)`` and
-    ``O(n²)``). With vectorized chains one Levinson recursion of ``n`` steps
-    runs on ``(C, …)`` tensors, i.e. all chains in the same Python loop.
+    For a stationary kernel on regularly spaced 1-D inputs :math:`x_i = x_0 + i h`,
+    the covariance matrix :math:`\mathbf{K} + \sigma^2 \mathbf{I}` is symmetric Toeplitz.
+    The marginal likelihood and solve are evaluated via Levinson-Durbin recursion in :math:`\mathcal{O}(N^2)` time
+    and :math:`\mathcal{O}(N)` memory.
 
-    **Gradients** (hand-derived). They need ``T⁻¹ e_0`` as a second
-    right-hand side of the same Levinson recursion and then ``O(n log n)``
-    work. A hyperparameter changes the first column by ``dt``; with
-    ``c_k = Σ_i α_i α_{i+k}``
-    and the diagonal sums ``D_k`` of ``T⁻¹`` (Gohberg-Semencul formula from
-    ``T⁻¹ e_0``, evaluated with FFT correlations)
+    Parameters
+    ----------
+    name : str
+        Name of the GP. Posterior predictive results store the latent function draws under this name.
+    inputs : torch.Tensor or Data
+        Fixed, equally spaced 1-D coordinates of shape ``(N,)`` or ``(N, 1)``.
+    kernel : Kernel
+        Stationary kernel built from :class:`~BayesianDLL.GP.RBF`, :class:`~BayesianDLL.GP.Matern`,
+        :class:`~BayesianDLL.GP.RationalQuadratic`, :class:`~BayesianDLL.GP.Periodic` and
+        :class:`~BayesianDLL.GP.Constant` kernels.
+    noise_variance : float or torch.Tensor or Parameter, default 1e-6
+        Scalar observation noise variance :math:`\sigma^2 > 0`.
+    mean : MeanFunction, optional
+        GP mean function :math:`m(x)`. Default is :class:`~BayesianDLL.GP.ZeroMean`.
+    jitter : float, default 1e-6
+        Relative diagonal jitter: ``jitter * max(1, k(0) + σ²)`` is added to the diagonal.
+    spacing_tolerance : float, default 1e-6
+        Relative tolerance for verifying equal grid spacing.
 
-    ``d log p = ½ αᵀ dT α - ½ tr(T⁻¹ dT) = Σ_k w_k dt_k (c_k - D_k) / 2``,
-
-    with ``w_0 = 1`` and ``w_k = 2`` for ``k > 0``. The noise variance only
-    changes ``t_0``. ``jitter`` (default ``1e-6``) follows the first attempt
-    of :class:`ExactGP`'s jitter: ``jitter * max(1, k(0) + σ²)`` is added to
-    the diagonal (including its derivative), per chain; unlike
-    :func:`stable_cholesky` it is not increased on failure.
-    ``noise_variance`` is the scalar noise variance ``σ²`` (default
-    ``1e-6``), ``mean`` a :class:`~BayesianDLL.GP.MeanFunction` (defaults
-    to ``ZeroMean()``; a number or named scalar node is a ``ConstantMean``;
-    its parameters get the cotangent ``α`` of ``m(X)``), and
-    ``spacing_tolerance`` (default ``1e-6``) the relative tolerance of
-    the equal-spacing check.
-
-    **Learnable inputs: not supported.** The Toeplitz structure needs fixed, equally
-    spaced inputs, and a learnable spacing would be redundant with the
-    kernel's length-scale. ``inputs`` given as a ``RandomParameter`` or
-    ``DeterministicParameter`` raises a ``TypeError``; use :class:`ExactGP`
-    or :class:`SparseGP` for learnable inputs.
-
-    The kernel must be stationary (RBF, Matern, RationalQuadratic,
-    Periodic, Constant and their sums/products); ``inputs`` must be equally
-    spaced with shape ``(n,)`` or ``(n, 1)``. Levinson's recursion is
-    sequential in ``n`` (a Python loop with a few tensor operations per
-    step, roughly 0.1 ms), so on a CPU a multi-threaded dense Cholesky
-    factorisation stays competitive up to one or two thousand points; the
-    recursion wins beyond that, and its memory use is ``O(n)`` throughout.
-    With vectorized chains the same loop serves all chains.
-    Levinson's recursion is weakly stable for symmetric positive-definite
-    Toeplitz matrices (Cybenko 1980): its error is of the same order as that
-    of a backward-stable solver of a system with condition number ``κ(T)``,
-    i.e. it grows like ``κ(T) ε``, although a small residual is not
-    guaranteed in general. On RBF-plus-nugget matrices with ``n = 50`` and
-    ``κ = 1e2, 1e6, 1e10`` the relative residual ``‖Tx - y‖ / ‖y‖`` was
-    ``4e-15, 4e-11, 5e-7`` (dense Cholesky: ``4e-15, 4e-11, 3e-7``) and the
-    log determinant agreed with Cholesky's to ``3e-14, 4e-10, 4e-7``. Very
-    smooth kernels with a tiny noise variance are ill-conditioned for any
-    solver, and the recursion raises if it breaks down.
+    Notes
+    -----
+    Learnable inputs are not supported (a learnable spacing would be redundant
+    with the lengthscale); use :class:`ExactGP` for them. The recursion is
+    sequential in :math:`N`, so a dense Cholesky factorisation stays
+    competitive up to one or two thousand points; beyond that, and for memory,
+    the recursion wins. Predictive sampling forms dense matrices over the new
+    inputs, so predict on modest windows.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=None, jitter=1e-6, spacing_tolerance=1e-6):
@@ -727,7 +731,7 @@ class ToeplitzGP(_GPDistribution):
             raise TypeError(
                 "ToeplitzGP needs fixed, equally spaced inputs (a Data node or a tensor); a learnable spacing would be "
                 "redundant with the kernel's lengthscale, so inputs cannot be a RandomParameter or "
-                "DeterministicParameter. Use ExactGP or SparseGP for learnable inputs."
+                "DeterministicParameter. Use ExactGP for learnable inputs."
             )
         self.name = name
         self.inputs = inputs
@@ -746,6 +750,11 @@ class ToeplitzGP(_GPDistribution):
         self.add_dependency(noise_variance)
         self._register_mean(mean, "ToeplitzGP")
 
+    def _training_x(self):
+        """The captured training inputs as an ``(n, 1)`` float matrix."""
+        x = _feature_matrix(torch.as_tensor(self._training_input_value()))
+        return x if x.is_floating_point() else x.to(torch.get_default_dtype())
+
     def _training_inputs(self):
         x = _feature_matrix(torch.as_tensor(_input_value(self.inputs)))
         if not x.is_floating_point():
@@ -754,7 +763,8 @@ class ToeplitzGP(_GPDistribution):
 
     @property
     def event_shape(self):
-        return (self._training_inputs().shape[0],)
+        new = _feature_matrix(torch.as_tensor(_input_value(self.inputs)))
+        return (new.shape[0],)
 
     def _named_parameter_values(self):
         return {parameter.name: resolve(parameter) for parameter in self.kernel.parameters}
@@ -855,15 +865,31 @@ class ToeplitzGP(_GPDistribution):
         )
         return _finish(gradients, parts["batched"])
 
-    def sample(self, n_samples=1):
-        """Prior predictive draws (dense Cholesky; intended for small ``n``)."""
+    def _prior_latent(self, n_samples):
+        """Prior draws of the latent function at the current inputs (dense Cholesky; intended for small ``n``)."""
         x = self._training_inputs()
-        noise = _resolved_value(self.noise_variance, x.dtype, x.device).reshape(())
-        covariance = self.kernel(x, x, parameter_values=self._named_parameter_values())
-        covariance = covariance + noise * torch.eye(x.shape[0], dtype=x.dtype, device=x.device)
-        factor = stable_cholesky(covariance, jitter=self.jitter)
-        draws = torch.randn((n_samples, x.shape[0]), dtype=x.dtype, device=x.device) @ factor.transpose(-2, -1)
-        return self._mean_at(x) + draws
+        factor = stable_cholesky(self.kernel(x, x, parameter_values=self._named_parameter_values()), jitter=self.jitter)
+        return self._mean_at(x) + torch.randn((n_samples, x.shape[0]), dtype=x.dtype, device=x.device) @ factor.transpose(-2, -1)
+
+    def _posterior_latent(self, n_samples):
+        """Posterior draws at the current inputs given the training data (Levinson solves, dense over the new inputs)."""
+        x = self._training_x()
+        dtype, device = x.dtype, x.device
+        n = x.shape[0]
+        new = _feature_matrix(torch.as_tensor(_input_value(self.inputs))).to(dtype=dtype, device=device)
+        observed_values = torch.as_tensor(self._training_observed_data, dtype=dtype, device=device).reshape(-1)
+        values = self._named_parameter_values()
+        mean_values = {p.name: resolve(p) for p in self.mean.parameters if _is_named(p)}
+        noise = _resolved_value(self.noise_variance, dtype, device).reshape(-1)[0]
+        column, _ = self._first_column(x, values, noise)
+        cross = self.kernel(x, new, parameter_values=values)
+        rhs = torch.cat([(observed_values - self.mean(x, parameter_values=mean_values)).reshape(n, 1), cross], dim=1)
+        solution, _ = levinson_solve(column, rhs)
+        predictive_mean = self.mean(new, parameter_values=mean_values) + cross.transpose(-2, -1) @ solution[:, 0]
+        covariance = self.kernel(new, new, parameter_values=values) - cross.transpose(-2, -1) @ solution[:, 1:]
+        covariance = (covariance + covariance.transpose(-2, -1)) / 2
+        factor = stable_cholesky(covariance, jitter=max(self.jitter, 1e-10))
+        return predictive_mean + torch.randn((n_samples, new.shape[0]), dtype=dtype, device=device) @ factor.transpose(-2, -1)
 
 
 def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
@@ -878,12 +904,11 @@ def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obse
     ``trace``; a given ``observation_noise`` variance is added to the
     diagonal. The result has shape ``(n_parameter_draws, n_samples, n*)``.
     """
-    from ._process import stable_cholesky
     if not isinstance(gp, ToeplitzGP):
         raise TypeError("gp must be a ToeplitzGP.")
     if n_samples < 1:
         raise ValueError("n_samples must be at least 1.")
-    x = gp._training_inputs()
+    x = gp._training_x()
     dtype, device = x.dtype, x.device
     n = x.shape[0]
     new = _feature_matrix(torch.as_tensor(_input_value(inputs))).to(dtype=dtype, device=device)

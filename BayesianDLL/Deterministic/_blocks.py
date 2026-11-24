@@ -230,9 +230,14 @@ class _ElementwiseBlock(_Block):
 
 # ============================================================ arithmetic
 class Add(_ElementwiseBlock):
-    """Elementwise sum ``inputs[0] + inputs[1] + ...`` with broadcasting.
+    r"""Elementwise addition node :math:`y = x_1 + x_2 + \dots`.
 
-    Example: ``Add("mu", alpha, beta_x)``.
+    Parameters
+    ----------
+    name : str
+        Node name.
+    *inputs : Parameter or Data or torch.Tensor
+        Inputs to add.
     """
 
     def __init__(self, name, *inputs):
@@ -251,7 +256,17 @@ class Add(_ElementwiseBlock):
 
 
 class Subtract(_ElementwiseBlock):
-    """Elementwise difference ``a - b`` with broadcasting."""
+    r"""Elementwise subtraction node :math:`y = a - b`.
+
+    Parameters
+    ----------
+    name : str
+        Node name.
+    a : Parameter or Data or torch.Tensor
+        Minuend tensor.
+    b : Parameter or Data or torch.Tensor
+        Subtrahend tensor.
+    """
 
     def __init__(self, name, a, b):
         super().__init__(name, [a, b])
@@ -264,7 +279,15 @@ class Subtract(_ElementwiseBlock):
 
 
 class Multiply(_ElementwiseBlock):
-    """Elementwise product ``inputs[0] * inputs[1] * ...`` with broadcasting."""
+    r"""Elementwise multiplication node :math:`y = x_1 \cdot x_2 \cdot \dots`.
+
+    Parameters
+    ----------
+    name : str
+        Node name.
+    *inputs : Parameter or Data or torch.Tensor
+        Inputs to multiply.
+    """
 
     def __init__(self, name, *inputs):
         if len(inputs) < 1:
@@ -293,7 +316,17 @@ class Multiply(_ElementwiseBlock):
 
 
 class Divide(_ElementwiseBlock):
-    """Elementwise quotient ``a / b`` with broadcasting."""
+    r"""Elementwise division node :math:`y = a / b`.
+
+    Parameters
+    ----------
+    name : str
+        Node name.
+    a : Parameter or Data or torch.Tensor
+        Numerator tensor.
+    b : Parameter or Data or torch.Tensor
+        Denominator tensor.
+    """
 
     def __init__(self, name, a, b):
         super().__init__(name, [a, b])
@@ -307,20 +340,23 @@ class Divide(_ElementwiseBlock):
 
 
 class Affine(_ElementwiseBlock):
-    """Location-scale transform ``loc + scale * x`` (elementwise, broadcasting).
+    r"""Elementwise affine (location-scale) transform :math:`y = \text{loc} + \text{scale} \cdot x`.
 
-    This is the building block of the **non-centered parameterisation** of
-    hierarchical models. A centered model samples group effects directly,
-    ``theta ~ Normal(mu, tau)``; when the data are weak, the posterior of
-    ``(theta, tau)`` forms a funnel (small ``tau`` forces every ``theta`` close
-    to ``mu``) that gradient-based samplers such as NUTS cannot explore,
-    which shows up as divergent transitions. The non-centered model samples
-    standardised effects ``z ~ Normal(0, 1)`` and sets
-    ``theta = Affine("theta", z, loc=mu, scale=tau)``. The prior geometry of
-    ``z`` no longer depends on ``tau``, which removes the funnel.
+    The building block of the non-centred parameterisation of hierarchical
+    models: sampling ``z ~ Normal(0, 1)`` and setting
+    ``theta = Affine("theta", z, loc=mu, scale=tau)`` removes the funnel that
+    ``theta ~ Normal(mu, tau)`` causes for NUTS when the data are weak.
 
-    ``loc`` (default ``0.0``) and ``scale`` (default ``1.0``) may be model
-    nodes, tensors or numbers.
+    Parameters
+    ----------
+    name : str
+        Node name.
+    x : Parameter or Data or torch.Tensor
+        Input tensor.
+    loc : Parameter or Data or torch.Tensor or float, default 0.0
+        Location parameter.
+    scale : Parameter or Data or torch.Tensor or float, default 1.0
+        Scale parameter.
     """
 
     def __init__(self, name, x, loc=0.0, scale=1.0):
@@ -377,7 +413,15 @@ class Elementwise(_ElementwiseBlock):
 
 # ============================================================ unary nonlinearities
 class Softplus(_ElementwiseBlock):
-    """Elementwise ``log(1 + exp(x))``, a smooth map to the positive reals."""
+    r"""Elementwise softplus node :math:`y = \ln(1 + e^x)`.
+
+    Parameters
+    ----------
+    name : str
+        Node name.
+    x : Parameter or Data or torch.Tensor
+        Input tensor.
+    """
 
     def __init__(self, name, x):
         super().__init__(name, [x])
@@ -390,7 +434,15 @@ class Softplus(_ElementwiseBlock):
 
 
 class Tanh(_ElementwiseBlock):
-    """Elementwise hyperbolic tangent."""
+    r"""Elementwise hyperbolic tangent node :math:`y = \tanh(x)`.
+
+    Parameters
+    ----------
+    name : str
+        Node name.
+    x : Parameter or Data or torch.Tensor
+        Input tensor.
+    """
 
     def __init__(self, name, x):
         super().__init__(name, [x])
@@ -403,12 +455,23 @@ class Tanh(_ElementwiseBlock):
 
 
 class Softmax(_Block):
-    """Softmax of ``x`` along ``dim`` (default ``-1``): maps real vectors to the probability simplex.
+    r"""Softmax node mapping real vectors to probability simplex along a dimension.
 
-    The VJP is ``s * (g - sum(g * s, dim))`` with ``s`` the output. For a
-    categorical likelihood prefer ``Categorical(logits=...)``, which is
-    numerically more stable; ``Softmax`` is for simplex-valued quantities
-    used elsewhere in a model.
+    .. math::
+
+        \mathrm{softmax}(\mathbf{x})_i = \frac{e^{x_i}}{\sum_j e^{x_j}}
+
+    For a categorical likelihood prefer ``Categorical(logits=...)``, which is
+    numerically more stable.
+
+    Parameters
+    ----------
+    name : str
+        Node name.
+    x : Parameter or Data or torch.Tensor
+        Input tensor.
+    dim : int, default -1
+        Dimension along which softmax is computed.
     """
 
     def __init__(self, name, x, dim=-1):
@@ -435,9 +498,18 @@ class Softmax(_Block):
 
 # ============================================================ reductions and shapes
 class Sum(_Block):
-    """Sum of ``x`` over ``dim`` (an int or a tuple; all elements when ``dim`` is ``None``, the default).
+    r"""Sum reduction node over specified dimension(s).
 
-    ``keepdim`` (default ``False``) keeps the summed dimensions with size one.
+    Parameters
+    ----------
+    name : str
+        Node name.
+    x : Parameter or Data or torch.Tensor
+        Input tensor.
+    dim : int or tuple of int, optional
+        Dimension(s) to sum over. If ``None``, sums over all elements.
+    keepdim : bool, default False
+        Whether the output tensor has ``dim`` retained with size 1.
     """
 
     def __init__(self, name, x, dim=None, keepdim=False):
@@ -486,9 +558,16 @@ class Sum(_Block):
 
 
 class Concat(_Block):
-    """Concatenate inputs along ``dim`` (keyword-only, default ``-1``; ``torch.cat``).
+    r"""Concatenate tensors along an existing dimension.
 
-    Scalar inputs are treated as vectors of length one.
+    Parameters
+    ----------
+    name : str
+        Node name.
+    *inputs : Parameter or Data or torch.Tensor
+        Tensors to concatenate; scalars are treated as vectors of length one.
+    dim : int, default -1
+        Dimension along which to concatenate.
     """
 
     def __init__(self, name, *inputs, dim=-1):
@@ -530,9 +609,16 @@ class Concat(_Block):
 
 
 class Stack(_Block):
-    """Stack inputs along a new dimension ``dim`` (keyword-only, default ``0``; ``torch.stack``).
+    r"""Stack tensors along a new dimension.
 
-    The inputs are first broadcast to a common shape.
+    Parameters
+    ----------
+    name : str
+        Node name.
+    *inputs : Parameter or Data or torch.Tensor
+        Tensors to stack; they are first broadcast to a common shape.
+    dim : int, default 0
+        Dimension along which to stack.
     """
 
     def __init__(self, name, *inputs, dim=0):
@@ -561,10 +647,16 @@ class Stack(_Block):
 
 # ============================================================ linear algebra and indexing
 class MatMul(_Block):
-    """Matrix product ``a @ b`` with ``torch.matmul`` semantics.
+    r"""Matrix product node :math:`y = A B` with ``torch.matmul`` semantics (vectors and broadcast batch dimensions).
 
-    Vectors and batch dimensions are supported (batch dimensions broadcast).
-    The VJP is ``grad_a = g @ b^T`` and ``grad_b = a^T @ g``.
+    Parameters
+    ----------
+    name : str
+        Node name.
+    a : Parameter or Data or torch.Tensor
+        First tensor :math:`A`.
+    b : Parameter or Data or torch.Tensor
+        Second tensor :math:`B`.
     """
 
     def __init__(self, name, a, b):
@@ -631,15 +723,25 @@ class MatMul(_Block):
 
 
 class Index(_Block):
-    """Gather ``x`` along ``dim`` (default ``0``) with an integer index, e.g. ``theta[group_idx]``.
+    r"""Gather elements along a dimension using integer indices.
 
-    ``index`` is an integer tensor (or list), or a model node holding integer
-    values: a :class:`~BayesianDLL.Data` object -- which can be replaced with
-    ``Data.set_value`` to predict for other observations or groups -- or a
-    discrete ``RandomParameter``. The output has shape
-    ``x.shape[:dim] + index.shape + x.shape[dim + 1:]``. The index receives no
-    gradient; the VJP w.r.t. ``x`` is a scatter-add (``index_add_``) of the
-    cotangent.
+    Parameters
+    ----------
+    name : str
+        Node name.
+    x : Parameter or Data or torch.Tensor
+        Source tensor.
+    index : Parameter or Data or torch.Tensor
+        Integer index tensor, e.g. group labels. A ``Data`` index can be replaced
+        with ``Data.set_value`` to predict for other observations or groups; a
+        discrete ``RandomParameter`` also works.
+    dim : int, default 0
+        Dimension along which to index.
+
+    Notes
+    -----
+    The output has shape ``x.shape[:dim] + index.shape + x.shape[dim + 1:]``,
+    e.g. ``theta[group_idx]``. The index receives no gradient.
     """
 
     _non_differentiable = (1,)
@@ -726,12 +828,16 @@ class Index(_Block):
 
 
 class CholeskyCovariance(_Block):
-    """Cholesky factor ``diag(sigma) @ L_corr`` of a covariance matrix.
+    r"""Construct Cholesky factor :math:`\mathbf{L} = \mathrm{diag}(\boldsymbol{\sigma}) \mathbf{L}_{\text{corr}}` of covariance matrix.
 
-    Combines the Cholesky factor of a correlation matrix (e.g. from
-    ``LKJCholesky``) with standard deviations ``sigma`` (last dimension ``D``)
-    into the lower-triangular factor of ``Sigma = diag(sigma) R diag(sigma)``,
-    ready for ``MultivariateNormal(mu, scale_tril=...)``.
+    Parameters
+    ----------
+    name : str
+        Node name.
+    L_corr : Parameter or torch.Tensor
+        Lower-triangular Cholesky factor of correlation matrix, shape ``(..., D, D)``.
+    sigma : Parameter or torch.Tensor
+        Standard deviations vector of shape ``(..., D)``.
     """
 
     def __init__(self, name, L_corr, sigma):
@@ -752,10 +858,14 @@ class CholeskyCovariance(_Block):
 
 
 class CovarianceFromCholesky(_Block):
-    """Covariance ``L @ L^T`` from a (lower-triangular) Cholesky factor ``L``.
+    r"""Reconstruct covariance matrix :math:`\boldsymbol{\Sigma} = \mathbf{L} \mathbf{L}^\top` from Cholesky factor.
 
-    ``MultivariateNormal`` also accepts ``scale_tril=L`` directly, which is
-    cheaper; use this block when the covariance matrix itself is needed.
+    Parameters
+    ----------
+    name : str
+        Node name.
+    L : Parameter or torch.Tensor
+        Lower-triangular Cholesky factor of shape ``(..., D, D)``.
     """
 
     def __init__(self, name, L):

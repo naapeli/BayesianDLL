@@ -24,6 +24,8 @@ class Data:
     event_ndim : int, default 0
         Number of trailing event dimensions, between 0 and the rank of ``value``.
 
+    Notes
+    -----
     ``value`` (and ``constrained_value``) return the current tensor,
     ``event_shape`` its trailing ``event_ndim`` dimensions and ``batch_shape``
     the leading ones.

@@ -11,9 +11,7 @@ from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, 
 from BayesianDLL.Deterministic import (
     Add,
     Affine,
-    CholeskyCovariance,
     Concat,
-    CovarianceFromCholesky,
     Divide,
     Elementwise,
     Exp,
@@ -28,6 +26,7 @@ from BayesianDLL.Deterministic import (
     Sum,
     Tanh,
 )
+from BayesianDLL.Deterministic._blocks import CholeskyCovariance, CovarianceFromCholesky
 from BayesianDLL.Distributions import (
     Bernoulli,
     Categorical,
@@ -429,7 +428,7 @@ def test_enumerated_index_and_weighted_reverse_pass():
         means = RandomParameter("means", Normal(0.0, 3.0), shape=(2,))
         scale = RandomParameter("scale", HalfNormal(1.0))
         with plate("data", 10):
-            z = RandomParameter("z", Bernoulli(0.4), shape=(), enumerate=True)
+            z = RandomParameter("z", Bernoulli(0.4), shape=(), marginalize=True)
             centre = Index("centre", means, z)
             ObservedParameter("y", Normal(Affine("loc", centre, scale=1.0), scale), data)
     randomize(model)
@@ -517,3 +516,49 @@ def test_batched_linear_matches_autograd(n_features, layout, coefficient_shape, 
     torch.testing.assert_close(lp, torch.stack(expected_lp))
     for name in values:
         torch.testing.assert_close(grads[name], torch.stack(expected_grads[name]), msg=f"gradient of {name}")
+
+
+@pytest.mark.parametrize("has_bias", [False, True])
+def test_linear_matrix_coefficients_matches_autograd(has_bias):
+    torch.manual_seed(42)
+    x_val = torch.randn(6, 4, dtype=torch.float64)
+    w_val = torch.randn(4, 5, dtype=torch.float64)
+    b_val = torch.randn(5, dtype=torch.float64)
+    with Model() as model:
+        x = Data("x", x_val)
+        w = RandomParameter("w", Normal(0.0, 1.0), shape=(4, 5), initial_value=w_val)
+        b = RandomParameter("b", Normal(0.0, 1.0), shape=(5,), initial_value=b_val) if has_bias else 0.0
+        h = Tanh("h", Linear("lin", x, w, intercept=b))
+        with plate("obs", 6):
+            ObservedParameter("y", Normal(h, 1.0), torch.zeros(6, 5, dtype=torch.float64))
+    assert_grads_match(model)
+
+
+def test_batched_linear_matrix_coefficients_matches_autograd():
+    torch.manual_seed(42)
+    x_val = torch.randn(6, 4, dtype=torch.float64)
+    with Model() as model:
+        x = Data("x", x_val)
+        w = RandomParameter("w", Normal(0.0, 1.0), shape=(4, 5), initial_value=torch.randn(4, 5, dtype=torch.float64))
+        b = RandomParameter("b", Normal(0.0, 1.0), shape=(5,), initial_value=torch.randn(5, dtype=torch.float64))
+        h = Tanh("h", Linear("lin", x, w, intercept=b))
+        with plate("obs", 6):
+            ObservedParameter("y", Normal(h, 1.0), torch.zeros(6, 5, dtype=torch.float64))
+    n_chains = 3
+    values = {name: 0.7 * torch.randn((n_chains, *p.unconstrained_value.shape), dtype=torch.float64) for name, p in model.params.items()}
+    expected_lp, expected_grads = [], {name: [] for name in values}
+    for chain in range(n_chains):
+        leaves = {name: value[chain].clone().requires_grad_(True) for name, value in values.items()}
+        with model.temporarily_set_many(leaves):
+            lp = model.model_log_prob()
+            grads = torch.autograd.grad(lp, list(leaves.values()))
+        expected_lp.append(lp.detach())
+        for name, grad in zip(leaves, grads):
+            expected_grads[name].append(grad)
+    with model.batched(n_chains, values=values):
+        lp = model.model_log_prob()
+        grads = model.joint_grad_log_prob(list(values))
+    torch.testing.assert_close(lp, torch.stack(expected_lp))
+    for name in values:
+        torch.testing.assert_close(grads[name], torch.stack(expected_grads[name]), msg=f"gradient of {name}")
+

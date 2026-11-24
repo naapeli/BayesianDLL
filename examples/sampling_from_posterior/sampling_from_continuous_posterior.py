@@ -34,12 +34,12 @@ with Model() as model:
     with plate("flips", n_flips):
         ObservedParameter("flips", Bernoulli(p), flips)
 
-result = model.sample(1000, 500, n_chains=4, seed=0, delta=0.85, progress_bar=False)
+result = model.sample(6000, 1000, n_chains=2, seed=0, delta=0.85, progress_bar=False, chain_method="vectorized")
 print(summary(result).to_string())
 a_post, b_post = a_prior + successes, b_prior + n_flips - successes
 print(f"exact posterior mean {a_post / (a_post + b_post):.3f}")
 
-predictive = model.posterior_predicative(result, n_samples=1000, samples_per_step=1, progress_bar=False)
+predictive = model.posterior_predicative(result, n_samples=10000, samples_per_step=10, progress_bar=False)
 new_successes = predictive["flips"].reshape(-1, n_flips).sum(1).long()
 
 
@@ -48,9 +48,16 @@ def log_beta_function(a, b):
 
 
 k = torch.arange(n_flips + 1, dtype=torch.float64)
-log_binomial_coefficient = torch.lgamma(torch.tensor(n_flips + 1.0)) - torch.lgamma(k + 1) - torch.lgamma(n_flips - k + 1)
-beta_binomial = torch.exp(log_binomial_coefficient + log_beta_function(k + a_post, n_flips - k + b_post)
-                          - log_beta_function(torch.tensor(a_post), torch.tensor(b_post)))
+log_binomial_coefficient = (
+    torch.lgamma(torch.tensor(n_flips + 1.0, dtype=torch.float64))
+    - torch.lgamma(k + 1)
+    - torch.lgamma(n_flips - k + 1)
+)
+beta_binomial = torch.exp(
+    log_binomial_coefficient
+    + log_beta_function(k + a_post, n_flips - k + b_post)
+    - log_beta_function(torch.tensor(float(a_post), dtype=torch.float64), torch.tensor(float(b_post), dtype=torch.float64))
+)
 
 fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), layout="constrained")
 ax = axes[0]

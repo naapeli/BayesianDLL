@@ -14,7 +14,7 @@ import torch
 from .._active_model._active_model import get_active_model
 from .._parameters import RandomParameter, VariationalParameter
 from ..Distributions import IdentityTransform, LogTransform
-from ._moments import GuideCovariance, mc_moments, transform_batch
+from ._moments import GuideMoments, mc_moments, transform_batch
 
 
 _LOG_2PI = math.log(2 * math.pi)
@@ -24,7 +24,7 @@ FAMILIES = ("mean_field", "full_rank")
 def _discrete_message(name, purpose):
     return (
         f"'{name}' is a discrete latent. {purpose} need continuous latents; sum it out with discrete "
-        f"enumeration instead, e.g. RandomParameter('{name}', ..., enumerate=True) or "
+        f"marginalization instead, e.g. RandomParameter('{name}', ..., marginalize=True) or "
         f"BayesianDLL.marginalize(model, ['{name}']), or give it a hand-written guide entry "
         f"(e.g. RandomParameter('{name}', Bernoulli(VariationalParameter(...))) inside the `with Guide(...)` block), "
         "which uses score-function gradients."
@@ -141,10 +141,10 @@ class Group:
         with Guide(model, default_family="mean_field") as guide:
             with Group(["mu", "theta"]):
                 mu = RandomParameter("mu", Normal(VariationalParameter("m", 0.0),
-                                                  VariationalParameter("s", 1.0, log_scale=True)))
+                                                  VariationalParameter("s", 1.0, transform=LogTransform())))
                 RandomParameter("theta", Normal(Affine("theta_loc", mu, loc=VariationalParameter("b", 0.0),
                                                        scale=VariationalParameter("a", 1.0)),
-                                                VariationalParameter("t", 1.0, log_scale=True)))
+                                                VariationalParameter("t", 1.0, transform=LogTransform())))
 
     ``q`` of the group then factorises along the guide graph,
     ``q(mu) q(theta | mu)``. Distributions and deterministic blocks inside the
@@ -157,44 +157,32 @@ class Group:
     exact; gradients are reparameterised through the chain when every
     distribution has a reparameterised sampler, and use the score function
     for the whole group otherwise (see :mod:`BayesianDLL.Variational._structured`).
-    Its ``mean`` and ``covariance`` are Monte Carlo estimates in both spaces.
+    Its :meth:`moments` are Monte Carlo estimates in both spaces.
 
-    Args:
-        params: the latents of the group, as names or as the model's
-            ``RandomParameter`` objects. Every latent belongs to exactly one
-            group or hand-written guide entry; unknown, enumerated and
-            discrete latents are rejected (sum discrete latents out with
-            enumeration, or give them a hand-written guide entry).
-        family: ``None`` (default): ``"mean_field"``, or a structured group
-            when the group is used as a context manager.
-            ``"mean_field"``: an independent Normal per unconstrained
-            coordinate, with VariationalParameters ``{prefix}{latent}_loc`` and
-            ``{prefix}{latent}_scale`` (optimised on the log scale).
-            ``"full_rank"``: one multivariate Normal ``z = loc + L eps`` over
-            the group's concatenated unconstrained coordinates, with
-            VariationalParameters ``{prefix}loc`` and ``{prefix}scale_tril``
-            (lower triangular, optimised in log-diagonal coordinates).
-        init_scale: initial standard deviation of every unconstrained
-            coordinate (default ``0.1``); the means start at the model's
-            current values.
-        name: prefix of the group's VariationalParameter names (``prefix =
-            name + "_"``). Default ``group0``, ``group1``, ... in creation
-            order.
+    Parameters
+    ----------
+    params : sequence of (str or RandomParameter)
+        The latent parameters belonging to this group. Every latent belongs to
+        exactly one group or hand-written entry; discrete latents need
+        marginalization or a hand-written entry instead.
+    family : {None, "mean_field", "full_rank"}, default None
+        ``"mean_field"``: an independent Normal per unconstrained coordinate, with
+        VariationalParameters ``{prefix}{latent}_loc`` and ``{prefix}{latent}_scale``.
+        ``"full_rank"``: one multivariate Normal ``loc + L eps`` over the group's
+        concatenated coordinates, with ``{prefix}loc`` and ``{prefix}scale_tril``.
+        ``None``: ``"mean_field"``, or a structured group when used as a context manager.
+    init_scale : float, default 0.1
+        Initial standard deviation of every unconstrained coordinate; the means
+        start at the model's current values.
+    name : str, optional
+        Name of the group (``prefix = name + "_"``). Default ``group0``, ``group1``, ...
+        in creation order.
 
-    The reparameterised ELBO gradients are hand-written: with ``g`` the
-    gradient of the unconstrained log joint at the draw ``z``,
-    ``d/dloc = g``, ``d/dscale = g eps + 1 / scale`` (mean-field) and
-    ``d/dL = tril(g eps^T) + diag(1 / L_ii)`` (full-rank), where the last
-    terms are the entropy gradients.
-
-    Attributes:
-        names: the latents of the group, in the order of the flat vector.
-        loc: the mean of the group in the unconstrained space (flat vector).
-        scale: standard deviations (mean-field only, flat vector).
-        scale_tril: the Cholesky factor ``L`` (full-rank only).
-        locs, scales: ``{latent: VariationalParameter}`` (mean-field only).
-        loc_parameter, scale_tril_parameter: the VariationalParameters
-            (full-rank only).
+    Attributes
+    ----------
+    names : list of str
+        Names of the latents in the group, in the order of the flat vector
+        (see also the properties ``loc``, ``scale`` and ``scale_tril``).
     """
 
     def __init__(self, params, family=None, init_scale=0.1, name=None):
@@ -263,10 +251,11 @@ class Group:
         initial = self.layout.current(model)
         if family == "mean_field":
             self.locs, self.scales = {}, {}
+            from ..Distributions import LogTransform
             for latent, value in self.layout.unpack(initial).items():
                 self.locs[latent] = VariationalParameter(f"{self.prefix}{latent}_loc", value.clone())
                 self.scales[latent] = VariationalParameter(
-                    f"{self.prefix}{latent}_scale", torch.full_like(value, self.init_scale), log_scale=True
+                    f"{self.prefix}{latent}_scale", torch.full_like(value, self.init_scale), transform=LogTransform()
                 )
         else:
             dim, dtype, device = self.layout.dim, self.layout.dtype, self.layout.device
@@ -381,14 +370,10 @@ class Group:
         L = self.scale_tril
         return L @ L.transpose(-2, -1)
 
-    def mean(self, space="unconstrained", n_samples=4000, seed=0):
-        """``{latent: mean}`` of the group in ``space`` (see :meth:`covariance`)."""
-        return self.covariance(space, n_samples, seed).means()
-
-    def covariance(self, space="unconstrained", n_samples=4000, seed=0):
+    def moments(self, space="unconstrained", n_samples=4000, seed=0):
         """Mean and covariance of the group in ``"unconstrained"`` or ``"constrained"`` space.
 
-        Returns a :class:`GuideCovariance`. In the unconstrained space the
+        Returns a :class:`GuideMoments`. In the unconstrained space the
         moments are exact (``loc`` and ``diag(scale^2)`` or ``L L^T``). In the
         constrained space they are exact for latents whose transform is the
         identity or an elementwise ``log`` (log-normal moments; for a
@@ -405,8 +390,9 @@ class Group:
             return self.guide._piece_moments(self._structured_piece(), space, n_samples, seed)
         loc = self.loc
         cov = self._unconstrained_covariance()
+        groups = {self.name: list(self.names)} if self.name is not None else {}
         if space == "unconstrained":
-            return GuideCovariance(space, self.names, dict(self.layout.shapes), loc, cov)
+            return GuideMoments(space, self.names, dict(self.layout.shapes), loc, cov, groups=groups)
 
         kinds = {latent: _elementwise_kind(self.model.params[latent].distribution.transform) for latent in self.names}
         exact = [latent for latent in self.names if kinds[latent][0] != "other"]
@@ -453,7 +439,7 @@ class Group:
                 shapes[latent] = tuple(self.model.params[latent].constrained_value.shape)
             else:
                 shapes[latent] = tuple(self.layout.shapes[latent])
-        result = GuideCovariance(space, self.names, shapes, dtype=loc.dtype, device=loc.device)
+        result = GuideMoments(space, self.names, shapes, dtype=loc.dtype, device=loc.device, groups=groups)
         if estimated:
             # Monte Carlo for the blocks that involve another transform, from
             # draws of this group only (a mean-field group's latents are

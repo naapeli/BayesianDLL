@@ -12,7 +12,7 @@ from ..Samplers._result import SamplingResult
 from ._ELBO import HandWrittenEntries, estimate_elbo
 from ._groups import FAMILIES, Group, _discrete_message
 from ._structured import StructuredPiece
-from ._moments import GuideCovariance, mc_moments, transform_batch
+from ._moments import GuideMoments, mc_moments, transform_batch
 
 
 class BaseGuide(ABC):
@@ -206,7 +206,7 @@ class Guide(Model, BaseGuide):
         with Guide(model, default_family="mean_field") as guide:
             Group(["mu", "beta"], family="full_rank")         # dependent latents share a group
             RandomParameter("sigma", LogNormal(VariationalParameter("sigma_loc", 0.0),
-                                               VariationalParameter("sigma_scale", 0.5, log_scale=True)))
+                                               VariationalParameter("sigma_scale", 0.5, transform=LogTransform())))
         BBVI(model, guide, ...)
         trace = guide.sample(1000)
 
@@ -254,24 +254,24 @@ class Guide(Model, BaseGuide):
     covariance is block diagonal: every block between two groups or entries
     is exactly zero. Within a block:
 
-    ==============================  =====================  =====================================
-    piece                           unconstrained space    constrained space
-    ==============================  =====================  =====================================
-    Gaussian group                  exact: ``loc``,        identity transform: exact;
-                                    ``diag(scale^2)`` or   elementwise ``log``: exact log-normal
-                                    ``L L^T``              moments (full-rank: exact
-                                                           cross-covariances too); any other
-                                                           transform (logit, stick-breaking,
-                                                           ...): Monte Carlo
-    real-line entry                 exact if the family    exact if the latent's transform is
-                                    has closed-form        the identity and the moments are
-                                    moments, else MC       closed-form, else MC
-    support-matched entry           exact if the           exact if the family has closed-form
-                                    transform is the       moments, else MC
-                                    identity, else MC
-    deterministic (auxiliary) entry Monte Carlo            Monte Carlo
-    structured group                Monte Carlo            Monte Carlo
-    ==============================  =====================  =====================================
+    =================================  =====================  =====================================
+    piece                              unconstrained space    constrained space
+    =================================  =====================  =====================================
+    Gaussian group                     exact: ``loc``,        identity transform: exact;
+                                       ``diag(scale^2)`` or   elementwise ``log``: exact log-normal
+                                       ``L L^T``              moments (full-rank: exact
+                                                              cross-covariances too); any other
+                                                              transform (logit, stick-breaking,
+                                                              ...): Monte Carlo
+    real-line entry                    exact if the family    exact if the latent's transform is
+                                       has closed-form        the identity and the moments are
+                                       moments, else MC       closed-form, else MC
+    support-matched entry              exact if the           exact if the family has closed-form
+                                       transform is the       moments, else MC
+                                       identity, else MC
+    deterministic (auxiliary) entry    Monte Carlo            Monte Carlo
+    structured group                   Monte Carlo            Monte Carlo
+    =================================  =====================  =====================================
 
     The result lists the Monte Carlo blocks in ``estimated`` and their
     standard errors in ``standard_error``.
@@ -526,31 +526,44 @@ class Guide(Model, BaseGuide):
         return trace_from_values(self.model, values, n_chains, n_samples)
 
     # --- moments --------------------------------------------------------------
-    def mean(self, space="unconstrained", n_samples=4000, seed=0):
-        """``{latent: mean}`` of the guide in ``space`` (see :meth:`covariance` and "Accuracy and cost")."""
-        return self.covariance(space, n_samples, seed).means()
+    def moments(self, space="unconstrained", n_samples=4000, seed=0):
+        """Compute the joint moments (mean and block-diagonal covariance) of the guide.
 
-    def covariance(self, space="unconstrained", n_samples=4000, seed=0):
-        """Mean and block-diagonal covariance of the guide over the concatenated flattened latents.
+        Returns a :class:`~BayesianDLL.Variational.GuideMoments` over the
+        latents in model order, e.g. ``.mean()`` (flat vector), ``.mean("sigma")``
+        (one latent in its own shape), ``.covariance(group="line")``,
+        ``.block("mu", "beta")`` (a cross-covariance block) and ``.matrix``.
+        See the class docstring for which blocks are exact and which are Monte
+        Carlo estimates (listed in ``estimated``, with standard errors, from
+        ``n_samples`` independent draws of that piece only, seeded with ``seed``).
 
-        Returns a :class:`GuideCovariance` with the latents in model order.
-        Blocks between different groups or entries are exactly zero; see the
-        table in the class docstring for which blocks are exact and which
-        are Monte Carlo estimates (listed in ``estimated``, with standard
-        errors, from ``n_samples`` independent draws of that piece only,
-        seeded with ``seed``).
+        Parameters
+        ----------
+        space : {"unconstrained", "constrained"}, default "unconstrained"
+            Coordinate space in which the moments are computed.
+        n_samples : int, default 4000
+            Number of Monte Carlo draws for latents whose moments have no closed
+            form.
+        seed : int, default 0
+            Seed for Monte Carlo moment estimates.
+
+        Returns
+        -------
+        GuideMoments
+            A moment container holding the mean and covariance matrix.
         """
         if space not in ("unconstrained", "constrained"):
             raise ValueError(f"space must be 'unconstrained' or 'constrained', got {space!r}.")
         parts = []
         for piece in self.validate():
             if isinstance(piece, Group):
-                parts.append(piece.covariance(space, n_samples, seed))
+                parts.append(piece.moments(space, n_samples, seed))
             elif isinstance(piece, StructuredPiece):
                 parts.append(self._piece_moments(piece, space, n_samples, seed))
             else:
                 parts.append(self._entry_moments(piece, space, n_samples, seed))
-        return GuideCovariance.combine(space, parts, list(self.model.params))
+        groups = {group.name: list(group.names) for group in self.groups if group.name is not None}
+        return GuideMoments.combine(space, parts, list(self.model.params), groups=groups)
 
     def _entry_moments(self, piece, space, n_samples, seed):
         model, plan = self.model, piece.plan
@@ -559,7 +572,7 @@ class Guide(Model, BaseGuide):
         shapes = {name: tuple(getattr(model.params[name], attribute).shape) for name in latents}
         reference = model.params[latents[0]].unconstrained_value
         dtype = reference.dtype if reference.is_floating_point() else torch.get_default_dtype()
-        result = GuideCovariance(space, latents, shapes, dtype=dtype, device=reference.device)
+        result = GuideMoments(space, latents, shapes, dtype=dtype, device=reference.device)
 
         estimated = []
         for name in latents:
@@ -620,7 +633,9 @@ class Guide(Model, BaseGuide):
         n = int(n_samples)
         draws = self._mc_draws(piece, latents, space, n, seed, shapes, dtype, reference.device)
         mean, matrix, standard_error = mc_moments(torch.cat([draws[name] for name in latents], dim=1))
-        result = GuideCovariance(space, latents, shapes, mean=mean, matrix=matrix)
+        group_name = getattr(piece, "name", None) or getattr(getattr(piece, "group", None), "name", None)
+        groups = {group_name: list(latents)} if group_name is not None else {}
+        result = GuideMoments(space, latents, shapes, mean=mean, matrix=matrix, groups=groups)
         result.set_standard_errors(latents, standard_error, latents, n)
         result.estimated = list(latents)
         return result

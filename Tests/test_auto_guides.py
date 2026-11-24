@@ -77,7 +77,7 @@ def test_full_rank_guide_captures_posterior_correlation():
     guide = Guide(model, default_family="full_rank")
     BBVI(model, guide, n_samples=8, epochs=2500, lr=0.02, verbose=False)
     group = guide.groups[0]
-    fitted = guide.covariance().matrix
+    fitted = guide.moments().matrix
     torch.testing.assert_close(group.loc, mean, atol=0.05, rtol=0)
     torch.testing.assert_close(fitted, covariance, atol=0.25 * covariance.abs().max().item(), rtol=0)
     correlation = fitted[0, 1] / fitted.diagonal().prod().sqrt()
@@ -93,9 +93,9 @@ def test_default_groups_reject_discrete_latents():
     with Model() as model:
         RandomParameter("z", Bernoulli(0.3))
     for family in ("mean_field", "full_rank"):
-        with pytest.raises(ValueError, match="enumerat"):
+        with pytest.raises(ValueError, match="marginaliz"):
             Guide(model, default_family=family).validate()
-    with pytest.raises(ValueError, match="enumerat"):
+    with pytest.raises(ValueError, match="marginaliz"):
         laplace_approximation(model)
 
 

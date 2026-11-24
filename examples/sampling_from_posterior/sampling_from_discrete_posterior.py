@@ -35,7 +35,7 @@ with Model() as model:
     with plate("observations", n_obs):
         ObservedParameter("counts", Binomial(n, p), counts)
 
-result = model.sample(1000, 200, n_chains=4, seed=0, chain_method="vectorized", progress_bar=False)
+result = model.sample(6000, 1000, n_chains=2, seed=0, chain_method="vectorized", progress_bar=False)
 print("sampler:", result.sample_stats.samplers)
 
 support = torch.arange(0, n_max + 1)

@@ -1,4 +1,4 @@
-"""SparseLatentGP: a whitened inducing-point (DTC) latent GP with learnable inducing inputs."""
+"""LatentGP with inducing points: a whitened inducing-point (DTC) latent GP with learnable inducing inputs."""
 
 import warnings
 
@@ -13,10 +13,9 @@ from BayesianDLL.GP import (
     LatentGP,
     Matern52,
     Periodic,
-    SparseLatentGP,
-    sparse_latent_gp_predictive,
     stable_cholesky,
 )
+from BayesianDLL.GP._process import _sparse_latent_gp_predictive as sparse_latent_gp_predictive
 
 DTYPE = torch.float64
 C = 4
@@ -54,7 +53,7 @@ def _model(kernel_name="rbf", likelihood="bernoulli", m=5, learnable_z=True, log
         v = RandomParameter("v", Normal(0.0, 1.0), shape=m,
                             initial_value=torch.randn(m, generator=generator, dtype=DTYPE))
         mean = RandomParameter("mean", Normal(0.0, 1.0), initial_value=torch.tensor([0.2], dtype=DTYPE))
-        f = SparseLatentGP("f", Data("x", x), kernel, z, v, mean=mean, jitter=jitter)
+        f = LatentGP("f", Data("x", x), kernel, latent=v, mean=mean, jitter=jitter, inducing_points=z)
         if likelihood == "bernoulli":
             ObservedParameter("y", Bernoulli(logits=f), labels)
         else:
@@ -117,7 +116,7 @@ def test_equals_latent_gp_when_inducing_points_are_the_inputs():
     with Model():
         inputs = Data("x", x)
         v = RandomParameter("v", Normal(0.0, 1.0), shape=7, initial_value=white)
-        sparse = SparseLatentGP("sparse", inputs, kernel, x.clone(), v, mean=0.5, jitter=1e-10)
+        sparse = LatentGP("sparse", inputs, kernel, latent=v, mean=0.5, jitter=1e-10, inducing_points=x.clone())
         latent = LatentGP("latent", inputs, kernel, latent=v, mean=0.5, jitter=1e-10)
         # f_sparse = K L⁻ᵀ v = L v - jitter L⁻ᵀ v: equal up to the jitter.
         torch.testing.assert_close(sparse.constrained_value, latent.constrained_value, atol=1e-7, rtol=0)
@@ -128,7 +127,7 @@ def test_fixed_one_dimensional_inducing_points_and_default_latent():
     z = torch.linspace(0.0, 3.0, 6, dtype=DTYPE)
     with Model() as model:
         log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 0.5))
-        f = SparseLatentGP("f", Data("x", x), Matern52(Exp("lengthscale", log_lengthscale), 1.0), Data("z", z))
+        f = LatentGP("f", Data("x", x), Matern52(Exp("lengthscale", log_lengthscale), 1.0), inducing_points=Data("z", z))
         ObservedParameter("y", Normal(f, 0.2), torch.sin(2 * x))
     assert "f_white" in model.params and model.params["f_white"].constrained_value.shape == (6,)
     assert f.constrained_value.shape == (20,)
@@ -141,9 +140,9 @@ def test_validates_arguments():
         inputs = Data("x", x)
         v = RandomParameter("v", Normal(0.0, 1.0), shape=4)
         with pytest.raises(ValueError, match="one value per inducing input"):
-            SparseLatentGP("f", inputs, RBF(0.5, 1.0), x[:3], v)
+            LatentGP("f", inputs, RBF(0.5, 1.0), latent=v, inducing_points=x[:3])
         with pytest.raises(TypeError):
-            SparseLatentGP("g", inputs, lambda a, b: a, x[:4], v)
+            LatentGP("g", inputs, lambda a, b: a, latent=v, inducing_points=x[:4])
 
 
 # ----------------------------------------------------------------------------
@@ -242,7 +241,7 @@ def test_batched_with_only_the_whitened_values_latent():
     x, labels, _ = _data()
     with Model() as model:
         v = RandomParameter("v", Normal(0.0, 1.0), shape=4)
-        f = SparseLatentGP("f", Data("x", x), RBF(0.6, 1.5), x[:4].clone(), v)
+        f = LatentGP("f", Data("x", x), RBF(0.6, 1.5), latent=v, inducing_points=x[:4].clone())
         ObservedParameter("y", Bernoulli(logits=f), labels)
     _assert_batched_equals_loop(model)
 
@@ -341,4 +340,4 @@ def test_a_per_input_vector_mean_is_rejected():
     x, _, _ = _data(n=5)
     with Model():
         with pytest.raises(ValueError, match="mean function"):
-            SparseLatentGP("f", Data("x", x), RBF(0.5, 1.0), x[:3].clone(), mean=torch.linspace(-1.0, 1.0, 5, dtype=DTYPE))
+            LatentGP("f", Data("x", x), RBF(0.5, 1.0), mean=torch.linspace(-1.0, 1.0, 5, dtype=DTYPE), inducing_points=x[:3].clone())

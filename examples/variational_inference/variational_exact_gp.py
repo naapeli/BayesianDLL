@@ -27,7 +27,7 @@ import torch
 from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import RBF, ExactGP, exact_gp_predictive
+from BayesianDLL.GP import RBF, ExactGP
 from BayesianDLL.Variational import BBVI
 
 
@@ -46,7 +46,7 @@ with Model() as model:
     variance = Exp("variance", log_variance)
     noise_variance = Exp("noise_variance", log_noise_variance)
     gp = ExactGP("f", inputs, RBF(lengthscale, variance), noise_variance=noise_variance)
-    with plate("observations", x):
+    with plate("observations", inputs):
         ObservedParameter("y", gp, y)
 
 # %%
@@ -66,7 +66,7 @@ print(f"NUTS: {sum(nuts.divergences)} divergences, largest R-hat {summary['r_hat
 # %%
 # Hyperparameters and predictions
 # -------------------------------
-# For every hyperparameter draw, ``exact_gp_predictive`` samples the latent
+# For every hyperparameter draw, ``model.posterior_predicative`` samples the latent
 # function on a grid from its Gaussian conditional given the data, so the
 # band combines the hyperparameter uncertainty and the GP's own uncertainty.
 # It widens outside the data range ``[0, 1]``.
@@ -93,8 +93,9 @@ for ax, name in zip(upper_axes[1:], ("lengthscale", "variance", "noise_variance"
 upper_axes[1].legend(fontsize="small")
 
 ax = top[1].subplots()
+inputs.set_value(x_new)
 for label, trace in predictive_traces.items():
-    draws = exact_gp_predictive(gp, trace, y, x_new, n_samples=4).reshape(-1, x_new.numel())
+    draws = model.posterior_predicative(trace, samples_per_step=4, progress_bar=False)["f"].reshape(-1, x_new.numel())
     lower, upper = draws.quantile(torch.tensor([0.025, 0.975], dtype=torch.float64), dim=0)
     ax.plot(x_new, draws.mean(0), color=colors[label], label=f"{label} mean")
     ax.fill_between(x_new, lower, upper, color=colors[label], alpha=0.15, label=f"{label} 95% band")

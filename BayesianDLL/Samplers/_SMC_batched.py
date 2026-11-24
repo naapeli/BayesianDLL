@@ -139,11 +139,14 @@ class _BatchedMutation:
         covariance = covariance + 1e-8 * variance.mean() * identity
         cholesky, info = torch.linalg.cholesky_ex(covariance)
         if int(info) != 0:
+            # Fall back to the diagonal; the NUTS metric and its factor must agree.
+            covariance = torch.diag(variance)
             cholesky = torch.diag(variance.sqrt())
         self._cholesky = cholesky
         if self.kernel == "nuts":
-            self._sampler = VectorizedNUTS(self._continuous_log_target, self._continuous_gradient, self.n, delta=0.8, max_depth=8)
-            self._sampler.inv_metric = variance.expand(self.n, self.dim_c).clone()
+            self._sampler = VectorizedNUTS(self._continuous_log_target, self._continuous_gradient, self.n, delta=0.8, max_depth=8, metric="dense")
+            self._sampler.inv_metric = covariance.expand(self.n, self.dim_c, self.dim_c).clone()
+            self._sampler._inv_metric_chol = cholesky.expand(self.n, self.dim_c, self.dim_c).clone()
         elif self.kernel == "slice":
             self._sampler = VectorizedSlice(self._continuous_log_target, _real_space(), self.n, adapt_width=False)
             self._sampler.width = (2.0 * variance.sqrt()).expand(self.n, self.dim_c).clone()

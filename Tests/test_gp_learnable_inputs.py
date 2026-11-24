@@ -1,6 +1,6 @@
-"""Learnable training inputs X: SparseGP (VFE, DTC, FITC), KroneckerGP grid axes, ToeplitzGP (rejected).
+"""Learnable training inputs X: ExactGP with inducing points (VFE, DTC, FITC), KroneckerGP grid axes, ToeplitzGP (rejected).
 
-Also the diagonal input VJP of every kernel and SparseGP with several
+Also the diagonal input VJP of every kernel and an inducing-point ExactGP with several
 independent output dimensions that share X (``n_outputs``), the building
 block of a GP latent variable model.
 """
@@ -26,11 +26,9 @@ from BayesianDLL.GP import (
     Periodic,
     RationalQuadratic,
     RBF,
-    SparseGP,
     ToeplitzGP,
     WhiteNoise,
     exact_gp_predictive,
-    sparse_gp_predictive,
 )
 
 DTYPE = torch.float64
@@ -180,7 +178,7 @@ def test_batched_diag_input_vjp_matches_per_element_calls():
 
 
 # ----------------------------------------------------------------------------
-# SparseGP with learnable training inputs
+# ExactGP with inducing points and learnable training inputs
 # ----------------------------------------------------------------------------
 
 
@@ -222,8 +220,8 @@ def _sparse_model(method, kernel_name, mean_kind, learnable=True, deterministic=
         log_l = RandomParameter("log_l", Normal(0.0, 1.0), shape=2, initial_value=torch.tensor([-0.3, 0.2], dtype=DTYPE))
         log_noise = RandomParameter("log_noise", Normal(-2.0, 1.0), initial_value=torch.tensor([-1.2], dtype=DTYPE))
         z = RandomParameter("z", Normal(z0, 1.0), shape=tuple(z0.shape), initial_value=z0.clone()) if learnable_z else z0
-        gp = SparseGP("f", inputs, _SPARSE_KERNELS[kernel_name](Exp("l", log_l)), inducing_points=z,
-                      noise_variance=Exp("noise", log_noise), mean=_mean(mean_kind), method=method)
+        gp = ExactGP("f", inputs, _SPARSE_KERNELS[kernel_name](Exp("l", log_l)), inducing_points=z,
+                     noise_variance=Exp("noise", log_noise), mean=_mean(mean_kind), method=method)
         ObservedParameter("y", gp, y)
     return model, gp, x, y, z0
 
@@ -301,7 +299,7 @@ def test_sparse_gp_learnable_inputs_at_fixed_values_match_fixed_inputs(method):
 
 
 # ----------------------------------------------------------------------------
-# SparseGP with several independent outputs sharing X (n_outputs)
+# ExactGP with inducing points and several independent outputs sharing X (n_outputs)
 # ----------------------------------------------------------------------------
 
 
@@ -316,8 +314,8 @@ def _multi_output_model(method, n_outputs=3, learnable=True, seed=5):
         log_l = RandomParameter("log_l", Normal(0.0, 1.0), initial_value=torch.tensor([-0.2], dtype=DTYPE))
         log_noise = RandomParameter("log_noise", Normal(-2.0, 1.0), initial_value=torch.tensor([-1.5], dtype=DTYPE))
         z = RandomParameter("z", Normal(z0, 1.0), shape=tuple(z0.shape), initial_value=z0.clone())
-        gp = SparseGP("f", inputs, RBF(Exp("l", log_l), 1.2) + Linear(0.3), inducing_points=z,
-                      noise_variance=Exp("noise", log_noise), mean=_mean("linear"), method=method, n_outputs=n_outputs)
+        gp = ExactGP("f", inputs, RBF(Exp("l", log_l), 1.2) + Linear(0.3), inducing_points=z,
+                     noise_variance=Exp("noise", log_noise), mean=_mean("linear"), method=method, n_outputs=n_outputs)
         ObservedParameter("y", gp, y)
     return model, gp, x, y, z0
 
@@ -329,8 +327,8 @@ def test_multi_output_sparse_gp_is_the_sum_of_single_outputs(method):
     total = 0.0
     for r in range(3):
         with Model():
-            single = SparseGP("s", Data("x", x), gp.kernel, inducing_points=gp.inducing_points.constrained_value,
-                              noise_variance=gp.noise_variance.constrained_value, mean=gp.mean, method=method)
+            single = ExactGP("s", Data("x", x), gp.kernel, inducing_points=gp.inducing_points.constrained_value,
+                             noise_variance=gp.noise_variance.constrained_value, mean=gp.mean, method=method)
             total = total + single.log_pdf(y[r])
     torch.testing.assert_close(gp.log_pdf(y), total, atol=1e-10, rtol=1e-10)
     assert gp.log_pdf_grad(y).shape == y.shape
@@ -357,18 +355,18 @@ def test_multi_output_sparse_gp_sample_and_predictive_shapes():
         "w": torch.zeros(1, 2, 2, dtype=DTYPE), "b": torch.zeros(1, 2, 1, dtype=DTYPE),
         "z": torch.stack([z, z + 0.1]).unsqueeze(0), "x": torch.stack([x, x + 0.05]).unsqueeze(0),
     }
-    samples = sparse_gp_predictive(gp, trace, y, x[:4], n_samples=6)
+    samples = exact_gp_predictive(gp, trace, y, x[:4], n_samples=6)
     assert samples.shape == (2, 6, 3, 4)
-    # Each output's predictive equals a single-output SparseGP on that output.
+    # Each output's predictive equals a single-output inducing-point ExactGP on that output.
     with Model():
-        single = SparseGP("s", Data("x", x), gp.kernel, inducing_points=z, noise_variance=0.05, mean=gp.mean)
+        single = ExactGP("s", Data("x", x), gp.kernel, inducing_points=z, noise_variance=0.05, mean=gp.mean)
     single_trace = {key: trace[key] for key in ("l", "w", "b", "z")}
     single_trace["noise"] = trace["noise"]
     torch.manual_seed(0)
-    multi = sparse_gp_predictive(gp, trace, y, x[:4], n_samples=40000)
+    multi = exact_gp_predictive(gp, trace, y, x[:4], n_samples=40000)
     for r in range(3):
         torch.manual_seed(1)
-        reference = sparse_gp_predictive(single, {k: v[:, :1] for k, v in single_trace.items()}, y[r], x[:4], n_samples=40000)
+        reference = exact_gp_predictive(single, {k: v[:, :1] for k, v in single_trace.items()}, y[r], x[:4], n_samples=40000)
         torch.testing.assert_close(multi[0, :, r].mean(0), reference[0].mean(0), atol=0.03, rtol=0)
 
 
@@ -377,12 +375,12 @@ def test_sparse_gp_predictive_reads_learnable_inputs_from_the_trace():
     trace = {"l": torch.full((1, 1, 2), 0.7, dtype=DTYPE), "noise": torch.full((1, 1, 1), 1e-8, dtype=DTYPE),
              "x": (x + 0.3).reshape(1, 1, *x.shape)}
     torch.manual_seed(0)
-    shifted = sparse_gp_predictive(gp, trace, y, x + 0.3, n_samples=1)
+    shifted = exact_gp_predictive(gp, trace, y, x + 0.3, n_samples=1)
     with Model():
-        reference_gp = SparseGP("r", Data("xr", x + 0.3), RBF(torch.full((2,), 0.7, dtype=DTYPE), 1.3),
-                                inducing_points=z, noise_variance=1e-8)
+        reference_gp = ExactGP("r", Data("xr", x + 0.3), RBF(torch.full((2,), 0.7, dtype=DTYPE), 1.3),
+                               inducing_points=z, noise_variance=1e-8)
     torch.manual_seed(0)
-    reference = sparse_gp_predictive(reference_gp, {"unused": torch.zeros(1, 1, 1)}, y, x + 0.3, n_samples=1)
+    reference = exact_gp_predictive(reference_gp, {"unused": torch.zeros(1, 1, 1)}, y, x + 0.3, n_samples=1)
     torch.testing.assert_close(shifted, reference, atol=1e-6, rtol=1e-6)
 
 
@@ -473,7 +471,7 @@ def test_toeplitz_gp_rejects_learnable_inputs():
     x = torch.linspace(0.0, 1.0, 8, dtype=DTYPE)
     with Model():
         inputs = RandomParameter("x", Normal(0.0, 1.0), shape=8, initial_value=x)
-        with pytest.raises(TypeError, match="ExactGP or SparseGP"):
+        with pytest.raises(TypeError, match="Use ExactGP"):
             ToeplitzGP("f", inputs, RBF(0.5, 1.0), noise_variance=0.1)
         spacing = RandomParameter("h", Normal(0.0, 1.0), initial_value=torch.tensor([1.0], dtype=DTYPE))
         with pytest.raises(TypeError, match="fixed, equally spaced"):

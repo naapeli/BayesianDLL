@@ -105,21 +105,24 @@ class plate:
     any order, e.g. ``plate("groups", group_data)`` around
     ``plate("items", item_data)``.
 
-    Args:
-        name: Human-readable identifier for this plate.
-        size: Number of independent repetitions along this dimension, a
-              ``Data`` object whose batch dimension ``dim`` determines the
-              size at runtime, or a tensor whose dimension ``dim`` gives the size.
-        dim:  Which dimension of a ``Data`` (its batch shape) or tensor
-              ``size`` gives the plate size; ignored for an integer size. It
-              does not change where the plate's dimension is placed in the
-              value shape, which is set by the nesting alone (see above; the
-              ``position`` of the plate's ``PlateInfo``). For a
-              one-dimensional ``Data`` or tensor the size is always its only
-              (batch) dimension, so ``dim`` defaults to ``-1`` and must be
-              ``0`` or ``-1``. Otherwise the default is ``-1`` for the
-              outermost plate, ``-2`` for a plate nested in one other plate,
-              and so on.
+    Parameters
+    ----------
+    name : str
+        Human-readable identifier for this plate.
+    size : int or Data or Tensor
+        Number of independent repetitions along this dimension, a
+        ``Data`` object whose batch dimension ``dim`` determines the
+        size at runtime, or a tensor whose dimension ``dim`` gives the size.
+    dim : int, optional
+        Which dimension of a ``Data`` (its batch shape) or tensor
+        ``size`` gives the plate size; ignored for an integer size. It
+        does not change where the plate's dimension is placed in the
+        value shape, which is set by the nesting alone (the ``position``
+        of the plate's ``PlateInfo``). For a one-dimensional ``Data`` or
+        tensor the size is always its only (batch) dimension, so ``dim``
+        defaults to ``-1`` and must be ``0`` or ``-1``. Otherwise the default
+        is ``-1`` for the outermost plate, ``-2`` for a plate nested in one
+        other plate, and so on.
     """
 
     def __init__(self, name: str, size: int, dim: int | None = None):

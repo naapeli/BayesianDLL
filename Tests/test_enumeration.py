@@ -1,4 +1,4 @@
-"""Exact marginalisation of finite-support discrete parameters (``enumerate=True``).
+"""Exact marginalisation of finite-support discrete parameters (``marginalize=True``).
 
 All Normal distributions use a unit scale, so the tests hold whether the
 second argument of ``Normal`` is a variance or a standard deviation.
@@ -19,14 +19,14 @@ from BayesianDLL.Distributions import Bernoulli, Beta, Binomial, Exponential, Mi
 Y3 = torch.tensor([-1.0, 0.3, 2.5])
 
 
-def _mixture_model(enumerate, y=Y3):
+def _mixture_model(marginalize, y=Y3):
     """p ~ Beta, mu0, mu1 ~ N, z_i ~ Bernoulli(p), y_i ~ N(mu_{z_i}, 1)."""
     with Model() as model:
         p = RandomParameter("p", Beta(2.0, 2.0))
         mu0 = RandomParameter("mu0", Normal(-1.0, 1.0))
         mu1 = RandomParameter("mu1", Normal(1.0, 1.0))
         with plate("n", len(y)):
-            z = RandomParameter("z", Bernoulli(p), shape=(), enumerate=enumerate)
+            z = RandomParameter("z", Bernoulli(p), shape=(), marginalize=marginalize)
             mean = DeterministicParameter(
                 "mean", lambda a, b, z: a + (b - a) * z,
                 lambda a, b, z: {"mu0": 1 - z, "mu1": z}, [mu0, mu1, z],
@@ -35,13 +35,13 @@ def _mixture_model(enumerate, y=Y3):
     return model
 
 
-def _three_component_model(enumerate):
+def _three_component_model(marginalize):
     """K = 3: z_i ~ Binomial(2, p), y_i ~ N(mus[z_i], 1)."""
     with Model() as model:
         p = RandomParameter("p", Beta(2.0, 2.0))
         mus = RandomParameter("mus", Normal(torch.tensor([-2.0, 0.0, 2.0]), 1.0), shape=3)
         with plate("n", 3):
-            z = RandomParameter("z", Binomial(2, p), shape=(), enumerate=enumerate)
+            z = RandomParameter("z", Binomial(2, p), shape=(), marginalize=marginalize)
 
             def derivative(m, z):
                 return {"mus": torch.nn.functional.one_hot(z.long(), 3).to(m.dtype)}
@@ -130,13 +130,13 @@ def test_marginal_gradient_matches_finite_differences(builder):
 
 def test_continuous_random_child_of_enumerated_parameter():
     # x_i ~ N(mu_{z_i}, 1) is latent: its own prior gradient is weighted per coordinate.
-    def build(enumerate):
+    def build(marginalize):
         with Model() as model:
             mu0 = RandomParameter("mu0", Normal(-1.0, 1.0))
             mu1 = RandomParameter("mu1", Normal(1.0, 1.0))
             rate = RandomParameter("rate", Exponential(1.0))
             with plate("n", 3):
-                z = RandomParameter("z", Bernoulli(0.4), shape=(), enumerate=enumerate)
+                z = RandomParameter("z", Bernoulli(0.4), shape=(), marginalize=marginalize)
                 mean = DeterministicParameter(
                     "mean", lambda a, b, z: a + (b - a) * z,
                     lambda a, b, z: {"mu0": 1 - z, "mu1": z}, [mu0, mu1, z],
@@ -153,12 +153,12 @@ def test_continuous_random_child_of_enumerated_parameter():
 
 
 # --------------------------------------------- non-factorising and brute force
-def _cumulative_model(n, enumerate=True):
+def _cumulative_model(n, marginalize=True):
     # mean_i = mu + sum_{j <= i} z_j couples the coordinates of z.
     with Model() as model:
         mu = RandomParameter("mu", Normal(0.0, 1.0))
         with plate("n", n):
-            z = RandomParameter("z", Bernoulli(0.3), shape=(), enumerate=enumerate)
+            z = RandomParameter("z", Bernoulli(0.3), shape=(), marginalize=marginalize)
             mean = DeterministicParameter(
                 "mean", lambda mu, z: mu + torch.cumsum(z, 0),
                 lambda mu, z: {"mu": torch.ones_like(z)}, [mu, z],
@@ -168,7 +168,7 @@ def _cumulative_model(n, enumerate=True):
 
 
 def test_non_factorising_group_falls_back_to_brute_force():
-    model, full = _cumulative_model(3), _cumulative_model(3, enumerate=False)
+    model, full = _cumulative_model(3), _cumulative_model(3, marginalize=False)
     _randomise([model, full], seed=1)
     assert [g.mode for g in model.prepare_enumeration()] == ["brute_force"]
     torch.testing.assert_close(model.model_log_prob(), _brute_force_log_prob(full, ["z"]))
@@ -185,11 +185,11 @@ def test_non_factorising_group_too_large_is_refused():
 
 
 def test_interacting_enumerated_parameters_are_summed_jointly():
-    def build(enumerate):
+    def build(marginalize):
         with Model() as model:
             mu = RandomParameter("mu", Normal(0.0, 1.0))
-            a = RandomParameter("a", Bernoulli(0.3), enumerate=enumerate)
-            b = RandomParameter("b", Bernoulli(0.6), enumerate=enumerate)
+            a = RandomParameter("a", Bernoulli(0.3), marginalize=marginalize)
+            b = RandomParameter("b", Bernoulli(0.6), marginalize=marginalize)
             mean = DeterministicParameter(
                 "mean", lambda mu, a, b: mu + 2 * a - b,
                 lambda mu, a, b: {"mu": torch.ones_like(mu)}, [mu, a, b],
@@ -209,7 +209,7 @@ def test_interacting_enumerated_parameters_are_summed_jointly():
 def test_only_finite_discrete_parameters_can_be_enumerated():
     with pytest.raises(ValueError, match="finite discrete support"):
         with Model():
-            RandomParameter("x", Normal(0.0, 1.0), enumerate=True)
+            RandomParameter("x", Normal(0.0, 1.0), marginalize=True)
     with Model() as model:
         RandomParameter("x", Normal(0.0, 1.0))
     with pytest.raises(ValueError, match="finite discrete support"):
@@ -268,7 +268,7 @@ def test_enumerated_mixture_matches_mixture_likelihood_with_nuts():
         mu0 = RandomParameter("mu0", Normal(-2.0, 1.0))
         mu1 = RandomParameter("mu1", Normal(2.0, 1.0))
         with plate("n", len(y)):
-            z = RandomParameter("z", Bernoulli(0.7), shape=(), enumerate=True)
+            z = RandomParameter("z", Bernoulli(0.7), shape=(), marginalize=True)
             mean = DeterministicParameter(
                 "mean", lambda a, b, z: a + (b - a) * z,
                 lambda a, b, z: {"mu0": 1 - z, "mu1": z}, [mu0, mu1, z],
@@ -308,10 +308,10 @@ def test_enumerated_mixture_matches_mixture_likelihood_with_nuts():
 
 
 # ------------------------------------------------------- scalar (no plate)
-def _scalar_model(enumerate):
+def _scalar_model(marginalize):
     # z ~ Bernoulli(0.5), mu ~ N(0, 1), y = 2 ~ N(mu + 3 z, 1).
     with Model() as model:
-        z = RandomParameter("z", Bernoulli(0.5), enumerate=enumerate)
+        z = RandomParameter("z", Bernoulli(0.5), marginalize=marginalize)
         mu = RandomParameter("mu", Normal(0.0, 1.0))
         mean = DeterministicParameter(
             "mean", lambda mu, z: mu + 3 * z,
@@ -340,3 +340,12 @@ def test_scalar_enumerated_parameter_sampling():
     assert result.enumerated_probs["z"][..., 1].mean().item() == pytest.approx(p_z, abs=0.03)
     expected_mu = p_z * (-0.5) + (1 - p_z) * 1.0
     assert result["mu"].mean().item() == pytest.approx(expected_mu, abs=0.1)
+
+
+def test_random_parameter_marginalize_alias():
+    from BayesianDLL.Distributions import Bernoulli
+    with Model() as model:
+        z = RandomParameter("z", Bernoulli(0.3), marginalize=True)
+    assert z.marginalized is True
+    assert z.enumerated is True
+    assert "z" in model.enumerated_params

@@ -17,19 +17,16 @@ from BayesianDLL.GP import (
     LinearMean,
     Matern52,
     MeanFunction,
-    SparseGP,
-    SparseLatentGP,
     SumMean,
     ToeplitzGP,
     ZeroMean,
     exact_gp_predictive,
     gp_predictive,
     kronecker_gp_predictive,
-    sparse_gp_predictive,
-    sparse_latent_gp_predictive,
     stable_cholesky,
     toeplitz_gp_predictive,
 )
+from BayesianDLL.GP._process import _sparse_latent_gp_predictive as sparse_latent_gp_predictive
 
 DTYPE = torch.float64
 C = 4
@@ -133,12 +130,12 @@ def _model(gp_class, mean_kind, learnable_inputs=False, learnable_z=False, metho
         if gp_class == "exact":
             ObservedParameter("y", ExactGP("f", inputs, _kernel(), noise_variance=_noise(), mean=mean), y)
         elif gp_class == "sparse":
-            ObservedParameter("y", SparseGP("f", inputs, _kernel(), z, noise_variance=_noise(), mean=mean, method=method), y)
+            ObservedParameter("y", ExactGP("f", inputs, _kernel(), noise_variance=_noise(), mean=mean, inducing_points=z, method=method), y)
         elif gp_class == "latent":
             f = LatentGP("f", inputs, _kernel(), mean=mean, jitter=1e-8)
             ObservedParameter("y", Normal(f, 0.3), y)
         elif gp_class == "sparse_latent":
-            f = SparseLatentGP("f", inputs, _kernel(), z, mean=mean, jitter=1e-8)
+            f = LatentGP("f", inputs, _kernel(), mean=mean, jitter=1e-8, inducing_points=z)
             ObservedParameter("y", Normal(f, 0.3), y)
         else:
             raise ValueError(gp_class)
@@ -379,9 +376,9 @@ def test_inducing_points_get_no_mean_term(gp_class):
         RandomParameter("w", Normal(0.0, 1.0), shape=2, initial_value=w.clone())
         RandomParameter("b", Normal(0.0, 1.0), initial_value=b.clone())
         if gp_class == "sparse":
-            ObservedParameter("y", SparseGP("f", Data("x", x), _kernel(), z, noise_variance=_noise()), y - m)
+            ObservedParameter("y", ExactGP("f", Data("x", x), _kernel(), noise_variance=_noise(), inducing_points=z), y - m)
         else:
-            f = SparseLatentGP("f", Data("x", x), _kernel(), z, jitter=1e-8)
+            f = LatentGP("f", Data("x", x), _kernel(), jitter=1e-8, inducing_points=z)
             ObservedParameter("y", Normal(f, 0.3), y - m)
     if gp_class == "sparse_latent":
         reference.params["f_white"].set_unconstrained_value(with_mean.params["f_white"].unconstrained_value.clone())
@@ -434,7 +431,7 @@ def test_zero_mean_default_adds_no_parameters_or_graph_edges():
         exact = ExactGP("f", Data("x", x), RBF(0.5, 1.0), noise_variance=0.1)
         other = ExactGP("g", Data("x2", x), RBF(0.5, 1.0), noise_variance=0.1)
         latent = LatentGP("h", Data("x3", x), RBF(0.5, 1.0))
-        sparse = SparseLatentGP("s", Data("x4", x), RBF(0.5, 1.0), x[:3].clone())
+        sparse = LatentGP("s", Data("x4", x), RBF(0.5, 1.0), inducing_points=x[:3].clone())
     for gp in (exact, other):
         assert isinstance(gp.mean, ZeroMean)
         assert gp._mean_parameter_nodes == []
@@ -546,7 +543,7 @@ def test_sparse_predictive_with_a_linear_mean_matches_a_dense_reference():
     new = torch.tensor([[0.1, 0.5], [-0.8, 0.7], [0.6, -0.2]], dtype=DTYPE)
     with Model():
         w, b = _linear_mean_nodes(2)
-        gp = SparseGP("f", Data("x", x), RBF(_LENGTHSCALE, _VARIANCE), z, noise_variance=_NOISE, mean=LinearMean(w, b), jitter=1e-12)
+        gp = ExactGP("f", Data("x", x), RBF(_LENGTHSCALE, _VARIANCE), noise_variance=_NOISE, mean=LinearMean(w, b), jitter=1e-12, inducing_points=z)
     trace = _trace()
     means, covariances = [], []
     k_mm, k_mn, k_ms = _rbf(z, z), _rbf(z, x), _rbf(z, new)
@@ -555,7 +552,7 @@ def test_sparse_predictive_with_a_linear_mean_matches_a_dense_reference():
         means.append(_linear(new, draw) + k_ms.T @ sigma_u @ k_mn @ (y - _linear(x, draw)) / _NOISE)
         covariances.append(_rbf(new, new) - k_ms.T @ torch.linalg.solve(k_mm, k_ms) + k_ms.T @ sigma_u @ k_ms)
     torch.manual_seed(3)
-    actual = sparse_gp_predictive(gp, trace, y, new, n_samples=2)
+    actual = exact_gp_predictive(gp, trace, y, new, n_samples=2)
     torch.testing.assert_close(actual, _gaussian_reference(means, covariances, 2, 1e-12, seed=3), atol=1e-6, rtol=0)
 
 
@@ -583,7 +580,7 @@ def test_sparse_latent_predictive_with_a_linear_mean_matches_a_dense_reference()
     new = torch.tensor([[0.1, 0.5], [-0.8, 0.7], [0.6, -0.2]], dtype=DTYPE)
     with Model():
         w, b = _linear_mean_nodes(2)
-        gp = SparseLatentGP("f", Data("x", x), RBF(_LENGTHSCALE, _VARIANCE), z, mean=LinearMean(w, b), jitter=1e-12)
+        gp = LatentGP("f", Data("x", x), RBF(_LENGTHSCALE, _VARIANCE), mean=LinearMean(w, b), jitter=1e-12, inducing_points=z)
     white = torch.randn(3, 4, generator=torch.Generator().manual_seed(1), dtype=DTYPE)
     trace = _trace(f_white=white)
     factor = torch.linalg.cholesky(_rbf(z, z))

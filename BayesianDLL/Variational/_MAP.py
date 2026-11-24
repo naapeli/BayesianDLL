@@ -1,6 +1,53 @@
+from collections.abc import Mapping
+
 import torch
 
 from .. import Model
+
+
+class MAPResult(Mapping):
+    """The result of :func:`find_MAP`: a read-only mapping from parameter names to their values at the mode.
+
+    ``result["sigma"]``, ``result.keys()``, ``result.items()``, ``len(result)``
+    and iteration all refer to the parameters, like a dictionary.
+
+    Attributes
+    ----------
+    params : dict[str, torch.Tensor]
+        The constrained values of the random and deterministic parameters at the mode.
+    history : list[float]
+        The log joint density recorded every ``callback_frequency`` epochs.
+    log_prob : float
+        The log joint density at the returned values (the objective of :func:`find_MAP`).
+    """
+
+    def __init__(self, mode: dict[str, torch.Tensor], history: list[float], log_prob: float):
+        self._mode = dict(mode)
+        self.history = list(history)
+        self.log_prob = log_prob
+
+    def mode(self) -> dict[str, torch.Tensor]:
+        """Return a copy of the parameter values at the mode."""
+        return {name: value.clone() for name, value in self._mode.items()}
+
+    @property
+    def params(self) -> dict[str, torch.Tensor]:
+        return dict(self._mode)
+
+    def __getitem__(self, name):
+        if name not in self._mode:
+            raise KeyError(f"Parameter '{name}' not found in the MAP result.")
+        return self._mode[name]
+
+    def __iter__(self):
+        return iter(self._mode)
+
+    def __len__(self):
+        return len(self._mode)
+
+    def __repr__(self):
+        params_str = ", ".join(f"{k}: {tuple(v.shape)}" for k, v in self._mode.items())
+        return f"MAPResult(log_prob={self.log_prob:.3f}, params={{{params_str}}})"
 
 
 def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_frequency=1, verbose=True):
@@ -20,8 +67,30 @@ def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_fre
 
     The model's latents are left at the final values. Every
     ``callback_frequency`` epochs the log joint is recorded (and printed if
-    ``verbose``). Returns the list of recorded log joint values.
+    ``verbose``).
+
+    Parameters
+    ----------
+    model : Model
+        The probabilistic model to optimize.
+    lr : float, default 1e-2
+        Learning rate (step size) for Adam optimization.
+    epochs : int, default 100
+        Number of optimization steps.
+    betas : tuple[float, float], default (0.9, 0.999)
+        Exponential decay rates for the first and second moment estimates in Adam.
+    callback_frequency : int, default 1
+        Frequency (in epochs) at which log joint probability is recorded and printed.
+    verbose : bool, default True
+        Whether to print log joint probability during optimization.
+
+    Returns
+    -------
+    MAPResult
+        Object containing the mode parameters, history of log joint probabilities,
+        and final log probability.
     """
+    model._capture_training_data()
     history = []
 
     m = {}
@@ -51,5 +120,15 @@ def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_fre
             if verbose:
                 print(f"Epoch: {epoch + 1} - Log_prob: {logp.item():.2f}")
 
-    return history
+    final_logp = model.model_log_prob().item()
+    mode = {
+        name: param.constrained_value.detach().clone()
+        for name, param in model.params.items()
+    }
+    for name, param in model.deterministic_params.items():
+        val = getattr(param, "constrained_value", getattr(param, "value", None))
+        if val is not None:
+            mode[name] = torch.as_tensor(val).detach().clone()
+
+    return MAPResult(mode, history, final_logp)
 

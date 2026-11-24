@@ -43,7 +43,7 @@ import torch
 
 from BayesianDLL import Data, Group, Guide, Model, ObservedParameter, RandomParameter, VariationalParameter, plate
 from BayesianDLL.Deterministic import Add, Index, Linear
-from BayesianDLL.Distributions import HalfNormal, LogNormal, Normal
+from BayesianDLL.Distributions import HalfNormal, LogNormal, LogTransform, Normal
 from BayesianDLL.Variational import BBVI
 
 torch.manual_seed(0)
@@ -81,7 +81,7 @@ with Model() as model:
 with Guide(model, default_family="mean_field") as grouped:
     Group(["mu", "beta"], family="full_rank", name="line")
     RandomParameter("sigma", LogNormal(VariationalParameter("sigma_loc", torch.tensor([0.0], dtype=torch.float64)),
-                                       VariationalParameter("sigma_scale", torch.tensor([0.2], dtype=torch.float64), log_scale=True)))
+                                       VariationalParameter("sigma_scale", torch.tensor([0.2], dtype=torch.float64), transform=LogTransform())))
 
 guides = {
     "all mean-field": Guide(model, default_family="mean_field"),
@@ -108,7 +108,7 @@ for label, guide in guides.items():
     traces[label] = guide.sample(1500)
 
 start = time.perf_counter()
-traces["NUTS"] = model.sample(n_samples=400, warmup_length=400, n_chains=4, progress_bar=False, seed=0,
+traces["NUTS"] = model.sample(n_samples=300, warmup_length=300, n_chains=4, progress_bar=False, seed=0,
                               metric="dense", chain_method="vectorized")
 seconds["NUTS"] = time.perf_counter() - start
 print(f"NUTS: {sum(traces['NUTS'].divergences)} divergences")
@@ -192,7 +192,7 @@ fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), layout="constrained")
 labels = list(traces)
 axes[0].bar(labels, [seconds[label] for label in labels], color=[colors[label] for label in labels])
 axes[0].set_ylabel("seconds")
-axes[0].set_title("Run time (BBVI 1500 steps; NUTS 4 x 800 iterations)")
+axes[0].set_title("Run time (BBVI 1500 steps; NUTS 4 x 600 iterations)")
 axes[1].bar(list(guides), [n_variational_parameters(guide) for guide in guides.values()], color=[colors[label] for label in guides])
 axes[1].set_ylabel("count")
 axes[1].set_title("Variational parameters")
@@ -202,64 +202,45 @@ plt.show()
 
 # %%
 # Mean and covariance of a guide
-# -------------------------------
-# ``guide.covariance(space=...)`` returns the mean and the covariance matrix
-# over all latents. The pieces of a guide are independent, so the matrix is
-# block diagonal and every block between two pieces is exactly zero. Within
-# a block, each moment is exact where a closed form exists and a Monte Carlo
-# estimate otherwise; ``estimated`` lists the Monte Carlo latents and
-# ``standard_error`` gives sd / sqrt(n) for their means.
+# ------------------------------
+# ``guide.moments(space)`` returns a :class:`~BayesianDLL.Variational.GuideMoments`
+# with the mean and the block-diagonal covariance of the guide (pieces of a
+# guide are independent). Specific latents or groups can be accessed directly:
 #
-# * In the **unconstrained** space every Gaussian block is exact: ``loc`` and
-#   ``diag(scale^2)`` or ``L L^T``. The ``LogNormal`` entry describes
-#   ``sigma`` itself. Its moments in the unconstrained space (those of
-#   ``log sigma``) are therefore estimated from ``n_samples`` draws.
-# * In the **constrained** space the identity-transformed latents keep their
-#   exact Gaussian moments. ``tau`` lives on a log scale in the mean-field
-#   group, so its moments are the exact log-normal ones,
-#   ``exp(m + s^2/2)`` and ``(exp(s^2) - 1) exp(2 m + s^2)``. The
-#   ``LogNormal`` entry now lives in the requested space, so its closed-form
-#   moments apply. Nothing needs sampling.
+# * ``m.mean("mu")``, ``m.variance("mu")``, ``m.covariance("mu")``, ``m.correlation("mu")``
+# * ``m.mean(group="line")``, ``m.covariance(group="line")``, ``m.correlation(group="line")``
+# * ``m.mean()``, ``m.variance()``, ``m.covariance()``, ``m.correlation()`` (full tensors)
 #
-# **Accuracy and cost.** An exact Gaussian block has no sampling error and
-# costs ``O(d)`` (mean-field) or ``O(d^2)`` (forming ``L L^T``): essentially
-# free. The constrained closed forms (log-normal moments, distribution
-# moments) are equally free and exact. They are exact moments of the
-# approximation ``q``, not of the posterior. A Monte Carlo block has an error
-# of about ``sd / sqrt(n)`` on each mean and a relative error of about
-# ``sqrt(2 / n)`` on each variance (more for heavy-tailed transforms). With
-# the default ``n = 4000`` that is about 1.6% of an sd and 2.2% of a
-# variance. Its cost is ``n`` draws times the transform plus ``O(d^2)`` for
-# the accumulation, linear in ``n``. The draws are exact and independent:
-# groups are sampled as ``loc + L eps`` and entries with their own
-# ``sample()``, never with MCMC. ``n`` draws are therefore ``n`` effective
-# samples, even for the strongly correlated ``(mu, beta)`` group: the
-# correlation lives in ``L`` and only makes estimates along its thin
-# direction noisier. MCMC draws of the posterior, in contrast, are
-# autocorrelated.
+# Each block is exact where a closed form exists and a Monte Carlo estimate
+# otherwise (listed in ``estimated``, with ``standard_error`` = sd / sqrt(n)).
+# In the **unconstrained** space every Gaussian block is exact, but the
+# ``LogNormal`` entry describes ``sigma`` itself, so the moments of
+# ``log sigma`` are estimated from independent draws. In the **constrained**
+# space ``tau`` (log scale in the mean-field group) gets the exact log-normal
+# moments and the ``LogNormal`` entry its closed form, so nothing is sampled.
+# These are moments of the approximation ``q``, not of the posterior.
 #
-# **Constrained vs unconstrained.** Constrained moments are not the
-# transformed unconstrained ones, because ``exp(E[log tau]) != E[tau]``.
-# ``exp(E[log tau])`` is the median of the log-normal, and it is smaller
-# than the mean by the factor ``exp(-s^2 / 2)``. Use the unconstrained
-# moments to inspect the optimisation and the constrained ones to report
-# results. For quantiles, functions of several latents or deterministic
-# nodes, use ``guide.sample(n)`` with ``summary()``.
+# Constrained moments are not the transformed unconstrained ones:
+# ``exp(E[log tau])`` is the median of the log-normal, smaller than ``E[tau]``
+# by the factor ``exp(-s^2 / 2)``. Use the unconstrained moments to inspect the
+# optimisation and the constrained ones to report results.
 
 for space in ("unconstrained", "constrained"):
-    start = time.perf_counter()
-    result = grouped.covariance(space)
-    elapsed = 1000 * (time.perf_counter() - start)
-    print(f"{space:>13}: {elapsed:6.1f} ms, exact {result.exact}, Monte Carlo {result.estimated}")
-    for name, error in result.standard_error.items():
-        print(f"{'':>15}standard error of the mean of {name}: {error.item():.4f} (n = {result.n_samples})")
+    m = grouped.moments(space)
+    print(f"{space:>13}: exact {m.exact}, Monte Carlo {m.estimated}")
 
-unconstrained, constrained = grouped.covariance("unconstrained"), grouped.covariance("constrained")
-block = constrained.block("mu", "beta")[0, 0] / (constrained.block("mu") * constrained.block("beta")).sqrt()
-print(f"corr(mu, beta) inside the full-rank group: {block.item():+.3f}; "
-      f"cov(mu, tau) between independent pieces: {constrained.block('mu', 'tau').item():.1f}")
-print(f"tau: exp(E[log tau]) = {unconstrained.means()['tau'].exp().item():.4f}, "
-      f"E[tau] = {constrained.means()['tau'].item():.4f}, "
+unconstrained = grouped.moments("unconstrained")
+constrained = grouped.moments("constrained")
+
+line_mean = constrained.mean(group="line")
+line_cov = constrained.covariance(group="line")
+line_corr = constrained.correlation(group="line")
+corr_mu_beta = line_corr[0, 1]
+
+print(f"line group mean [mu, beta]: {line_mean.tolist()}")
+print(f"corr(mu, beta) inside line group: {corr_mu_beta.item():+.3f}")
+print(f"tau: exp(E[log tau]) = {unconstrained.mean('tau').exp().item():.4f}, "
+      f"E[tau] = {constrained.mean('tau').item():.4f}, "
       f"Monte Carlo from guide.sample: {traces['grouped']['tau'].mean().item():.4f}")
-print(f"sigma: E[sigma] = {constrained.means()['sigma'].item():.4f} (closed form of the LogNormal entry), "
-      f"E[log sigma] = {unconstrained.means()['sigma'].item():.4f} +- {unconstrained.standard_error['sigma'].item():.4f} (Monte Carlo)")
+print(f"sigma: E[sigma] = {constrained.mean('sigma').item():.4f} (closed form of the LogNormal entry), "
+      f"E[log sigma] = {unconstrained.mean('sigma').item():.4f} +- {unconstrained.standard_error['sigma'].item():.4f} (Monte Carlo)")
