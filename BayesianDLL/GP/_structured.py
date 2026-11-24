@@ -31,6 +31,7 @@ from ._kernels import (
     ProductKernel,
     RationalQuadratic,
     RBF,
+    SpectralMixture,
     SumKernel,
     _feature_matrix,
     _is_named,
@@ -681,7 +682,7 @@ def _toeplitz_inverse_diagonal_sums(inverse_first_column):
     return (_lower_toeplitz_diagonal_sums(x) - _lower_toeplitz_diagonal_sums(c)) / x[..., :1]
 
 
-_TOEPLITZ_KERNELS = (RBF, Matern, RationalQuadratic, Periodic, Constant)
+_TOEPLITZ_KERNELS = (RBF, Matern, RationalQuadratic, Periodic, SpectralMixture, Constant)
 
 
 def _check_stationary(kernel):
@@ -691,7 +692,7 @@ def _check_stationary(kernel):
         return
     if not isinstance(kernel, _TOEPLITZ_KERNELS):
         raise TypeError(
-            "ToeplitzGP needs a stationary kernel built from RBF, Matern, RationalQuadratic, Periodic and "
+            "ToeplitzGP needs a stationary kernel built from RBF, Matern, RationalQuadratic, Periodic, SpectralMixture and "
             f"Constant kernels; got {type(kernel).__name__}. Use noise_variance instead of WhiteNoise."
         )
 

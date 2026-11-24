@@ -865,6 +865,150 @@ class RationalQuadratic(_StationaryDiagonal, Kernel):
         return -_radial_input_vjp(cotangent * covariance / base, x1, x2, 1.0 / lengthscale.square())
 
 
+def _prod_except(values):
+    """``out[..., d] = Π_{d' ≠ d} values[..., d']`` along the last axis (no division)."""
+    ones = torch.ones_like(values[..., :1])
+    prefix = torch.cumprod(torch.cat([ones, values[..., :-1]], dim=-1), dim=-1)
+    suffix = torch.cumprod(torch.cat([values[..., 1:], ones], dim=-1).flip(-1), dim=-1).flip(-1)
+    return prefix * suffix
+
+
+def _per_feature_derivative(value, per_feature):
+    """Shape a derivative ``(B, Q, N, M, D)`` of a ``(Q,)`` or ``(Q, D)`` parameter like the parameter.
+
+    A value shared by the features (``(Q,)`` or ``(Q, 1)``) gets the sum over the
+    features; the result is ``(B, *parameter_shape, N, M)``.
+    """
+    if value[0].numel() == per_feature.shape[1]:
+        per_feature = per_feature.sum(dim=-1)
+    else:
+        per_feature = per_feature.movedim(-1, 2)
+    return per_feature.reshape(per_feature.shape[0], *value.shape[1:], *per_feature.shape[-2:])
+
+
+class SpectralMixture(Kernel):
+    r"""Spectral mixture covariance kernel (Wilson & Adams, 2013).
+
+    A mixture of :math:`Q` Gaussians in the spectral domain gives, with
+    :math:`\boldsymbol{\tau} = \mathbf{x}_1 - \mathbf{x}_2`,
+
+    .. math::
+
+        k(\mathbf{x}_1, \mathbf{x}_2) = \sum_{q=1}^Q w_q \prod_{d=1}^D
+        \exp\left(-\frac{\tau_d^2}{2 l_{qd}^2}\right) \cos\left(2 \pi \mu_{qd} \tau_d\right)
+
+    Component :math:`q` is quasi-periodic with frequency :math:`\mu_{qd}` (period
+    :math:`1 / \mu_{qd}`) and its correlations decay with lengthscale :math:`l_{qd}`;
+    its spectral density is a Gaussian with mean :math:`\pm 2 \pi \mu_{qd}` and standard
+    deviation :math:`1 / l_{qd}` in angular frequency. The kernel is stationary
+    (usable with :class:`~BayesianDLL.GP.ToeplitzGP` and Hilbert-space latent GPs).
+
+    Parameters
+    ----------
+    weights : float or torch.Tensor or Parameter
+        Mixture weights :math:`w_q > 0`, shape ``(Q,)``; ``k(x, x) = Σ_q w_q``.
+    frequencies : float or torch.Tensor or Parameter
+        Frequencies :math:`\mu_{qd} \geq 0`, shape ``(Q,)`` (shared by the features) or ``(Q, D)``.
+    lengthscales : float or torch.Tensor or Parameter
+        Lengthscales :math:`l_{qd} > 0`, shape ``(Q,)`` (shared by the features) or ``(Q, D)``.
+    """
+
+    def __init__(self, weights, frequencies, lengthscales):
+        super().__init__(weights, frequencies, lengthscales)
+        self.weights = weights
+        self.frequencies = frequencies
+        self.lengthscales = lengthscales
+
+    def _mixture(self, reference, parameter_values):
+        """``(w_value, w (B, Q), μ_value, μ (B, Q, 1 or D), l_value, l (B, Q, 1 or D))``."""
+        weights_value = _bparam(self.weights, parameter_values, reference)
+        weights = weights_value.reshape(weights_value.shape[0], -1)
+        count, features = weights.shape[1], reference.shape[-1]
+        result = [weights_value, weights]
+        for parameter, label in ((self.frequencies, "frequencies"), (self.lengthscales, "lengthscales")):
+            value = _bparam(parameter, parameter_values, reference)
+            per_component = value[0].numel() // count if value[0].numel() % count == 0 else 0
+            if per_component not in (1, features):
+                raise ValueError(
+                    f"SpectralMixture {label} must have shape ({count},) or ({count}, {features}) for {count} "
+                    f"components and {features} features; got {tuple(value.shape[1:])}."
+                )
+            result += [value, value.reshape(value.shape[0], count, per_component)]
+        return result
+
+    def _geometry(self, x1, x2, parameter_values):
+        weights_value, weights, frequency_value, frequencies, lengthscale_value, lengthscales = self._mixture(x1, parameter_values)
+        tau = _differences(x1, x2).unsqueeze(1)  # (B, 1, N, M, D)
+        frequency = frequencies[:, :, None, None, :]
+        lengthscale = lengthscales[:, :, None, None, :]
+        scaled = tau / lengthscale  # (B, Q, N, M, D)
+        envelope = torch.exp(-0.5 * scaled.square().sum(dim=-1))  # (B, Q, N, M)
+        phase = 2.0 * torch.pi * frequency * tau
+        cosines = torch.cos(phase)
+        components = envelope * cosines.prod(dim=-1)
+        covariance = (weights[:, :, None, None] * components).sum(dim=1)
+        return {
+            "weights_value": weights_value, "weights": weights, "frequency_value": frequency_value,
+            "frequency": frequency, "lengthscale_value": lengthscale_value, "lengthscale": lengthscale,
+            "tau": tau, "scaled": scaled, "envelope": envelope, "phase": phase, "cosines": cosines,
+            "components": components, "covariance": covariance,
+        }
+
+    def batch_evaluate(self, x1, x2, parameter_values):
+        return self._geometry(x1, x2, parameter_values)["covariance"]
+
+    def batch_derivatives(self, x1, x2, parameter_values):
+        parts = self._geometry(x1, x2, parameter_values)
+        weighted = parts["weights"][:, :, None, None, None]
+        derivatives = {}
+        if _is_named(self.weights):
+            components = parts["components"]
+            _accumulate_derivative(derivatives, self.weights.name,
+                                   components.reshape(components.shape[0], *parts["weights_value"].shape[1:], *components.shape[-2:]))
+        if _is_named(self.lengthscales):
+            # ∂/∂l_qd = w_q k_q τ_d² / l_qd³
+            per_feature = weighted * parts["components"].unsqueeze(-1) * parts["scaled"].square() / parts["lengthscale"]
+            _accumulate_derivative(derivatives, self.lengthscales.name, _per_feature_derivative(parts["lengthscale_value"], per_feature))
+        if _is_named(self.frequencies):
+            # ∂/∂μ_qd = -w_q e_q Π_{d'≠d} cos_qd' sin(2π μ_qd τ_d) 2π τ_d
+            others = _prod_except(parts["cosines"])
+            per_feature = -weighted * parts["envelope"].unsqueeze(-1) * others * torch.sin(parts["phase"]) * (2.0 * torch.pi * parts["tau"])
+            _accumulate_derivative(derivatives, self.frequencies.name, _per_feature_derivative(parts["frequency_value"], per_feature))
+        return derivatives
+
+    def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
+        r"""``∂k/∂x1_d = -Σ_q w_q e_q [k̃_q τ_d / l_qd² + Π_{d'≠d} cos_qd' sin(2π μ_qd τ_d) 2π μ_qd]`` with ``k̃_q = Π_d cos_qd``."""
+        parts = self._geometry(x1, x2, parameter_values)
+        weighted = parts["weights"][:, :, None, None, None]
+        envelope = parts["envelope"].unsqueeze(-1)
+        decay = parts["components"].unsqueeze(-1) * parts["tau"] / parts["lengthscale"].square()
+        oscillation = envelope * _prod_except(parts["cosines"]) * torch.sin(parts["phase"]) * (2.0 * torch.pi * parts["frequency"])
+        per_feature = -(weighted * (decay + oscillation)).sum(dim=1)  # (B, N, M, D)
+        return (cotangent.unsqueeze(-1) * per_feature).sum(dim=-2)
+
+    def batch_diag(self, x, parameter_values, chunk_size=256):
+        weights = self._mixture(x, parameter_values)[1]
+        return weights.sum(dim=-1, keepdim=True).expand(weights.shape[0], x.shape[1])
+
+    def batch_diag_derivatives(self, x, parameter_values, chunk_size=256):
+        """``k(x, x) = Σ_q w_q``: only the weights change the diagonal."""
+        derivatives = {}
+        for parameter in self.parameters:
+            value = _bparam(parameter, parameter_values, x)
+            derivatives[parameter.name] = torch.zeros((1, *value.shape[1:], x.shape[1]), dtype=x.dtype, device=x.device)
+        if _is_named(self.weights):
+            derivatives[self.weights.name] = derivatives[self.weights.name] + 1.0
+        return derivatives
+
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Zero: the diagonal ``Σ_q w_q`` does not depend on ``x``."""
+        return _zero_input_vjp(x, cotangent)
+
+
+def _accumulate_derivative(derivatives, name, derivative):
+    derivatives[name] = derivatives[name] + derivative if name in derivatives else derivative
+
+
 class Linear(Kernel):
     r"""Linear covariance kernel with offset.
 
@@ -1009,6 +1153,151 @@ class ProductKernel(Kernel):
                     weighted = weighted * diagonal
             result = result + _batch_kernel_diag_input_vjp(kernel, x, weighted, parameter_values, chunk_size)
         return result
+
+
+def _times_diagonal(derivative, weights):
+    """Multiply a diagonal derivative ``(B, *P, N)`` by weights ``(B, N)`` (broadcasting ``B``)."""
+    return derivative * weights.reshape(weights.shape[0], *([1] * (derivative.ndim - 2)), weights.shape[-1])
+
+
+class ChangePoint(Kernel):
+    r"""Change-point kernel: a smooth switch between two kernels along one input feature.
+
+    .. math::
+
+        k(\mathbf{x}_1, \mathbf{x}_2) = \bar{s}(\mathbf{x}_1) \bar{s}(\mathbf{x}_2) k_1(\mathbf{x}_1, \mathbf{x}_2)
+        + s(\mathbf{x}_1) s(\mathbf{x}_2) k_2(\mathbf{x}_1, \mathbf{x}_2),
+        \quad s(\mathbf{x}) = \sigma\big(a (x_d - c)\big), \quad \bar{s} = 1 - s
+
+    with the logistic sigmoid :math:`\sigma`: :math:`k_1` describes the function
+    before the change point :math:`c` and :math:`k_2` after it, and the steepness
+    :math:`a` sets how abrupt the change is. The functions on the two sides are
+    independent (each kernel is weighted by an outer product of sigmoids).
+
+    Parameters
+    ----------
+    kernel_before : Kernel
+        Kernel :math:`k_1` for :math:`x_d < c`.
+    kernel_after : Kernel
+        Kernel :math:`k_2` for :math:`x_d > c`.
+    location : float or torch.Tensor or Parameter
+        Scalar change-point location :math:`c`.
+    steepness : float or torch.Tensor or Parameter, default 1.0
+        Scalar steepness :math:`a > 0` of the switch (in units of one over the input).
+    dimension : int, default 0
+        The input feature :math:`d` along which the change happens.
+    """
+
+    def __init__(self, kernel_before, kernel_after, location, steepness=1.0, dimension=0):
+        for kernel in (kernel_before, kernel_after):
+            if not isinstance(kernel, Kernel):
+                raise TypeError("ChangePoint kernels must be instances of BayesianDLL.GP.Kernel.")
+        if isinstance(dimension, bool) or not isinstance(dimension, int):
+            raise TypeError("ChangePoint dimension must be an integer.")
+        self.kernels = (kernel_before, kernel_after)
+        self.location = location
+        self.steepness = steepness
+        self.dimension = dimension
+        super().__init__(*kernel_before.parameters, *kernel_after.parameters, location, steepness)
+
+    def _switch(self, x, parameter_values):
+        """``(a, offset, s̄, s)``: steepness ``(B,)``, ``x_d - c``, ``1 - s(x)`` and ``s(x)`` ``(B, N)``."""
+        if not -x.shape[-1] <= self.dimension < x.shape[-1]:
+            raise ValueError(f"ChangePoint dimension {self.dimension} is out of range for {x.shape[-1]} input features.")
+        location = _bscalar(self.location, parameter_values, x, "location", "ChangePoint")
+        steepness = _bscalar(self.steepness, parameter_values, x, "steepness", "ChangePoint")
+        offset = x[..., self.dimension] - location[:, None]
+        scaled = steepness[:, None] * offset
+        return steepness, offset, torch.sigmoid(-scaled), torch.sigmoid(scaled)
+
+    def _parts(self, x1, x2, parameter_values):
+        steepness, offset1, before1, after1 = self._switch(x1, parameter_values)
+        _, offset2, before2, after2 = self._switch(x2, parameter_values)
+        first = self.kernels[0].batch_evaluate(x1, x2, parameter_values)
+        second = self.kernels[1].batch_evaluate(x1, x2, parameter_values)
+        return steepness, (offset1, before1, after1), (offset2, before2, after2), first, second
+
+    def batch_evaluate(self, x1, x2, parameter_values):
+        _, (_, before1, after1), (_, before2, after2), first, second = self._parts(x1, x2, parameter_values)
+        return _outer(before1, before2) * first + _outer(after1, after2) * second
+
+    def batch_derivatives(self, x1, x2, parameter_values):
+        r"""Sub-kernel parameters get ``s̄ s̄ᵀ ⊙ ∂K_1`` and ``s sᵀ ⊙ ∂K_2``.
+
+        With ``t = a s s̄`` and ``r = s s̄ (x_d - c)``: ``∂s/∂c = -t``,
+        ``∂s/∂a = r`` (and ``∂s̄ = -∂s``).
+        """
+        steepness, (offset1, before1, after1), (offset2, before2, after2), first, second = self._parts(x1, x2, parameter_values)
+        derivatives = {}
+        for kernel, weights in zip(self.kernels, (_outer(before1, before2), _outer(after1, after2))):
+            for name, derivative in kernel.batch_derivatives(x1, x2, parameter_values).items():
+                _accumulate_derivative(derivatives, name, _times_matrix(derivative, weights))
+        # d k = (dŝ1 ŝ2ᵀ + ŝ1 dŝ2ᵀ) ⊙ K_1 + (ds1 s2ᵀ + s1 ds2ᵀ) ⊙ K_2 with dŝ = -ds.
+        for parameter, slope1, slope2 in (
+            (self.location, -steepness[:, None] * after1 * before1, -steepness[:, None] * after2 * before2),
+            (self.steepness, after1 * before1 * offset1, after2 * before2 * offset2),
+        ):
+            if _is_named(parameter):
+                derivative = (
+                    -(_outer(slope1, before2) + _outer(before1, slope2)) * first
+                    + (_outer(slope1, after2) + _outer(after1, slope2)) * second
+                )
+                _accumulate_derivative(derivatives, parameter.name, _scalar_derivative(derivative))
+        return derivatives
+
+    def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
+        """The sub-kernels' VJPs with the cotangents ``G ⊙ s̄ s̄ᵀ`` and ``G ⊙ s sᵀ``, plus the switch term on feature ``d``."""
+        steepness, (_, before1, after1), (_, before2, after2), first, second = self._parts(x1, x2, parameter_values)
+        result = self.kernels[0].batch_input_vjp(x1, x2, cotangent * _outer(before1, before2), parameter_values)
+        result = result + self.kernels[1].batch_input_vjp(x1, x2, cotangent * _outer(after1, after2), parameter_values)
+        # ∂s(x1_i)/∂x1_id = a s s̄, so row i gets a s_i s̄_i Σ_j G_ij (s_j K2_ij - s̄_j K1_ij).
+        slope = steepness[:, None] * after1 * before1
+        switch = slope * (cotangent * (after2.unsqueeze(-2) * second - before2.unsqueeze(-2) * first)).sum(dim=-1)
+        return result + switch.unsqueeze(-1) * _unit(x1, self.dimension)
+
+    def batch_diag(self, x, parameter_values, chunk_size=256):
+        _, _, before, after = self._switch(x, parameter_values)
+        first = self.kernels[0].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        second = self.kernels[1].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        return before.square() * first + after.square() * second
+
+    def batch_diag_derivatives(self, x, parameter_values, chunk_size=256):
+        steepness, offset, before, after = self._switch(x, parameter_values)
+        derivatives = {}
+        for kernel, weights in zip(self.kernels, (before.square(), after.square())):
+            for name, derivative in kernel.batch_diag_derivatives(x, parameter_values, chunk_size=chunk_size).items():
+                _accumulate_derivative(derivatives, name, _times_diagonal(derivative, weights))
+        first = self.kernels[0].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        second = self.kernels[1].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        # d diag = 2 ds (s k2 - s̄ k1).
+        for parameter, slope in (
+            (self.location, -steepness[:, None] * after * before),
+            (self.steepness, after * before * offset),
+        ):
+            if _is_named(parameter):
+                _accumulate_derivative(derivatives, parameter.name, (2.0 * slope * (after * second - before * first)).unsqueeze(1))
+        return derivatives
+
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        steepness, _, before, after = self._switch(x, parameter_values)
+        result = self.kernels[0].batch_diag_input_vjp(x, cotangent * before.square(), parameter_values, chunk_size=chunk_size)
+        result = result + self.kernels[1].batch_diag_input_vjp(x, cotangent * after.square(), parameter_values, chunk_size=chunk_size)
+        first = self.kernels[0].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        second = self.kernels[1].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        switch = 2.0 * cotangent * steepness[:, None] * after * before * (after * second - before * first)
+        return result + switch.unsqueeze(-1) * _unit(x, self.dimension)
+
+
+def _outer(a, b):
+    """``(B, N)``, ``(B, M)`` -> ``(B, N, M)``."""
+    return a.unsqueeze(-1) * b.unsqueeze(-2)
+
+
+def _unit(x, dimension):
+    """One-hot row ``(D,)`` selecting input feature ``dimension``."""
+    unit = torch.zeros(x.shape[-1], dtype=x.dtype, device=x.device)
+    unit[dimension] = 1.0
+    return unit
 
 
 def _kernel_parameters(kernel):

@@ -34,6 +34,10 @@ lengthscales and algebraic composition via sums and products.
    :members:
    :show-inheritance:
 
+.. autoclass:: SpectralMixture
+   :members:
+   :show-inheritance:
+
 .. autoclass:: Linear
    :members:
    :show-inheritance:
@@ -51,5 +55,9 @@ lengthscales and algebraic composition via sums and products.
    :show-inheritance:
 
 .. autoclass:: ProductKernel
+   :members:
+   :show-inheritance:
+
+.. autoclass:: ChangePoint
    :members:
    :show-inheritance:
