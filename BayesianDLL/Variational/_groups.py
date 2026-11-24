@@ -157,24 +157,32 @@ class Group:
     exact; gradients are reparameterised through the chain when every
     distribution has a reparameterised sampler, and use the score function
     for the whole group otherwise (see :mod:`BayesianDLL.Variational._structured`).
-    Its ``mean`` and ``covariance`` are Monte Carlo estimates in both spaces.
+    Its :meth:`moments` are Monte Carlo estimates in both spaces.
 
     Parameters
     ----------
     params : sequence of (str or RandomParameter)
-        The latent parameters belonging to this group.
+        The latent parameters belonging to this group. Every latent belongs to
+        exactly one group or hand-written entry; discrete latents need
+        marginalization or a hand-written entry instead.
     family : {None, "mean_field", "full_rank"}, default None
-        Variational distribution family for the group. If ``None``, defaults to
-        ``"mean_field"`` or a structured group when used as a context manager.
+        ``"mean_field"``: an independent Normal per unconstrained coordinate, with
+        VariationalParameters ``{prefix}{latent}_loc`` and ``{prefix}{latent}_scale``.
+        ``"full_rank"``: one multivariate Normal ``loc + L eps`` over the group's
+        concatenated coordinates, with ``{prefix}loc`` and ``{prefix}scale_tril``.
+        ``None``: ``"mean_field"``, or a structured group when used as a context manager.
     init_scale : float, default 0.1
-        Initial standard deviation for the group's unconstrained coordinates.
+        Initial standard deviation of every unconstrained coordinate; the means
+        start at the model's current values.
     name : str, optional
-        Prefix for the group's variational parameter names.
+        Name of the group (``prefix = name + "_"``). Default ``group0``, ``group1``, ...
+        in creation order.
 
     Attributes
     ----------
     names : list of str
-        Names of the latents in the group.
+        Names of the latents in the group, in the order of the flat vector
+        (see also the properties ``loc``, ``scale`` and ``scale_tril``).
     """
 
     def __init__(self, params, family=None, init_scale=0.1, name=None):

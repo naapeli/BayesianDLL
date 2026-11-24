@@ -82,8 +82,8 @@ class Linear(DeterministicParameter):
     inputs : Parameter or Data or torch.Tensor
         Covariates :math:`X` of shape ``(N, D)`` or ``(N,)``.
     coefficients : Parameter or torch.Tensor
-        Coefficients :math:`\mathbf{w}` of shape ``(D_{\text{in}}, D_{\text{out}})``,
-        ``(D,)``, or scalar.
+        Coefficients :math:`\mathbf{w}`: a scalar, a vector of shape ``(D,)``, or a
+        matrix of shape ``(D, D_out)`` for ``D_out`` outputs per row.
     intercept : Parameter or torch.Tensor or float, default 0.0
         Intercept :math:`b`, scalar or broadcastable.
     """
@@ -291,8 +291,8 @@ class Exp(DeterministicParameter):
     ----------
     name : str
         Node name.
-    input : Parameter or Data or torch.Tensor
-        Input tensor.
+    input : RandomParameter or DeterministicParameter or Data
+        Named input node.
     """
 
     def __init__(self, name, input):
@@ -318,8 +318,8 @@ class Log(DeterministicParameter):
     ----------
     name : str
         Node name.
-    input : Parameter or Data or torch.Tensor
-        Input tensor (must be strictly positive).
+    input : RandomParameter or DeterministicParameter or Data
+        Named input node with strictly positive values.
     """
 
     def __init__(self, name, input):
@@ -345,8 +345,8 @@ class Sigmoid(DeterministicParameter):
     ----------
     name : str
         Node name.
-    input : Parameter or Data or torch.Tensor
-        Input tensor.
+    input : RandomParameter or DeterministicParameter or Data
+        Named input node.
     """
 
     def __init__(self, name, input):

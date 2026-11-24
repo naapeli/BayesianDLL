@@ -13,7 +13,8 @@ Model and Context
    :members:
    :show-inheritance:
 
-.. autofunction:: plate
+.. autoclass:: plate
+   :show-inheritance:
 
 .. autoclass:: Data
    :members:

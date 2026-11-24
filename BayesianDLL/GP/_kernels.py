@@ -471,16 +471,16 @@ class Constant(Kernel):
 
 
 class WhiteNoise(Kernel):
-    r"""Independent white noise covariance kernel.
+    r"""Independent white noise covariance kernel: :math:`\mathbf{K}(X_1, X_2) = v \mathbf{I}` if :math:`X_1` and :math:`X_2` are the same inputs, else :math:`\mathbf{0}`.
 
-    .. math::
-
-        k(\mathbf{x}_1, \mathbf{x}_2) = v \cdot \delta(\mathbf{x}_1, \mathbf{x}_2)
+    "The same inputs" means equal tensors (same shape and values): the kernel adds
+    :math:`v` to the diagonal of :math:`\mathbf{K}(X, X)` and nothing to
+    cross-covariances, even at coincident points.
 
     Parameters
     ----------
-    variance : float or torch.Tensor or Parameter, default 1.0
-        Noise variance parameter :math:`v > 0`.
+    variance : float or torch.Tensor or Parameter, default 1e-6
+        Scalar noise variance :math:`v > 0`.
     """
 
     def __init__(self, variance=1e-6):
@@ -590,14 +590,17 @@ class Periodic(_StationaryDiagonal, Kernel):
 
         k(\mathbf{x}_1, \mathbf{x}_2) = v \exp\left( -\frac{2\sin^2\left(\frac{\pi \|\mathbf{x}_1 - \mathbf{x}_2\|}{p}\right)}{l^2} \right)
 
+    With an ARD lengthscale the sine is applied per feature,
+    :math:`v \exp\left(-2 \sum_d \sin^2(\pi (x_{1d} - x_{2d}) / p) / l_d^2\right)`.
+
     Parameters
     ----------
     lengthscale : float or torch.Tensor or Parameter, default 1.0
-        Lengthscale parameter :math:`l > 0`.
-    period : float or torch.Tensor or Parameter, default 1.0
-        Period of the repetition :math:`p > 0`.
+        Lengthscale :math:`l > 0`, scalar or ARD vector of shape ``(D,)``.
     variance : float or torch.Tensor or Parameter, default 1.0
-        Output variance :math:`v > 0`.
+        Scalar output variance :math:`v > 0`.
+    period : float or torch.Tensor or Parameter, default 1.0
+        Scalar period of the repetition :math:`p > 0`.
     """
 
     def __init__(self, lengthscale=1.0, variance=1.0, period=1.0):
@@ -807,7 +810,7 @@ class Matern52(Matern):
 class RationalQuadratic(_StationaryDiagonal, Kernel):
     r"""Rational quadratic covariance kernel.
 
-    Equivalent to a continuous scale mixture of RBF kernels with Gamma-distributed inverse lengthscales:
+    Equivalent to a continuous scale mixture of RBF kernels with Gamma-distributed inverse squared lengthscales:
 
     .. math::
 
@@ -917,12 +920,13 @@ class Linear(Kernel):
 
 
 class SumKernel(Kernel):
-    r"""Sum of covariance kernels :math:`k = k_1 + k_2 + \dots`.
+    r"""Sum of covariance kernels :math:`k = k_1 + k_2 + \dots` (also built with ``k1 + k2``).
 
     Parameters
     ----------
-    kernels : sequence of Kernel
-        Kernels to sum.
+    *kernels : Kernel or float or callable
+        Kernels to sum. A number is a constant kernel without gradient, a plain
+        callable ``k(x1, x2)`` gets no gradients (unbatched inputs only).
     """
 
     def __init__(self, *kernels):
@@ -948,12 +952,12 @@ class SumKernel(Kernel):
 
 
 class ProductKernel(Kernel):
-    r"""Elementwise product of covariance kernels :math:`k = k_1 \cdot k_2 \cdot \dots`.
+    r"""Elementwise product of covariance kernels :math:`k = k_1 \cdot k_2 \cdot \dots` (also built with ``k1 * k2``).
 
     Parameters
     ----------
-    kernels : sequence of Kernel
-        Kernels to multiply.
+    *kernels : Kernel or float or callable
+        Kernels to multiply, as for :class:`SumKernel`.
     """
 
     def __init__(self, *kernels):

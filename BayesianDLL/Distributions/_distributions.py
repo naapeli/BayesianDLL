@@ -159,7 +159,8 @@ class Distribution(ABC):
     Parameters
     ----------
     transform : Transform, optional
-        Bijection mapping unconstrained parameter space to the support of the distribution.
+        Bijection between the support and the unconstrained space: ``forward`` maps a
+        value to the unconstrained space the samplers work in, ``inverse`` maps back.
         Default is :class:`~BayesianDLL.Distributions.IdentityTransform`.
     state_space : StateSpace, optional
         Support of the distribution in constrained space. Default is :class:`~BayesianDLL.Distributions.ContinuousReal`.
@@ -2249,7 +2250,7 @@ class Categorical(Distribution):
 
     .. math::
 
-        P(X = k \mid \mathbf{p}) = \frac{p_k}{\sum_{j=1}^K p_j}
+        P(X = k \mid \mathbf{p}) = \frac{p_k}{\sum_{j=0}^{K-1} p_j}
 
     Parameters
     ----------
@@ -2744,17 +2745,17 @@ class TransformedDistribution(Distribution):
 class Ordered(Distribution):
     r"""Distribution over sorted vectors :math:`x_1 < x_2 < \dots < x_K`.
 
-    Evaluates the joint density of :math:`K` draws from a univariate continuous base distribution
-    restricted to the strictly ordered region:
+    The (unnormalised) density is that of the elementwise base distribution restricted to
+    the strictly ordered region:
 
     .. math::
 
-        p(\mathbf{x}) = \sum_{k=1}^K \ln p_{\text{base}}(x_k) \quad \text{for } x_1 < x_2 < \dots < x_K
+        \ln p(\mathbf{x}) = \sum_{k=1}^K \ln p_{\text{base}}(x_k) + \text{const} \quad \text{for } x_1 < x_2 < \dots < x_K
 
     Parameters
     ----------
     base : Distribution
-        Univariate continuous base distribution.
+        Univariate continuous base distribution; its parameters may hold one value per element.
     K : int
         Length of the ordered vector (:math:`K \ge 1`).
     """

@@ -342,6 +342,11 @@ class Divide(_ElementwiseBlock):
 class Affine(_ElementwiseBlock):
     r"""Elementwise affine (location-scale) transform :math:`y = \text{loc} + \text{scale} \cdot x`.
 
+    The building block of the non-centred parameterisation of hierarchical
+    models: sampling ``z ~ Normal(0, 1)`` and setting
+    ``theta = Affine("theta", z, loc=mu, scale=tau)`` removes the funnel that
+    ``theta ~ Normal(mu, tau)`` causes for NUTS when the data are weak.
+
     Parameters
     ----------
     name : str
@@ -414,7 +419,7 @@ class Softplus(_ElementwiseBlock):
     ----------
     name : str
         Node name.
-    input : Parameter or Data or torch.Tensor
+    x : Parameter or Data or torch.Tensor
         Input tensor.
     """
 
@@ -435,7 +440,7 @@ class Tanh(_ElementwiseBlock):
     ----------
     name : str
         Node name.
-    input : Parameter or Data or torch.Tensor
+    x : Parameter or Data or torch.Tensor
         Input tensor.
     """
 
@@ -456,11 +461,14 @@ class Softmax(_Block):
 
         \mathrm{softmax}(\mathbf{x})_i = \frac{e^{x_i}}{\sum_j e^{x_j}}
 
+    For a categorical likelihood prefer ``Categorical(logits=...)``, which is
+    numerically more stable.
+
     Parameters
     ----------
     name : str
         Node name.
-    input : Parameter or Data or torch.Tensor
+    x : Parameter or Data or torch.Tensor
         Input tensor.
     dim : int, default -1
         Dimension along which softmax is computed.
@@ -496,7 +504,7 @@ class Sum(_Block):
     ----------
     name : str
         Node name.
-    input : Parameter or Data or torch.Tensor
+    x : Parameter or Data or torch.Tensor
         Input tensor.
     dim : int or tuple of int, optional
         Dimension(s) to sum over. If ``None``, sums over all elements.
@@ -557,7 +565,7 @@ class Concat(_Block):
     name : str
         Node name.
     *inputs : Parameter or Data or torch.Tensor
-        Tensors to concatenate.
+        Tensors to concatenate; scalars are treated as vectors of length one.
     dim : int, default -1
         Dimension along which to concatenate.
     """
@@ -608,7 +616,7 @@ class Stack(_Block):
     name : str
         Node name.
     *inputs : Parameter or Data or torch.Tensor
-        Tensors to stack.
+        Tensors to stack; they are first broadcast to a common shape.
     dim : int, default 0
         Dimension along which to stack.
     """
@@ -639,7 +647,7 @@ class Stack(_Block):
 
 # ============================================================ linear algebra and indexing
 class MatMul(_Block):
-    r"""Matrix product node :math:`y = A B`.
+    r"""Matrix product node :math:`y = A B` with ``torch.matmul`` semantics (vectors and broadcast batch dimensions).
 
     Parameters
     ----------
@@ -724,9 +732,16 @@ class Index(_Block):
     x : Parameter or Data or torch.Tensor
         Source tensor.
     index : Parameter or Data or torch.Tensor
-        Integer index tensor.
+        Integer index tensor, e.g. group labels. A ``Data`` index can be replaced
+        with ``Data.set_value`` to predict for other observations or groups; a
+        discrete ``RandomParameter`` also works.
     dim : int, default 0
         Dimension along which to index.
+
+    Notes
+    -----
+    The output has shape ``x.shape[:dim] + index.shape + x.shape[dim + 1:]``,
+    e.g. ``theta[group_idx]``. The index receives no gradient.
     """
 
     _non_differentiable = (1,)
@@ -819,10 +834,10 @@ class CholeskyCovariance(_Block):
     ----------
     name : str
         Node name.
-    sigma : Parameter or torch.Tensor
-        Standard deviations vector of shape ``(..., D)``.
     L_corr : Parameter or torch.Tensor
         Lower-triangular Cholesky factor of correlation matrix, shape ``(..., D, D)``.
+    sigma : Parameter or torch.Tensor
+        Standard deviations vector of shape ``(..., D)``.
     """
 
     def __init__(self, name, L_corr, sigma):

@@ -231,12 +231,12 @@ class LinearMean(MeanFunction):
 
 
 class SumMean(MeanFunction):
-    r"""Sum of mean functions :math:`m(x) = m_1(x) + m_2(x) + \dots`.
+    r"""Sum of mean functions :math:`m(x) = m_1(x) + m_2(x) + \dots` (also built with ``m1 + m2``).
 
     Parameters
     ----------
-    means : sequence of MeanFunction
-        Mean functions to sum.
+    *means : MeanFunction or float
+        Mean functions to sum; a number is a :class:`ConstantMean`.
     """
 
     def __init__(self, *means):
