@@ -91,6 +91,16 @@ def _grid_points(xs):
     return torch.cat([_expand_batch(x, size)[:, indices[:, p]] for p, x in enumerate(xs)], dim=-1)
 
 
+def _check_isotropic_noise(noise_variance, what, structure):
+    """Structured GPs need ``σ² I``: per-observation noise would break the structure of ``K + σ² I``."""
+    value = _input_value(noise_variance) if _is_named(noise_variance) else resolve(noise_variance)
+    if torch.as_tensor(value).numel() != 1:
+        raise ValueError(
+            f"{what} needs a scalar (isotropic) noise_variance: per-observation (heteroscedastic) noise breaks "
+            f"the {structure} of K + σ² I. Use ExactGP for heteroscedastic noise."
+        )
+
+
 def _batched_kronecker_eigenvalues(eigenvalues):
     """``λ_1 ⊗ … ⊗ λ_P`` per batch element: ``(B, n_1, …, n_P)`` from ``(B_p, n_p)``."""
     result = eigenvalues[0]
@@ -150,6 +160,7 @@ class KroneckerGP(_GPDistribution):
         for kernel in kernels:
             if not isinstance(kernel, Kernel):
                 raise TypeError("kernels must be instances of BayesianDLL.GP.Kernel.")
+        _check_isotropic_noise(noise_variance, "KroneckerGP", "shared eigenvectors (Kronecker structure)")
         self.name = name
         self.grid_inputs = grid_inputs
         self.kernels = kernels
@@ -727,6 +738,7 @@ class ToeplitzGP(_GPDistribution):
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
         _check_stationary(kernel)
+        _check_isotropic_noise(noise_variance, "ToeplitzGP", "Toeplitz structure")
         if _is_learnable(inputs):
             raise TypeError(
                 "ToeplitzGP needs fixed, equally spaced inputs (a Data node or a tensor); a learnable spacing would be "
