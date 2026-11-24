@@ -529,12 +529,13 @@ class Guide(Model, BaseGuide):
     def moments(self, space="unconstrained", n_samples=4000, seed=0):
         """Compute the joint moments (mean and block-diagonal covariance) of the guide.
 
-        Evaluates the first and second moments of the guide's parameters.
-        Returns a :class:`~BayesianDLL.Variational.GuideMoments` containing
-        the full covariance matrix (``.matrix``), block accessors
-        (``.block(latent)``), per-latent variances (``.variances()``),
-        covariances (``.covariance()`` or ``.covariances()``), and means
-        (``.means()``).
+        Returns a :class:`~BayesianDLL.Variational.GuideMoments` over the
+        latents in model order, e.g. ``.mean()`` (flat vector), ``.mean("sigma")``
+        (one latent in its own shape), ``.covariance(group="line")``,
+        ``.block("mu", "beta")`` (a cross-covariance block) and ``.matrix``.
+        See the class docstring for which blocks are exact and which are Monte
+        Carlo estimates (listed in ``estimated``, with standard errors, from
+        ``n_samples`` independent draws of that piece only, seeded with ``seed``).
 
         Parameters
         ----------
@@ -551,7 +552,18 @@ class Guide(Model, BaseGuide):
         GuideMoments
             A moment container holding the mean and covariance matrix.
         """
-        return GuideMoments.compute(self, space=space, n_samples=n_samples, seed=seed)
+        if space not in ("unconstrained", "constrained"):
+            raise ValueError(f"space must be 'unconstrained' or 'constrained', got {space!r}.")
+        parts = []
+        for piece in self.validate():
+            if isinstance(piece, Group):
+                parts.append(piece.moments(space, n_samples, seed))
+            elif isinstance(piece, StructuredPiece):
+                parts.append(self._piece_moments(piece, space, n_samples, seed))
+            else:
+                parts.append(self._entry_moments(piece, space, n_samples, seed))
+        groups = {group.name: list(group.names) for group in self.groups if group.name is not None}
+        return GuideMoments.combine(space, parts, list(self.model.params), groups=groups)
 
     def _entry_moments(self, piece, space, n_samples, seed):
         model, plan = self.model, piece.plan

@@ -1,3 +1,5 @@
+from warnings import warn
+
 import torch
 
 
@@ -12,6 +14,11 @@ def _normalize_slice(s):
         return s
     else:
         raise TypeError(f"Expected int or slice for thinning, got {type(s).__name__}.")
+
+
+def _as_floating(values):
+    """``values`` as a floating-point tensor (float64 for integer or boolean draws)."""
+    return values if values.is_floating_point() else values.to(torch.float64)
 
 
 class SampleStats:
@@ -253,18 +260,26 @@ class SamplingResult:
 
     @property
     def lp(self) -> torch.Tensor | None:
-        """The log posterior density tensor of shape ``(n_chains, n_samples)`` for each draw, if recorded."""
+        """The joint log density ``(n_chains, n_samples)`` of each draw, or ``None`` if it was not recorded.
+
+        It is the log density of the unconstrained parameters that the sampler
+        targets (including the transforms' Jacobians), recorded only when a
+        single sampling block covers every parameter: a block of a Gibbs sweep
+        records the log density terms of its own parameters only.
+        """
         if self.sample_stats is None:
             return None
-        try:
-            return self.sample_stats["lp"]
-        except (KeyError, ValueError, IndexError):
+        blocks = [block for block in self.sample_stats.blocks if "lp" in block["stats"]]
+        if len(blocks) != 1 or len(self.sample_stats.blocks) != 1:
             return None
+        return blocks[0]["stats"]["lp"]
 
     def mode(self, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
-        """Return the parameter values of the draw with the highest log posterior density (MAP sample).
+        """Return the parameter values of the draw with the highest log density (see :attr:`lp`).
 
-        If log posterior densities are not available, falls back to coordinate-wise mode/median.
+        When :attr:`lp` is not available (several sampling blocks), a warning is
+        issued and the coordinate-wise median (most frequent value for discrete
+        parameters) is returned instead.
 
         Parameters
         ----------
@@ -279,12 +294,14 @@ class SamplingResult:
         traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
         lp = self.lp
         if lp is not None and lp.numel() > 0:
-            flat_lp = lp.flatten(0, 1)
-            best_idx = torch.argmax(flat_lp).item()
-            chain_idx = best_idx // lp.shape[1]
-            sample_idx = best_idx % lp.shape[1]
+            best_idx = torch.argmax(lp.flatten(0, 1)).item()
+            chain_idx, sample_idx = divmod(best_idx, lp.shape[1])
             return {name: val[chain_idx, sample_idx].clone() for name, val in traces.items()}
 
+        warn(
+            "The joint log density of the draws was not recorded (several sampling blocks); "
+            "mode() returns the coordinate-wise median (most frequent value for discrete parameters) instead."
+        )
         res = {}
         for name, val in traces.items():
             flat = val.flatten(0, 1)
@@ -315,7 +332,7 @@ class SamplingResult:
         return res
 
     def mean(self, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
-        """Return the coordinate-wise posterior mean for each parameter.
+        """Return the coordinate-wise posterior mean for each parameter (as float64 for discrete parameters).
 
         Parameters
         ----------
@@ -328,17 +345,10 @@ class SamplingResult:
             Dictionary mapping parameter names to tensors of shape ``(*param_shape)``.
         """
         traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
-        res = {}
-        for name, val in traces.items():
-            flat = val.flatten(0, 1)
-            if flat.is_floating_point():
-                res[name] = torch.mean(flat, dim=0).clone()
-            else:
-                res[name] = torch.mean(flat.double(), dim=0).to(val.dtype).clone()
-        return res
+        return {name: torch.mean(_as_floating(val.flatten(0, 1)), dim=0) for name, val in traces.items()}
 
     def quantile(self, q: float | torch.Tensor, include_deterministic: bool = False) -> dict[str, torch.Tensor]:
-        """Return the coordinate-wise posterior quantile for each parameter.
+        """Return the coordinate-wise posterior quantile for each parameter (as float64 for discrete parameters).
 
         Parameters
         ----------
@@ -354,13 +364,9 @@ class SamplingResult:
         """
         traces = {**self.trace, **(self.deterministic_trace if include_deterministic else {})}
         res = {}
-        q_tensor = torch.as_tensor(q, dtype=torch.float64)
         for name, val in traces.items():
-            flat = val.flatten(0, 1)
-            if flat.is_floating_point():
-                res[name] = torch.quantile(flat, q=q_tensor, dim=0).clone()
-            else:
-                res[name] = torch.quantile(flat.double(), q=q_tensor, dim=0).to(val.dtype).clone()
+            flat = _as_floating(val.flatten(0, 1))
+            res[name] = torch.quantile(flat, q=torch.as_tensor(q, dtype=flat.dtype, device=flat.device), dim=0)
         return res
 
     def __repr__(self):
@@ -371,9 +377,21 @@ class SamplingResult:
 class PredicativeResult:
     """Predictive draws of shape ``(n_samples, samples_per_step, *predictive_shape)`` per observed node.
 
-    ``prior`` holds the prior draws of the model parameters (a
-    :class:`SamplingResult` with one chain) for results of
-    ``prior_predicative``, and is ``None`` otherwise.
+    Attributes
+    ----------
+    samples : dict[str, torch.Tensor]
+        The predictive draws of the observed nodes; ``keys()``, ``values()``
+        and ``items()`` iterate over these.
+    deterministic : dict[str, torch.Tensor]
+        The deterministic nodes for every parameter draw (``(n_samples, *shape)``)
+        and the latent function draws of GP likelihoods, stored under the GP's
+        name (``(n_samples, samples_per_step, *predictive_shape)``).
+    prior : SamplingResult or None
+        The prior draws of the model parameters (one chain) for results of
+        ``prior_predicative``.
+
+    Indexing (``result[name]``) and ``name in result`` cover both ``samples``
+    and ``deterministic``.
     """
 
     def __init__(self, samples: dict[str, torch.Tensor], prior=None, deterministic_samples: dict[str, torch.Tensor] = None):

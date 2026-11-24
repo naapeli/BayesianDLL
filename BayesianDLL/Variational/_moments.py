@@ -40,21 +40,34 @@ def _numel(shape):
 class GuideMoments:
     """Mean and covariance of (part of) a guide over the concatenated flattened latents.
 
-    Attributes:
-        space: ``"unconstrained"`` or ``"constrained"``.
-        names: the latents, in the order of the flat vector.
-        shapes: ``{latent: shape}`` of each latent in ``space``.
-        slices: ``{latent: (start, end)}`` of each latent in the flat vector.
-        matrix: the full covariance matrix. Blocks between independent parts
-            of the guide (different groups or hand-written entries) are
-            exactly zero.
-        estimated: the latents whose moments are Monte Carlo estimates; every
-            block that involves one of them is estimated, all other blocks
-            are exact.
-        standard_error: ``{latent: sd / sqrt(n)}`` per coordinate for the
-            estimated latents (the standard error of the Monte Carlo mean).
-        n_samples: the number of draws behind the estimates (``None`` when
-            everything is exact).
+    :meth:`mean`, :meth:`variance`, :meth:`covariance` and :meth:`correlation`
+    return the full flat vector or matrix by default, the moments of one latent
+    (in its own shape) or of several latents with ``latent``, and those of a
+    named group with ``group``.
+
+    Attributes
+    ----------
+    space : {"unconstrained", "constrained"}
+        The space of the moments.
+    names : list of str
+        The latents, in the order of the flat vector.
+    shapes : dict[str, tuple]
+        The shape of each latent in ``space``.
+    slices : dict[str, tuple[int, int]]
+        The ``(start, end)`` positions of each latent in the flat vector.
+    groups : dict[str, list of str]
+        The latents of each named :class:`Group`.
+    matrix : torch.Tensor
+        The full covariance matrix. Blocks between independent parts of the
+        guide (different groups or hand-written entries) are exactly zero.
+    estimated : list of str
+        The latents whose moments are Monte Carlo estimates; every block that
+        involves one of them is estimated, all other blocks are exact.
+    standard_error : dict[str, torch.Tensor]
+        ``sd / sqrt(n)`` per coordinate of the estimated latents (the standard
+        error of the Monte Carlo mean).
+    n_samples : int or None
+        The number of draws behind the estimates (``None`` when everything is exact).
     """
 
     def __init__(self, space, names, shapes, mean=None, matrix=None, dtype=None, device=None, groups=None):
@@ -138,8 +151,6 @@ class GuideMoments:
     def means(self, latent=None, group=None):
         """Alias for :meth:`mean`."""
         return self.mean(latent=latent, group=group)
-
-    _means = mean
 
     def variance(self, latent=None, group=None):
         """The posterior marginal variance tensor.
@@ -303,25 +314,6 @@ class GuideMoments:
             if part.n_samples is not None:
                 result.n_samples = part.n_samples
         return result
-
-    @classmethod
-    def compute(cls, guide, space="unconstrained", n_samples=4000, seed=0):
-        """Compute the moments (mean and block-diagonal covariance) of a guide."""
-        if space not in ("unconstrained", "constrained"):
-            raise ValueError(f"space must be 'unconstrained' or 'constrained', got {space!r}.")
-        parts = []
-        for piece in guide.validate():
-            if hasattr(piece, "moments"):
-                parts.append(piece.moments(space, n_samples, seed))
-            elif piece.__class__.__name__ == "StructuredPiece":
-                parts.append(guide._piece_moments(piece, space, n_samples, seed))
-            else:
-                parts.append(guide._entry_moments(piece, space, n_samples, seed))
-        groups = {}
-        for group in guide.groups:
-            if getattr(group, "name", None) is not None:
-                groups[group.name] = list(group.names)
-        return cls.combine(space, parts, list(guide.model.params), groups=groups)
 
     def __repr__(self):
         return (

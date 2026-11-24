@@ -3,6 +3,7 @@ from contextlib import contextmanager
 import networkx as nx
 from networkx import DiGraph
 from collections import deque
+from collections.abc import Mapping
 import copy
 
 from ._active_model._active_model import push_model, pop_model, get_active_model
@@ -1236,6 +1237,30 @@ class Model:
         from .Variational import find_MAP as _find_MAP
         return _find_MAP(self, lr=lr, epochs=epochs, betas=betas, callback_frequency=callback_frequency, verbose=verbose)
     
+    def _capture_training_data(self):
+        """Remember the current data as the training data of nodes that condition predictions on it (GPs).
+
+        Called when the model is built and by the inference functions, so
+        inputs replaced afterwards with ``Data.set_value`` are prediction inputs.
+        """
+        nodes = [parameter.distribution for parameter in self.observed_params.values()]
+        nodes += list(self.deterministic_params.values())
+        for node in nodes:
+            capture = getattr(node, "_capture_training_data", None)
+            if capture is not None:
+                capture()
+
+    def _point_values(self, parameters):
+        """``{name: value}`` of the latent parameters in ``parameters`` (a mapping or an object with ``mode()``)."""
+        if callable(getattr(parameters, "mode", None)):
+            parameters = parameters.mode()
+        elif not isinstance(parameters, Mapping):
+            raise TypeError(f"parameters must be a mapping or a MAPResult, got {type(parameters).__name__}")
+        return {
+            name: torch.as_tensor(value) for name, value in parameters.items()
+            if name in self.params or name in self.enumerated_params
+        }
+
     def point_trace(self):
         """Return a 1-sample trace dictionary containing the current constrained values of all parameters.
 
@@ -1246,12 +1271,10 @@ class Model:
         dict[str, torch.Tensor]
             A dictionary mapping parameter names to tensors of shape ``(1, 1, *param_shape)``.
         """
-        trace = {}
-        for name, param in {**self.params, **self.enumerated_params}.items():
-            val = getattr(param, "constrained_value", getattr(param, "value", None))
-            if val is not None:
-                trace[name] = val.detach().clone().unsqueeze(0).unsqueeze(0)
-        return trace
+        return {
+            name: param.constrained_value.detach().clone().reshape(1, 1, *param.constrained_value.shape)
+            for name, param in {**self.params, **self.enumerated_params}.items()
+        }
 
     def predict(self, parameters=None, samples_per_step=20, progress_bar=False):
         """Draw predictive samples using a single point setting of parameters.
@@ -1265,7 +1288,7 @@ class Model:
         parameters : dict[str, torch.Tensor] or MAPResult, optional
             Parameter dictionary mapping parameter names to point values, or a
             :class:`~BayesianDLL.Variational.MAPResult`. If ``None``, uses the model's
-            current parameter values.
+            current parameter values. Parameters that are left out keep their current values.
         samples_per_step : int, default=20
             Number of observation draws per parameter setting.
         progress_bar : bool, default=False
@@ -1274,37 +1297,12 @@ class Model:
         Returns
         -------
         PredicativeResult
-            Predictive samples of observed nodes.
+            Predictive samples of shape ``(1, samples_per_step, *predictive_shape)``.
         """
-        if parameters is None:
-            pt = self.point_trace()
-        else:
-            if hasattr(parameters, "mode") and callable(parameters.mode):
-                param_dict = parameters.mode()
-            elif isinstance(parameters, dict):
-                param_dict = parameters
-            else:
-                raise TypeError(f"parameters must be a dict, MAPResult, or None, got {type(parameters).__name__}")
-
-            pt = {}
-            for name, val in param_dict.items():
-                if name in self.params or name in self.enumerated_params:
-                    t_val = torch.as_tensor(val)
-                    p = self.params.get(name) or self.enumerated_params.get(name)
-                    param_shape = p.constrained_value.shape if p is not None else ()
-                    extra_dims = t_val.dim() - len(param_shape)
-                    if extra_dims == 0:
-                        t_val = t_val.unsqueeze(0).unsqueeze(0)
-                    elif extra_dims == 1:
-                        t_val = t_val.unsqueeze(0)
-                    pt[name] = t_val
-
-        return self.posterior_predicative(
-            pt,
-            n_samples=1,
-            samples_per_step=samples_per_step,
-            progress_bar=progress_bar,
-        )
+        values = self.point_trace()
+        if parameters is not None:
+            values.update(self._point_values(parameters))
+        return self.posterior_predicative(values, n_samples=1, samples_per_step=samples_per_step, progress_bar=progress_bar)
 
     def set_params(self, parameters):
         """Set the model's current parameters from a dictionary or MAPResult.
@@ -1314,22 +1312,9 @@ class Model:
         parameters : dict[str, torch.Tensor] or MAPResult
             Parameter values (e.g. from ``trace.median()`` or ``map_result``).
         """
-        if hasattr(parameters, "mode") and callable(parameters.mode):
-            param_dict = parameters.mode()
-        elif isinstance(parameters, dict):
-            param_dict = parameters
-        else:
-            raise TypeError(f"parameters must be a dict or MAPResult, got {type(parameters).__name__}")
-
-        for name, val in param_dict.items():
-            if name in self.params:
-                p = self.params[name]
-                device = getattr(p.constrained_value, "device", None)
-                p.set_constrained_value(torch.as_tensor(val, device=device))
-            elif name in self.enumerated_params:
-                p = self.enumerated_params[name]
-                device = getattr(p.constrained_value, "device", None)
-                p.set_constrained_value(torch.as_tensor(val, device=device))
+        for name, value in self._point_values(parameters).items():
+            parameter = self.params.get(name, self.enumerated_params.get(name))
+            parameter.set_constrained_value(value.to(device=parameter.constrained_value.device))
 
     def posterior_predicative(self, trace, n_samples=None, samples_per_step=20, progress_bar=True):
         """Draw posterior predictive samples conditional on observed data.
@@ -1642,65 +1627,3 @@ def predict(parameters=None, samples_per_step=20, model=None, progress_bar=False
         samples_per_step=samples_per_step,
         progress_bar=progress_bar,
     )
-
-
-def prior_predicative(n_samples=20, samples_per_step=500, model=None, progress_bar=True):
-    """Draw from the prior predictive distribution by ancestral sampling.
-
-    Parameters
-    ----------
-    n_samples : int, default 20
-        Number of parameter draws from the prior.
-    samples_per_step : int, default 500
-        Number of simulated data sets drawn per parameter setting.
-    model : Model, optional
-        The model to sample from (defaults to the active model).
-    progress_bar : bool, default True
-        Whether to display a progress bar during sampling.
-
-    Returns
-    -------
-    PredicativeResult
-        Object containing predictive draws with shape ``(n_samples, samples_per_step, *predictive_shape)``.
-        Its ``prior`` attribute holds a :class:`SamplingResult` of the prior parameter draws.
-    """
-    model = get_active_model() if model is None else model
-    return model.prior_predicative(
-        n_samples=n_samples,
-        samples_per_step=samples_per_step,
-        progress_bar=progress_bar,
-    )
-
-
-def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None, progress_bar=True):
-    """Draw posterior predictive samples by exact ancestral sampling.
-
-    Parameters
-    ----------
-    trace : SamplingResult or dict[str, torch.Tensor]
-        Posterior samples of model parameters (e.g. from :func:`~BayesianDLL.sample`).
-    n_samples : int or None, default None
-        Number of posterior draws to evaluate (evenly spaced across the trace).
-        If ``None``, uses all draws in ``trace``.
-    samples_per_step : int, default 20
-        Number of observation draws per posterior parameter setting.
-    model : Model, optional
-        The model to sample from (defaults to the active model).
-    progress_bar : bool, default True
-        Whether to display a progress bar during sampling.
-
-    Returns
-    -------
-    PredicativeResult
-        Object containing predictive draws with shape ``(n_samples, samples_per_step, *predictive_shape)``.
-    """
-    model = get_active_model() if model is None else model
-    return model.posterior_predicative(
-        trace=trace,
-        n_samples=n_samples,
-        samples_per_step=samples_per_step,
-        progress_bar=progress_bar,
-    )
-
-
-

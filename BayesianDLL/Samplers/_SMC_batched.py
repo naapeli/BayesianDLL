@@ -139,6 +139,8 @@ class _BatchedMutation:
         covariance = covariance + 1e-8 * variance.mean() * identity
         cholesky, info = torch.linalg.cholesky_ex(covariance)
         if int(info) != 0:
+            # Fall back to the diagonal; the NUTS metric and its factor must agree.
+            covariance = torch.diag(variance)
             cholesky = torch.diag(variance.sqrt())
         self._cholesky = cholesky
         if self.kernel == "nuts":

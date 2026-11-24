@@ -267,6 +267,8 @@ class _Mutation:
         covariance = covariance + 1e-8 * variance.mean() * identity
         cholesky, info = torch.linalg.cholesky_ex(covariance)
         if int(info) != 0:
+            # Fall back to the diagonal; the NUTS metric and its factor must agree.
+            covariance = torch.diag(variance)
             cholesky = torch.diag(variance.sqrt())
         self._cholesky = cholesky
         if self.kernel == "nuts":
@@ -425,6 +427,7 @@ def sample_smc(model=None, n_particles=1000, kernel="metropolis", n_mutation_ste
         parameter, or a prior cannot be sampled.
     """
     model = get_active_model() if model is None else model
+    model._capture_training_data()
     if kernel not in _KERNELS:
         raise ValueError(f"kernel must be one of {_KERNELS}, got {kernel!r}.")
     if not 0.0 < target_ess < 1.0:

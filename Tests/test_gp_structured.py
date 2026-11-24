@@ -20,13 +20,11 @@ from BayesianDLL.GP import (
     Periodic,
     RationalQuadratic,
     RBF,
-    SparseGP,
     ToeplitzGP,
     WhiteNoise,
     exact_gp_predictive,
     kronecker_gp_predictive,
     levinson_solve,
-    sparse_gp_predictive,
     toeplitz_gp_predictive,
 )
 
@@ -147,7 +145,7 @@ def _learnable_inducing_model(method, kernel_name, deterministic=False, n=14, m=
         else:
             inducing = RandomParameter("z", Normal(z0, 1.0), shape=tuple(z0.shape), initial_value=z0)
         kernel = _SPARSE_KERNELS[kernel_name](Exp("lengthscale", log_lengthscale))
-        function = SparseGP(
+        function = ExactGP(
             "f", inputs, kernel, inducing_points=inducing, noise_variance=Exp("noise", log_noise),
             mean=RandomParameter("mean", Normal(0.0, 1.0), initial_value=torch.tensor([0.1], dtype=DTYPE)),
             method=method,
@@ -178,7 +176,7 @@ def test_learnable_inducing_gradient_includes_scale_dependent_jitter():
     with Model() as model:
         inputs = Data("inputs", x)
         z = RandomParameter("z", Normal(z0, 1.0), shape=tuple(z0.shape), initial_value=z0)
-        function = SparseGP("f", inputs, RBF(0.5, 1.5) + Linear(1.0, 0.0), inducing_points=z, noise_variance=0.1, method="vfe", jitter=1e-3)
+        function = ExactGP("f", inputs, RBF(0.5, 1.5) + Linear(1.0, 0.0), inducing_points=z, noise_variance=0.1, method="vfe", jitter=1e-3)
         ObservedParameter("y", function, y)
     _finite_difference_check(model)
 
@@ -212,7 +210,7 @@ def test_learnable_inducing_gradient_matches_autograd_oracle(method):
     with Model():
         inputs = Data("inputs", x)
         z = RandomParameter("z", Normal(0.0, 1.0), shape=tuple(z0.shape), initial_value=z0)
-        function = SparseGP("f", inputs, RBF(lengthscale, 1.2), inducing_points=z, noise_variance=0.05, mean=0.3, method=method)
+        function = ExactGP("f", inputs, RBF(lengthscale, 1.2), inducing_points=z, noise_variance=0.05, mean=0.3, method=method)
     leaf = z0.clone().requires_grad_(True)
     reference = _autograd_sparse_log_likelihood(
         method, x, y, leaf, lengthscale, 1.2, 0.05, torch.tensor(0.3, dtype=DTYPE), function.jitter
@@ -224,7 +222,7 @@ def test_learnable_inducing_gradient_matches_autograd_oracle(method):
 
 def _bound_at(x, y, z, lengthscale=0.3, noise=0.01):
     with Model():
-        function = SparseGP("f", Data("inputs", x), RBF(lengthscale, 1.0), inducing_points=z, noise_variance=noise)
+        function = ExactGP("f", Data("inputs", x), RBF(lengthscale, 1.0), inducing_points=z, noise_variance=noise)
     return function.log_pdf(y)
 
 
@@ -237,7 +235,7 @@ def test_learning_inducing_points_improves_the_vfe_bound():
     with Model() as model:
         inputs = Data("inputs", x)
         z = RandomParameter("z", Normal(z_bad, 5.0), shape=tuple(z_bad.shape), initial_value=z_bad.clone())
-        function = SparseGP("f", inputs, RBF(0.3, 1.0), inducing_points=z, noise_variance=0.01, method="vfe")
+        function = ExactGP("f", inputs, RBF(0.3, 1.0), inducing_points=z, noise_variance=0.01, method="vfe")
         ObservedParameter("y", function, y)
     fixed_bound = _bound_at(x, y, z_bad)
     model.find_MAP(lr=0.05, epochs=400, verbose=False)
@@ -262,7 +260,7 @@ def test_learnable_inducing_predictive_reads_inducing_draws():
         "mean": torch.zeros(1, 2, 1, dtype=DTYPE),
         "z": torch.stack([x[:5], x[5:10]]).unsqueeze(0),
     }
-    samples = sparse_gp_predictive(function, trace, y, x[:3], n_samples=4)
+    samples = exact_gp_predictive(function, trace, y, x[:3], n_samples=4)
     assert samples.shape == (2, 4, 3)
     assert torch.isfinite(samples).all()
 
@@ -568,7 +566,7 @@ def test_structured_gps_follow_model_to_float32():
         x = Data("x", torch.linspace(0, 1, 20, dtype=DTYPE))
         ObservedParameter("y_line", ToeplitzGP("t", x, Matern52(l, 1.0), noise_variance=0.1), torch.zeros(20, dtype=DTYPE))
         z = RandomParameter("z", Normal(0.0, 1.0), shape=(3, 1), initial_value=torch.tensor([[0.1], [0.5], [0.9]], dtype=DTYPE))
-        ObservedParameter("y_sparse", SparseGP("s", x, RBF(l, 1.0), inducing_points=z, noise_variance=0.1), torch.zeros(20, dtype=DTYPE))
+        ObservedParameter("y_sparse", ExactGP("s", x, RBF(l, 1.0), inducing_points=z, noise_variance=0.1), torch.zeros(20, dtype=DTYPE))
     reference = model.joint_grad_log_prob()
     model.to(dtype=torch.float32)
     value = model.model_log_prob()
@@ -647,3 +645,35 @@ def test_levinson_accuracy_against_cholesky(condition):
     assert residual <= 10 * cholesky_residual
     # Measured |Δ log det| 3e-14, 4e-10, 4e-7.
     assert abs(log_det - 2 * torch.log(torch.diagonal(factor)).sum()) <= 10 * eps * condition
+
+
+@pytest.mark.parametrize("new_grid", [False, True])
+def test_kronecker_posterior_predictive_matches_the_dense_posterior(new_grid):
+    """Matheron's rule on the union grid gives exact posterior draws without an N x N matrix."""
+    axis_1 = torch.linspace(0.0, 1.0, 4, dtype=DTYPE)
+    axis_2 = torch.linspace(0.0, 2.0, 3, dtype=DTYPE)
+    kernels = [RBF(0.6, 1.3), RBF(0.9)]
+    noise = 0.05
+    y = torch.sin(3 * axis_1)[:, None] * torch.cos(axis_2)[None, :]
+    with Model() as model:
+        grid_1, grid_2 = Data("a1", axis_1), Data("a2", axis_2)
+        function = KroneckerGP("f", [grid_1, grid_2], kernels, noise_variance=noise, mean=0.2)
+        ObservedParameter("y", function, y)
+    new = [axis_1, axis_2]
+    if new_grid:
+        new = [torch.tensor([-0.2, 0.5, 1.3], dtype=DTYPE), torch.tensor([0.4, 2.5], dtype=DTYPE)]
+        grid_1.set_value(new[0])
+        grid_2.set_value(new[1])
+    torch.manual_seed(0)
+    draws = model.predict(samples_per_step=40000)["f"][0].reshape(40000, -1)
+
+    def kron(a, b):
+        return [kernel(u, v) for kernel, u, v in zip(kernels, a, b)]
+
+    k_train = torch.kron(*kron([axis_1, axis_2], [axis_1, axis_2])) + (noise + function.jitter) * torch.eye(12, dtype=DTYPE)
+    k_cross = torch.kron(*kron(new, [axis_1, axis_2]))
+    k_new = torch.kron(*kron(new, new))
+    mean = 0.2 + k_cross @ torch.linalg.solve(k_train, y.reshape(-1) - 0.2)
+    covariance = k_new - k_cross @ torch.linalg.solve(k_train, k_cross.T)
+    torch.testing.assert_close(draws.mean(0), mean, atol=0.02, rtol=0.0)
+    torch.testing.assert_close(torch.cov(draws.T), covariance, atol=0.02, rtol=0.0)

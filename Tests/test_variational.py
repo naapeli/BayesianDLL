@@ -19,15 +19,18 @@ def test_map_recovers_conjugate_normal_mode(normal_model, use_method):
 
 
 def test_map_history_and_reporting(normal_model, capsys):
-    history = normal_model.find_MAP(epochs=5, callback_frequency=2)
+    result = normal_model.find_MAP(epochs=5, callback_frequency=2)
+    history = result.history
     assert len(history) == 3
     assert capsys.readouterr().out.count("Epoch:") == 3
     assert history[-1] > history[0]
 
 
 def test_map_records_history_when_silent(normal_model, capsys):
-    history = find_MAP(normal_model, epochs=5, callback_frequency=2, verbose=False)
-    assert len(history) == 3
+    result = find_MAP(normal_model, epochs=5, callback_frequency=2, verbose=False)
+    assert len(result.history) == 3
+    # log_prob is the log density at the returned values, not the last recorded one.
+    assert result.log_prob == normal_model.model_log_prob().item()
     assert capsys.readouterr().out == ""
 
 

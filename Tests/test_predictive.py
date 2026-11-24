@@ -232,7 +232,11 @@ def test_map_result_and_predict():
     assert "slope" in res.mode()
     assert "intercept" in res.mode()
     assert res["slope"].numel() == 1
-    assert len(res) == len(res.history)
+    # MAPResult is a read-only mapping of the parameter values; the history is separate.
+    assert set(res) == set(res.keys()) == {"slope", "intercept", "line"}
+    assert dict(res.items())["slope"] is res["slope"]
+    assert len(res.history) == 150
+    assert res.log_prob == model.model_log_prob().item()
 
     # Predict with no arguments (current model params)
     p1 = model.predict(samples_per_step=5)
@@ -282,3 +286,87 @@ def test_sampling_result_mode_median_mean_quantile():
     torch.testing.assert_close(model.params["w"].constrained_value, med["w"])
 
 
+
+
+def test_predictive_shape_of_a_broadcasting_likelihood_without_plates():
+    """A likelihood that broadcasts to the observations keeps their shape (no plate needed)."""
+    y = torch.randn(30, 3)
+    with Model() as model:
+        alpha = RandomParameter("alpha", Normal(0.0, 5.0), shape=3)
+        sigma = RandomParameter("sigma", HalfNormal(2.0))
+        observed = ObservedParameter("y", Normal(alpha, sigma), y)
+    assert observed.predictive_shape == (30, 3)
+    trace = {"alpha": torch.zeros(1, 2, 3), "sigma": torch.ones(1, 2, 1)}
+    assert model.posterior_predicative(trace, samples_per_step=4, progress_bar=False)["y"].shape == (2, 4, 30, 3)
+
+
+def test_gp_predictions_condition_on_the_training_data_after_new_inputs():
+    """Evaluating the log density after Data.set_value does not replace the training data."""
+    from BayesianDLL import Data
+    from BayesianDLL.GP import ExactGP, RBF, exact_gp_predictive
+
+    x_train = torch.linspace(0.0, 3.0, 12, dtype=torch.float64)
+    y_train = torch.sin(x_train)
+    x_new = torch.linspace(-1.0, 4.0, 12, dtype=torch.float64)  # same length as the training inputs
+    with Model() as model:
+        inputs = Data("inputs", x_train)
+        f = ExactGP("f", inputs, RBF(0.8, 1.0), noise_variance=0.01)
+        ObservedParameter("y", f, y_train)
+    inputs.set_value(x_new)
+    model.model_log_prob()  # evaluates the likelihood at the new inputs
+    torch.testing.assert_close(f._training_inputs_data, x_train)
+
+    torch.manual_seed(0)
+    predicted = model.predict(samples_per_step=4000)["f"][0].mean(0)
+    with Model():
+        reference = ExactGP("r", Data("reference_inputs", x_train), RBF(0.8, 1.0), noise_variance=0.01)
+    expected = exact_gp_predictive(reference, {}, y_train, x_new, n_samples=4000)[0].mean(0)
+    torch.testing.assert_close(predicted, expected, atol=0.05, rtol=0.0)
+
+
+def test_latent_gp_prediction_shares_one_function_draw_and_rejects_other_inputs_outside_prediction():
+    from BayesianDLL import Data
+    from BayesianDLL.GP import LatentGP, RBF
+
+    x_train = torch.linspace(0.0, 3.0, 8, dtype=torch.float64)
+    with Model() as model:
+        inputs = Data("inputs", x_train)
+        f = LatentGP("f", inputs, RBF(0.7, 1.0))
+        ObservedParameter("y", Normal(f, 1e-4), torch.sin(x_train))
+    inputs.set_value(torch.linspace(-1.0, 4.0, 15, dtype=torch.float64))
+    with pytest.raises(ValueError, match="only supported for prediction"):
+        model.model_log_prob()
+    trace = {"f_white": torch.randn(1, 5, 8, dtype=torch.float64)}
+    prediction = model.posterior_predicative(trace, samples_per_step=3, progress_bar=False)
+    assert prediction["y"].shape == (5, 3, 15) and prediction["f"].shape == (5, 15)
+    # Every reader of the node sees the same conditional draw of f.
+    torch.testing.assert_close(prediction["y"], prediction["f"].unsqueeze(1).expand(5, 3, 15), atol=1e-3, rtol=0.0)
+    # At the training inputs the function is the deterministic value m + L z.
+    inputs.set_value(x_train)
+    at_training = model.posterior_predicative(trace, samples_per_step=1, progress_bar=False)["f"]
+    model.params["f_white"].set_constrained_value(trace["f_white"][0, 0])
+    torch.testing.assert_close(at_training[0], f.constrained_value)
+
+
+def test_mode_warns_without_a_joint_log_density_and_means_of_discrete_parameters_are_fractional():
+    torch.manual_seed(0)
+    with Model() as model:
+        p = RandomParameter("p", Beta(2.0, 2.0))
+        k = RandomParameter("k", Bernoulli(0.7))
+        with plate("data", 10):
+            ObservedParameter("y", Normal(p, 1.0), torch.randn(10) + 0.5)
+    trace = model.sample(100, 50, n_chains=2, progress_bar=False, chain_method="vectorized", check_convergence=False)
+    assert trace.lp is None  # NUTS for p and Gibbs for k record their own log density terms only
+    with pytest.warns(UserWarning, match="coordinate-wise median"):
+        trace.mode()
+    mean = trace.mean()["k"]
+    assert mean.is_floating_point() and 0.0 < mean.item() < 1.0
+    assert trace.quantile(0.5)["k"].is_floating_point()
+
+    with Model() as single_block:
+        w = RandomParameter("w", Normal(0.0, 1.0))
+        ObservedParameter("y", Normal(w, 0.1), torch.zeros(5))
+    single = single_block.sample(30, 20, n_chains=2, progress_bar=False, chain_method="vectorized")
+    assert single.lp.shape == (2, 30)
+    best = single.lp.flatten().argmax()
+    torch.testing.assert_close(single.mode()["w"], single.trace["w"].flatten(0, 1)[best])

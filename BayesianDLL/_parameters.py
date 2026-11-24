@@ -1,5 +1,4 @@
 import torch
-import math
 import copy
 
 from ._active_model._active_model import get_active_model
@@ -252,17 +251,30 @@ class ObservedParameter:
 
     @property
     def predictive_shape(self):
-        """Shape of a generated value, with plate sizes resolved at runtime."""
+        """Shape of a generated value, with plate sizes resolved at runtime.
+
+        Without plates it is the shape of the observations, unless the
+        likelihood no longer broadcasts to them (its parameters now follow
+        new inputs, e.g. a GP after ``Data.set_value``): then it is the
+        likelihood's own batch and event shape. A GP likelihood always gives
+        its own shape.
+        """
         if not self.plates:
-            dist = self.distribution
-            batch = getattr(dist, "batch_shape", ())
-            event = getattr(dist, "event_shape", ())
-            dist_shape = tuple(batch) + tuple(event)
-            obs_shape = tuple(self.observed_values.shape)
-            if dist_shape and dist_shape != obs_shape:
-                if math.prod(dist_shape) == 1 and math.prod(obs_shape) > 1:
-                    return torch.Size(obs_shape)
-                return torch.Size(dist_shape)
+            distribution = self.distribution
+            try:
+                own_shape = torch.Size(tuple(distribution.batch_shape) + tuple(distribution.event_shape))
+            except (RuntimeError, ValueError, TypeError, AttributeError, NotImplementedError):
+                own_shape = None  # the shape cannot be derived from the parameters: use the observations
+            if own_shape is not None and getattr(distribution, "_shape_follows_inputs", False):
+                return own_shape
+            if own_shape is not None:
+                observed_shape = torch.Size(self.observed_values.shape)
+                try:
+                    broadcasts = torch.broadcast_shapes(own_shape, observed_shape) == observed_shape
+                except RuntimeError:
+                    broadcasts = False
+                if not broadcasts:
+                    return own_shape
         shape = list(self.observed_values.shape)
         for index, plate_info in enumerate(self.plates):
             if index < len(shape):
@@ -510,11 +522,15 @@ class VariationalParameter:
     max : float, default inf
         Upper clamp bound for updates in constrained space.
     transform : Transform, optional
-        Bijection between constrained and unconstrained parameter space. If
-        omitted, defaults to :class:`~BayesianDLL.Distributions.IdentityTransform`.
-        Use :class:`~BayesianDLL.Distributions.LogTransform` for positive parameters
-        (such as variances or standard deviations) so that optimization proceeds
-        in unconstrained log-space.
+        Bijection whose ``forward`` maps the value to the unconstrained coordinate
+        in which the optimizer takes its steps; ``IdentityTransform()`` by default.
+        For a constrained value, choose a transform onto its support (e.g.
+        :class:`~BayesianDLL.Distributions.LogTransform` for a scale).
+
+    Notes
+    -----
+    ``value`` is converted to a tensor (float32 unless it already is a tensor)
+    of at least one dimension.
     """
 
     def __init__(self, name, value, min=-float("inf"), max=float("inf"), transform=None):

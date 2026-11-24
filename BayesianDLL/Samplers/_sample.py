@@ -492,6 +492,7 @@ def sample(n_samples, warmup_length, n_chains=4, model=None, progress_bar=True, 
     (``sampler_params``) apply to its block and are overridden by these.
     """
     model = get_active_model() if model is None else model
+    model._capture_training_data()
     if device is not None:
         model.to(device)
     on_gpu = model.device.type != "cpu"
@@ -849,7 +850,9 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None
     Parameters
     ----------
     trace : SamplingResult or dict[str, Tensor]
-        Posterior samples of model parameters (from :func:`~BayesianDLL.sample`).
+        Posterior draws of every random parameter (e.g. from :func:`~BayesianDLL.sample`):
+        a :class:`SamplingResult`, or a mapping of traces ``(n_chains, n_samples, *shape)``
+        or of single point values ``(*shape)``.
     n_samples : int or None, default=None
         Number of posterior draws to evaluate (evenly spaced across the trace).
         If ``None``, uses all draws in ``trace``.
@@ -864,6 +867,16 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None
     -------
     PredicativeResult
         Object containing predictive draws with shape ``(n_samples, samples_per_step, *predictive_shape)``.
+
+    Notes
+    -----
+    For each draw the parameters are set, the graph is walked in topological
+    order and every observed node is sampled with its distribution's ``sample``
+    method; plate sizes (also those given by ``Data``) are resolved at call time,
+    so replacing ``Data`` with new inputs predicts at them. An observed node
+    that feeds another one is replicated first, and the child conditions on the
+    replicated value. A likelihood without a sampler falls back to MCMC for that
+    node, with a warning.
     """
     if trace is None:
         raise ValueError(
@@ -872,22 +885,14 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None
         )
     model = get_active_model() if model is None else model
 
-    if isinstance(trace, dict):
-        norm_trace = {}
-        for name, val in trace.items():
-            t_val = torch.as_tensor(val)
-            p = model.params.get(name) or model.enumerated_params.get(name)
-            param_shape = p.constrained_value.shape if p is not None else ()
-            extra_dims = t_val.dim() - len(param_shape)
-            if extra_dims == 0:
-                t_val = t_val.unsqueeze(0).unsqueeze(0)
-            elif extra_dims == 1:
-                t_val = t_val.unsqueeze(0)
-            norm_trace[name] = t_val
-        trace = norm_trace
-
-    n_chains, trace_length = next(iter(trace.values())).shape[:2]
-    flattened_trace = {name: values.flatten(0, 1) for name, values in trace.items()}
+    draws = _latent_draws(model, trace)
+    missing = [name for name in model.params if name not in draws]
+    if missing:
+        raise KeyError(f"The trace has no draws of the random parameter(s) {missing}.")
+    if not draws:
+        draws = {"": torch.zeros(1, 1)}  # a model without latent parameters: one draw
+    n_chains, trace_length = next(iter(draws.values())).shape[:2]
+    flattened_trace = {name: values.flatten(0, 1) for name, values in draws.items()}
     total_samples = n_chains * trace_length
 
     if n_samples is None:
@@ -899,10 +904,6 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None
         # Integer positions computed on the host (the traces live on the CPU by default).
         indices = torch.linspace(0, total_samples - 1, steps=n_samples, dtype=torch.float64, device="cpu").long()
 
-    missing = [name for name in model.params if name not in flattened_trace]
-    if missing:
-        raise KeyError(f"The trace has no draws of the random parameter(s) {missing}.")
-
     device = model.device
 
     def parameter_values(i):
@@ -913,6 +914,25 @@ def posterior_predicative(trace, n_samples=None, samples_per_step=20, model=None
         }
 
     return _ancestral_predictive(model, n_samples, samples_per_step, parameter_values, progress_bar)
+
+
+def _latent_draws(model, trace):
+    """``{name: (n_chains, n_draws, *shape)}`` draws of the model's latent parameters in ``trace``.
+
+    ``trace`` is a :class:`SamplingResult` or a mapping of traces. A value
+    with as many elements as its parameter is a single point (e.g. from
+    ``trace.median()`` or ``map_result.mode()``) and becomes one draw.
+    """
+    draws = {}
+    for name, parameter in {**model.params, **model.enumerated_params}.items():
+        if name not in trace:
+            continue
+        value = torch.as_tensor(trace[name])
+        shape = parameter.constrained_value.shape
+        if value.numel() == shape.numel():
+            value = value.reshape(1, 1, *shape)
+        draws[name] = value
+    return draws
 
 
 def _observed_parents(model):
@@ -980,65 +1000,75 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
     replicated_parents = set().union(set(), *observed_parents.values())
     chained = bool(replicated_parents)
 
-    if not prior:
-        model._in_posterior_predictive = True
-        for parameter in observed_order:
-            if hasattr(parameter.distribution, "_in_posterior_predictive"):
-                parameter.distribution._in_posterior_predictive = True
-        for parameter in model.deterministic_params.values():
-            if hasattr(parameter, "_in_posterior_predictive"):
-                parameter._in_posterior_predictive = True
-
-    if prior:
-        for parameter in random_order:
-            if any(node in model.observed_params for node in nx.ancestors(model.graph, parameter.name)):
-                warn(f"The prior of '{parameter.name}' depends on an observed node; its prior predictive draws condition on the observed data.")
-
-    fallbacks = {}
-
-    def draw(parameter, n, shape, dtype):
-        if parameter.name not in fallbacks and can_sample(parameter.distribution):
-            try:
-                return draw_shaped(parameter.distribution, n, shape).to(dtype)
-            except NotImplementedError:
-                pass
-        if parameter.name not in fallbacks:
-            warn(
-                f"{type(parameter.distribution).__name__} of '{parameter.name}' cannot be sampled directly; "
-                f"falling back to MCMC for this node."
-            )
-            fallbacks[parameter.name] = _MCMCFallback(parameter)
-        return fallbacks[parameter.name].draw(n, shape, dtype).to(dtype)
-
-    predicative_samples = {
-        # Predictive draws are collected on the CPU, like the traces of sample().
-        parameter.name: torch.empty(size=(n_draws, samples_per_step, *parameter.predictive_shape), dtype=parameter.observed_values.dtype, device="cpu")
-        for parameter in observed_order
-    }
-    gp_observed = [
-        parameter for parameter in observed_order
-        if hasattr(parameter.distribution, "name") and parameter.distribution.name
+    # Nodes that predict differently from the prior (GPs condition on their
+    # training data) are switched to posterior predictive mode while drawing.
+    predictive_nodes = [] if prior else [
+        node for node in [*(p.distribution for p in observed_order), *model.deterministic_params.values()]
+        if hasattr(node, "_in_posterior_predictive")
     ]
-    predicative_gp_samples = {
-        parameter.distribution.name: torch.empty(
-            size=(n_draws, samples_per_step, *parameter.predictive_shape),
-            dtype=parameter.observed_values.dtype,
-            device="cpu",
-        )
-        for parameter in gp_observed
-    }
-    prior_trace = {parameter.name: [] for parameter in random_order}
-    prior_det_trace = {name: [] for name in model.deterministic_params}
-    predicative_det_samples = {name: [] for name in model.deterministic_params}
+    for node in predictive_nodes:
+        node._in_posterior_predictive = True
+    try:
+        if prior:
+            for parameter in random_order:
+                if any(node in model.observed_params for node in nx.ancestors(model.graph, parameter.name)):
+                    warn(f"The prior of '{parameter.name}' depends on an observed node; its prior predictive draws condition on the observed data.")
 
-    saved_values = {name: parameter.unconstrained_value for name, parameter in latents.items()}
-    saved_observed = {parameter.name: parameter._observed_values for parameter in observed_order}
+        fallbacks = {}
 
-    _progress_bar = tqdm(
-        range(n_draws),
-        desc="Prior predicative sampling" if prior else "Predicative sampling",
-        bar_format=r"{desc}: {percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}"
-    ) if progress_bar else range(n_draws)
+        def draw(parameter, n, shape, dtype):
+            if parameter.name not in fallbacks and can_sample(parameter.distribution):
+                try:
+                    return draw_shaped(parameter.distribution, n, shape).to(dtype)
+                except NotImplementedError:
+                    pass
+            if parameter.name not in fallbacks:
+                warn(
+                    f"{type(parameter.distribution).__name__} of '{parameter.name}' cannot be sampled directly; "
+                    f"falling back to MCMC for this node."
+                )
+                fallbacks[parameter.name] = _MCMCFallback(parameter)
+            return fallbacks[parameter.name].draw(n, shape, dtype).to(dtype)
+
+        predicative_samples = {
+            # Predictive draws are collected on the CPU, like the traces of sample().
+            parameter.name: torch.empty(size=(n_draws, samples_per_step, *parameter.predictive_shape), dtype=parameter.observed_values.dtype, device="cpu")
+            for parameter in observed_order
+        }
+        # Likelihoods with a latent function (GPs) also report their latent draws.
+        gp_observed = [parameter for parameter in observed_order if getattr(parameter.distribution, "_records_latent", False)]
+        predicative_gp_samples = {
+            parameter.name: torch.empty(
+                size=(n_draws, samples_per_step, *parameter.predictive_shape),
+                dtype=parameter.observed_values.dtype,
+                device="cpu",
+            )
+            for parameter in gp_observed
+        }
+        complete_gp_samples = {parameter.name: True for parameter in gp_observed}
+
+        def record_latent(parameter, index):
+            latent = parameter.distribution._last_latent_samples
+            if latent is None:
+                complete_gp_samples[parameter.name] = False
+            else:
+                predicative_gp_samples[parameter.name][index] = latent.detach().to(device="cpu", dtype=predicative_gp_samples[parameter.name].dtype)
+        prior_trace = {parameter.name: [] for parameter in random_order}
+        prior_det_trace = {name: [] for name in model.deterministic_params}
+        predicative_det_samples = {name: [] for name in model.deterministic_params}
+
+        saved_values = {name: parameter.unconstrained_value for name, parameter in latents.items()}
+        saved_observed = {parameter.name: parameter._observed_values for parameter in observed_order}
+
+        _progress_bar = tqdm(
+            range(n_draws),
+            desc="Prior predicative sampling" if prior else "Predicative sampling",
+            bar_format=r"{desc}: {percentage:3.0f}% | {bar} | {n_fmt}/{total} | {elapsed}<{remaining}> | {rate_fmt}"
+        ) if progress_bar else range(n_draws)
+    except BaseException:
+        for node in predictive_nodes:
+            node._in_posterior_predictive = False
+        raise
 
     try:
         for i in _progress_bar:
@@ -1058,11 +1088,11 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
             if not chained:
                 for parameter in observed_order:
                     samples = predicative_samples[parameter.name]
+                    if parameter.name in predicative_gp_samples:
+                        parameter.distribution._last_latent_samples = None
                     samples[i] = draw(parameter, samples_per_step, parameter.predictive_shape, samples.dtype)
-                    if parameter in gp_observed:
-                        latent = getattr(parameter.distribution, "_last_latent_samples", None)
-                        if latent is not None:
-                            predicative_gp_samples[parameter.distribution.name][i] = latent.detach().to(device="cpu", dtype=samples.dtype)
+                    if parameter.name in predicative_gp_samples:
+                        record_latent(parameter, i)
                 continue
 
             # An observed node feeds another node: draw the replicated data
@@ -1072,26 +1102,20 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
                 for j in range(samples_per_step):
                     for parameter in observed_order:
                         samples = predicative_samples[parameter.name]
+                        if parameter.name in predicative_gp_samples:
+                            parameter.distribution._last_latent_samples = None
                         value = draw(parameter, 1, parameter.predictive_shape, samples.dtype)[0]
                         samples[i, j] = value
-                        if parameter in gp_observed:
-                            latent = getattr(parameter.distribution, "_last_latent_samples", None)
-                            if latent is not None:
-                                predicative_gp_samples[parameter.distribution.name][i, j] = latent[0].detach().to(device="cpu", dtype=samples.dtype)
+                        if parameter.name in predicative_gp_samples:
+                            record_latent(parameter, (i, slice(j, j + 1)))
                         if parameter.name in replicated_parents:
                             parameter.observed_values = value
             finally:
                 for parameter in observed_order:
                     parameter._observed_values = saved_observed[parameter.name]
     finally:
-        if not prior:
-            model._in_posterior_predictive = False
-            for parameter in observed_order:
-                if hasattr(parameter.distribution, "_in_posterior_predictive"):
-                    parameter.distribution._in_posterior_predictive = False
-            for parameter in model.deterministic_params.values():
-                if hasattr(parameter, "_in_posterior_predictive"):
-                    parameter._in_posterior_predictive = False
+        for node in predictive_nodes:
+            node._in_posterior_predictive = False
         for name, value in saved_values.items():
             latents[name].set_unconstrained_value(value)
         for parameter in observed_order:
@@ -1106,10 +1130,14 @@ def _ancestral_predictive(model, n_draws, samples_per_step, parameter_values, pr
         det_samples = {
             name: torch.stack(values, dim=0) for name, values in prior_det_trace.items() if values
         }
-    for gp_name, tensor in predicative_gp_samples.items():
-        target_name = gp_name if gp_name not in predicative_samples else f"{gp_name}_latent"
-        if target_name not in det_samples:
-            det_samples[target_name] = tensor
+    # A GP's latent draws are stored under the GP's name (``<name>_latent``
+    # when that name is taken by another node).
+    for parameter in gp_observed:
+        if not complete_gp_samples[parameter.name]:
+            continue
+        gp_name = parameter.distribution.name
+        taken = gp_name in predicative_samples or gp_name in det_samples
+        det_samples[f"{gp_name}_latent" if taken else gp_name] = predicative_gp_samples[parameter.name]
     result = PredicativeResult(predicative_samples, deterministic_samples=det_samples)
     if prior:
         trace = {name: torch.stack(values, dim=0).unsqueeze(0) for name, values in prior_trace.items() if values}

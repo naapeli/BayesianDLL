@@ -1,60 +1,49 @@
+from collections.abc import Mapping
+
 import torch
 
 from .. import Model
 
 
-class MAPResult:
-    """The result of maximum a posteriori (MAP) optimization.
+class MAPResult(Mapping):
+    """The result of :func:`find_MAP`: a read-only mapping from parameter names to their values at the mode.
+
+    ``result["sigma"]``, ``result.keys()``, ``result.items()``, ``len(result)``
+    and iteration all refer to the parameters, like a dictionary.
 
     Attributes
     ----------
     params : dict[str, torch.Tensor]
-        Dictionary mapping parameter names to their constrained values at the mode.
+        The constrained values of the random and deterministic parameters at the mode.
     history : list[float]
-        Log joint probability recorded at each callback frequency epoch.
+        The log joint density recorded every ``callback_frequency`` epochs.
     log_prob : float
-        Final log joint probability at the mode.
+        The log joint density at the returned values (the objective of :func:`find_MAP`).
     """
 
     def __init__(self, mode: dict[str, torch.Tensor], history: list[float], log_prob: float):
-        self._mode = mode
-        self.history = history
+        self._mode = dict(mode)
+        self.history = list(history)
         self.log_prob = log_prob
 
     def mode(self) -> dict[str, torch.Tensor]:
-        """Return the dictionary of parameter values at the posterior mode."""
-        return {k: v.clone() for k, v in self._mode.items()}
+        """Return a copy of the parameter values at the mode."""
+        return {name: value.clone() for name, value in self._mode.items()}
 
     @property
     def params(self) -> dict[str, torch.Tensor]:
-        return self._mode
+        return dict(self._mode)
 
-    def __getitem__(self, key):
-        if isinstance(key, str):
-            if key in self._mode:
-                return self._mode[key]
-            raise KeyError(f"Parameter '{key}' not found in MAP result.")
-        elif isinstance(key, (int, slice)):
-            return self.history[key]
-        raise TypeError(f"Key must be str (for parameter) or int/slice (for history), got {type(key).__name__}")
-
-    def __contains__(self, key):
-        return key in self._mode
-
-    def __len__(self):
-        return len(self.history)
+    def __getitem__(self, name):
+        if name not in self._mode:
+            raise KeyError(f"Parameter '{name}' not found in the MAP result.")
+        return self._mode[name]
 
     def __iter__(self):
-        return iter(self.history)
+        return iter(self._mode)
 
-    def keys(self):
-        return self._mode.keys()
-
-    def values(self):
-        return self._mode.values()
-
-    def items(self):
-        return self._mode.items()
+    def __len__(self):
+        return len(self._mode)
 
     def __repr__(self):
         params_str = ", ".join(f"{k}: {tuple(v.shape)}" for k, v in self._mode.items())
@@ -101,6 +90,7 @@ def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_fre
         Object containing the mode parameters, history of log joint probabilities,
         and final log probability.
     """
+    model._capture_training_data()
     history = []
 
     m = {}
@@ -130,7 +120,7 @@ def find_MAP(model: Model, lr=1e-2, epochs=100, betas=(0.9, 0.999), callback_fre
             if verbose:
                 print(f"Epoch: {epoch + 1} - Log_prob: {logp.item():.2f}")
 
-    final_logp = history[-1] if history else model.model_log_prob().item()
+    final_logp = model.model_log_prob().item()
     mode = {
         name: param.constrained_value.detach().clone()
         for name, param in model.params.items()

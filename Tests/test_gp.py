@@ -29,8 +29,6 @@ from BayesianDLL.GP import (
     exact_gp_predictive,
     Matern52,
     RationalQuadratic,
-    SparseGP,
-    sparse_gp_predictive,
     stable_cholesky,
 )
 from BayesianDLL.Variational import elbo
@@ -650,7 +648,7 @@ def _sparse_model(method, inducing=None, n=15, mean_parameter=True):
         mean = RandomParameter("mean", Normal(0.0, 1.0), initial_value=torch.tensor([0.2], dtype=torch.float64)) if mean_parameter else 0.0
         lengthscale = Exp("lengthscale", log_lengthscale)
         kernel = RBF(lengthscale, Exp("variance", log_variance)) * Periodic(1.2, 1.0, period) + Matern(lengthscale, 0.3, nu=1.5)
-        function = SparseGP("function", inputs, kernel, inducing_points=inducing, noise_variance=Exp("noise", log_noise), mean=mean, method=method)
+        function = ExactGP("function", inputs, kernel, inducing_points=inducing, noise_variance=Exp("noise", log_noise), mean=mean, method=method)
         ObservedParameter("observations", function, y)
     return model, function, x, y
 
@@ -692,7 +690,7 @@ def test_sparse_gp_equals_exact_gp_when_inducing_points_are_the_inputs(method):
     with Model():
         inputs = Data("inputs", x)
         exact = ExactGP("exact", inputs, kernel, noise_variance=0.1, jitter=1e-12)
-        sparse = SparseGP("sparse", inputs, kernel, inducing_points=x, noise_variance=0.1, method=method, jitter=1e-12)
+        sparse = ExactGP("sparse", inputs, kernel, inducing_points=x, noise_variance=0.1, method=method, jitter=1e-12)
     torch.testing.assert_close(sparse.log_pdf(y), exact.log_pdf(y), atol=1e-7, rtol=1e-7)
 
 
@@ -702,7 +700,7 @@ def test_sparse_gp_vfe_is_a_lower_bound_on_the_exact_likelihood():
     with Model():
         inputs = Data("inputs", x)
         exact = ExactGP("exact", inputs, kernel, noise_variance=0.1, jitter=1e-10)
-        sparse = SparseGP("sparse", inputs, kernel, inducing_points=x[:5], noise_variance=0.1, jitter=1e-10)
+        sparse = ExactGP("sparse", inputs, kernel, inducing_points=x[:5], noise_variance=0.1, jitter=1e-10)
     assert sparse.log_pdf(y) < exact.log_pdf(y)
 
 
@@ -711,10 +709,10 @@ def test_sparse_gp_validates_its_arguments():
     with Model() as model:
         inputs = Data("inputs", x)
         with pytest.raises(ValueError, match="method"):
-            SparseGP("f", inputs, RBF(1.0), inducing_points=x, method="svgp")
+            ExactGP("f", inputs, RBF(1.0), inducing_points=x, method="svgp")
         # Learnable inducing inputs are accepted (see Tests/test_gp_structured.py).
         z = RandomParameter("z", Normal(0.0, 1.0), shape=(2, 3))
-        SparseGP("f", inputs, RBF(1.0), inducing_points=z)
+        ExactGP("f", inputs, RBF(1.0), inducing_points=z)
 
 
 def test_sparse_gp_scales_to_many_observations():
@@ -728,7 +726,7 @@ def test_sparse_gp_scales_to_many_observations():
         inputs = Data("inputs", x)
         log_lengthscale = RandomParameter("log_lengthscale", Normal(0.0, 1.0), shape=3)
         log_noise = RandomParameter("log_noise", Normal(-2.0, 1.0))
-        function = SparseGP(
+        function = ExactGP(
             "function", inputs, RBF(Exp("lengthscale", log_lengthscale), 1.0),
             inducing_points=x[:m], noise_variance=Exp("noise", log_noise),
         )
@@ -737,7 +735,7 @@ def test_sparse_gp_scales_to_many_observations():
     log_probability = model.model_log_prob()
     gradients = model.joint_grad_log_prob()
     elapsed = time.perf_counter() - start
-    print(f"SparseGP n={n}, m={m}: log density + gradient in {elapsed:.3f} s")
+    print(f"ExactGP with inducing points n={n}, m={m}: log density + gradient in {elapsed:.3f} s")
     assert torch.isfinite(log_probability)
     assert all(torch.isfinite(gradient).all() for gradient in gradients.values())
 
@@ -748,13 +746,13 @@ def test_sparse_gp_predictive_matches_exact_gp_when_inducing_points_are_the_inpu
     with Model():
         inputs = Data("inputs", x)
         exact = ExactGP("exact", inputs, kernel, noise_variance=0.1, jitter=1e-10)
-        sparse = SparseGP("sparse", inputs, kernel, inducing_points=x, noise_variance=0.1, jitter=1e-10)
+        sparse = ExactGP("sparse", inputs, kernel, inducing_points=x, noise_variance=0.1, jitter=1e-10)
     new_inputs = torch.rand(4, 3, generator=torch.Generator().manual_seed(1), dtype=torch.float64)
     trace = {"dummy": torch.zeros(1, 1, 1, dtype=torch.float64)}
     torch.manual_seed(0)
     exact_samples = exact_gp_predictive(exact, trace, y, new_inputs, n_samples=2000)
     torch.manual_seed(0)
-    sparse_samples = sparse_gp_predictive(sparse, trace, y, new_inputs, n_samples=2000)
+    sparse_samples = exact_gp_predictive(sparse, trace, y, new_inputs, n_samples=2000)
     assert sparse_samples.shape == (1, 2000, 4)
     torch.testing.assert_close(sparse_samples.mean(dim=1), exact_samples.mean(dim=1), atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(sparse_samples, exact_samples, atol=1e-4, rtol=1e-4)
@@ -764,7 +762,7 @@ def test_sparse_gp_predictive_matches_exact_gp_when_inducing_points_are_the_inpu
 def test_sparse_gp_nuts_and_predictive():
     model, function, x, y = _sparse_model("vfe", n=40)
     trace = model.sample(10, 10, n_chains=1, progress_bar=False, check_convergence=False, seed=0)
-    samples = sparse_gp_predictive(function, trace, y, torch.rand(5, 2, dtype=torch.float64), n_samples=3, observation_noise=0.01)
+    samples = exact_gp_predictive(function, trace, y, torch.rand(5, 2, dtype=torch.float64), n_samples=3, observation_noise=0.01)
     assert samples.shape == (10, 3, 5)
     assert torch.isfinite(samples).all()
 
@@ -936,7 +934,7 @@ def test_gp_classes_reject_a_per_input_vector_mean():
         inputs = Data("inputs", x)
         vector_node = RandomParameter("vector_mean", Normal(0.0, 1.0), shape=4)
         with pytest.raises(ValueError, match="LinearMean"):
-            SparseGP("sparse", inputs, RBF(0.4, 1.3), x[:2].clone(), noise_variance=0.1, mean=train_mean)
+            ExactGP("sparse", inputs, RBF(0.4, 1.3), noise_variance=0.1, mean=train_mean, inducing_points=x[:2].clone())
         with pytest.raises(ValueError, match="MeanFunction"):
             LatentGP("latent", inputs, RBF(0.4, 1.3), mean=vector_node)
 
@@ -949,27 +947,27 @@ def test_exact_gp_and_latent_gp_sparse_merging():
 
     with Model():
         inputs = Data("x", x)
-        # ExactGP without inducing_points is dense ExactGP
+        # Both variants are instances of the public class, and neither inherits the other.
         dense_gp = ExactGP("dense", inputs, kernel, noise_variance=0.1)
-        assert type(dense_gp) is ExactGP
-        assert isinstance(dense_gp, ExactGP)
-        assert not isinstance(dense_gp, SparseGP)
-
-        # ExactGP with inducing_points is SparseGP
         sparse_gp = ExactGP("sparse", inputs, kernel, noise_variance=0.1, inducing_points=z)
-        assert isinstance(sparse_gp, ExactGP)
-        assert isinstance(sparse_gp, SparseGP)
+        assert isinstance(dense_gp, ExactGP) and isinstance(sparse_gp, ExactGP)
+        assert not isinstance(dense_gp, type(sparse_gp)) and not isinstance(sparse_gp, type(dense_gp))
         assert sparse_gp.inducing_points is z
+        assert not hasattr(dense_gp, "inducing_points")
 
-        # LatentGP without inducing_points is dense LatentGP
         dense_latent = LatentGP("dense_lat", inputs, kernel)
-        assert type(dense_latent) is LatentGP
-        assert isinstance(dense_latent, LatentGP)
-
-        # LatentGP with inducing_points is SparseLatentGP
         sparse_latent = LatentGP("sparse_lat", inputs, kernel, inducing_points=z)
-        assert isinstance(sparse_latent, LatentGP)
+        assert isinstance(dense_latent, LatentGP) and isinstance(sparse_latent, LatentGP)
+        assert not isinstance(dense_latent, type(sparse_latent)) and not isinstance(sparse_latent, type(dense_latent))
         assert hasattr(sparse_latent, "gp_inducing_points")
+
+        # Unknown arguments and sparse-only options without inducing points are rejected.
+        with pytest.raises(TypeError):
+            ExactGP("typo", inputs, kernel, noise_varience=0.1)
+        with pytest.raises(ValueError, match="need inducing_points"):
+            ExactGP("method", inputs, kernel, method="fitc")
+        with pytest.raises(TypeError):
+            LatentGP("typo_lat", inputs, kernel, whitened_values=None)
 
         # exact_gp_predictive dispatching on sparse GP
         trace = {

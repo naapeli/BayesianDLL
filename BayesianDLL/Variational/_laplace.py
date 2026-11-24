@@ -70,7 +70,7 @@ class LaplaceApproximation:
     model : Model
         The probabilistic model.
     layout : LatentLayout
-        Memory layout mapping flat unconstrained vectors to model parameters.
+        Layout of the latents in the flat unconstrained vector.
     mean : Tensor
         Mode :math:`\eta^*` in unconstrained space.
     hessian : Tensor
@@ -85,7 +85,7 @@ class LaplaceApproximation:
     mean : Tensor
         The posterior mode in unconstrained space.
     cov : Tensor
-        Covariance matrix :math:`\Sigma = (-H)^{-1}`.
+        Covariance matrix :math:`\Sigma = (-H)^{-1}` (with the jitter added to :math:`-H`).
     scale_tril : Tensor
         Lower Cholesky factor :math:`L` of the covariance matrix :math:`\Sigma = L L^T`.
     hessian : Tensor
@@ -95,7 +95,9 @@ class LaplaceApproximation:
     log_joint_at_mode : float or Tensor
         Log-joint density at the mode :math:`\log p(\eta^*, y)`.
     log_marginal_likelihood : Tensor
-        Laplace approximation of the log marginal likelihood (evidence) :math:`\log p(y)`.
+        Laplace approximation of the log marginal likelihood (evidence),
+        :math:`\log p(\eta^*, y) + \frac{d}{2} \log(2\pi) - \frac{1}{2} \log\det(-H)` with
+        :math:`d` the number of unconstrained values.
     names : list of str
         Names of the latent parameters in order.
     """
@@ -157,8 +159,11 @@ def laplace_approximation(
 ):
     r"""Compute the Laplace approximation of the model posterior.
 
-    Finds the maximum a posteriori (MAP) mode in unconstrained space and approximates
-    the posterior distribution by a Gaussian :math:`\mathcal{N}(\eta^*, (-H)^{-1})`.
+    Finds the maximum a posteriori (MAP) mode in unconstrained space (Adam steps from the
+    current values, refined by Newton steps with a backtracking line search) and approximates
+    the posterior distribution by a Gaussian :math:`\mathcal{N}(\eta^*, (-H)^{-1})`, where
+    :math:`H` is the Hessian of the unconstrained log joint (central finite differences of
+    the hand-written gradient, symmetrised). The model's parameters are left at the mode.
 
     Parameters
     ----------
@@ -171,15 +176,17 @@ def laplace_approximation(
     betas : tuple of float, default (0.9, 0.999)
         Betas momentum hyperparameters for Adam optimizer.
     newton_steps : int, default 20
-        Maximum number of Newton refinement steps.
+        Maximum number of Newton refinement steps; Newton stops early when :math:`-H`
+        is not positive definite.
     hessian : {"fd"}, default "fd"
         Method used to evaluate the Hessian matrix.
     fd_step : float, optional
-        Finite-difference step size for numerical derivative evaluation.
+        Relative finite-difference step (default :math:`\epsilon^{1/3}` of the dtype).
     jitter : float, default 1e-10
-        Diagonal regularizer added if :math:`-H` is not positive definite.
+        If :math:`-H` is not positive definite, a warning is issued and at least
+        ``jitter`` times the mean absolute diagonal of :math:`-H` is added to it.
     tolerance : float, default 1e-9
-        Convergence tolerance on gradient norm for Newton steps.
+        Newton stops when the largest absolute gradient entry or step is below ``tolerance``.
     verbose : bool, default False
         Whether to display progress information during optimization.
 
@@ -188,6 +195,7 @@ def laplace_approximation(
     LaplaceApproximation
         The fitted Gaussian approximation with sampling methods and marginal likelihood estimate.
     """
+    model._capture_training_data()
     if hessian != "fd":
         raise ValueError(f"Unknown hessian method '{hessian}'; only 'fd' (finite differences of the gradient) is available.")
     layout = LatentLayout(model, purpose="The Laplace approximation")

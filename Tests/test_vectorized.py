@@ -14,9 +14,10 @@ import torch
 
 from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, RandomParameter, plate
 from BayesianDLL.Deterministic import (
-    Add, Affine, CholeskyCovariance, Concat, CovarianceFromCholesky, Exp, Index, Linear, MatMul, Multiply,
+    Add, Affine, Concat, Exp, Index, Linear, MatMul, Multiply,
     Softmax, Softplus, Stack, Sum,
 )
+from BayesianDLL.Deterministic._blocks import CholeskyCovariance, CovarianceFromCholesky
 from BayesianDLL.Distributions import (
     Bernoulli, Beta, Binomial, Categorical, Cauchy, Dirichlet, Exponential, Gamma, HalfCauchy, HalfNormal,
     InvGamma, LKJCholesky, Laplace, LogNormal, Mixture, MultivariateNormal, Normal, Poisson, StudentT,
