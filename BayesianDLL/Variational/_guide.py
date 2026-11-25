@@ -23,8 +23,13 @@ class BaseGuide(ABC):
         """``{key: VariationalParameter}`` optimised by :func:`BBVI`; the keys of the ELBO gradient."""
 
     @abstractmethod
-    def _elbo(self, model, n_samples, scales=None):
-        """Monte Carlo ``(elbo, grads)`` for ``model`` with observed terms scaled by ``scales``."""
+    def _elbo(self, model, n_samples, scales=None, kl_weight=1.0):
+        """Monte Carlo ``(elbo, grads)`` for ``model`` with observed terms scaled by ``scales``.
+
+        ``grads`` is the gradient of the annealed objective
+        ``E_q[log p(y | theta) + kl_weight (log p(theta) - log q(theta))]``
+        (the ELBO when ``kl_weight = 1``); ``elbo`` is always the ELBO estimate.
+        """
 
     @abstractmethod
     def sample(self, n_samples=1000, n_chains=1):
@@ -202,6 +207,7 @@ class Guide(Model, BaseGuide):
 
         guide = Guide(model, default_family="full_rank")    # one full-rank MVN over the whole model
         guide = Guide(model, default_family="mean_field")   # an independent Normal per coordinate
+        guide = Guide(model, default_family="low_rank", rank=8)  # covariance diag(scale^2) + V V^T, V of rank 8
 
         with Guide(model, default_family="mean_field") as guide:
             Group(["mu", "beta"], family="full_rank")         # dependent latents share a group
@@ -215,7 +221,7 @@ class Guide(Model, BaseGuide):
     pieces:
 
     * **Groups** (:class:`Group`): Gaussians over the unconstrained values of
-      their latents, mean-field or full-rank, or structured groups
+      their latents, mean-field, full-rank or low-rank plus diagonal, or structured groups
       (``with Group([...]):``) whose hand-written latents may depend on each
       other within the group.
     * **Hand-written entries**: a ``RandomParameter`` named like a model
@@ -229,17 +235,28 @@ class Guide(Model, BaseGuide):
       reparameterised sampler (discrete or ``Gamma`` entries, mixtures) are
       fitted with score-function gradients. Entries must not depend on other
       guide nodes and must not be enumerated.
-    * **The default group**: with ``default_family="mean_field"`` or
-      ``"full_rank"``, every latent that no group or entry covers is
-      collected into one group of that family (created at the first
+    * **The default group**: with ``default_family="mean_field"``,
+      ``"full_rank"`` or ``"low_rank"``, every latent that no group or entry
+      covers is collected into one group of that family (created at the first
       :meth:`validate`, and on :attr:`groups`). When it covers the whole
       model its VariationalParameters are unprefixed (``{latent}_loc`` /
-      ``{latent}_scale``, or ``loc`` / ``scale_tril``); otherwise they are
-      prefixed with ``default_``. With ``default_family=None`` (the default)
-      an uncovered latent is an error.
+      ``{latent}_scale``, ``loc`` / ``scale_tril``, or ``loc`` / ``scale`` /
+      ``cov_factor``); otherwise they are prefixed with ``default_``. With
+      ``default_family=None`` (the default) an uncovered latent is an error.
 
     Every latent belongs to exactly one group or entry. ``init_scale`` is
-    the initial standard deviation of the default group's coordinates.
+    the initial standard deviation of the default group's coordinates and
+    ``rank`` the rank of a low-rank default group (default ``ceil(sqrt(d))``
+    for ``d`` coordinates; see :class:`Group`).
+
+    **Which family.** Mean-field ignores all posterior correlations.
+    Full-rank captures them with ``d (d + 1) / 2`` parameters and ``O(d^2)``
+    work per draw, which is cheap for tens of coordinates but slow to fit for
+    hundreds. Low-rank plus diagonal (``d (rank + 1)`` covariance parameters,
+    ``O(d rank)`` per draw) captures a few dominant directions of correlation
+    that are spread over many latents, e.g. the weights of a neural network;
+    when the correlations are confined to a few known latents, a small
+    full-rank :class:`Group` for them is the better choice.
 
     A guide cannot be conditioned or marginalised (``condition(guide, ...)``
     raises ``TypeError``): to fix a latent to a known value, condition the
@@ -258,11 +275,11 @@ class Guide(Model, BaseGuide):
     piece                              unconstrained space    constrained space
     =================================  =====================  =====================================
     Gaussian group                     exact: ``loc``,        identity transform: exact;
-                                       ``diag(scale^2)`` or   elementwise ``log``: exact log-normal
-                                       ``L L^T``              moments (full-rank: exact
-                                                              cross-covariances too); any other
-                                                              transform (logit, stick-breaking,
-                                                              ...): Monte Carlo
+                                       ``diag(scale^2)``,     elementwise ``log``: exact log-normal
+                                       ``L L^T`` or           moments (full-rank and low-rank:
+                                       ``diag(scale^2)``      exact cross-covariances too); any
+                                       ``+ V V^T``            other transform (logit,
+                                                              stick-breaking, ...): Monte Carlo
     real-line entry                    exact if the family    exact if the latent's transform is
                                        has closed-form        the identity and the moments are
                                        moments, else MC       closed-form, else MC
@@ -279,8 +296,9 @@ class Guide(Model, BaseGuide):
     Accuracy and cost
     -----------------
     * **Exact Gaussian moments, unconstrained space.** No sampling error.
-      The cost is ``O(d)`` for a mean-field group and ``O(d^2)`` for a
-      full-rank group (forming ``L L^T``): essentially free.
+      The cost is ``O(d)`` for a mean-field group, ``O(d^2)`` for a
+      full-rank group (forming ``L L^T``) and ``O(d^2 rank)`` for a low-rank
+      group (forming ``V V^T``): essentially free.
     * **Exact closed forms, constrained space** (log-normal moments
       ``exp(mu + s^2/2)``, ``(exp(s^2) - 1) exp(2 mu + s^2)`` and
       ``cov(e^x_i, e^x_j) = exp(mu_i + mu_j + (S_ii + S_jj)/2) (exp(S_ij) - 1)``,
@@ -301,8 +319,8 @@ class Guide(Model, BaseGuide):
       seeded with ``seed``, so the global random state is untouched and the
       result is reproducible.
     * **The draws are exact and independent.** Every group is sampled
-      exactly (``z = loc + L eps`` for full-rank, independent Normals for
-      mean-field), every hand-written entry with its distribution's own
+      exactly (``z = loc + L eps`` for full-rank, ``loc + scale eps_1 + V eps_2``
+      for low-rank, independent Normals for mean-field), every hand-written entry with its distribution's own
       ``sample()`` and every structured group by ancestral sampling in
       topological order; the guide is never sampled with MCMC (an entry without a
       working ``sample()`` raises an error). So ``n`` draws are ``n``
@@ -341,20 +359,25 @@ class Guide(Model, BaseGuide):
         """Guides cannot be marginalised (raises ``TypeError``)."""
         raise TypeError(_GUIDE_CONDITION_MESSAGE)
 
-    def __init__(self, model=None, default_family=None, init_scale=0.1):
+    def __init__(self, model=None, default_family=None, init_scale=0.1, rank=None):
         if not isinstance(model, Model) or isinstance(model, Guide):
             raise TypeError(
                 "Guide(model, default_family=...) needs the model it approximates as its first argument, "
                 f"got {type(model).__name__}."
             )
         if default_family is not None and default_family not in FAMILIES:
-            raise ValueError(f"default_family must be None, 'mean_field' or 'full_rank', got {default_family!r}.")
+            raise ValueError(
+                f"default_family must be None, 'mean_field', 'full_rank' or 'low_rank', got {default_family!r}."
+            )
+        if rank is not None and default_family != "low_rank":
+            raise ValueError(f"rank is only used by default_family='low_rank', not by {default_family!r}.")
         super().__init__()
         if not model._compiled:
             model.compile()
         self.model = model
         self.default_family = default_family
         self.init_scale = float(init_scale)
+        self.rank = rank
         self._groups = []
         self._default_group = None
         self._reinforce_baseline = None
@@ -437,7 +460,7 @@ class Guide(Model, BaseGuide):
             raise ValueError(
                 f"The guide has no distribution for the model latent(s) {uncovered}. Put them in a Group, write "
                 "hand-written entries for them inside `with Guide(model) as guide:`, or pass "
-                "default_family='mean_field' or 'full_rank' to collect them into one default group."
+                "default_family='mean_field', 'full_rank' or 'low_rank' to collect them into one default group."
             )
         if not uncovered:
             self._default_group = None
@@ -445,8 +468,11 @@ class Guide(Model, BaseGuide):
             default = self._default_group
             whole = len(uncovered) == len(model.params)
             if (default is None or default.names != uncovered or default.model is not model
-                    or default.family != self.default_family or (default.prefix == "") != whole):
-                self._default_group = Group._default(model, uncovered, self.default_family, self.init_scale, prefixed=not whole)
+                    or default.family != self.default_family or (default.prefix == "") != whole
+                    or default._rank_option != self.rank):
+                self._default_group = Group._default(
+                    model, uncovered, self.default_family, self.init_scale, prefixed=not whole, rank=self.rank
+                )
         pieces = [StructuredPiece(group, self, model) if group.family == "structured" else group for group in self._groups]
         if self._default_group is not None:
             pieces.append(self._default_group)
@@ -488,21 +514,23 @@ class Guide(Model, BaseGuide):
                 table[key] = parameter
         return table
 
-    def _elbo(self, model, n_samples, scales=None):
-        return estimate_elbo(model, self.validate(model), n_samples, scales=scales, baseline_owner=self)
+    def _elbo(self, model, n_samples, scales=None, kl_weight=1.0):
+        return estimate_elbo(model, self.validate(model), n_samples, scales=scales, baseline_owner=self, kl_weight=kl_weight)
 
     # --- sampling -------------------------------------------------------------
     def sample(self, n_samples=1000, n_chains=1):
         """Draw ``n_chains * n_samples`` exact, independent draws from the guide (never MCMC).
 
         Every group is sampled exactly (``z = loc + L eps`` for a full-rank
-        group, independent Normals for a mean-field group; one
-        ``randn(n, d)`` block per group, in group order) and every
+        group, ``loc + scale eps_1 + V eps_2`` for a low-rank group,
+        independent Normals for a mean-field group; one ``randn(n, d)`` block
+        per group, in group order, followed by ``randn(n, rank)`` for a
+        low-rank group) and every
         hand-written entry with its distribution's ``sample()``; an entry
         without a working ``sample()`` raises an error instead of falling
         back to MCMC. The draws are independent, so ``n`` draws are ``n``
-        effective samples, however strongly a full-rank group correlates its
-        latents (that correlation lives in ``L``). Contrast
+        effective samples, however strongly a full-rank or low-rank group
+        correlates its latents (that correlation lives in ``L`` or ``V``). Contrast
         :func:`~BayesianDLL.sample` on the posterior, whose MCMC draws are
         autocorrelated.
 
