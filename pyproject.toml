@@ -1,53 +1,40 @@
 [project]
 name = "bayesiandll"
 version = "0.1.0"
-description = "Add your description here"
+description = "Bayesian modelling in PyTorch: graphical models sampled with NUTS, Gibbs and SMC, variational inference and Gaussian processes."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = [
-    "cloudpickle==3.1.2",
-    "colorama==0.4.6",
-    "contourpy==1.3.2",
-    "cycler==0.12.1",
-    "filelock==3.18.0",
-    "fonttools==4.57.0",
-    "fsspec==2025.3.0",
-    "jinja2==3.1.6",
-    "joblib==1.5.0",
-    "kiwisolver==1.4.8",
+    "cycler>=0.11",
     "loky>=3.5.6",
-    "markupsafe==3.0.2",
-    "matplotlib==3.10.1",
-    "mpmath==1.3.0",
-    "networkx==3.4.2",
-    "numpy==2.1.3",
-    "opt-einsum==3.4.0",
-    "packaging==25.0",
-    "pandas>=2.3.3",
-    "pillow==11.2.1",
-    "pyparsing==3.2.3",
-    "python-dateutil==2.9.0.post0",
-    "six==1.17.0",
-    "sympy==1.13.1",
-    "threadpoolctl==3.6.0",
-    "torch==2.6.0",
-    "tqdm==4.67.1",
-    "typing-extensions==4.13.0",
+    "matplotlib>=3.8",
+    "networkx>=3.0",
+    "numpy>=1.26",
+    "pandas>=2.0",
+    "torch>=2.6",
+    "tqdm>=4.64",
 ]
+
+[project.optional-dependencies]
+arviz = ["arviz>=1.3.0; python_version >= '3.12'"]
 
 [dependency-groups]
 dev = [
-    "arviz>=1.3.0",
+    # ArviZ 1.3 needs Python 3.12; the tests that compare against it skip without it.
+    "arviz>=1.3.0; python_version >= '3.12'",
     "pyro-api==0.1.2",
     "pyro-ppl==1.9.1",
     "pytest>=9.1.1",
-    "scipy==1.15.2",
+    "scipy>=1.15.2",
 ]
 docs = [
     "sphinx>=8.2",
     "sphinx-rtd-theme>=3.0",
     "sphinx-gallery>=0.19",
 ]
+
+[tool.uv.dependency-groups]
+docs = { requires-python = ">=3.11" }
 
 [tool.pytest.ini_options]
 testpaths = ["Tests"]
