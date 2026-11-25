@@ -84,8 +84,18 @@ plt.show()
 # %%
 # The model
 # ---------
-# ``f_white`` holds the 30 standard-normal basis weights, whatever the
-# number of observations, and the rate is ``exp(f)``.
+# The latent parameters are the 30 basis weights, whatever the number of
+# observations, and the rate is ``exp(f)``. By default ``LatentGP`` samples
+# standard-normal weights ``z`` and scales them by ``sqrt(S)`` (the
+# non-centred form). With 2000 counts the data pin the function down, so the
+# weights ``sqrt(S) z`` are nearly fixed and every change of the lengthscale
+# or variance has to rescale all ``z`` at once, a curved posterior in which
+# the hyperparameters mix slowly. ``centred=True`` samples the weights
+# themselves (``f_weights``, with prior standard deviations
+# ``f_basis_sd = sqrt(S)``): their posterior then hardly depends on the
+# hyperparameters, which here gives several times the effective sample size
+# for the same number of draws. The non-centred form is the better choice
+# when the data are weakly informative.
 
 with Model() as model:
     inputs = Data("t", t)
@@ -93,7 +103,7 @@ with Model() as model:
     log_variance = RandomParameter("log_variance", Normal(-1.0, 0.7))
     intercept = RandomParameter("intercept", Normal(0.0, 2.0))
     kernel = Matern52(Exp("lengthscale", log_lengthscale), Exp("variance", log_variance))
-    f = LatentGP("f", inputs, kernel, mean=ConstantMean(intercept), n_basis=30, boundary_factor=1.5)
+    f = LatentGP("f", inputs, kernel, mean=ConstantMean(intercept), n_basis=30, boundary_factor=1.5, centred=True)
     ObservedParameter("counts", Poisson(Exp("rate", f)), counts)
 
 # %%
@@ -122,11 +132,13 @@ for label, current in (("Hilbert space, m = 30", model), ("dense", dense_model))
 # --------
 
 start = time.perf_counter()
-trace = model.sample(100, 100, n_chains=2, chain_method="vectorized", max_depth=5, init_scale=0.1, seed=0, progress_bar=False)
+trace = model.sample(400, 400, n_chains=4, chain_method="vectorized", max_depth=6, init_scale=0.1, seed=0, progress_bar=False)
 elapsed = time.perf_counter() - start
-summary = trace.summary(include_deterministic=True)
-print(summary.loc[["log_lengthscale[0]", "log_variance[0]", "intercept[0]"]])
-print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}")
+summary = trace.summary()
+print(summary.loc[["log_lengthscale[0]", "log_variance[0]", "intercept[0]"], ["mean", "sd", "ess_bulk", "r_hat"]])
+print(f"all {len(summary)} parameters: largest R-hat {summary['r_hat'].max():.3f}, smallest bulk ESS {summary['ess_bulk'].min():.0f}")
+print(f"sampling: {elapsed:.1f} s, mean step size {trace.sample_stats['step_size'].double().mean():.3f}, "
+      f"divergences: {sum(trace.divergences)}")
 
 # %%
 # Posterior rate and a forecast
