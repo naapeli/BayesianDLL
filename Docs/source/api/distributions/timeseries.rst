@@ -15,3 +15,29 @@ series, and state-space models whose hidden states are integrated out exactly.
    :show-inheritance:
 
 .. autofunction:: is_stationary
+
+.. autoclass:: LinearGaussianStateSpace
+   :members:
+   :show-inheritance:
+
+.. autoclass:: SARIMAX
+   :members:
+   :show-inheritance:
+
+.. autoclass:: SARIMA
+   :show-inheritance:
+
+.. autoclass:: ARIMA
+   :show-inheritance:
+
+.. autoclass:: ARMA
+   :show-inheritance:
+
+.. autoclass:: MovingAverage
+   :show-inheritance:
+
+.. autoclass:: StationaryAR
+   :show-inheritance:
+
+.. autoclass:: InvertibleMA
+   :show-inheritance:
