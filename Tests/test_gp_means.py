@@ -529,12 +529,15 @@ def test_kronecker_predictive_with_a_linear_mean_matches_a_dense_reference():
     torch.manual_seed(2)
     actual = kronecker_gp_predictive(gp, trace, y, new, n_samples=2)
     torch.testing.assert_close(actual, _gaussian_reference(means, covariances, 2, 1e-10, seed=2), atol=1e-7, rtol=0)
-    # A new grid (one array per factor) is the same as its points in row-major order.
+    # A new grid (one array per factor, sampled by Matheron's rule on the union grid) has the moments of its points
+    # in row-major order.
     torch.manual_seed(2)
-    on_grid = kronecker_gp_predictive(gp, trace, y, [grids[0][:2], grids[1]], n_samples=1)
-    torch.manual_seed(2)
-    as_points = kronecker_gp_predictive(gp, trace, y, torch.cartesian_prod(grids[0][:2], grids[1]), n_samples=1)
-    torch.testing.assert_close(on_grid, as_points)
+    on_grid = kronecker_gp_predictive(gp, trace, y, [grids[0][:2], grids[1]], n_samples=20000)
+    as_points = kronecker_gp_predictive(gp, trace, y, torch.cartesian_prod(grids[0][:2], grids[1]), n_samples=20000)
+    assert on_grid.shape == as_points.shape
+    for draw in range(3):
+        torch.testing.assert_close(on_grid[draw].mean(0), as_points[draw].mean(0), atol=0.05, rtol=0.0)
+        torch.testing.assert_close(torch.cov(on_grid[draw].T), torch.cov(as_points[draw].T), atol=0.06, rtol=0.0)
 
 
 def test_sparse_predictive_with_a_linear_mean_matches_a_dense_reference():
