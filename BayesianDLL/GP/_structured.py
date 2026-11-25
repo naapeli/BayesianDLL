@@ -395,31 +395,38 @@ class KroneckerGP(_GPDistribution):
         train = self._training_axes()
         dtype, device = train[0].dtype, train[0].device
         new = [axis.to(dtype=dtype, device=device) for axis in self._factor_inputs()]
-        shape = tuple(axis.shape[0] for axis in train)
-        new_shape = tuple(axis.shape[0] for axis in new)
         noise = _resolved_value(self.noise_variance, dtype, device).reshape(-1)[0] + self.jitter
-        observed = torch.as_tensor(self._training_observed_data, dtype=dtype, device=device).reshape(shape)
+        observed = torch.as_tensor(self._training_observed_data, dtype=dtype, device=device).reshape(tuple(a.shape[0] for a in train))
+        return _kronecker_matheron(self, train, new, values, noise, observed, self._grid_mean(train), self._grid_mean(new), n_samples)
 
-        same_grid = all(a.shape == b.shape and torch.equal(a, b) for a, b in zip(new, train))
-        union = train if same_grid else [torch.cat([a, b]) for a, b in zip(new, train)]
-        _, eigenvalues, eigenvectors = self._decompose(union, values)
-        draws = self._prior_draws(union, eigenvalues, eigenvectors, n_samples)
-        if same_grid:
-            prior_new = prior_train = draws
-        else:
-            prior_new = draws[(slice(None), *(slice(0, n) for n in new_shape))]
-            prior_train = draws[(slice(None), *(slice(n, None) for n in new_shape))]
-            _, eigenvalues, eigenvectors = self._decompose(train, values)
 
-        residual = observed - self._grid_mean(train) - prior_train - noise.sqrt() * torch.randn_like(prior_train)
-        for mode, vectors in enumerate(eigenvectors):
-            residual = _mode_product(residual, vectors.transpose(-2, -1), mode + 1)
-        residual = residual / (_kronecker_eigenvalues(eigenvalues).clamp_min(0.0) + noise)
-        for mode, vectors in enumerate(eigenvectors):
-            residual = _mode_product(residual, vectors, mode + 1)  # (K + σ² I)⁻¹ r
-        for mode, (kernel, a, b) in enumerate(zip(self.kernels, new, train)):
-            residual = _mode_product(residual, kernel(a, b, parameter_values=values), mode + 1)  # K_*X
-        return self._grid_mean(new) + prior_new + residual
+def _kronecker_matheron(gp, train, new, values, noise, observed, mean_train, mean_new, n_samples):
+    """Posterior draws ``(n_samples, n*_1, …, n*_P)`` on the grid ``new`` by Matheron's rule on the union grid.
+
+    ``noise`` is the noise variance plus jitter; ``observed``, ``mean_train`` are
+    shaped like the training grid and ``mean_new`` like the new grid.
+    """
+    same_grid = all(a.shape == b.shape and torch.equal(a, b) for a, b in zip(new, train))
+    new_shape = tuple(axis.shape[0] for axis in new)
+    union = train if same_grid else [torch.cat([a, b]) for a, b in zip(new, train)]
+    _, eigenvalues, eigenvectors = gp._decompose(union, values)
+    draws = gp._prior_draws(union, eigenvalues, eigenvectors, n_samples)
+    if same_grid:
+        prior_new = prior_train = draws
+    else:
+        prior_new = draws[(slice(None), *(slice(0, n) for n in new_shape))]
+        prior_train = draws[(slice(None), *(slice(n, None) for n in new_shape))]
+        _, eigenvalues, eigenvectors = gp._decompose(train, values)
+
+    residual = observed - mean_train - prior_train - noise.sqrt() * torch.randn_like(prior_train)
+    for mode, vectors in enumerate(eigenvectors):
+        residual = _mode_product(residual, vectors.transpose(-2, -1), mode + 1)
+    residual = residual / (_kronecker_eigenvalues(eigenvalues).clamp_min(0.0) + noise)
+    for mode, vectors in enumerate(eigenvectors):
+        residual = _mode_product(residual, vectors, mode + 1)  # (K + σ² I)⁻¹ r
+    for mode, (kernel, a, b) in enumerate(zip(gp.kernels, new, train)):
+        residual = _mode_product(residual, kernel(a, b, parameter_values=values), mode + 1)  # K_*X
+    return mean_new + prior_new + residual
 
 
 def _split_new_inputs(gp, inputs, xs):
@@ -474,6 +481,15 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
     parameters of the mean function are read from ``trace``, and a given
     ``observation_noise`` variance is added to the diagonal. The result has
     shape ``(n_parameter_draws, n_samples, n*)``.
+
+    When ``inputs`` is a list (a new grid) and ``diagonal`` is false, the draws
+    come from Matheron's rule on the union of the training and new grids (as in
+    posterior predictive sampling), which never forms an ``n* x n*``
+    covariance or an ``n* x N`` matrix: its cost is the factors'
+    eigendecompositions on the union grid plus mode products. Arbitrary points
+    (a matrix) have no such structure, so they use the dense conditional above
+    (``O(n*² N)`` time and ``O(n*²)`` memory); use ``diagonal=True`` for large
+    sets of points when pointwise bands suffice.
     """
     if not isinstance(gp, KroneckerGP):
         raise TypeError("gp must be a KroneckerGP.")
@@ -483,6 +499,10 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
     dtype, device = xs[0].dtype, xs[0].device
     new = _split_new_inputs(gp, inputs, xs)
     n_new = new[0].shape[0]
+    new_axes = (
+        [_feature_matrix(torch.as_tensor(_input_value(v))).to(dtype=dtype, device=device) for v in inputs]
+        if isinstance(inputs, (list, tuple)) and not diagonal else None
+    )
     observed_values = torch.as_tensor(_input_value(observed_values), dtype=dtype, device=device)
     n_draws = _draw_count(trace)
     parameter_draws = _parameter_draws(trace, [p for kernel in gp.kernels for p in kernel.parameters], n_draws, dtype, device)
@@ -517,6 +537,17 @@ def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obs
         extra = 0.0
         if observation_noise is not None:
             extra = _resolved_value(observation_noise, dtype, device).reshape(-1)[0]
+        if new_axes is not None:
+            # A new grid: Matheron's rule on the union grid, no n* x n* covariance matrix.
+            mean_train = gp.mean(training_points, parameter_values=mean_values).reshape(shape)
+            mean_new = gp.mean(new_points, parameter_values=mean_values).reshape(tuple(axis.shape[0] for axis in new_axes))
+            grid_draws = _kronecker_matheron(
+                gp, xs, new_axes, values, noise + gp.jitter, observed_values.reshape(shape), mean_train, mean_new, n_samples
+            ).reshape(n_samples, n_new)
+            if observation_noise is not None:
+                grid_draws = grid_draws + torch.as_tensor(extra).sqrt() * torch.randn_like(grid_draws)
+            outputs.append(grid_draws)
+            continue
         if diagonal:
             prior_variance = torch.ones(n_new, dtype=dtype, device=device)
             for kernel, x_new in zip(gp.kernels, new):
@@ -685,6 +716,78 @@ def _toeplitz_inverse_diagonal_sums(inverse_first_column):
 _TOEPLITZ_KERNELS = (RBF, Matern, RationalQuadratic, Periodic, SpectralMixture, Constant)
 
 
+def _grid_positions(x, new, tolerance=1e-6):
+    """Integer positions of ``new`` ``(n*, 1)`` on the regular grid of ``x`` ``(n, 1)``, or ``None`` if some point is off the grid."""
+    if x.shape[0] < 2:
+        return None
+    position = (new[:, 0] - x[0, 0]) / (x[1, 0] - x[0, 0])
+    rounded = position.round()
+    if not bool(((position - rounded).abs() <= tolerance).all()):
+        return None
+    return rounded.long()
+
+
+def _circulant_spectrum(gp, values, spacing, size, reference):
+    """Spectrum ``(λ, N)`` of a circulant embedding of the kernel's Toeplitz matrix on ``size`` grid points.
+
+    The first row ``k(0), k(h), …, k((m - 1) h)`` of the (padded) grid is
+    mirrored to a symmetric circulant of order ``N = 2 (m - 1)`` whose
+    eigenvalues are the FFT of that row (real). The embedding is doubled up to
+    twice if some eigenvalue is more negative than round-off; ``None`` if it
+    never becomes positive semi-definite.
+    """
+    for padded in (size, 2 * size, 4 * size):
+        lags = spacing * torch.arange(max(padded, 2), dtype=reference.dtype, device=reference.device)
+        row = gp.kernel(torch.zeros(1, 1, dtype=reference.dtype, device=reference.device), lags.unsqueeze(-1), parameter_values=values)[0]
+        embedded = torch.cat([row, row[1:-1].flip(0)])
+        spectrum = torch.fft.fft(embedded).real
+        if bool(spectrum.min() >= -1e-9 * spectrum.max().clamp_min(1e-300)):
+            return spectrum, embedded.shape[0]
+    return None
+
+
+def _toeplitz_matheron(gp, x, new, observed, values, mean_values, noise, n_samples, extra_noise=None):
+    r"""Posterior draws ``(n_samples, n*)`` at new points on the training grid by Matheron's rule, or ``None``.
+
+    With prior draws ``g`` of the zero-mean GP on the grid extended to cover
+    the training and new points (circulant embedding and FFT, ``O(m log m)``)
+    and ``ε ~ N(0, σ² I)``, ``m(X*) + g_* + K_*X T⁻¹ (y - m(X) - g_X - ε)`` is an
+    exact posterior draw: ``T⁻¹`` is solved by Levinson's recursion and the
+    product with ``K_*X`` is a Toeplitz matrix-vector product by FFT. No
+    covariance matrix over the new inputs is formed. Returns ``None`` when
+    the new inputs are not on the training grid or the circulant embedding
+    is not positive semi-definite (the caller then forms the dense conditional).
+    """
+    positions = _grid_positions(x, new)
+    if positions is None:
+        return None
+    n = x.shape[0]
+    start, stop = min(0, int(positions.min())), max(n - 1, int(positions.max()))
+    spectrum = _circulant_spectrum(gp, values, x[1, 0] - x[0, 0], stop - start + 1, x)
+    if spectrum is None:
+        return None
+    eigenvalues, order = spectrum
+    train, target = torch.arange(n, device=x.device) - start, positions - start
+    pairs = (n_samples + 1) // 2
+    shape = (pairs, order)
+    weights = (eigenvalues.clamp_min(0.0) / order).sqrt() * torch.complex(
+        torch.randn(shape, dtype=x.dtype, device=x.device), torch.randn(shape, dtype=x.dtype, device=x.device)
+    )
+    draws = torch.fft.fft(weights, dim=-1)
+    prior = torch.cat([draws.real, draws.imag])[:n_samples, : stop - start + 1]
+    column, _ = gp._first_column(x, values, noise)
+    residual = observed - gp.mean(x, parameter_values=mean_values) - prior[:, train]
+    residual = residual - torch.as_tensor(noise, dtype=x.dtype, device=x.device).clamp_min(0.0).sqrt() * torch.randn_like(residual)
+    solution, _ = levinson_solve(column, residual.transpose(0, 1))  # T⁻¹ r, (n, S)
+    padded = torch.zeros((n_samples, order), dtype=x.dtype, device=x.device)
+    padded[:, train] = solution.transpose(0, 1)
+    cross = torch.fft.ifft(eigenvalues * torch.fft.fft(padded, dim=-1), dim=-1).real[:, target]  # K_*X T⁻¹ r
+    result = gp.mean(new, parameter_values=mean_values) + prior[:, target] + cross
+    if extra_noise is not None:
+        result = result + torch.as_tensor(extra_noise, dtype=x.dtype, device=x.device).sqrt() * torch.randn_like(result)
+    return result
+
+
 def _check_stationary(kernel):
     if isinstance(kernel, (SumKernel, ProductKernel)):
         for part in kernel.kernels:
@@ -730,8 +833,19 @@ class ToeplitzGP(_GPDistribution):
     with the lengthscale); use :class:`ExactGP` for them. The recursion is
     sequential in :math:`N`, so a dense Cholesky factorisation stays
     competitive up to one or two thousand points; beyond that, and for memory,
-    the recursion wins. Predictive sampling forms dense matrices over the new
-    inputs, so predict on modest windows.
+    the recursion wins.
+
+    Posterior predictive sampling at new inputs that lie on the training grid
+    (training points, interior points and extrapolation to either side, any
+    order, repeats allowed) uses Matheron's rule: prior draws on the extended
+    grid by circulant embedding and FFT, :math:`\mathcal{O}(m \log m)`, plus one
+    Levinson solve per draw and a Toeplitz product by FFT, so no covariance
+    matrix over the new inputs is formed. New inputs off the grid, or kernels
+    whose circulant embedding is not positive semi-definite (e.g. a
+    :class:`~BayesianDLL.GP.Periodic` part with a period that does not fit the
+    window, or a very long lengthscale; the embedding is doubled twice before
+    giving up), fall back to the dense conditional over the new inputs, which
+    needs ``O(n*^2)`` memory.
     """
 
     def __init__(self, name, inputs, kernel: Kernel, noise_variance=1e-6, mean=None, jitter=1e-6, spacing_tolerance=1e-6):
@@ -895,6 +1009,9 @@ class ToeplitzGP(_GPDistribution):
         mean_values = {p.name: resolve(p) for p in self.mean.parameters if _is_named(p)}
         noise = _resolved_value(self.noise_variance, dtype, device).reshape(-1)[0]
         column, _ = self._first_column(x, values, noise)
+        grid_draws = _toeplitz_matheron(self, x, new, observed_values, values, mean_values, noise, n_samples)
+        if grid_draws is not None:
+            return grid_draws
         cross = self.kernel(x, new, parameter_values=values)
         rhs = torch.cat([(observed_values - self.mean(x, parameter_values=mean_values)).reshape(n, 1), cross], dim=1)
         solution, _ = levinson_solve(column, rhs)
@@ -908,6 +1025,9 @@ class ToeplitzGP(_GPDistribution):
 def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
     r"""Sample predictions of a :class:`ToeplitzGP` at arbitrary new 1-D inputs.
 
+    New inputs on the training grid are sampled by Matheron's rule (FFT prior
+    draws and Levinson solves, with no ``n* x n*`` matrix; see
+    :class:`ToeplitzGP`). Otherwise
     ``mean = m(X*) + K_*X α`` and ``cov = K_** - K_*X T⁻¹ K_X*``, where the
     solves use :func:`levinson_solve` with ``n*`` right-hand sides
     (``O(n² n*)``; no ``n x n`` matrix is formed), ``T = K + σ² I`` plus
@@ -936,6 +1056,11 @@ def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, obse
         values = _draw(parameter_draws, draw_index)
         mean_values = _draw(mean_draws, draw_index)
         noise = noise_draws[draw_index].reshape(-1)[0]
+        extra = None if observation_noise is None else _resolved_value(observation_noise, dtype, device).reshape(-1)[0]
+        grid_draws = _toeplitz_matheron(gp, x, new, observed_values, values, mean_values, noise, n_samples, extra)
+        if grid_draws is not None:
+            outputs.append(grid_draws)
+            continue
         column, _ = gp._first_column(x, values, noise)
         cross = gp.kernel(x, new, parameter_values=values)  # (n, n*)
         rhs = torch.cat([(observed_values - gp.mean(x, parameter_values=mean_values)).reshape(n, 1), cross], dim=1)
