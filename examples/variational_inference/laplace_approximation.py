@@ -9,6 +9,11 @@ of the model's gradient), and approximates the posterior by the Gaussian
 marginal likelihood. The method is cheap and accurate when the posterior is
 close to Gaussian in the unconstrained coordinates.
 
+``hessian="fd"`` (default) is the exact Hessian. ``hessian="ggn"`` uses the
+positive semi-definite generalised Gauss-Newton matrix instead, which is the
+better choice for neural networks (see the Bayesian neural network example).
+For the canonical logit link of the logistic regression below both agree.
+
 Two models are approximated, each with an exact or sampled reference:
 
 1. **Beta-Bernoulli.** A success probability ``p ~ Beta(2, 2)`` with 30 coin
@@ -81,6 +86,8 @@ with Model() as logistic_model:
         ObservedParameter("y", Bernoulli(logits=logits), labels)
 
 logistic_laplace = laplace_approximation(logistic_model, map_epochs=500, lr=0.05)
+logistic_ggn = laplace_approximation(logistic_model, map_epochs=500, lr=0.05, hessian="ggn")
+print("Gauss-Newton Laplace sd:", logistic_ggn.cov.diagonal().sqrt().tolist())
 laplace_trace = logistic_laplace.sample(4000)
 nuts_trace = logistic_model.sample(n_samples=1000, warmup_length=500, n_chains=4, progress_bar=False, seed=1, delta=0.9,
                                   chain_method="vectorized")
