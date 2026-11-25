@@ -559,7 +559,7 @@ class LatentGP(DeterministicParameter):
 
 def _same_tensors(first, second):
     return len(first) == len(second) and all(
-        a.shape == b.shape and a.dtype == b.dtype and torch.equal(a, b) for a, b in zip(first, second)
+        a.shape == b.shape and a.dtype == b.dtype and a.device == b.device and torch.equal(a, b) for a, b in zip(first, second)
     )
 
 
@@ -1928,7 +1928,16 @@ class _HilbertLatentGP(LatentGP):
         pass
 
     def _basis(self, x, feature=None):
-        """``Φ(X)`` ``(B, n, M)`` for inputs ``(B, n, D)``; with ``feature = d`` its derivative w.r.t. ``x_d``."""
+        """``Φ(X)`` ``(B, n, M)`` for inputs ``(B, n, D)``; with ``feature = d`` its derivative w.r.t. ``x_d``.
+
+        ``Φ(X)`` of the last inputs is cached: with fixed inputs every log
+        density and gradient evaluation reuses it, and the comparison of the
+        inputs costs ``O(n D)`` instead of the ``O(n M)`` sines.
+        """
+        if feature is None:
+            cached = getattr(self, "_basis_cache", None)
+            if cached is not None and _same_tensors((cached[0],), (x,)):
+                return cached[1]
         result = None
         for d, (frequencies, centre, boundary) in enumerate(zip(self._axis_frequencies, self._basis_centre, self._basis_boundary)):
             frequencies = frequencies.to(dtype=x.dtype, device=x.device)
@@ -1939,6 +1948,8 @@ class _HilbertLatentGP(LatentGP):
             else:
                 values = torch.sin(angle) / boundary.sqrt()
             result = values if result is None else (result.unsqueeze(-1) * values.unsqueeze(-2)).flatten(-2)
+        if feature is None:
+            self._basis_cache = (x.detach().clone(), result.detach())
         return result
 
     def _batched_function(self, values, flags):
