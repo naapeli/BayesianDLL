@@ -300,6 +300,6 @@ for ax in axes[1]:
     ax.set_xlabel("x")
 for ax in axes[:, 0]:
     ax.set_ylabel("f(x)")
-axes[1, 1].legend(fontsize="small", loc="lower right")
+axes[1, 1].legend(fontsize="small", loc="upper right")
 fig.suptitle("Four-hidden-layer Bayesian neural network (Linear & Tanh layers)")
 plt.show()
