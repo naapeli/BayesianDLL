@@ -24,4 +24,5 @@ Subpackages and Categories
    distributions/discrete
    distributions/multivariate
    distributions/compound
+   distributions/timeseries
    distributions/transforms
