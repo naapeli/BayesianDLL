@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request or branch cancels the older run
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest supported Python and the one the project is developed on
+        python-version: ["3.10", "3.13"]
+    env:
+      MPLBACKEND: Agg
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --locked --dev --python ${{ matrix.python-version }}
+
+      - name: Run the tests
+        run: uv run --no-sync --python ${{ matrix.python-version }} pytest
+
+  docs:
+    # Pushes to main build the full documentation in docs.yml; pull requests
+    # only check that the docs build, without running the gallery examples.
+    if: github.event_name == 'pull_request'
+    name: Docs build (examples not run)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      MPLBACKEND: Agg
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install dependencies
+        run: uv sync --locked --dev --group docs
+
+      - name: Build Sphinx documentation
+        run: uv run --no-sync make -C Docs html SPHINXOPTS="--keep-going -D plot_gallery=0"

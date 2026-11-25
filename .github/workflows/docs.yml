@@ -24,6 +24,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       MPLBACKEND: Agg
+      # Run four gallery examples at a time (one per runner core), each single-threaded
+      GALLERY_JOBS: "4"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
     steps:
       - name: Check out the code
         uses: actions/checkout@v4
@@ -37,7 +41,19 @@ jobs:
         run: uv python install
 
       - name: Install dependencies
-        run: uv sync --dev --group docs
+        run: uv sync --locked --dev --group docs
+
+      # sphinx-gallery re-runs only the examples whose own source changed, so
+      # the executed output is reused only when nothing the examples depend
+      # on (library, examples, dependencies, docs configuration) changed.
+      # There is deliberately no restore-keys fallback to an older cache.
+      - name: Restore executed gallery
+        uses: actions/cache@v4
+        with:
+          path: |
+            Docs/source/auto_examples
+            Docs/source/gen_modules
+          key: gallery-${{ runner.os }}-${{ hashFiles('BayesianDLL/**', 'examples/**', 'uv.lock', 'Docs/source/conf.py') }}
 
       - name: Build Sphinx documentation
         run: uv run --no-sync make -C Docs html SPHINXOPTS="--keep-going"
