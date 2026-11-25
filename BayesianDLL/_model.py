@@ -560,7 +560,7 @@ class Model:
                 result[name] = result[name] + grad
         return result
 
-    def _reverse_pass(self, param_names, nodes=None, active_terms=None, term_weights=None):
+    def _reverse_pass(self, param_names, nodes=None, active_terms=None, term_weights=None, seeds=None):
         """Hand-written reverse pass over the model graph.
 
         ``active_terms`` (a container or a predicate on term names) selects the
@@ -568,7 +568,10 @@ class Model:
         default. ``term_weights`` maps a term name to a tensor of the shape of
         its elementwise log density that multiplies that term elementwise
         (``None``: weight one), which yields the gradient of a weighted sum of
-        the terms' elementwise log densities.
+        the terms' elementwise log densities. ``seeds`` maps node names to
+        cotangents that start the pass in addition to the terms (with
+        ``active_terms=()`` the result is the vector-Jacobian product of the
+        seeded nodes w.r.t. the unconstrained ``param_names``).
         """
         if self.n_chains is not None and self._batch_mode != "loop":
             return self._batched_reverse_pass(param_names, nodes=nodes, active_terms=active_terms, term_weights=term_weights)
@@ -580,7 +583,7 @@ class Model:
             is_active = active_terms.__contains__
         term_weights = {} if term_weights is None else term_weights
 
-        cotangents: dict[str, torch.Tensor] = {}
+        cotangents: dict[str, torch.Tensor] = dict(seeds) if seeds else {}
 
         def add_param_grads(distribution, value, weight):
             param_grads = distribution.log_pdf_param_grads(value)

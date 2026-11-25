@@ -8,6 +8,7 @@ import torch
 from ._MAP import find_MAP
 from ._groups import LatentLayout
 from ._guide import trace_from_unconstrained
+from ._ggn import GaussNewtonCurvature, finite_difference_columns
 
 
 def _log_joint(model, layout, flat):
@@ -26,16 +27,16 @@ def finite_difference_hessian(model, layout, flat, step=None):
     Column ``j`` is ``(g(x + h_j e_j) - g(x - h_j e_j)) / (2 h_j)`` with
     ``h_j = step * max(1, |x_j|)``; the result is symmetrised.
     """
-    if step is None:
-        step = torch.finfo(flat.dtype).eps ** (1 / 3)
-    dim = flat.numel()
-    hessian = torch.empty(dim, dim, dtype=flat.dtype, device=flat.device)
-    for j in range(dim):
-        h = step * max(1.0, abs(float(flat[j])))
-        shift = torch.zeros_like(flat)
-        shift[j] = h
-        hessian[:, j] = (_gradient(model, layout, flat + shift) - _gradient(model, layout, flat - shift)) / (2 * h)
-    return 0.5 * (hessian + hessian.T)
+    return finite_difference_columns(lambda x: _gradient(model, layout, x), flat, step)
+
+
+def ggn_hessian(model, layout, flat, fd_step=None):
+    """Generalised Gauss-Newton approximation of the Hessian of the unconstrained log joint (negative semi-definite).
+
+    See :class:`~BayesianDLL.Variational._ggn.GaussNewtonCurvature`.
+    """
+    with model.temporarily_set_many(layout.unpack(flat)):
+        return -GaussNewtonCurvature(model, layout, fd_step).matrix
 
 
 def _stable_cholesky(matrix, jitter):
@@ -63,7 +64,9 @@ class LaplaceApproximation:
 
     Approximates the posterior distribution by a multivariate normal centered at the
     maximum a posteriori (MAP) estimate :math:`\eta^*` with covariance equal to the
-    inverse of the negative Hessian of the unconstrained log-joint density.
+    inverse of the negative Hessian of the unconstrained log-joint density. With
+    ``params`` (a subset of the latents) the Gaussian covers only those latents,
+    conditional on the others, which stay at their values at the mode.
 
     Parameters
     ----------
@@ -74,11 +77,14 @@ class LaplaceApproximation:
     mean : Tensor
         Mode :math:`\eta^*` in unconstrained space.
     hessian : Tensor
-        Hessian matrix :math:`H` of the unconstrained log-joint density at the mode.
+        Hessian matrix :math:`H` of the unconstrained log-joint density at the mode
+        (the generalised Gauss-Newton approximation for ``method="ggn"``).
     log_joint : Tensor or float
         Unconstrained log-joint density :math:`\log p(\eta^*, y)` evaluated at the mode.
     jitter : float
         Diagonal jitter added to ensure positive definiteness of :math:`-H`.
+    method : {"fd", "ggn"}, default "fd"
+        How ``hessian`` was computed.
 
     Attributes
     ----------
@@ -100,14 +106,17 @@ class LaplaceApproximation:
         :math:`d` the number of unconstrained values.
     names : list of str
         Names of the latent parameters in order.
+    method : str
+        ``"fd"`` or ``"ggn"``.
     """
 
-    def __init__(self, model, layout, mean, hessian, log_joint, jitter):
+    def __init__(self, model, layout, mean, hessian, log_joint, jitter, method="fd"):
         self.model = model
         self.layout = layout
         self.names = list(layout.names)
         self.mean = mean
         self.hessian = hessian
+        self.method = method
         negative = -hessian
         L, added = _stable_cholesky(negative, jitter)
         if added > 0:
@@ -145,65 +154,9 @@ class LaplaceApproximation:
         return f"LaplaceApproximation(params={self.names}, log_marginal_likelihood={float(self.log_marginal_likelihood):.4f})"
 
 
-def laplace_approximation(
-    model,
-    map_epochs=1000,
-    lr=1e-2,
-    betas=(0.9, 0.999),
-    newton_steps=20,
-    hessian="fd",
-    fd_step=None,
-    jitter=1e-10,
-    tolerance=1e-9,
-    verbose=False,
-):
-    r"""Compute the Laplace approximation of the model posterior.
-
-    Finds the maximum a posteriori (MAP) mode in unconstrained space (Adam steps from the
-    current values, refined by Newton steps with a backtracking line search) and approximates
-    the posterior distribution by a Gaussian :math:`\mathcal{N}(\eta^*, (-H)^{-1})`, where
-    :math:`H` is the Hessian of the unconstrained log joint (central finite differences of
-    the hand-written gradient, symmetrised). The model's parameters are left at the mode.
-
-    Parameters
-    ----------
-    model : Model
-        The probabilistic model to approximate.
-    map_epochs : int, default 1000
-        Number of Adam optimization steps to locate the mode. If 0, initial optimization is skipped.
-    lr : float, default 1e-2
-        Learning rate for Adam optimization.
-    betas : tuple of float, default (0.9, 0.999)
-        Betas momentum hyperparameters for Adam optimizer.
-    newton_steps : int, default 20
-        Maximum number of Newton refinement steps; Newton stops early when :math:`-H`
-        is not positive definite.
-    hessian : {"fd"}, default "fd"
-        Method used to evaluate the Hessian matrix.
-    fd_step : float, optional
-        Relative finite-difference step (default :math:`\epsilon^{1/3}` of the dtype).
-    jitter : float, default 1e-10
-        If :math:`-H` is not positive definite, a warning is issued and at least
-        ``jitter`` times the mean absolute diagonal of :math:`-H` is added to it.
-    tolerance : float, default 1e-9
-        Newton stops when the largest absolute gradient entry or step is below ``tolerance``.
-    verbose : bool, default False
-        Whether to display progress information during optimization.
-
-    Returns
-    -------
-    LaplaceApproximation
-        The fitted Gaussian approximation with sampling methods and marginal likelihood estimate.
-    """
-    model._capture_training_data()
-    if hessian != "fd":
-        raise ValueError(f"Unknown hessian method '{hessian}'; only 'fd' (finite differences of the gradient) is available.")
-    layout = LatentLayout(model, purpose="The Laplace approximation")
-    if map_epochs:
-        find_MAP(model, lr=lr, epochs=map_epochs, betas=betas, verbose=verbose)
-    x = layout.current(model)
-
-    for step in range(newton_steps):
+def _newton(model, layout, x, steps, tolerance, fd_step, verbose):
+    """Newton steps with the finite-difference Hessian and a backtracking line search."""
+    for step in range(steps):
         gradient = _gradient(model, layout, x)
         if float(gradient.abs().max()) < tolerance:
             break
@@ -227,8 +180,141 @@ def laplace_approximation(
             print(f"Newton step {step + 1} - Log_prob: {float(value):.6f}")
         if float((t * direction).abs().max()) < tolerance:
             break
+    return x
+
+
+def _gauss_newton(model, layout, x, steps, tolerance, damping, fd_step, verbose):
+    r"""Levenberg-Marquardt steps :math:`(A + \lambda s I)\,\delta = g` with the Gauss-Newton curvature ``A``.
+
+    ``s`` is the mean diagonal of ``A``. A step is accepted when it does not
+    decrease the log joint (``lambda`` is divided by 3), otherwise ``lambda``
+    is multiplied by 4 and the step is recomputed with the same curvature.
+    """
+    current = _log_joint(model, layout, x)
+    damping = max(damping, 1e-12)
+    identity = torch.eye(layout.dim, dtype=layout.dtype, device=layout.device)
+    for step in range(steps):
+        gradient = _gradient(model, layout, x)
+        if float(gradient.abs().max()) < tolerance:
+            break
+        with model.temporarily_set_many(layout.unpack(x)):
+            curvature = GaussNewtonCurvature(model, layout, fd_step).matrix
+        scale = float(torch.diagonal(curvature).mean()) or 1.0
+        while damping < 1e16:
+            L, info = torch.linalg.cholesky_ex(curvature + damping * scale * identity)
+            if int(info) == 0:
+                delta = torch.cholesky_solve(gradient.unsqueeze(-1), L).squeeze(-1)
+                value = _log_joint(model, layout, x + delta)
+                if torch.isfinite(value) and value >= current:
+                    break
+            damping *= 4
+        else:
+            break
+        x = x + delta
+        improvement = float(value - current)
+        current = value
+        damping = max(damping / 3, 1e-12)
+        if verbose:
+            print(f"Gauss-Newton step {step + 1} - Log_prob: {float(value):.6f}, damping: {damping:.2e}")
+        if float(delta.abs().max()) < tolerance or improvement <= 1e-14 * max(1.0, abs(float(value))):
+            break
+    return x
+
+
+def laplace_approximation(
+    model,
+    map_epochs=1000,
+    lr=1e-2,
+    betas=(0.9, 0.999),
+    newton_steps=20,
+    hessian="fd",
+    fd_step=None,
+    jitter=1e-10,
+    tolerance=1e-9,
+    verbose=False,
+    params=None,
+    damping=1e-3,
+):
+    r"""Compute the Laplace approximation of the model posterior.
+
+    Finds the maximum a posteriori (MAP) mode in unconstrained space (Adam steps from the
+    current values, refined by Newton or Gauss-Newton steps) and approximates
+    the posterior distribution by a Gaussian :math:`\mathcal{N}(\eta^*, (-H)^{-1})`, where
+    :math:`H` is the Hessian of the unconstrained log joint. The model's parameters
+    are left at the mode.
+
+    Parameters
+    ----------
+    model : Model
+        The probabilistic model to approximate.
+    map_epochs : int, default 1000
+        Number of Adam optimization steps to locate the mode. If 0, initial optimization is skipped.
+    lr : float, default 1e-2
+        Learning rate for Adam optimization.
+    betas : tuple of float, default (0.9, 0.999)
+        Betas momentum hyperparameters for Adam optimizer.
+    newton_steps : int, default 20
+        Maximum number of refinement steps after Adam.
+    hessian : {"fd", "ggn"}, default "fd"
+        Curvature used for the refinement and for the covariance.
+
+        * ``"fd"``: the exact Hessian by central differences of the hand-written
+          gradient (symmetrised), refined by Newton steps with a backtracking line search
+          that stop early when :math:`-H` is not positive definite.
+        * ``"ggn"``: the generalised Gauss-Newton matrix, which works for every model and
+          is positive semi-definite by construction. Every likelihood term :math:`\log p(y \mid \eta)`
+          contributes :math:`J^\top F J`, with :math:`F` the Fisher information of its
+          distribution (``log_pdf_param_curvature``) and :math:`J` the Jacobian of the
+          distribution's arguments w.r.t. the unconstrained latents (one reverse pass through
+          the hand-written VJPs per argument element). Prior terms contribute their exact
+          negative Hessian (including the :math:`\log|\det J|` of the transforms), projected
+          onto the positive semi-definite matrices if it is not, as do likelihoods whose
+          distribution has no Fisher information and the summed-out terms of enumerated latents
+          (finite differences of the gradient). The refinement uses Levenberg-Marquardt steps.
+          It is exact for models with a Gaussian likelihood of fixed scale and arguments linear
+          in the latents; otherwise it replaces the observed information by the expected one.
+    fd_step : float, optional
+        Relative finite-difference step (default :math:`\epsilon^{1/3}` of the dtype).
+    jitter : float, default 1e-10
+        If :math:`-H` is not positive definite, a warning is issued and at least
+        ``jitter`` times the mean absolute diagonal of :math:`-H` is added to it.
+    tolerance : float, default 1e-9
+        The refinement stops when the largest absolute gradient entry or step is below ``tolerance``.
+    verbose : bool, default False
+        Whether to display progress information during optimization.
+    params : sequence of str or parameters, optional
+        Latents to approximate (subset, e.g. the last layer of a network). Adam optimises all
+        latents, the refinement and the Hessian then only the selected ones with the others
+        held at their values, so the result is the Gaussian approximation of the conditional
+        posterior of the subset. Default: all latents.
+    damping : float, default 1e-3
+        Initial Levenberg-Marquardt damping of ``hessian="ggn"``, relative to the mean
+        diagonal of the curvature.
+
+    Returns
+    -------
+    LaplaceApproximation
+        The fitted Gaussian approximation with sampling methods, predictive draws and marginal likelihood estimate.
+    """
+    model._capture_training_data()
+    if hessian not in ("fd", "ggn"):
+        raise ValueError(f"Unknown hessian method '{hessian}'; use 'fd' (finite differences of the gradient) or 'ggn' (Gauss-Newton).")
+    names = None if params is None else [getattr(p, "name", p) for p in params]
+    if names is not None:
+        unknown = [name for name in names if name not in model.params]
+        if unknown:
+            raise ValueError(f"Unknown latent parameter(s) {unknown}.")
+    layout = LatentLayout(model, purpose="The Laplace approximation", names=names)
+    if map_epochs:
+        find_MAP(model, lr=lr, epochs=map_epochs, betas=betas, verbose=verbose)
+    x = layout.current(model)
+
+    if hessian == "ggn":
+        x = _gauss_newton(model, layout, x, newton_steps, tolerance, damping, fd_step, verbose)
+    else:
+        x = _newton(model, layout, x, newton_steps, tolerance, fd_step, verbose)
 
     for name, value in layout.unpack(x).items():
         model.params[name].set_unconstrained_value(value.clone())
-    H = finite_difference_hessian(model, layout, x, fd_step)
-    return LaplaceApproximation(model, layout, x, H, _log_joint(model, layout, x), jitter)
+    H = ggn_hessian(model, layout, x, fd_step) if hessian == "ggn" else finite_difference_hessian(model, layout, x, fd_step)
+    return LaplaceApproximation(model, layout, x, H, _log_joint(model, layout, x), jitter, method=hessian)

@@ -355,8 +355,13 @@ class DeterministicParameter:
         else:
             raise RuntimeError("One should select an active model before creating random variables.")
 
+    #: A tensor that replaces the computed value while set (used by linearised Laplace predictions).
+    _value_override = None
+
     @property
     def constrained_value(self):
+        if self._value_override is not None:
+            return self._value_override
         model = self.owner_model
         if model is not None and model.n_chains is not None and self.name in model._batched_nodes:
             if model._batch_mode == "loop":
