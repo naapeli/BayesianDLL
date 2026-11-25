@@ -207,3 +207,82 @@ def test_subset_laplace_is_the_conditional_posterior():
         torch.testing.assert_close(again.cov, approximation.cov, atol=1e-6, rtol=1e-5)
     with pytest.raises(ValueError, match="Unknown latent"):
         laplace_approximation(model, map_epochs=0, params=["nothing"])
+
+
+def test_linearised_predictive_is_exact_for_linear_models():
+    model, X, y = _regression(scale=0.3, dynamic_plate=True)
+    approximation = laplace_approximation(model, map_epochs=0, hessian="ggn")
+    X_new = torch.randn(6, 3)
+    model.data["X"].set_value(X_new)
+    assert approximation.linearised_outputs() == ["f"]
+    result = approximation.predictive(n_samples=30000, samples_per_step=1, linearise=True)
+    f = result["f"]
+    design = torch.cat([X_new, torch.ones(6, 1)], dim=1)
+    torch.testing.assert_close(f.mean(0), design @ approximation.mean, atol=0.02, rtol=0)
+    torch.testing.assert_close(torch.cov(f.T), design @ approximation.cov @ design.T, atol=2e-4, rtol=0.06)
+    observations = result["y"]
+    assert observations.shape == (30000, 1, 6)
+    torch.testing.assert_close(observations[:, 0].var(0), torch.diagonal(design @ approximation.cov @ design.T) + 0.09, atol=3e-3, rtol=0.06)
+    plain = approximation.predictive(n_samples=30000, linearise=False)
+    torch.testing.assert_close(torch.cov(plain["f"].T), torch.cov(f.T), atol=1.5e-3, rtol=0.1)
+    assert model.deterministic_params["f"]._value_override is None
+
+
+def test_linearised_predictive_is_the_first_order_expansion_of_a_network():
+    torch.manual_seed(1)
+    x = torch.linspace(-2, 2, 30).unsqueeze(-1)
+    y = torch.sin(x[:, 0]) + 0.1 * torch.randn(30)
+    with Model() as model:
+        data = Data("x", x)
+        w1 = RandomParameter("w1", Normal(0.0, 1.0), shape=(1, 4), initial_value=torch.randn(1, 4))
+        b1 = RandomParameter("b1", Normal(0.0, 1.0), shape=(4,))
+        w2 = RandomParameter("w2", Normal(0.0, 1.0), shape=(4,), initial_value=torch.randn(4))
+        sigma = Exp("sigma", RandomParameter("log_sigma", Normal(-2.0, 0.5), initial_value=torch.tensor([-2.0])))
+        f = Linear("f", Tanh("h", Linear("lin", data, coefficients=w1, intercept=b1)), coefficients=w2)
+        with plate("obs", 30):
+            ObservedParameter("y", Normal(f, sigma), y)
+    approximation = laplace_approximation(model, map_epochs=300, lr=0.03, hessian="ggn", newton_steps=40)
+    assert approximation.linearised_outputs() == ["f"]
+    layout = approximation.layout
+
+    def network(vector):
+        values = layout.unpack(vector)
+        return torch.tanh(x @ values["w1"] + values["b1"]) @ values["w2"]
+
+    torch.manual_seed(5)
+    expected_draws = approximation.sample_unconstrained(50)
+    torch.manual_seed(5)
+    linear = approximation.predictive(n_samples=50, linearise=True)
+    jacobian = torch.autograd.functional.jacobian(network, approximation.mean)
+    expected = network(approximation.mean) + (expected_draws - approximation.mean) @ jacobian.T
+    torch.testing.assert_close(linear["f"], expected, atol=1e-8, rtol=1e-8)
+    nonlinear = approximation.predictive(n_samples=50, linearise=False)
+    assert nonlinear["f"].shape == linear["f"].shape == (50, 30)
+    assert not torch.allclose(nonlinear["f"], linear["f"])
+    # The noise scale is not an output: it is evaluated at the draws.
+    assert linear["y"].shape == (50, 1, 30)
+    with pytest.raises(ValueError, match="not a deterministic"):
+        approximation.predictive(n_samples=2, outputs=["w1"])
+
+
+def test_ggn_with_enumerated_latents():
+    """The summed-out mixture indicators are handled through the exact gradient of their group."""
+    y = torch.cat([torch.randn(12) - 2.0, torch.randn(28) + 2.0])
+    with Model() as model:
+        mu0 = RandomParameter("mu0", Normal(-2.0, 1.0), initial_value=torch.tensor([-1.0]))
+        mu1 = RandomParameter("mu1", Normal(2.0, 1.0), initial_value=torch.tensor([1.0]))
+        with plate("n", len(y)):
+            z = RandomParameter("z", Bernoulli(0.7), shape=(), marginalize=True)
+            mean = DeterministicParameter(
+                "mean", lambda a, b, z: a + (b - a) * z,
+                lambda a, b, z: {"mu0": 1 - z, "mu1": z}, [mu0, mu1, z],
+            )
+            ObservedParameter("y", Normal(mean, 1.0), y)
+    layout = LatentLayout(model)
+    curvature = GaussNewtonCurvature(model, layout)
+    assert torch.isfinite(curvature.matrix).all()
+    assert torch.linalg.eigvalsh(curvature.matrix).min() > -1e-8
+    before = model.model_log_prob()
+    approximation = laplace_approximation(model, map_epochs=0, hessian="ggn", newton_steps=30)
+    assert model.model_log_prob() > before
+    assert torch.isfinite(approximation.cov).all()

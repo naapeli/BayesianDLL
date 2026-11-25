@@ -8,7 +8,7 @@ import torch
 from ._MAP import find_MAP
 from ._groups import LatentLayout
 from ._guide import trace_from_unconstrained
-from ._ggn import GaussNewtonCurvature, finite_difference_columns
+from ._ggn import GaussNewtonCurvature, NodeJacobians, finite_difference_columns
 
 
 def _log_joint(model, layout, flat):
@@ -150,6 +150,85 @@ class LaplaceApproximation:
         draws = self.sample_unconstrained(n_chains * n_samples).reshape(n_chains, n_samples, self.layout.dim)
         return trace_from_unconstrained(self.model, self.layout, draws)
 
+    def linearised_outputs(self):
+        """Default outputs of :meth:`predictive`: the deterministic nodes that feed a likelihood and depend on ``Data``."""
+        model = self.model
+        jacobians = NodeJacobians(model, self.layout)
+        found = []
+        for observed in model.observed_params.values():
+            for name in observed.distribution.parameters:
+                if name in model.deterministic_params and name not in found and (jacobians.ancestors(name) & set(model.data)):
+                    found.append(name)
+        return found
+
+    def predictive(self, n_samples=100, samples_per_step=1, linearise=True, outputs=None, progress_bar=False):
+        r"""Posterior predictive draws, optionally through a linearisation of the model outputs.
+
+        With ``linearise=False`` this evaluates the model at ``n_samples`` draws of the
+        latents (like ``model.posterior_predicative(approximation.sample(n_samples))``).
+        With ``linearise=True`` every output node :math:`f(\theta)` is replaced by
+        its first-order expansion at the mode,
+        :math:`f(\theta) \approx f(\theta^*) + J (\theta - \theta^*)`, where
+        :math:`J` is the Jacobian w.r.t. the unconstrained latents (one reverse
+        pass per output element through the hand-written VJPs, at the current
+        ``Data``, so new inputs set with ``Data.set_value`` are predicted at),
+        so that the output is Gaussian with covariance :math:`J \Sigma J^\top`
+        (the *linearised* or GLM predictive). The remaining nodes, such as a
+        noise scale, are evaluated at the draws of :math:`\theta`. For models
+        that are linear in the latents the result is exact; for neural networks
+        it avoids the poor predictions of the nonlinear network at sampled
+        weights when the Gaussian is wide.
+
+        Parameters
+        ----------
+        n_samples : int, default 100
+            Number of draws of the latents.
+        samples_per_step : int, default 1
+            Observation draws per draw of the latents.
+        linearise : bool, default True
+            Linearise the output nodes.
+        outputs : sequence of str, optional
+            Names of the deterministic nodes to linearise. Default: the
+            deterministic arguments of the likelihoods that depend on ``Data``
+            (the model function, not scale parameters); none if there are none.
+        progress_bar : bool, default False
+            Whether to show a progress bar.
+
+        Returns
+        -------
+        PredicativeResult
+            Draws of shape ``(n_samples, samples_per_step, *predictive_shape)``; the
+            (linearised) values of the deterministic nodes are in ``deterministic``.
+        """
+        from ..Samplers._sample import _ancestral_predictive
+        model, layout = self.model, self.layout
+        draws = self.sample_unconstrained(n_samples)
+        names = [] if not linearise else (self.linearised_outputs() if outputs is None else list(outputs))
+        for name in names:
+            if name not in model.deterministic_params:
+                raise ValueError(f"'{name}' is not a deterministic node of the model.")
+        unconstrained = layout.unpack(draws)
+        others = {name: parameter.unconstrained_value for name, parameter in {**model.params, **model.enumerated_params}.items()
+                  if name not in unconstrained}
+        linear = {}
+        with model.temporarily_set_many(layout.unpack(self.mean)):
+            jacobians = NodeJacobians(model, layout)
+            for name in names:
+                value = jacobians.node_value(name)
+                moved = (draws - self.mean) @ jacobians.jacobian(name).T
+                linear[name] = (value.reshape(1, -1) + moved).reshape(n_samples, *value.shape)
+
+            def parameter_values(i):
+                for name, values in linear.items():
+                    model.deterministic_params[name]._value_override = values[i]
+                return {**others, **{name: value[i] for name, value in unconstrained.items()}}
+
+            try:
+                return _ancestral_predictive(model, n_samples, samples_per_step, parameter_values, progress_bar)
+            finally:
+                for name in linear:
+                    model.deterministic_params[name]._value_override = None
+
     def __repr__(self):
         return f"LaplaceApproximation(params={self.names}, log_marginal_likelihood={float(self.log_marginal_likelihood):.4f})"
 
@@ -282,8 +361,8 @@ def laplace_approximation(
         The refinement stops when the largest absolute gradient entry or step is below ``tolerance``.
     verbose : bool, default False
         Whether to display progress information during optimization.
-    params : sequence of str or parameters, optional
-        Latents to approximate (subset, e.g. the last layer of a network). Adam optimises all
+    params : sequence of str, optional
+        Names (or ``RandomParameter`` objects) of the latents to approximate, e.g. the last layer of a network. Adam optimises all
         latents, the refinement and the Hessian then only the selected ones with the others
         held at their values, so the result is the Gaussian approximation of the conditional
         posterior of the subset. Default: all latents.
