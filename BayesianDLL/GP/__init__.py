@@ -1,6 +1,6 @@
-"""Gaussian processes: latent and exact (optionally with inducing points) and
-structured (Kronecker grid and Toeplitz) models with hand-derived gradients,
-composable kernels and mean functions."""
+"""Gaussian processes: latent and exact (optionally with inducing points or Hilbert-space
+basis functions) and structured (Kronecker grid and Toeplitz) models with hand-derived
+gradients, composable and multi-output (coregionalisation) kernels and mean functions."""
 
 from ._kernels import (
     Kernel,
@@ -18,6 +18,7 @@ from ._kernels import (
     ProductKernel,
     ChangePoint,
 )
+from ._multioutput import IntrinsicCoregionalization, LinearCoregionalization
 from ._means import (
     MeanFunction,
     ZeroMean,
@@ -56,6 +57,8 @@ __all__ = [
     "SumKernel",
     "ProductKernel",
     "ChangePoint",
+    "LinearCoregionalization",
+    "IntrinsicCoregionalization",
     "MeanFunction",
     "ZeroMean",
     "ConstantMean",

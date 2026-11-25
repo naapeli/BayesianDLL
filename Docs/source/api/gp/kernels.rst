@@ -61,3 +61,11 @@ lengthscales and algebraic composition via sums and products.
 .. autoclass:: ChangePoint
    :members:
    :show-inheritance:
+
+.. autoclass:: LinearCoregionalization
+   :members:
+   :show-inheritance:
+
+.. autoclass:: IntrinsicCoregionalization
+   :members:
+   :show-inheritance:
