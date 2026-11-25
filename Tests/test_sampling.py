@@ -9,6 +9,7 @@ from BayesianDLL.Samplers import (
     FiniteGibbs, Metropolis, NUTS, PredicativeResult, SamplingBlock, SamplingResult,
     posterior_predicative,
 )
+from BayesianDLL.Samplers._metrics import inverse_metric_matrix
 from BayesianDLL.Samplers._sample import _build_blocks, _select_sampler
 
 
@@ -353,7 +354,7 @@ def test_nuts_mass_matrix_adaptation_learns_scales():
         theta, _, _, _ = sampler.step(theta, warmup=i < 400)
         if i >= 400:
             draws.append(theta.clone())
-    torch.testing.assert_close(torch.diagonal(sampler.inv_metric).sqrt(), scales, rtol=0.5, atol=0.0)
+    torch.testing.assert_close(torch.diagonal(inverse_metric_matrix(sampler.inv_metric)).sqrt(), scales, rtol=0.5, atol=0.0)
     torch.testing.assert_close(torch.stack(draws).std(dim=0), scales, rtol=0.2, atol=0.0)
     sampler.reset()
     assert sampler.inv_metric is None
