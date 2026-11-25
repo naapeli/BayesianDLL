@@ -406,6 +406,17 @@ class LatentGP(DeterministicParameter):
     smaller than :math:`k(x, x)` away from the inducing inputs, so they should cover
     the data (or be learned).
 
+    With ``n_basis`` the function is the Hilbert-space approximation (Solin & Särkkä,
+    2020; Riutort-Mayol et al., 2023) of a stationary kernel,
+    :math:`\mathbf{f} = \mathbf{m}(X) + \boldsymbol{\Phi}(X) \left(\sqrt{S(\sqrt{\boldsymbol{\lambda}})} \odot \mathbf{z}\right)`,
+    with the Laplacian eigenfunctions :math:`\phi_j(x) = L^{-1/2} \sin(\pi j (x - c + L) / (2L))`
+    and eigenvalues :math:`\lambda_j = (\pi j / (2L))^2` on :math:`[c - L, c + L]` per input
+    feature (tensor products for :math:`D > 1`) and the kernel's spectral density :math:`S`
+    (:class:`~BayesianDLL.GP.RBF`, :class:`~BayesianDLL.GP.Matern`,
+    :class:`~BayesianDLL.GP.SpectralMixture`, sums of these and products with
+    :class:`~BayesianDLL.GP.Constant`). It costs :math:`\mathcal{O}(N M)` per evaluation with no
+    matrix factorisation, and :math:`M = \prod_d m_d` latent values.
+
     Parameters
     ----------
     name : str
@@ -417,7 +428,8 @@ class LatentGP(DeterministicParameter):
         Covariance kernel function :math:`k(x_1, x_2)`.
     latent : RandomParameter, optional
         Standard normal latent parameter :math:`\mathbf{z}` with one value per input
-        (per inducing input with ``inducing_points``). If ``None``, it is created automatically.
+        (per inducing input with ``inducing_points``, per basis function with ``n_basis``).
+        If ``None``, it is created automatically.
     mean : MeanFunction, optional
         GP mean function :math:`m(x)`. Default is :class:`~BayesianDLL.GP.ZeroMean`.
     jitter : float, default 1e-6
@@ -427,21 +439,40 @@ class LatentGP(DeterministicParameter):
         Defaults to ``f"{name}_white"``.
     inducing_points : torch.Tensor or Data or Parameter, optional
         Inducing inputs :math:`Z` of shape ``(M, D)`` or ``(M,)``; may be learnable.
+    n_basis : int or sequence of int, optional
+        Number of basis functions :math:`m_d` per input feature (one number for all features)
+        of the Hilbert-space approximation.
+    boundary_factor : float, optional
+        Boundary factor :math:`c_b \geq 1` of the Hilbert-space approximation (default 1.5):
+        :math:`L = c_b S` for the half-range :math:`S` of the inputs (per feature, centred at
+        the midpoint :math:`c` of their range when the node is built).
 
     Notes
     -----
     Posterior predictive sampling at new inputs (set with ``Data.set_value``
     after fitting) draws the function from its GP conditional given the values
-    at the training inputs; with inducing points the function is simply
-    evaluated at the new inputs. Outside of prediction the inputs must keep one
-    row per latent value.
+    at the training inputs; with inducing points or basis functions the function
+    is simply evaluated at the new inputs. Outside of prediction the inputs of the
+    dense variant must keep one row per latent value.
+
+    The Hilbert-space approximation is accurate within roughly
+    :math:`[c - S, c + S]` when :math:`m_d` and :math:`c_b` are large enough for the
+    kernel's lengthscale (Riutort-Mayol et al. suggest :math:`c_b \geq 1.2` and
+    :math:`m_d \gtrsim 1.75 c_b S / l`); the basis functions vanish at :math:`c \pm L`, so
+    predictions beyond the training range need a larger ``boundary_factor``. The
+    boundary is fixed when the node is built, also for learnable inputs.
     """
 
     def __new__(cls, *args, **kwargs):
-        # LatentGP(...) builds the dense or the inducing-point variant; both are LatentGP instances.
+        # LatentGP(...) builds the dense, inducing-point or Hilbert-space variant; all are LatentGP instances.
         if cls is LatentGP:
             arguments = LatentGP.__signature__.bind(*args, **kwargs).arguments
-            cls = _DenseLatentGP if arguments.get("inducing_points") is None else _SparseLatentGP
+            sparse, basis = arguments.get("inducing_points") is not None, arguments.get("n_basis") is not None
+            if sparse and basis:
+                raise ValueError("LatentGP takes either inducing_points or n_basis, not both.")
+            if arguments.get("boundary_factor") is not None and not basis:
+                raise ValueError("LatentGP boundary_factor needs n_basis.")
+            cls = _SparseLatentGP if sparse else _HilbertLatentGP if basis else _DenseLatentGP
         return super().__new__(cls)
 
     def __init__(
@@ -454,6 +485,8 @@ class LatentGP(DeterministicParameter):
         jitter=1e-6,
         latent_name=None,
         inducing_points=None,
+        n_basis=None,
+        boundary_factor=None,
     ):
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
@@ -462,6 +495,7 @@ class LatentGP(DeterministicParameter):
 
         mean = as_mean_function(mean, "LatentGP")
         inducing_points = self._prepare_inducing(inducing_points)
+        self._prepare_basis(inputs, kernel, n_basis, boundary_factor)
         n = self._latent_count(inputs, inducing_points)
         if latent is None:
             latent = RandomParameter(latent_name or f"{name}_white", Normal(0.0, 1.0), shape=n)
@@ -503,6 +537,9 @@ class LatentGP(DeterministicParameter):
 
     def _capture_training_data(self):
         """Remember the training inputs (see :class:`ExactGP`); nothing to do by default."""
+
+    def _prepare_basis(self, inputs, kernel, n_basis, boundary_factor):
+        """Set up the basis functions of the Hilbert-space variant; nothing to do by default."""
 
     # -- vectorized chains -------------------------------------------------
     def batched_forward(self, input_values):
@@ -1332,7 +1369,8 @@ def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
     times from the noise-free GP conditional
     ``N(m(X*) + K_*X K⁻¹ (f - m(X)), K_** - K_*X K⁻¹ K_X*)``. With inducing
     points the function is deterministic given the whitened values (which the
-    trace must contain), ``f* = m(X*) + K_*Z L⁻ᵀ v``. A given
+    trace must contain), ``f* = m(X*) + K_*Z L⁻ᵀ v``, and with basis functions
+    (``n_basis``) it is the basis expansion ``f* = m(X*) + Φ(X*) (sqrt(S) ⊙ z)``. A given
     ``observation_noise`` variance (a scalar or one value per new input) is
     added. The result has shape
     ``(n_parameter_draws, n_samples, n_new)``.
@@ -1343,8 +1381,9 @@ def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
         raise TypeError("trace must be a SamplingResult or mapping-like object.")
     if n_samples < 1:
         raise ValueError("n_samples must be at least 1.")
-    if isinstance(gp, _SparseLatentGP):
-        samples = _sparse_latent_gp_predictive(gp, trace, inputs, n_samples=n_samples)
+    if isinstance(gp, (_SparseLatentGP, _HilbertLatentGP)):
+        predict = _sparse_latent_gp_predictive if isinstance(gp, _SparseLatentGP) else _hilbert_latent_gp_predictive
+        samples = predict(gp, trace, inputs, n_samples=n_samples)
         if observation_noise is not None:
             noise = _resolved_value(observation_noise, dtype=samples.dtype, device=samples.device)
             samples = samples + _noise_view(noise, (samples.shape[-1],), "observation_noise").sqrt() * torch.randn_like(samples)
@@ -1809,6 +1848,177 @@ class _SparseLatentGP(LatentGP):
             input_shape=shape_of(self.inputs[0], values[0]),
         )
         return grads
+
+
+# ----------------------------------------------------------------------------
+# Hilbert-space (reduced-rank) latent GP
+# ----------------------------------------------------------------------------
+
+
+class _HilbertLatentGP(LatentGP):
+    r""":class:`LatentGP` with ``n_basis``: ``f = m(X) + Φ(X) (sqrt(S(ω)) ⊙ z)`` (Hilbert-space approximation).
+
+    ``Φ_ik = Π_d φ_{d, j_d(k)}(x_id)`` with ``φ_{d,j}(x) = L_d^{-1/2} sin(ω_dj (x - c_d + L_d))``
+    and ``ω_dj = π j / (2 L_d)`` (``j = 1, …, m_d``); ``S`` is the kernel's spectral
+    density at ``ω_k = (ω_{1 j_1(k)}, …, ω_{D j_D(k)})``, so the kernel's
+    hyperparameters enter only through ``S`` and no matrix is factorised.
+
+    **Gradients** (hand-derived VJP). For a cotangent ``g`` of ``f`` let
+    ``h = Φᵀ g`` and ``a = sqrt(S) ⊙ z``: ``z`` gets ``sqrt(S) ⊙ h``; ``S`` gets
+    ``h ⊙ z / (2 sqrt(S))``, contracted with the kernel's spectral-density
+    derivatives for every hyperparameter; learnable inputs get
+    ``g_i Σ_k ∂Φ_ik/∂x_id a_k`` (one factor of the tensor product replaced by
+    its derivative ``L_d^{-1/2} ω_dj cos(…)``) plus the mean's input VJP; the
+    mean's parameters get the mean's VJP of ``g``.
+    """
+
+    _latent_unit = "basis function"
+
+    def _prepare_inducing(self, inducing_points):
+        return None
+
+    def _prepare_basis(self, inputs, kernel, n_basis, boundary_factor):
+        x = _as_tensor(_input_value(inputs))
+        if not x.is_floating_point():
+            x = x.to(torch.get_default_dtype())
+        x = x.reshape(-1, 1) if x.ndim <= 1 else x
+        if x.ndim != 2:
+            raise ValueError(f"LatentGP inputs must have shape (N,) or (N, D); got {tuple(x.shape)}.")
+        features = x.shape[1]
+        counts = (n_basis,) * features if isinstance(n_basis, int) and not isinstance(n_basis, bool) else tuple(n_basis)
+        if len(counts) != features or any(isinstance(m, bool) or not isinstance(m, int) or m < 1 for m in counts):
+            raise ValueError(
+                f"LatentGP n_basis must be a positive integer or one per input feature ({features}); got {n_basis!r}."
+            )
+        factor = 1.5 if boundary_factor is None else float(boundary_factor)
+        if not factor >= 1.0:
+            raise ValueError(f"LatentGP boundary_factor must be at least 1 (the inputs must lie inside the domain); got {factor}.")
+        lower, upper = x.min(dim=0).values, x.max(dim=0).values
+        half_range = (upper - lower) / 2.0
+        if not bool((half_range > 0).all()):
+            raise ValueError("Every input feature of a LatentGP with n_basis must vary over the inputs (they set its domain).")
+        self.gp_n_basis = counts
+        self.gp_boundary_factor = factor
+        self._basis_centre = ((upper + lower) / 2.0).detach().clone()
+        self._basis_boundary = (factor * half_range).detach().clone()
+        # Square roots of the Laplacian eigenvalues per feature, and the tensor-product frequencies (M, D).
+        self._axis_frequencies = [
+            torch.pi * torch.arange(1, m + 1, dtype=x.dtype, device=x.device) / (2.0 * boundary)
+            for m, boundary in zip(counts, self._basis_boundary)
+        ]
+        self._basis_frequencies = torch.cartesian_prod(*self._axis_frequencies).reshape(-1, features)
+        try:
+            kernel.spectral_density(self._basis_frequencies[:1])
+        except NotImplementedError as error:
+            raise TypeError(
+                "LatentGP with n_basis needs a stationary kernel with a closed-form spectral density: RBF, Matern "
+                f"(any nu), SpectralMixture, their sums and their products with Constant ({error})"
+            ) from None
+
+    def _latent_count(self, inputs, inducing_points):
+        return math.prod(self.gp_n_basis)
+
+    def _model_inputs(self, inputs, latent, inducing_points, mean):
+        return _with_parameters([inputs, latent, *self._kernel_parameters], mean.parameters)
+
+    def _derivative_function(self):
+        return None
+
+    def _finish_init(self, inducing_points):
+        pass
+
+    def _basis(self, x, feature=None):
+        """``Φ(X)`` ``(B, n, M)`` for inputs ``(B, n, D)``; with ``feature = d`` its derivative w.r.t. ``x_d``."""
+        result = None
+        for d, (frequencies, centre, boundary) in enumerate(zip(self._axis_frequencies, self._basis_centre, self._basis_boundary)):
+            frequencies = frequencies.to(dtype=x.dtype, device=x.device)
+            centre, boundary = centre.to(dtype=x.dtype, device=x.device), boundary.to(dtype=x.dtype, device=x.device)
+            angle = (x[..., d:d + 1] - centre + boundary) * frequencies  # (B, n, m_d)
+            if d == feature:
+                values = frequencies * torch.cos(angle) / boundary.sqrt()
+            else:
+                values = torch.sin(angle) / boundary.sqrt()
+            result = values if result is None else (result.unsqueeze(-1) * values.unsqueeze(-2)).flatten(-2)
+        return result
+
+    def _batched_function(self, values, flags):
+        """``(f, pieces)`` in batched form for input ``values`` with chain flags ``flags``."""
+        context = _BatchContext({id(node): bool(flag) for node, flag in zip(self.inputs, flags)})
+        z = context.value(self.inputs[1], raw=values[1])
+        z = z.reshape(z.shape[0], -1)
+        dtype, device = z.dtype, z.device
+        x = context.inputs(self.inputs[0], dtype, device, raw=values[0])
+        if x.shape[-1] != len(self.gp_n_basis):
+            raise ValueError(f"LatentGP '{self.name}' has basis functions for {len(self.gp_n_basis)} input features; got {x.shape[-1]}.")
+        raw = _raw_values(self.inputs, values)
+        kernel_values = context.kernel_values(self.gp_kernel, dtype, device, raw)
+        frequencies = self._basis_frequencies.to(dtype=dtype, device=device)
+        root = self.gp_kernel.batch_spectral_density(frequencies, kernel_values).clamp_min(0.0).sqrt()  # (B, M)
+        weights = root * z
+        basis = self._basis(x)
+        mean = _evaluate_mean(context, self.gp_mean, x, dtype, device, raw)
+        f = mean + (basis @ weights.unsqueeze(-1)).squeeze(-1)
+        return f, (context, x, z, kernel_values, frequencies, root, weights, basis, raw)
+
+    def _batched_vjp(self, cotangent, values, flags):
+        _, (context, x, z, kernel_values, frequencies, root, weights, basis, raw) = self._batched_function(values, flags)
+        g = cotangent.reshape(cotangent.shape[0], -1).to(dtype=z.dtype)
+
+        def shape_of(node):
+            value = _as_tensor(values[self.inputs.index(node)])
+            return tuple(value.shape[1:]) if context.is_batched(node) else tuple(value.shape)
+
+        projected = (basis.transpose(-2, -1) @ g.unsqueeze(-1)).squeeze(-1)  # h = Φᵀ g, (B, M)
+        latent = self.inputs[1]
+        latent_gradient = root * projected
+        grads = {latent.name: latent_gradient.reshape(latent_gradient.shape[0], *shape_of(latent))}
+        # d sqrt(S) = dS / (2 sqrt(S)); a spectral density that underflows to zero contributes nothing.
+        positive = root > 0
+        safe = torch.where(positive, root, torch.ones_like(root))
+        spectral_cotangent = torch.where(positive, projected * z / (2.0 * safe), torch.zeros_like(projected * z))
+        for name, derivative in self.gp_kernel.batch_spectral_density_derivatives(frequencies, kernel_values).items():
+            parameter = next(p for p in self._kernel_parameters if p.name == name)
+            _accumulate(grads, name, _to_parameter_shape(_contract_diagonal(spectral_cotangent, derivative), shape_of(parameter)))
+        inputs_node = self.inputs[0]
+        learnable_inputs = _is_learnable(inputs_node)
+        if learnable_inputs:
+            columns = [g * (self._basis(x, feature=d) @ weights.unsqueeze(-1)).squeeze(-1) for d in range(x.shape[-1])]
+            input_gradient = torch.stack(columns, dim=-1)  # (B, n, D)
+            _accumulate(grads, inputs_node.name, input_gradient.reshape(input_gradient.shape[0], *shape_of(inputs_node)))
+        # f = m(X) + Φ a: the mean parameters and the inputs get the mean's VJP of g.
+        _add_mean_gradients(
+            grads, self.gp_mean, context, x, g, shape_of, z.dtype, z.device, raw,
+            input_node=inputs_node if learnable_inputs else None, input_shape=shape_of(inputs_node),
+        )
+        return grads
+
+
+def _hilbert_latent_gp_predictive(gp, trace, new_inputs, n_samples=1, chunk_size=256):
+    """Values ``(n_parameter_draws, n_samples, n_new)`` of a Hilbert-space latent GP at new inputs.
+
+    The function is deterministic given the basis weights, so it is the basis
+    evaluated at ``new_inputs`` for every draw of ``trace`` (the samples per
+    draw are identical); draws are evaluated in batches of ``chunk_size``.
+    """
+    latent = torch.as_tensor(trace[gp.gp_latent.name])
+    dtype, device = latent.dtype, latent.device
+    z = latent.reshape(-1, latent.shape[-1])
+    n_draws = z.shape[0]
+    new = torch.as_tensor(_input_value(new_inputs)).to(dtype=dtype, device=device)
+    draws = {node.name: _draws_of(trace, node, n_draws, dtype, device) for node in gp.inputs[2:]}
+    outputs = []
+    for start in range(0, n_draws, chunk_size):
+        stop = min(start + chunk_size, n_draws)
+        values, flags = [new, z[start:stop]], [False, True]
+        for node in gp.inputs[2:]:
+            node_draws = draws[node.name]
+            batched = node_draws.shape[0] > 1
+            values.append(node_draws[start:stop] if batched else node_draws[0])
+            flags.append(batched)
+        f, _ = gp._batched_function(values, flags)
+        f = _expand_batch(f, stop - start)
+        outputs.append(f.unsqueeze(1).expand(stop - start, n_samples, f.shape[-1]))
+    return torch.cat(outputs)
 
 
 def _constructor_signature(init):

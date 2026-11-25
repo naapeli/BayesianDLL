@@ -114,6 +114,25 @@ def _scalar_derivative(matrix):
     return matrix.unsqueeze(1)
 
 
+def _spectral_frequencies(frequencies):
+    """Angular frequencies as a shared batch ``(1, M, D)``."""
+    return _feature_matrix(frequencies).unsqueeze(0)
+
+
+def _spectral_lengthscale_derivative(value, per_feature):
+    """Shape a spectral-density derivative ``(B, M, D)`` like the length-scale (``(B, 1, M)`` or ``(B, *shape, M)``)."""
+    if value[0].numel() == 1:
+        return per_feature.sum(dim=-1).unsqueeze(1)
+    per_feature = per_feature.movedim(-1, 1)
+    return per_feature.reshape(per_feature.shape[0], *value.shape[1:], per_feature.shape[-1])
+
+
+def _log_lengthscale_volume(lengthscale, features):
+    """``Σ_d log l_d`` ``(B,)`` for a length-scale ``(B, 1 or D)`` (a scalar one counts ``D`` times)."""
+    total = torch.log(lengthscale).sum(dim=-1)
+    return total * features if lengthscale.shape[-1] == 1 else total
+
+
 def _lengthscale_derivative(value, per_feature):
     """Shape a per-feature derivative ``(B, N, M, D)`` like the parameter.
 
@@ -420,6 +439,26 @@ class Kernel(ABC):
             blocks.append(self.batch_input_vjp(block, block, weights, parameter_values))
         return torch.cat(blocks, dim=1)
 
+    # ------------------------------------------------------------------
+    # Spectral density (stationary kernels; Hilbert-space latent GPs)
+    # ------------------------------------------------------------------
+    def spectral_density(self, frequencies, parameter_values=None):
+        r"""Spectral density :math:`S(\boldsymbol{\omega})` ``(M,)`` at angular frequencies ``(M, D)`` or ``(M,)``.
+
+        For a stationary kernel :math:`k(\boldsymbol{\tau}) = (2\pi)^{-D} \int
+        S(\boldsymbol{\omega}) e^{i \boldsymbol{\omega}^\top \boldsymbol{\tau}} d\boldsymbol{\omega}`.
+        Raises ``NotImplementedError`` for kernels without a closed-form spectral density.
+        """
+        return self.batch_spectral_density(_feature_matrix(frequencies), self._single_values(parameter_values))[0]
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        """``(B, M)`` spectral density at shared angular frequencies ``(M, D)``."""
+        raise NotImplementedError(f"{type(self).__name__} has no closed-form spectral density.")
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        """``{name: (B, *parameter_shape, M)}``: derivatives of :meth:`batch_spectral_density`."""
+        raise NotImplementedError(f"{type(self).__name__} has no closed-form spectral density.")
+
     def __add__(self, other):
         return SumKernel(self, other)
 
@@ -579,6 +618,30 @@ class RBF(_StationaryDiagonal, Kernel):
     def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
         _, lengthscale, _, _, covariance = self._geometry(x1, x2, parameter_values)
         return -_radial_input_vjp(cotangent * covariance, x1, x2, 1.0 / lengthscale.square())
+
+    def _spectral(self, frequencies, parameter_values):
+        omega = _spectral_frequencies(frequencies)
+        value, lengthscale = _blengthscale(self.lengthscale, parameter_values, omega, "RBF")
+        variance = _bscalar(self.variance, parameter_values, omega, "variance", "RBF")
+        features = omega.shape[-1]
+        # S(ω) = v (2π)^{D/2} Π_d l_d exp(-½ Σ_d l_d² ω_d²)
+        log_scale = torch.log(variance) + 0.5 * features * math.log(2.0 * math.pi) + _log_lengthscale_volume(lengthscale, features)
+        density = torch.exp(log_scale.unsqueeze(-1) - 0.5 * (omega * lengthscale.unsqueeze(-2)).square().sum(dim=-1))
+        return density, value, lengthscale, variance, omega
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        return self._spectral(frequencies, parameter_values)[0]
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        density, value, lengthscale, variance, omega = self._spectral(frequencies, parameter_values)
+        derivatives = {}
+        if _is_named(self.lengthscale):
+            scale = lengthscale.unsqueeze(-2)
+            per_feature = density.unsqueeze(-1) * (1.0 / scale - scale * omega.square())
+            derivatives[self.lengthscale.name] = _spectral_lengthscale_derivative(value, per_feature)
+        if _is_named(self.variance):
+            _accumulate_derivative(derivatives, self.variance.name, (density / variance.unsqueeze(-1)).unsqueeze(1))
+        return derivatives
 
 
 class Periodic(_StationaryDiagonal, Kernel):
@@ -763,6 +826,37 @@ class Matern(_StationaryDiagonal, Kernel):
         _, slope = self._correlation(argument, derivative=True)
         weights = cotangent * variance.reshape(-1, 1, 1) * math.sqrt(2.0 * self.nu) * self._radial(scaled_distance, slope)
         return _radial_input_vjp(weights, x1, x2, 1.0 / lengthscale.square())
+
+    def _spectral(self, frequencies, parameter_values):
+        omega = _spectral_frequencies(frequencies)
+        value, lengthscale = _blengthscale(self.lengthscale, parameter_values, omega, "Matern")
+        variance = _bscalar(self.variance, parameter_values, omega, "variance", "Matern")
+        features, nu = omega.shape[-1], self.nu
+        power = nu + 0.5 * features
+        # S(ω) = v 2^D π^{D/2} Γ(ν + D/2) (2ν)^ν / Γ(ν) Π_d l_d (2ν + Σ_d l_d² ω_d²)^{-(ν + D/2)}
+        constant = (
+            features * math.log(2.0) + 0.5 * features * math.log(math.pi) + math.lgamma(power)
+            - math.lgamma(nu) + nu * math.log(2.0 * nu)
+        )
+        base = 2.0 * nu + (omega * lengthscale.unsqueeze(-2)).square().sum(dim=-1)  # (B, M)
+        log_scale = torch.log(variance) + constant + _log_lengthscale_volume(lengthscale, features)
+        density = torch.exp(log_scale.unsqueeze(-1) - power * torch.log(base))
+        return density, value, lengthscale, variance, omega, base
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        return self._spectral(frequencies, parameter_values)[0]
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        density, value, lengthscale, variance, omega, base = self._spectral(frequencies, parameter_values)
+        derivatives = {}
+        if _is_named(self.lengthscale):
+            scale = lengthscale.unsqueeze(-2)
+            power = 2.0 * self.nu + omega.shape[-1]
+            per_feature = density.unsqueeze(-1) * (1.0 / scale - power * scale * omega.square() / base.unsqueeze(-1))
+            derivatives[self.lengthscale.name] = _spectral_lengthscale_derivative(value, per_feature)
+        if _is_named(self.variance):
+            _accumulate_derivative(derivatives, self.variance.name, (density / variance.unsqueeze(-1)).unsqueeze(1))
+        return derivatives
 
 
 class Matern32(Matern):
@@ -1004,6 +1098,50 @@ class SpectralMixture(Kernel):
         """Zero: the diagonal ``Σ_q w_q`` does not depend on ``x``."""
         return _zero_input_vjp(x, cotangent)
 
+    def _spectral(self, frequencies, parameter_values):
+        r"""``S(ω) = Σ_q w_q Π_d g_qd(ω_d)``, ``g = √(2π) l ½ [e⁻ + e⁺]``, ``e^∓ = exp(-½ l² (ω ∓ 2πμ)²)``."""
+        omega = _spectral_frequencies(frequencies)
+        weights_value, weights, frequency_value, frequencies, lengthscale_value, lengthscales = self._mixture(omega, parameter_values)
+        omega = omega.unsqueeze(1)  # (1, 1, M, D)
+        centre = 2.0 * torch.pi * frequencies.unsqueeze(-2)  # (B, Q, 1, 1 or D)
+        lengthscale = lengthscales.unsqueeze(-2)
+        below, above = omega - centre, omega + centre
+        minus = torch.exp(-0.5 * (lengthscale * below).square())
+        plus = torch.exp(-0.5 * (lengthscale * above).square())
+        factors = math.sqrt(2.0 * math.pi) * lengthscale * 0.5 * (minus + plus)  # (B, Q, M, D)
+        products = factors.prod(dim=-1)  # (B, Q, M)
+        density = (weights.unsqueeze(-1) * products).sum(dim=1)
+        return {
+            "density": density, "weights_value": weights_value, "weights": weights, "frequency_value": frequency_value,
+            "lengthscale_value": lengthscale_value, "lengthscale": lengthscale, "below": below, "above": above,
+            "minus": minus, "plus": plus, "factors": factors, "products": products,
+        }
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        return self._spectral(frequencies, parameter_values)["density"]
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        parts = self._spectral(frequencies, parameter_values)
+        weighted = parts["weights"][:, :, None, None] * _prod_except(parts["factors"])  # w_q Π_{d'≠d} g_qd'
+        lengthscale, minus, plus = parts["lengthscale"], parts["minus"], parts["plus"]
+        amplitude = math.sqrt(2.0 * math.pi) * lengthscale * 0.5
+        derivatives = {}
+        if _is_named(self.weights):
+            products = parts["products"]
+            _accumulate_derivative(derivatives, self.weights.name,
+                                   products.reshape(products.shape[0], *parts["weights_value"].shape[1:], products.shape[-1]))
+        if _is_named(self.lengthscales):
+            slope = parts["factors"] / lengthscale - amplitude * lengthscale * (minus * parts["below"].square() + plus * parts["above"].square())
+            per_feature = (weighted * slope).unsqueeze(2)  # (B, Q, 1, M, D)
+            _accumulate_derivative(derivatives, self.lengthscales.name,
+                                   _per_feature_derivative(parts["lengthscale_value"], per_feature).squeeze(-2))
+        if _is_named(self.frequencies):
+            slope = amplitude * lengthscale.square() * 2.0 * torch.pi * (minus * parts["below"] - plus * parts["above"])
+            per_feature = (weighted * slope).unsqueeze(2)
+            _accumulate_derivative(derivatives, self.frequencies.name,
+                                   _per_feature_derivative(parts["frequency_value"], per_feature).squeeze(-2))
+        return derivatives
+
 
 def _accumulate_derivative(derivatives, name, derivative):
     derivatives[name] = derivatives[name] + derivative if name in derivatives else derivative
@@ -1094,6 +1232,22 @@ class SumKernel(Kernel):
         """Sum rule: the parts' diagonal input VJPs added up."""
         return sum(_batch_kernel_diag_input_vjp(kernel, x, cotangent, parameter_values, chunk_size) for kernel in self.kernels)
 
+    def _spectral_parts(self):
+        if not all(isinstance(kernel, Kernel) for kernel in self.kernels):
+            raise NotImplementedError("A sum with a constant or a plain callable has no closed-form spectral density.")
+        return self.kernels
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        """The sum of the parts' spectral densities."""
+        return sum(kernel.batch_spectral_density(frequencies, parameter_values) for kernel in self._spectral_parts())
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        derivatives = {}
+        for kernel in self._spectral_parts():
+            for name, derivative in kernel.batch_spectral_density_derivatives(frequencies, parameter_values).items():
+                _accumulate_derivative(derivatives, name, derivative)
+        return derivatives
+
 
 class ProductKernel(Kernel):
     r"""Elementwise product of covariance kernels :math:`k = k_1 \cdot k_2 \cdot \dots` (also built with ``k1 * k2``).
@@ -1153,6 +1307,47 @@ class ProductKernel(Kernel):
                     weighted = weighted * diagonal
             result = result + _batch_kernel_diag_input_vjp(kernel, x, weighted, parameter_values, chunk_size)
         return result
+
+    def _spectral_parts(self, reference, parameter_values):
+        """``(kernel, scale, constants)``: the one stationary part and the product ``(B,)`` of the constant parts."""
+        stationary = [kernel for kernel in self.kernels if isinstance(kernel, Kernel) and not isinstance(kernel, Constant)]
+        others = [kernel for kernel in self.kernels if not (isinstance(kernel, Kernel) and not isinstance(kernel, Constant))]
+        if len(stationary) != 1 or any(callable(kernel) and not isinstance(kernel, Kernel) for kernel in others):
+            raise NotImplementedError(
+                "Only a product of one stationary kernel and constants has a closed-form spectral density."
+            )
+        values = [
+            _bscalar(kernel.variance, parameter_values, reference, "variance", "Constant") if isinstance(kernel, Constant)
+            else torch.as_tensor(kernel, dtype=reference.dtype, device=reference.device).reshape(1)
+            for kernel in others
+        ]
+        return stationary[0], others, values
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        """``c S(ω)`` for a product of a stationary kernel with spectral density ``S`` and constants ``c``."""
+        reference = _spectral_frequencies(frequencies)
+        kernel, _, values = self._spectral_parts(reference, parameter_values)
+        density = kernel.batch_spectral_density(frequencies, parameter_values)
+        for value in values:
+            density = value.unsqueeze(-1) * density
+        return density
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        reference = _spectral_frequencies(frequencies)
+        kernel, others, values = self._spectral_parts(reference, parameter_values)
+        density = kernel.batch_spectral_density(frequencies, parameter_values)
+        scale = math.prod(values) if values else torch.ones(1, dtype=reference.dtype, device=reference.device)
+        derivatives = {}
+        for name, derivative in kernel.batch_spectral_density_derivatives(frequencies, parameter_values).items():
+            _accumulate_derivative(derivatives, name, scale.reshape(-1, *([1] * (derivative.ndim - 1))) * derivative)
+        for index, other in enumerate(others):
+            if isinstance(other, Constant) and _is_named(other.variance):
+                rest = density
+                for other_index, value in enumerate(values):
+                    if other_index != index:
+                        rest = value.unsqueeze(-1) * rest
+                _accumulate_derivative(derivatives, other.variance.name, rest.unsqueeze(1))
+        return derivatives
 
 
 def _times_diagonal(derivative, weights):

@@ -2,7 +2,7 @@ Gaussian Process Models
 =======================
 
 Gaussian process prior and likelihood specifications for exact inference, latent GPs,
-sparse inducing-point approximations, and structured Kronecker/Toeplitz grids.
+sparse inducing-point and Hilbert-space approximations, and structured Kronecker/Toeplitz grids.
 
 .. currentmodule:: BayesianDLL.GP
 
