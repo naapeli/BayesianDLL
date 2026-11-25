@@ -303,3 +303,29 @@ def test_nuts_recovers_local_level_variances():
         assert abs(float(draws.mean()) - truth) < 3.5 * float(draws.std())
     # the posterior mean of the signal-to-noise ratio is close to the exact MAP-free reference from a dense grid
     assert float(q.std()) > 0 and float(h.std()) > 0
+
+
+def test_remembered_forward_pass_is_never_stale():
+    # The last Kalman forward pass is reused for identical inputs; any change must recompute.
+    from BayesianDLL.TimeSeries import _kalman
+
+    y = torch.randn(30, 1, generator=torch.Generator().manual_seed(0), dtype=torch.float64)
+    y[5] = float("nan")
+
+    def model(rho, sd):
+        transition = torch.tensor([[rho]], dtype=torch.float64)
+        return LinearGaussianStateSpace(transition, torch.ones(1, 1, dtype=torch.float64),
+                                        torch.tensor([[sd]], dtype=torch.float64), obs_cov=torch.tensor([[0.3]], dtype=torch.float64))
+
+    first, second = model(0.5, 1.0), model(0.7, 1.0)
+    reference = [first.log_pdf(y), second.log_pdf(y)]
+    _kalman._last_forward = None
+    fresh_gradients = first.log_pdf_param_grads(y)
+    for _ in range(2):
+        torch.testing.assert_close(first.log_pdf(y), reference[0])
+        torch.testing.assert_close(second.log_pdf(y), reference[1])
+    first.log_pdf(y)
+    for name, gradient in first.log_pdf_param_grads(y).items():
+        torch.testing.assert_close(gradient, fresh_gradients[name])
+    y[3] += 1.0
+    assert not torch.equal(first.log_pdf(y), reference[0])

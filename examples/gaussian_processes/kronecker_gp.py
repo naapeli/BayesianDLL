@@ -78,27 +78,41 @@ print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-
 # ------------------
 # ``kronecker_gp_predictive`` predicts on a list of axes (a new grid) or on
 # arbitrary points. With ``diagonal=True`` it only computes the pointwise
-# variances, which keeps the 3600-point prediction cheap.
+# variances, which keeps the 3600-point prediction cheap but makes the draws
+# independent across points. With ``diagonal=False`` and a new grid it draws
+# *joint* posterior samples by Matheron's rule on the union of the training
+# and new grids: Kronecker prior draws plus a Kronecker solve, so no
+# 3600 x 3600 covariance is formed. Joint draws are needed for any quantity
+# that mixes grid points, such as the average of the surface.
 
-draws = kronecker_gp_predictive(f, trace.thin(15), y, [axis_a, axis_b], n_samples=10, diagonal=True)
+thinned = trace.thin(15)
+draws = kronecker_gp_predictive(f, thinned, y, [axis_a, axis_b], n_samples=10, diagonal=True)
 draws = draws.reshape(-1, size, size)
 posterior_mean, posterior_sd = draws.mean(0), draws.std(0)
 
-fig, axes = plt.subplots(1, 4, figsize=(16, 4), layout="constrained")
+start = time.perf_counter()
+joint = kronecker_gp_predictive(f, thinned, y, [axis_a, axis_b], n_samples=1).reshape(-1, size, size)
+print(f"{joint.shape[0]} joint draws of the 60 x 60 surface in {time.perf_counter() - start:.2f} s")
+
+fig, axes = plt.subplots(1, 5, figsize=(20, 4), layout="constrained")
 extent = (0.0, 1.0, 0.0, 1.0)
 limits = dict(vmin=float(truth.min()) - 0.3, vmax=float(truth.max()) + 0.3, cmap="viridis", origin="lower", extent=extent)
-panels = [(truth, "True surface"), (y, "Noisy data (σ = 0.2)"), (posterior_mean, "Posterior mean")]
+panels = [(truth, "True surface"), (y, "Noisy data (σ = 0.2)"), (posterior_mean, "Posterior mean"), (joint[0], "One joint posterior draw")]
 for ax, (image, title) in zip(axes, panels):
     shown = ax.imshow(image.T, **limits)
     ax.set(title=title, xlabel="a", ylabel="b")
-fig.colorbar(shown, ax=axes[:3], shrink=0.85, label="f(a, b)")
-sd_image = axes[3].imshow(posterior_sd.T, cmap="magma", origin="lower", extent=extent)
-axes[3].set(title="Posterior sd", xlabel="a", ylabel="b")
-fig.colorbar(sd_image, ax=axes[3], shrink=0.85, label="sd")
+fig.colorbar(shown, ax=axes[:4], shrink=0.85, label="f(a, b)")
+sd_image = axes[4].imshow(posterior_sd.T, cmap="magma", origin="lower", extent=extent)
+axes[4].set(title="Posterior sd", xlabel="a", ylabel="b")
+fig.colorbar(sd_image, ax=axes[4], shrink=0.85, label="sd")
 plt.show()
 
 error = (posterior_mean - truth).abs().mean()
 print(f"mean absolute error of the posterior mean: {error:.3f} (noise sd 0.2)")
+average_joint = joint.mean(dim=(1, 2))
+average_pointwise = draws.mean(dim=(1, 2))
+print(f"sd of the surface average: {average_joint.std():.4f} from joint draws, "
+      f"{average_pointwise.std():.4f} from independent pointwise draws (true average {truth.mean():.3f})")
 
 # %%
 # Timing against ExactGP

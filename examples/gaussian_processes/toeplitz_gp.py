@@ -72,18 +72,28 @@ print(f"type-II MAP estimate in {elapsed:.1f} s: lengthscale {fitted['lengthscal
       f"variance {fitted['variance'].item():.2f}, noise sd {fitted['noise'].item() ** 0.5:.3f} (true 0.3)")
 
 # %%
-# Predictive distribution on a window and a forecast
+# Predictive distribution on the grid and a forecast
 # --------------------------------------------------
-# ``model.predict`` conditions on the training readings with Levinson solves
-# (one right-hand side per new input, so no ``n x n`` matrix is formed) and
-# draws the function from its posterior at the new inputs. The predictive
-# covariance over the new inputs is dense, so predict on a window. The band
-# widens beyond the last reading.
+# New inputs on the training grid (here the last 15 time units of readings
+# and 30 more beyond them, 900 points) are predicted with Matheron's rule:
+# prior draws on the extended grid by circulant embedding and FFT, one Levinson
+# solve per draw and a Toeplitz product by FFT. No covariance matrix over the
+# new inputs is formed, so the cost grows almost linearly in their number
+# (inputs off the grid fall back to a dense ``n* x n*`` conditional).
+# The band widens beyond the last reading.
 
-new_t = torch.linspace(45.0, 75.0, 60, dtype=torch.float64)
+new_t = t_all[900:1800]
 model.data["t"].set_value(new_t)
+start = time.perf_counter()
 draws = model.predict(map_result.mode(), samples_per_step=300)["f"].squeeze(0)
+print(f"{draws.shape[1]} predictive points, {draws.shape[0]} draws in {time.perf_counter() - start:.2f} s")
 lower, median, upper = torch.quantile(draws, torch.tensor([0.05, 0.5, 0.95], dtype=draws.dtype), dim=0)
+width = upper - lower
+inside = (new_t <= t[-1]).sum()
+covered = ((true_signal(new_t) >= lower) & (true_signal(new_t) <= upper))
+print(f"90% band width: {width[inside - 1]:.2f} at the last reading, {width[-1]:.2f} at t = {new_t[-1]:.0f}; "
+      f"the true signal is inside the band at {covered[:inside].float().mean():.0%} of the readings' times and "
+      f"{covered[inside:].float().mean():.0%} of the forecast")
 
 # %%
 # Timing against ExactGP

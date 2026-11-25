@@ -35,8 +35,29 @@ def _t(A):
     return A.swapaxes(-1, -2)
 
 
+# Inputs and result of the last forward pass (see kalman_forward).
+_last_forward = None
+
+
 def kalman_forward(y, mask, d, Tm, Z, H, RQR, a, P):
-    """Log likelihood per batch element, the cache the backward recursion needs and the final predicted ``a, P``."""
+    """Log likelihood per batch element, the cache the backward recursion needs and the final predicted ``a, P``.
+
+    The last call is remembered: a log density followed by its gradient at the same values (as in every
+    NUTS step) runs the recursion once. The result is a pure function of the inputs and is never modified
+    by the callers.
+    """
+    global _last_forward
+    inputs = (y, mask, d, Tm, Z, H, RQR, a, P)
+    if _last_forward is not None and all(
+        x.shape == c.shape and x.dtype == c.dtype and np.array_equal(x, c) for x, c in zip(inputs, _last_forward[0])
+    ):
+        return _last_forward[1]
+    result = _kalman_forward(*inputs)
+    _last_forward = (tuple(np.array(x, copy=True) for x in inputs), result)
+    return result
+
+
+def _kalman_forward(y, mask, d, Tm, Z, H, RQR, a, P):
     N, k = y.shape[0], y.shape[-1]
     mm = mask[..., :, None] * mask[..., None, :]
     Zs = Z[None] * mask[..., None]

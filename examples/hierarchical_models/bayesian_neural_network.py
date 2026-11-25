@@ -267,13 +267,18 @@ deep_functions = {label: network_outputs(draws) for label, draws in deep_draws.i
 
 # Gauss-Newton Laplace from the MAP estimate: Levenberg-Marquardt steps with the
 # generalised Gauss-Newton matrix, then the Gaussian over all weights and over
-# the last layer only. The network is linearised on the grid.
+# the last layer only. The network is linearised on the grid. ``damping`` is the
+# initial Levenberg-Marquardt damping, relative to the mean diagonal of the
+# curvature (it shrinks while the steps succeed and grows when they fail); the
+# value below is the default.
 deep_bnn.set_params(map_values)
 start = time.perf_counter()
-laplace_full = laplace_approximation(deep_bnn, map_epochs=0, hessian="ggn", newton_steps=100)
+laplace_full = laplace_approximation(deep_bnn, map_epochs=0, hessian="ggn", newton_steps=100, damping=1e-3)
 print(f"Deep BNN Gauss-Newton Laplace: {time.perf_counter() - start:.1f} s, "
       f"gradient norm {max(float(g.abs().max()) for g in deep_bnn.joint_grad_log_prob().values()):.2f}")
 laplace_last = laplace_approximation(deep_bnn, map_epochs=0, hessian="ggn", newton_steps=0, params=["w5", "b5"])
+# ``predictive`` linearises the deterministic inputs of the likelihood that depend on Data.
+print("Linearised outputs:", laplace_full.linearised_outputs())
 grid_inputs = ((grid_raw - x_deep_mean) / x_deep_std).unsqueeze(-1)
 x_in.set_value(grid_inputs)
 for label, approximation in (("Laplace (all weights)", laplace_full), ("Laplace (last layer)", laplace_last)):
@@ -295,6 +300,6 @@ for ax in axes[1]:
     ax.set_xlabel("x")
 for ax in axes[:, 0]:
     ax.set_ylabel("f(x)")
-axes[1, 1].legend(fontsize="small", loc="lower right")
+axes[1, 1].legend(fontsize="small", loc="upper right")
 fig.suptitle("Four-hidden-layer Bayesian neural network (Linear & Tanh layers)")
 plt.show()
