@@ -46,7 +46,7 @@ import time
 import matplotlib.pyplot as plt
 import torch
 
-from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, plate
+from BayesianDLL import Data, Guide, Model, ObservedParameter, RandomParameter, laplace_approximation, plate
 from BayesianDLL.Deterministic import Add, Exp, Linear, MatMul, Tanh
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.Variational import BBVI
@@ -176,6 +176,16 @@ plt.show()
 # * **NUTS from the MAP estimate**, two chains. Each chain explores one of the
 #   equivalent modes (see above), but the predicted functions agree, and the
 #   band is narrow where the data are and widens beyond them.
+# * **Gauss-Newton Laplace.** The exact Hessian of the log joint is indefinite
+#   at the Adam result, but the generalised Gauss-Newton matrix is positive
+#   semi-definite, so ``laplace_approximation(..., hessian="ggn")`` refines the
+#   mode with Levenberg-Marquardt steps and gives a Gaussian over all 242
+#   unconstrained values. Pushing that Gaussian through the network at sampled
+#   weights fails (the weights are widely spread and the network is highly
+#   nonlinear there), so ``predictive`` linearises the network around the mode
+#   instead. ``params=["w5", "b5"]`` restricts the Gaussian to the last layer
+#   (*last-layer Laplace*): it is cheap but, with the other weights fixed,
+#   it stays overconfident away from the data.
 
 h1_dim, h2_dim, h3_dim, h4_dim = 8, 8, 8, 8
 
@@ -193,7 +203,7 @@ x_deep = (x_deep_raw - x_deep_mean) / x_deep_std
 y_deep = (y_deep_raw - y_deep_mean) / y_deep_std
 
 with Model() as deep_bnn:
-    x_in = Data("x_in", x_deep.unsqueeze(-1))
+    x_in = Data("x_in", x_deep.unsqueeze(-1), event_ndim=1)
     w1 = RandomParameter("w1", Normal(0.0, 2.0), shape=(1, h1_dim),
                          initial_value=2.0 * torch.randn(1, h1_dim, dtype=torch.float64))
     b1 = RandomParameter("b1", Normal(0.0, 2.0), shape=(h1_dim,),
@@ -221,7 +231,7 @@ with Model() as deep_bnn:
     h3 = Tanh("h3", Linear("h3_lin", h2, coefficients=w3, intercept=b3))
     h4 = Tanh("h4", Linear("h4_lin", h3, coefficients=w4, intercept=b4))
     f_mlp = Linear("f_mlp", h4, coefficients=w5, intercept=b5)
-    with plate("deep_obs", n_deep):
+    with plate("deep_obs", x_in):
         ObservedParameter("y_deep", Normal(f_mlp, sigma_deep), y_deep)
 
 # Start at the MAP mode: random initial weights are far from the posterior mass.
@@ -253,19 +263,38 @@ def network_outputs(draws):
     return torch.stack(outputs)
 
 
-fig, axes = plt.subplots(1, 2, figsize=(13, 4.5), sharey=True, layout="constrained")
+deep_functions = {label: network_outputs(draws) for label, draws in deep_draws.items()}
+
+# Gauss-Newton Laplace from the MAP estimate: Levenberg-Marquardt steps with the
+# generalised Gauss-Newton matrix, then the Gaussian over all weights and over
+# the last layer only. The network is linearised on the grid.
+deep_bnn.set_params(map_values)
+start = time.perf_counter()
+laplace_full = laplace_approximation(deep_bnn, map_epochs=0, hessian="ggn", newton_steps=100)
+print(f"Deep BNN Gauss-Newton Laplace: {time.perf_counter() - start:.1f} s, "
+      f"gradient norm {max(float(g.abs().max()) for g in deep_bnn.joint_grad_log_prob().values()):.2f}")
+laplace_last = laplace_approximation(deep_bnn, map_epochs=0, hessian="ggn", newton_steps=0, params=["w5", "b5"])
+grid_inputs = ((grid_raw - x_deep_mean) / x_deep_std).unsqueeze(-1)
+x_in.set_value(grid_inputs)
+for label, approximation in (("Laplace (all weights)", laplace_full), ("Laplace (last layer)", laplace_last)):
+    deep_functions[label] = approximation.predictive(n_samples=100)["f_mlp"] * y_deep_std + y_deep_mean
+x_in.set_value(x_deep.unsqueeze(-1))
+
+fig, axes = plt.subplots(2, 2, figsize=(13, 8), sharex=True, sharey=True, layout="constrained")
 in_range = grid_raw.abs() <= 3.0
-for ax, (label, draws), color in zip(axes, deep_draws.items(), ("C1", "C4")):
-    f = network_outputs(draws)
+for ax, (label, f), color in zip(axes.flat, deep_functions.items(), ("C1", "C4", "C0", "C2")):
     q05, q95 = f.quantile(torch.tensor([0.05, 0.95], dtype=torch.float64), dim=0)
     error = (f.mean(0) - complex_signal(grid_raw))[in_range].square().mean().sqrt()
-    print(f"{label:>18}: RMS error of the predictive mean in the data range {error:.3f}")
+    print(f"{label:>22}: RMS error of the predictive mean in the data range {error:.3f}")
     ax.fill_between(grid_raw, q05, q95, color=color, alpha=0.25, label="90% band")
     ax.plot(grid_raw, f.mean(0), color=color, lw=2, label="predictive mean")
     ax.plot(grid_raw, complex_signal(grid_raw), "k--", label="true function")
     ax.scatter(x_deep_raw, y_deep_raw, color="black", s=10, zorder=3, label="data")
-    ax.set(title=label, xlabel="x", ylim=(-2.8, 2.8))
-axes[0].set_ylabel("f(x)")
-axes[1].legend(fontsize="small", loc="lower right")
+    ax.set(title=label, ylim=(-2.8, 2.8))
+for ax in axes[1]:
+    ax.set_xlabel("x")
+for ax in axes[:, 0]:
+    ax.set_ylabel("f(x)")
+axes[1, 1].legend(fontsize="small", loc="lower right")
 fig.suptitle("Four-hidden-layer Bayesian neural network (Linear & Tanh layers)")
 plt.show()

@@ -268,6 +268,19 @@ class Distribution(ABC):
         """
         pass
 
+    def log_pdf_param_curvature(self, x):
+        """Fisher information of :meth:`log_pdf` w.r.t. the parameters (positive semi-definite blocks).
+
+        Returns ``{(name_a, name_b): block}`` with the names of
+        :meth:`log_pdf_param_grads`, one entry per unordered pair of parameters
+        (zero blocks are left out); a block has the broadcast shape of
+        ``log_pdf(x)`` followed by the event dimensions of parameter ``a`` and
+        of parameter ``b``. Used by the Gauss-Newton Laplace approximation;
+        ``NotImplementedError`` for distributions without it.
+        """
+        from ._curvature import parameter_curvature
+        return parameter_curvature(self, x)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         """Draw ``n_samples`` samples of shape ``(n_samples, *batch_shape, *event_shape)``.
 
