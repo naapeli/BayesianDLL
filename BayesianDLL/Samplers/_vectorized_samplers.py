@@ -392,7 +392,7 @@ class VectorizedNUTS:
 
     def __init__(self, log_target, gradient, n_chains, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10,
                  kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0,
-                 adapt_mass_matrix=True, metric="dense"):
+                 adapt_mass_matrix=True, metric="low_rank"):
         from ._NUTS import _adaptation_windows
         check_metric(metric)
         self._windows = _adaptation_windows

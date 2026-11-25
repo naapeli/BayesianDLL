@@ -38,7 +38,7 @@ def _filter_sampler_params(cls, sampler_params):
     """Keep the settings ``cls`` understands.
 
     ``sample(..., **sampler_params)`` passes the same settings to every block,
-    e.g. ``metric="dense"`` is meant for NUTS and ignored by the discrete
+    e.g. ``metric="low_rank"`` is meant for NUTS and ignored by the discrete
     samplers. Settings that no sampler understands are rejected.
     """
     known = set().union(*(_tunable_arguments(c) for c in _SAMPLER_CLASSES.values()))

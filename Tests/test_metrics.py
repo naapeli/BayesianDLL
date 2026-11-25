@@ -188,8 +188,8 @@ def test_nuts_low_rank_momentum_kinetic_and_velocity_use_one_metric():
 
 
 def test_defaults_and_invalid_metric():
-    assert NUTS(lambda x: x, lambda x: x, lambda x: x).metric == "dense"
-    assert VectorizedNUTS(lambda x: x.sum(-1), lambda x: x, 2).metric == "dense"
+    assert NUTS(lambda x: x, lambda x: x, lambda x: x).metric == "low_rank"
+    assert VectorizedNUTS(lambda x: x.sum(-1), lambda x: x, 2).metric == "low_rank"
     with pytest.raises(ValueError, match="metric"):
         VectorizedNUTS(lambda x: x.sum(-1), lambda x: x, 2, metric="full")
 

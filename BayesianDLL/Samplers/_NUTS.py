@@ -115,7 +115,7 @@ class NUTS:
     adapt_mass_matrix : bool, default True
         Whether to adapt the metric during warmup; it is only adapted after
         :meth:`set_warmup_length` and for at least 20 warmup steps.
-    metric : {"low_rank", "dense", "diag", "ledoit_wolf", "oas", "auto"}, default "dense"
+    metric : {"low_rank", "dense", "diag", "ledoit_wolf", "oas", "auto"}, default "low_rank"
         The adapted inverse metric (an estimate of the posterior covariance).
 
         * ``"diag"``: the marginal variances.
@@ -143,7 +143,7 @@ class NUTS:
     selected point) and ``lp`` (log density at the selected point).
     """
 
-    def __init__(self, log_target, gradient, inverse_transformation, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True, metric="dense"):
+    def __init__(self, log_target, gradient, inverse_transformation, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True, metric="low_rank"):
         check_metric(metric)
         self.log_target = log_target
         self.gradient = gradient
