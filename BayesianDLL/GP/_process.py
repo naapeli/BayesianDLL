@@ -415,7 +415,10 @@ class LatentGP(DeterministicParameter):
     (:class:`~BayesianDLL.GP.RBF`, :class:`~BayesianDLL.GP.Matern`,
     :class:`~BayesianDLL.GP.SpectralMixture`, sums of these and products with
     :class:`~BayesianDLL.GP.Constant`). It costs :math:`\mathcal{O}(N M)` per evaluation with no
-    matrix factorisation, and :math:`M = \prod_d m_d` latent values.
+    matrix factorisation, and :math:`M = \prod_d m_d` latent values. With ``centred=True``
+    the latent values are the basis weights themselves,
+    :math:`\mathbf{f} = \mathbf{m}(X) + \boldsymbol{\Phi}(X) \boldsymbol{\beta}` with
+    :math:`\beta_k \sim \mathcal{N}(0, S(\sqrt{\lambda_k}))`.
 
     Parameters
     ----------
@@ -446,6 +449,13 @@ class LatentGP(DeterministicParameter):
         Boundary factor :math:`c_b \geq 1` of the Hilbert-space approximation (default 1.5):
         :math:`L = c_b S` for the half-range :math:`S` of the inputs (per feature, centred at
         the midpoint :math:`c` of their range when the node is built).
+    centred : bool, default False
+        Centred parameterisation of the Hilbert-space approximation (needs ``n_basis``):
+        the latent parameter (``f"{name}_weights"``) holds the basis weights with prior
+        standard deviations :math:`\sqrt{S(\sqrt{\lambda_k})}` (the deterministic node
+        ``f"{name}_basis_sd"``), and ``latent`` cannot be given. NUTS mixes better in
+        this form when the data determine the function well (many or precise
+        observations); the default non-centred form suits weakly informative data.
 
     Notes
     -----
@@ -472,6 +482,8 @@ class LatentGP(DeterministicParameter):
                 raise ValueError("LatentGP takes either inducing_points or n_basis, not both.")
             if arguments.get("boundary_factor") is not None and not basis:
                 raise ValueError("LatentGP boundary_factor needs n_basis.")
+            if arguments.get("centred") and not basis:
+                raise ValueError("LatentGP centred needs n_basis.")
             cls = _SparseLatentGP if sparse else _HilbertLatentGP if basis else _DenseLatentGP
         return super().__new__(cls)
 
@@ -487,6 +499,7 @@ class LatentGP(DeterministicParameter):
         inducing_points=None,
         n_basis=None,
         boundary_factor=None,
+        centred=False,
     ):
         if not isinstance(kernel, Kernel):
             raise TypeError("kernel must be an instance of BayesianDLL.GP.Kernel.")
@@ -495,10 +508,12 @@ class LatentGP(DeterministicParameter):
 
         mean = as_mean_function(mean, "LatentGP")
         inducing_points = self._prepare_inducing(inducing_points)
-        self._prepare_basis(inputs, kernel, n_basis, boundary_factor)
+        self._prepare_basis(inputs, kernel, n_basis, boundary_factor, centred)
         n = self._latent_count(inputs, inducing_points)
         if latent is None:
-            latent = RandomParameter(latent_name or f"{name}_white", Normal(0.0, 1.0), shape=n)
+            latent = self._make_latent(name, latent_name, kernel, n)
+        elif centred:
+            raise ValueError("LatentGP creates the basis weights itself when centred=True; latent cannot be given.")
         if not _is_named(latent) or isinstance(latent, Data):
             raise TypeError("latent must be a named model parameter node.")
         if latent.constrained_value.numel() != n:
@@ -538,8 +553,12 @@ class LatentGP(DeterministicParameter):
     def _capture_training_data(self):
         """Remember the training inputs (see :class:`ExactGP`); nothing to do by default."""
 
-    def _prepare_basis(self, inputs, kernel, n_basis, boundary_factor):
+    def _prepare_basis(self, inputs, kernel, n_basis, boundary_factor, centred):
         """Set up the basis functions of the Hilbert-space variant; nothing to do by default."""
+
+    def _make_latent(self, name, latent_name, kernel, n):
+        """The standard normal latent parameter created when ``latent`` is not given."""
+        return RandomParameter(latent_name or f"{name}_white", Normal(0.0, 1.0), shape=n)
 
     # -- vectorized chains -------------------------------------------------
     def batched_forward(self, input_values):
@@ -1855,6 +1874,75 @@ class _SparseLatentGP(LatentGP):
 # ----------------------------------------------------------------------------
 
 
+def _accumulate_spectral_gradients(grads, kernel, parameters, frequencies, kernel_values, root, cotangent, shape_of):
+    """Add the hyperparameter gradients of ``sqrt(S(ω))`` ``(B, M)`` for its cotangent ``(B, M)`` to ``grads``.
+
+    ``d sqrt(S) = dS / (2 sqrt(S))``; a spectral density that underflows to zero contributes nothing.
+    """
+    positive = root > 0
+    safe = torch.where(positive, root, torch.ones_like(root))
+    spectral_cotangent = torch.where(positive, cotangent / (2.0 * safe), torch.zeros_like(cotangent))
+    for name, derivative in kernel.batch_spectral_density_derivatives(frequencies, kernel_values).items():
+        parameter = next(p for p in parameters if p.name == name)
+        _accumulate(grads, name, _to_parameter_shape(_contract_diagonal(spectral_cotangent, derivative), shape_of(parameter)))
+
+
+class _HilbertBasisScale(DeterministicParameter):
+    """``sqrt(S(ω_k))`` ``(M,)``: the prior standard deviations of the weights of a centred Hilbert-space GP.
+
+    A function of the kernel's hyperparameters only; its VJP is the spectral
+    part of the non-centred :class:`_HilbertLatentGP` gradient.
+    """
+
+    def __init__(self, name, kernel, frequencies):
+        self.gp_kernel = kernel
+        self._basis_frequencies = frequencies
+        self._kernel_parameters = list(kernel.parameters)
+
+        def forward(*values):
+            return self._batched_function(values, [False] * len(values))[0][0]
+
+        def vjp(cotangent, *values):
+            flags = [False] * len(values)
+            return _finish(self._batched_vjp(_as_tensor(cotangent).unsqueeze(0), values, flags), False)
+
+        super().__init__(name, forward, None, list(self._kernel_parameters), vjp_func=vjp)
+
+    def _batched_function(self, values, flags):
+        context = _BatchContext({id(node): bool(flag) for node, flag in zip(self.inputs, flags)})
+        frequencies = self._basis_frequencies
+        raw = _raw_values(self.inputs, values)
+        kernel_values = context.kernel_values(self.gp_kernel, frequencies.dtype, frequencies.device, raw)
+        root = self.gp_kernel.batch_spectral_density(frequencies, kernel_values).clamp_min(0.0).sqrt()  # (B, M)
+        return root, (context, kernel_values, frequencies, root)
+
+    def _batched_vjp(self, cotangent, values, flags):
+        _, (context, kernel_values, frequencies, root) = self._batched_function(values, flags)
+
+        def shape_of(node):
+            value = _as_tensor(values[self.inputs.index(node)])
+            return tuple(value.shape[1:]) if context.is_batched(node) else tuple(value.shape)
+
+        grads = {}
+        cotangent = cotangent.reshape(cotangent.shape[0], -1).to(dtype=root.dtype)
+        _accumulate_spectral_gradients(grads, self.gp_kernel, self._kernel_parameters, frequencies, kernel_values,
+                                       root, cotangent, shape_of)
+        return grads
+
+    def batched_forward(self, input_values):
+        root, _ = self._batched_function(input_values, self._batched_flags())
+        return _expand_batch(root, self.owner_model.n_chains)
+
+    def batched_vjp(self, cotangent, input_values):
+        flags = self._batched_flags()
+        grads = self._batched_vjp(cotangent, input_values, flags)
+        result = {}
+        for node, flag in zip(self.inputs, flags):
+            if flag and node.name in grads:
+                result[node.name] = _expand_batch(grads[node.name], self.owner_model.n_chains)
+        return result
+
+
 class _HilbertLatentGP(LatentGP):
     r""":class:`LatentGP` with ``n_basis``: ``f = m(X) + Φ(X) (sqrt(S(ω)) ⊙ z)`` (Hilbert-space approximation).
 
@@ -1866,7 +1954,8 @@ class _HilbertLatentGP(LatentGP):
     **Gradients** (hand-derived VJP). For a cotangent ``g`` of ``f`` let
     ``h = Φᵀ g`` and ``a = sqrt(S) ⊙ z``: ``z`` gets ``sqrt(S) ⊙ h``; ``S`` gets
     ``h ⊙ z / (2 sqrt(S))``, contracted with the kernel's spectral-density
-    derivatives for every hyperparameter; learnable inputs get
+    derivatives for every hyperparameter (centred: ``a = z`` gets ``h``, and the
+    hyperparameters get theirs through :class:`_HilbertBasisScale`); learnable inputs get
     ``g_i Σ_k ∂Φ_ik/∂x_id a_k`` (one factor of the tensor product replaced by
     its derivative ``L_d^{-1/2} ω_dj cos(…)``) plus the mean's input VJP; the
     mean's parameters get the mean's VJP of ``g``.
@@ -1877,7 +1966,8 @@ class _HilbertLatentGP(LatentGP):
     def _prepare_inducing(self, inducing_points):
         return None
 
-    def _prepare_basis(self, inputs, kernel, n_basis, boundary_factor):
+    def _prepare_basis(self, inputs, kernel, n_basis, boundary_factor, centred):
+        self.gp_centred = bool(centred)
         x = _as_tensor(_input_value(inputs))
         if not x.is_floating_point():
             x = x.to(torch.get_default_dtype())
@@ -1918,8 +2008,19 @@ class _HilbertLatentGP(LatentGP):
     def _latent_count(self, inputs, inducing_points):
         return math.prod(self.gp_n_basis)
 
+    def _make_latent(self, name, latent_name, kernel, n):
+        if not self.gp_centred:
+            return super()._make_latent(name, latent_name, kernel, n)
+        if kernel.parameters:
+            scale = _HilbertBasisScale(f"{name}_basis_sd", kernel, self._basis_frequencies)
+        else:
+            scale = kernel.spectral_density(self._basis_frequencies).clamp_min(0.0).sqrt()
+        return RandomParameter(latent_name or f"{name}_weights", Normal(0.0, scale), shape=n)
+
     def _model_inputs(self, inputs, latent, inducing_points, mean):
-        return _with_parameters([inputs, latent, *self._kernel_parameters], mean.parameters)
+        # Centred: the hyperparameters enter through the prior of the weights, not through f.
+        kernel_parameters = [] if self.gp_centred else self._kernel_parameters
+        return _with_parameters([inputs, latent, *kernel_parameters], mean.parameters)
 
     def _derivative_function(self):
         return None
@@ -1962,10 +2063,14 @@ class _HilbertLatentGP(LatentGP):
         if x.shape[-1] != len(self.gp_n_basis):
             raise ValueError(f"LatentGP '{self.name}' has basis functions for {len(self.gp_n_basis)} input features; got {x.shape[-1]}.")
         raw = _raw_values(self.inputs, values)
-        kernel_values = context.kernel_values(self.gp_kernel, dtype, device, raw)
-        frequencies = self._basis_frequencies.to(dtype=dtype, device=device)
-        root = self.gp_kernel.batch_spectral_density(frequencies, kernel_values).clamp_min(0.0).sqrt()  # (B, M)
-        weights = root * z
+        if self.gp_centred:
+            kernel_values = frequencies = root = None
+            weights = z
+        else:
+            kernel_values = context.kernel_values(self.gp_kernel, dtype, device, raw)
+            frequencies = self._basis_frequencies.to(dtype=dtype, device=device)
+            root = self.gp_kernel.batch_spectral_density(frequencies, kernel_values).clamp_min(0.0).sqrt()  # (B, M)
+            weights = root * z
         basis = self._basis(x)
         mean = _evaluate_mean(context, self.gp_mean, x, dtype, device, raw)
         f = mean + (basis @ weights.unsqueeze(-1)).squeeze(-1)
@@ -1981,15 +2086,11 @@ class _HilbertLatentGP(LatentGP):
 
         projected = (basis.transpose(-2, -1) @ g.unsqueeze(-1)).squeeze(-1)  # h = Φᵀ g, (B, M)
         latent = self.inputs[1]
-        latent_gradient = root * projected
+        latent_gradient = projected if self.gp_centred else root * projected
         grads = {latent.name: latent_gradient.reshape(latent_gradient.shape[0], *shape_of(latent))}
-        # d sqrt(S) = dS / (2 sqrt(S)); a spectral density that underflows to zero contributes nothing.
-        positive = root > 0
-        safe = torch.where(positive, root, torch.ones_like(root))
-        spectral_cotangent = torch.where(positive, projected * z / (2.0 * safe), torch.zeros_like(projected * z))
-        for name, derivative in self.gp_kernel.batch_spectral_density_derivatives(frequencies, kernel_values).items():
-            parameter = next(p for p in self._kernel_parameters if p.name == name)
-            _accumulate(grads, name, _to_parameter_shape(_contract_diagonal(spectral_cotangent, derivative), shape_of(parameter)))
+        if not self.gp_centred:
+            _accumulate_spectral_gradients(grads, self.gp_kernel, self._kernel_parameters, frequencies, kernel_values,
+                                           root, projected * z, shape_of)
         inputs_node = self.inputs[0]
         learnable_inputs = _is_learnable(inputs_node)
         if learnable_inputs:

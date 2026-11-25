@@ -186,7 +186,7 @@ def _kernel(kind, lengthscale, variance):
     return Constant(variance) * RBF(lengthscale, 1.0)
 
 
-def _model(kind="rbf", d=1, learnable_inputs=False, likelihood="normal", n_basis=12, mean="linear"):
+def _model(kind="rbf", d=1, learnable_inputs=False, likelihood="normal", n_basis=12, mean="linear", centred=False):
     x, y = _series(d=d)
     with Model() as model:
         if learnable_inputs:
@@ -211,13 +211,17 @@ def _model(kind="rbf", d=1, learnable_inputs=False, likelihood="normal", n_basis
             mean_function = LinearMean(coefficients, RandomParameter("intercept", Normal(0.0, 1.0)))
         else:
             mean_function = None
-        f = LatentGP("f", inputs, kernel, mean=mean_function, n_basis=n_basis, boundary_factor=1.6)
+        f = LatentGP("f", inputs, kernel, mean=mean_function, n_basis=n_basis, boundary_factor=1.6, centred=centred)
         f.gp_latent.set_unconstrained_value(torch.randn(f.gp_latent.unconstrained_value.shape,
                                                          generator=torch.Generator().manual_seed(4), dtype=DTYPE))
         if likelihood == "normal":
             ObservedParameter("y", Normal(f, 0.3), y)
         else:
             ObservedParameter("y", Bernoulli(logits=f), (y > 0).to(DTYPE))
+    if centred:
+        # Weights of a typical size under their prior (standard deviations sqrt(S)).
+        sd = model.deterministic_params["f_basis_sd"].constrained_value
+        f.gp_latent.set_unconstrained_value(sd * f.gp_latent.constrained_value)
     return model, f, x
 
 
@@ -260,6 +264,30 @@ def test_gradients_match_finite_differences(kind, likelihood):
     _finite_difference_check(model)
 
 
+@pytest.mark.parametrize("likelihood", ["normal", "bernoulli"])
+@pytest.mark.parametrize("kind", ["matern32", "spectral_mixture", "scaled_rbf"])
+def test_centred_gradients_match_finite_differences(kind, likelihood):
+    model, f, _ = _model(kind, likelihood=likelihood, centred=True)
+    assert f.gp_latent.name == "f_weights" and "f_basis_sd" in model.deterministic_params
+    _finite_difference_check(model)
+
+
+def test_centred_with_learnable_inputs_matches_finite_differences():
+    model, _, _ = _model("rbf", d=2, learnable_inputs=True, n_basis=(6, 5), centred=True)
+    _finite_difference_check(model)
+
+
+def test_centred_is_a_reparameterisation_of_the_non_centred_form():
+    # With beta = sqrt(S) z both forms give the same function, and the log densities
+    # differ by the log Jacobian sum(log sqrt(S)) of z -> beta.
+    model, f, _ = _model("matern32")
+    centred_model, centred_f, _ = _model("matern32", centred=True)
+    root = centred_model.deterministic_params["f_basis_sd"].constrained_value
+    centred_f.gp_latent.set_unconstrained_value(root * f.gp_latent.constrained_value)
+    torch.testing.assert_close(centred_f.constrained_value, f.constrained_value)
+    torch.testing.assert_close(centred_model.model_log_prob(), model.model_log_prob() - root.log().sum())
+
+
 @pytest.mark.parametrize("kind", ["rbf", "matern32"])
 def test_two_dimensional_ard_with_learnable_inputs_matches_finite_differences(kind):
     model, _, _ = _model(kind, d=2, learnable_inputs=True, n_basis=(6, 5))
@@ -296,8 +324,9 @@ def test_vjp_matches_autograd_oracle():
 
 @pytest.mark.parametrize("kind", ["rbf", "spectral_mixture"])
 @pytest.mark.parametrize("learnable_inputs", [False, True])
-def test_batched_matches_chain_by_chain(kind, learnable_inputs):
-    model, _, _ = _model(kind, learnable_inputs=learnable_inputs)
+@pytest.mark.parametrize("centred", [False, True])
+def test_batched_matches_chain_by_chain(kind, learnable_inputs, centred):
+    model, _, _ = _model(kind, learnable_inputs=learnable_inputs, centred=centred)
     generator = torch.Generator().manual_seed(0)
     values = {}
     for name, parameter in model.params.items():
@@ -345,8 +374,9 @@ def _trace(model, n_draws=3, seed=0):
     return {name: torch.stack(values).unsqueeze(0) for name, values in draws.items()}
 
 
-def test_prediction_evaluates_the_basis_at_new_inputs():
-    model, f, x = _model("rbf")
+@pytest.mark.parametrize("centred", [False, True])
+def test_prediction_evaluates_the_basis_at_new_inputs(centred):
+    model, f, x = _model("rbf", centred=centred)
     trace = _trace(model)
     at_training = gp_predictive(f, trace, x, n_samples=2)
     torch.testing.assert_close(at_training[:, 0], trace["f"][0])
@@ -377,3 +407,11 @@ def test_validates_arguments():
             LatentGP("f", inputs, RBF(0.5), n_basis=4, latent=RandomParameter("z", Normal(0.0, 1.0), shape=5))
         f = LatentGP("g", inputs, RBF(0.5), n_basis=7)
         assert isinstance(f, LatentGP) and f.gp_latent.constrained_value.shape == (7,)
+        with pytest.raises(ValueError, match="centred needs n_basis"):
+            LatentGP("h", inputs, RBF(0.5), centred=True)
+        with pytest.raises(ValueError, match="latent cannot be given"):
+            LatentGP("i", inputs, RBF(0.5), n_basis=4, centred=True, latent=RandomParameter("w", Normal(0.0, 1.0), shape=4))
+        # A kernel without model parameters gives the weights fixed prior standard deviations.
+        fixed = LatentGP("j", inputs, RBF(0.5), n_basis=7, centred=True)
+        root = RBF(0.5).spectral_density(fixed._basis_frequencies).sqrt()
+        torch.testing.assert_close(fixed.gp_latent.distribution.sigma, root)
