@@ -1,12 +1,19 @@
 """
-NUTS With a Dense Mass Matrix
-=============================
+NUTS With a Dense or Low-Rank Mass Matrix
+==========================================
 
 NUTS adapts a mass matrix (``metric``) during warmup. ``metric="diag"`` learns
-one scale per coordinate; the default ``metric="dense"`` learns the full
-posterior covariance and therefore also removes linear correlations between
-coordinates. With few warmup draws per dimension the dense estimate is shrunk
-towards its diagonal, so it also works for models with many parameters.
+one scale per coordinate. ``metric="dense"`` learns the full posterior
+covariance and therefore also removes linear correlations between
+coordinates; with few warmup draws per dimension it is shrunk towards its
+diagonal, but it costs ``O(d^2)`` per leapfrog step. The default,
+``metric="low_rank"``, learns diagonal scales from the draws and gradients
+plus a few directions in which the scaled posterior is still much wider or
+narrower than a standard normal; it removes the dominant correlations at
+``O(d k)`` cost for ``k`` such directions and so scales to many parameters.
+``"ledoit_wolf"`` and ``"oas"`` are dense metrics from shrinkage estimators of
+the correlation matrix, and ``"auto"`` uses ``"dense"`` up to 50 parameters
+and ``"low_rank"`` above.
 
 The test case is a straight-line fit ``y = a + b x`` with a covariate that is
 away from zero (``x`` between 2 and 6) and a known noise level. Without
@@ -16,11 +23,12 @@ here the posterior is exactly Gaussian, so its density contours can be drawn
 for reference.
 
 A diagonal metric leaves a narrow diagonal ridge: NUTS needs a small step and
-longer trajectories. The dense metric turns the ridge into a round target and
-NUTS takes long steps with short trees. (Centring ``x``, as in the regression
-examples, removes the correlation too; the dense metric helps when no such
-reparameterisation is at hand.) The figures show the draws of both runs on the
-exact contours and compare step size, tree depth and ESS per second.
+longer trajectories. The dense and low-rank metrics turn the ridge into a
+round target and NUTS takes long steps with short trees. (Centring ``x``, as
+in the regression examples, removes the correlation too; the correlation-aware
+metrics help when no such reparameterisation is at hand.) The figures show the
+draws of the diagonal and low-rank runs on the exact contours and compare
+step size, tree depth and ESS per second of all three.
 """
 
 import time
@@ -58,7 +66,7 @@ with Model() as model:
         ObservedParameter("y", Normal(mu, noise), y)
 
 runs = {}
-for metric in ("diag", "dense"):
+for metric in ("diag", "dense", "low_rank"):
     start = time.perf_counter()
     result = model.sample(1000, 500, n_chains=4, seed=1, metric=metric, delta=0.85, progress_bar=False,
                           chain_method="vectorized")
@@ -66,7 +74,7 @@ for metric in ("diag", "dense"):
     ess = effective_sample_size({"c": result["coefficients"]})["c"].min().item()
     runs[metric] = {"result": result, "seconds": seconds, "ess": ess}
     stats = result.sample_stats
-    print(f"{metric:5s}: step size {stats['step_size'].double().mean():.4f}, "
+    print(f"{metric:8s}: step size {stats['step_size'].double().mean():.4f}, "
           f"mean tree depth {stats['tree_depth'].double().mean():.1f}, "
           f"leapfrog steps per draw {stats['n_leapfrog'].double().mean():.0f}, "
           f"min ESS {ess:.0f}, {seconds:.1f} s, ESS/s {ess / seconds:.0f}, "
@@ -83,10 +91,10 @@ offset = torch.stack([A, B], dim=-1) - posterior_mean
 density = torch.exp(-0.5 * torch.einsum("...i,ij,...j->...", offset, precision, offset))
 
 fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), layout="constrained")
-for ax, metric in zip(axes[:2], ("diag", "dense")):
+for ax, metric in zip(axes[:2], ("diag", "low_rank")):
     draws = runs[metric]["result"]["coefficients"].reshape(-1, 2)
     ax.contour(A, B, density, levels=[0.011, 0.135, 0.607], colors="black", linewidths=1, zorder=3)
-    ax.scatter(draws[:600, 0], draws[:600, 1], s=4, alpha=0.4, color="C0" if metric == "diag" else "C1")
+    ax.scatter(draws[:600, 0], draws[:600, 1], s=4, alpha=0.4, color="C0" if metric == "diag" else "C2")
     stats = runs[metric]["result"].sample_stats
     ax.set_title(f'metric="{metric}": step size {stats["step_size"].double().mean():.3f}, '
                  f'tree depth {stats["tree_depth"].double().mean():.1f}', fontsize="medium")
@@ -98,8 +106,8 @@ names = ["ESS per second", "leapfrog steps per draw"]
 values = {m: [runs[m]["ess"] / runs[m]["seconds"],
               runs[m]["result"].sample_stats["n_leapfrog"].double().mean().item()] for m in runs}
 positions = torch.arange(len(names), dtype=torch.float64)
-ax.bar(positions - 0.2, values["diag"], width=0.4, label='metric="diag"')
-ax.bar(positions + 0.2, values["dense"], width=0.4, label='metric="dense"')
+for offset_, metric in zip((-0.27, 0.0, 0.27), ("diag", "dense", "low_rank")):
+    ax.bar(positions + offset_, values[metric], width=0.26, label=f'metric="{metric}"')
 ax.set_xticks(positions, names)
 ax.set_yscale("log")
 ax.set_title("Efficiency (log scale)")

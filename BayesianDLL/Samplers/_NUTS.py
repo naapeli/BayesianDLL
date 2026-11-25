@@ -2,32 +2,15 @@ import torch
 import math
 from collections import namedtuple
 
+from ._metrics import (cast_metric, check_metric, dense_inverse_metric, low_rank_inverse_metric, low_rank_momentum,
+                       low_rank_valid, low_rank_velocity, metric_kind, needs_draws, resolve_metric, shrinkage_inverse_metric)
+
 
 Tree = namedtuple("Tree", ["theta_minus", "r_minus", "grad_minus", "theta_plus", "r_plus", "grad_plus", "theta_prime", "grad_prime", "log_prob_prime", "n_prime", "s_prime", "alpha_prime", "n_prime_alpha", "diverging", "r_prime"])
 
 def _dot(a, b):
     """Dot product that works for any-shape tensors (flattened)."""
     return (a * b).sum()
-
-def _dense_inverse_metric(covariance, n):
-    """Regularised dense inverse metric from the sample covariance ``(..., d, d)`` of ``n`` warmup draws.
-
-    A window with fewer than ``4 d`` draws gives a rank-deficient or very noisy
-    covariance, and directions it has not seen would otherwise get a (near)
-    zero variance, along which the sampler then barely moves. Its off-diagonal
-    terms are therefore kept with weight ``n / (4 d)`` and the rest is taken
-    from the diagonal; larger windows use the sample covariance as it is. The
-    result is then regularised towards a small multiple of the identity, as
-    in Stan.
-    """
-    d = covariance.shape[-1]
-    weight = min(1.0, n / (4.0 * d))
-    diagonal = torch.diag_embed(torch.diagonal(covariance, dim1=-2, dim2=-1))
-    covariance = weight * covariance + (1.0 - weight) * diagonal
-    identity = torch.eye(d, dtype=covariance.dtype, device=covariance.device)
-    inv_metric = (n / (n + 5.0)) * covariance + 1e-3 * (5.0 / (n + 5.0)) * identity
-    return 0.5 * (inv_metric + inv_metric.transpose(-2, -1))
-
 
 def _adaptation_windows(warmup_length, init_buffer=75, term_buffer=50, base_window=25):
     """Return the iterations that end a metric-adaptation window.
@@ -92,15 +75,16 @@ class NUTS:
     warmup the heuristic initial step size is kept. ``eps_0`` comes from
     the doubling/halving heuristic of Hoffman and Gelman (Algorithm 4).
 
-    Metric: Stan's windowed adaptation (see :func:`_adaptation_windows`):
-    within each slow window the draws are accumulated with Welford's online
-    algorithm (running mean and sum of squared deviations ``M2``, covariance
-    ``M2 / (n - 1)``), and at the window's end the inverse metric becomes the
-    regularised estimate ``n/(n + 5) * Sigma + 1e-3 * 5/(n + 5) * I`` and the
-    step size adaptation restarts. Until the first window ends the identity
-    is used. ``metric="dense"`` keeps the full covariance (momenta are drawn
-    as ``L^{-T} z`` with ``M^{-1} = L L^T``); if its Cholesky factorisation
-    fails, the previous metric is kept.
+    Metric: Stan's windowed adaptation (see :func:`_adaptation_windows`): the
+    draws of each slow window (and, for ``"low_rank"``, their gradients)
+    give a new inverse metric at the window's end and the step size
+    adaptation restarts. Until the first window ends the identity is used.
+    ``"diag"`` and ``"dense"`` use Welford's running mean and covariance
+    ``M2 / (n - 1)`` (regularised as ``n/(n + 5) * Sigma + 1e-3 * 5/(n + 5) * I``);
+    the estimators of the other options are in :mod:`BayesianDLL.Samplers._metrics`.
+    Dense momenta are drawn as ``L^{-T} z`` with ``M^{-1} = L L^T``; if the
+    Cholesky factorisation of a dense estimate fails, the previous metric is
+    kept.
 
     Parameters
     ----------
@@ -131,12 +115,24 @@ class NUTS:
     adapt_mass_matrix : bool, default True
         Whether to adapt the metric during warmup; it is only adapted after
         :meth:`set_warmup_length` and for at least 20 warmup steps.
-    metric : {"diag", "dense"}, default "dense"
-        The adapted inverse metric (posterior covariance estimate): the
-        full covariance (dense), or the marginal variances (diag).
-        A dense metric accounts for correlations between parameters; its
-        estimate is shrunk towards the diagonal when a window has few draws
-        per dimension.
+    metric : {"low_rank", "dense", "diag", "ledoit_wolf", "oas", "auto"}, default "low_rank"
+        The adapted inverse metric (an estimate of the posterior covariance).
+
+        * ``"diag"``: the marginal variances.
+        * ``"dense"``: the full covariance; correlations are accounted for,
+          but a window with fewer than ``4 d`` draws is shrunk towards the
+          diagonal (weight ``n / (4 d)`` on the off-diagonals). Needs
+          ``O(d^2)`` memory and ``O(d^2)`` work per leapfrog step.
+        * ``"ledoit_wolf"``, ``"oas"``: dense, from the Ledoit-Wolf or the
+          Oracle Approximating Shrinkage estimator of the window's
+          correlation matrix (shrunk towards the identity), rescaled by the
+          standard deviations.
+        * ``"low_rank"``: diagonal scales from draws and gradients plus a
+          low-rank correction along the directions in which the scaled
+          posterior is much wider or narrower than a standard normal (nutpie,
+          Seyboldt et al.); ``O(d k)`` work and memory per leapfrog step for
+          ``k`` directions.
+        * ``"auto"``: ``"dense"`` up to 50 dimensions, ``"low_rank"`` above.
 
     Notes
     -----
@@ -147,9 +143,8 @@ class NUTS:
     selected point) and ``lp`` (log density at the selected point).
     """
 
-    def __init__(self, log_target, gradient, inverse_transformation, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True, metric="dense"):
-        if metric not in ("diag", "dense"):
-            raise ValueError(f"metric must be 'diag' or 'dense', got {metric!r}.")
+    def __init__(self, log_target, gradient, inverse_transformation, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10, kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0, adapt_mass_matrix=True, metric="low_rank"):
+        check_metric(metric)
         self.log_target = log_target
         self.gradient = gradient
         self.inverse_transformation = inverse_transformation
@@ -168,8 +163,9 @@ class NUTS:
 
         # Inverse metric (posterior variance / covariance estimate). ``None``
         # means the identity, which is used until the first adaptation window
-        # ends. For ``metric="dense"`` it is a matrix whose Cholesky factor is
-        # kept in ``_inv_metric_chol``.
+        # ends. A diagonal metric is a vector, a dense one a matrix whose
+        # Cholesky factor is kept in ``_inv_metric_chol``, and a low-rank one a
+        # :class:`~BayesianDLL.Samplers._metrics.LowRankMetric`.
         self.inv_metric = None
         self._inv_metric_chol = None
         self.warmup_length = None
@@ -214,22 +210,43 @@ class NUTS:
         self._welford_n = 0
         self._welford_mean = None
         self._welford_m2 = None
+        self._window_draws = []
+        self._window_gradients = []
 
-    def _welford_update(self, theta):
+    def _estimator(self, dim):
+        """The estimator used for a state of ``dim`` dimensions (``"auto"`` resolved)."""
+        return resolve_metric(self.metric, dim)
+
+    def _welford_update(self, theta, grad=None):
+        """Add a warmup draw (and its gradient) to the current window's statistics."""
         theta = theta.detach().reshape(-1)
+        kind = self._estimator(theta.numel())
+        if needs_draws(kind):
+            if kind == "low_rank":
+                grad = grad.detach().reshape(-1)
+                if not bool(torch.isfinite(grad).all()):
+                    return
+                self._window_gradients.append(grad)
+            self._window_draws.append(theta)
+            self._welford_n += 1
+            return
         if self._welford_mean is None:
             self._welford_mean = torch.zeros_like(theta)
-            if self.metric == "dense":
+            if kind == "dense":
                 self._welford_m2 = torch.zeros(theta.numel(), theta.numel(), dtype=theta.dtype, device=theta.device)
             else:
                 self._welford_m2 = torch.zeros_like(theta)
         self._welford_n += 1
         delta = theta - self._welford_mean
         self._welford_mean = self._welford_mean + delta / self._welford_n
-        if self.metric == "dense":
+        if kind == "dense":
             self._welford_m2 = self._welford_m2 + torch.outer(delta, theta - self._welford_mean)
         else:
             self._welford_m2 = self._welford_m2 + delta * (theta - self._welford_mean)
+
+    def _kind(self):
+        """Representation of the current inverse metric: ``None``, ``"diag"``, ``"dense"`` or ``"low_rank"``."""
+        return metric_kind(self.inv_metric)
 
     def _metric_like(self, theta):
         """Diagonal inverse metric shaped like ``theta`` (diagonal metric only)."""
@@ -238,22 +255,28 @@ class NUTS:
         return self.inv_metric.reshape(theta.shape).to(dtype=theta.dtype, device=theta.device)
 
     def _dense_active(self):
-        return self.metric == "dense" and self.inv_metric is not None
+        return self._kind() == "dense"
 
     def _velocity(self, r):
         """Return ``M^{-1} r``, the time derivative of the position."""
-        if self._dense_active():
+        kind = self._kind()
+        if kind == "dense":
             inv_metric = self.inv_metric.to(dtype=r.dtype, device=r.device)
             return (inv_metric @ r.reshape(-1)).reshape(r.shape)
+        if kind == "low_rank":
+            return low_rank_velocity(r.reshape(-1), cast_metric(self.inv_metric, r)).reshape(r.shape)
         return self._metric_like(r) * r
 
     def _sample_momentum(self, theta):
         z = torch.randn_like(theta)
-        if self._dense_active():
+        kind = self._kind()
+        if kind == "dense":
             # With M^{-1} = L L^T, r = L^{-T} z has covariance (L L^T)^{-1} = M.
             chol = self._inv_metric_chol.to(dtype=theta.dtype, device=theta.device)
             r = torch.linalg.solve_triangular(chol.T, z.reshape(-1, 1), upper=True)
             return r.reshape(theta.shape)
+        if kind == "low_rank":
+            return low_rank_momentum(z.reshape(-1), cast_metric(self.inv_metric, theta)).reshape(theta.shape)
         return z / torch.sqrt(self._metric_like(theta))
 
     def _kinetic(self, r):
@@ -262,16 +285,23 @@ class NUTS:
     def _end_adaptation_window(self, theta):
         n = self._welford_n
         if n >= 2:
-            covariance = self._welford_m2 / (n - 1)
-            # Regularize towards a small multiple of the identity (as in Stan).
-            if self.metric == "dense":
-                inv_metric = _dense_inverse_metric(covariance, n)
-                chol, info = torch.linalg.cholesky_ex(inv_metric)
-                if int(info) == 0:
-                    self.inv_metric = inv_metric
-                    self._inv_metric_chol = chol
+            kind = self._estimator(theta.numel())
+            if kind == "low_rank":
+                draws = torch.stack(self._window_draws)
+                gradients = torch.stack(self._window_gradients)
+                try:
+                    metric = low_rank_inverse_metric(draws, gradients)
+                except RuntimeError:  # non-finite draws
+                    metric = None
+                if metric is not None and bool(low_rank_valid(metric)):
+                    self.inv_metric = metric
+            elif kind in ("ledoit_wolf", "oas"):
+                self._set_dense(shrinkage_inverse_metric(torch.stack(self._window_draws), kind))
+            elif kind == "dense":
+                self._set_dense(dense_inverse_metric(self._welford_m2 / (n - 1), n))
             else:
-                self.inv_metric = (n / (n + 5.0)) * covariance + 1e-3 * (5.0 / (n + 5.0))
+                # Regularize towards a small multiple of the identity (as in Stan).
+                self.inv_metric = (n / (n + 5.0)) * (self._welford_m2 / (n - 1)) + 1e-3 * (5.0 / (n + 5.0))
         self._reset_welford()
         # Restart dual averaging for the new metric.
         self.step_size = self.find_reasonable_step_size(theta, self.gradient_cache, self.log_prob_cache)
@@ -279,6 +309,13 @@ class NUTS:
         self.H_bar = self._H_bar
         self.step_size_bar = self._step_size_bar
         self.m = 1
+
+    def _set_dense(self, inv_metric):
+        """Adopt a dense inverse metric if it is positive definite; otherwise keep the previous one."""
+        chol, info = torch.linalg.cholesky_ex(inv_metric)
+        if int(info) == 0:
+            self.inv_metric = inv_metric
+            self._inv_metric_chol = chol
 
     def leapfrog(self, theta, r, grad, step_size):
         r_prime = r + 0.5 * step_size * grad
@@ -484,7 +521,7 @@ class NUTS:
             iteration = self._warmup_iteration
             self._warmup_iteration += 1
             if self._window_ends and self._window_start <= iteration <= self._window_ends[-1]:
-                self._welford_update(new_theta)
+                self._welford_update(new_theta, self.gradient_cache if self._cached_theta is new_theta else self.gradient(new_theta))
                 if iteration in self._window_ends:
                     self._end_adaptation_window(new_theta)
 
