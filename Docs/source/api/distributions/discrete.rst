@@ -36,3 +36,15 @@ Discrete probability distributions for count and categorical random variables.
 .. autoclass:: Multinomial
    :members:
    :show-inheritance:
+
+.. autoclass:: BetaBinomial
+   :members:
+   :show-inheritance:
+
+.. autoclass:: DirichletMultinomial
+   :members:
+   :show-inheritance:
+
+.. autoclass:: OrderedLogistic
+   :members:
+   :show-inheritance:
