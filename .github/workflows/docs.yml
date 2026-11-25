@@ -39,6 +39,18 @@ jobs:
       - name: Install dependencies
         run: uv sync --dev --group docs
 
+      # sphinx-gallery re-runs only the examples whose own source changed, so
+      # the executed output is reused only when nothing the examples depend
+      # on (library, examples, dependencies, docs configuration) changed.
+      # There is deliberately no restore-keys fallback to an older cache.
+      - name: Restore executed gallery
+        uses: actions/cache@v4
+        with:
+          path: |
+            Docs/source/auto_examples
+            Docs/source/gen_modules
+          key: gallery-${{ runner.os }}-${{ hashFiles('BayesianDLL/**', 'examples/**', 'uv.lock', 'Docs/source/conf.py') }}
+
       - name: Build Sphinx documentation
         run: uv run --no-sync make -C Docs html SPHINXOPTS="--keep-going"
 

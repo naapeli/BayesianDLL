@@ -51,4 +51,6 @@ sphinx_gallery_conf = {
     "reference_url": {"BayesianDLL": None},
     "within_subsection_order": "FileNameSortKey",
     "nested_sections": False,  # keeps each section once in the sidebar
+    # Number of examples run at the same time (set GALLERY_JOBS; 1 runs them one by one)
+    "parallel": int(os.environ.get("GALLERY_JOBS", "1")),
 }
