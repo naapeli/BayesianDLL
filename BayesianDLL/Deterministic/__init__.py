@@ -1,4 +1,5 @@
 from ._transforms import Exp, Linear, Log, Sigmoid
+from ._constraints import StationaryAR, InvertibleMA
 from ._blocks import (
     Add,
     Affine,
@@ -35,4 +36,6 @@ __all__ = [
     "Concat",
     "Stack",
     "Elementwise",
+    "StationaryAR",
+    "InvertibleMA",
 ]

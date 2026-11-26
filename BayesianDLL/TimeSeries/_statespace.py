@@ -30,7 +30,7 @@ def spectral_radius(T):
     return torch.linalg.eigvals(T).abs().amax(-1)
 
 
-class LinearGaussianStateSpace(Distribution):
+class StateSpace(Distribution):
     r"""Linear Gaussian state-space model; the likelihood of the observed series integrates the hidden states out exactly.
 
     With :math:`m` hidden states and :math:`k` observed components:
@@ -64,7 +64,7 @@ class LinearGaussianStateSpace(Distribution):
         Design matrix :math:`Z` of shape ``(..., k, m)``.
     state_cov : torch.Tensor or Parameter
         State innovation covariance :math:`Q` of shape ``(..., r, r)``.
-    obs_cov : torch.Tensor or Parameter, optional
+    observation_cov : torch.Tensor or Parameter, optional
         Observation noise covariance :math:`H` of shape ``(..., k, k)`` (default: zero).
     selection : torch.Tensor or Parameter, optional
         Selection matrix :math:`R` of shape ``(..., m, r)`` (default: identity, so ``r = m``).
@@ -72,29 +72,29 @@ class LinearGaussianStateSpace(Distribution):
         Initial state mean :math:`a_1` of shape ``(..., m)`` (default: zero).
     init_cov : torch.Tensor or Parameter, optional
         Initial state covariance :math:`P_1` of shape ``(..., m, m)`` (default: stationary covariance).
-    obs_offset : torch.Tensor or Parameter, optional
+    observation_offset : torch.Tensor or Parameter, optional
         Time-varying observation offset :math:`d_t` of shape ``(..., N, k)``.
-    T : int, optional
+    n_steps : int, optional
         Series length. Needed for sampling and to give a latent series its shape.
     """
 
-    _param_event_ndims = {"transition": 2, "design": 2, "state_cov": 2, "obs_cov": 2, "selection": 2,
-                          "init_mean": 1, "init_cov": 2, "obs_offset": 2}
+    _param_event_ndims = {"transition": 2, "design": 2, "state_cov": 2, "observation_cov": 2, "selection": 2,
+                          "init_mean": 1, "init_cov": 2, "observation_offset": 2}
 
-    _PARAMS = ("transition", "design", "state_cov", "obs_cov", "selection", "init_mean", "init_cov", "obs_offset")
+    _PARAMS = ("transition", "design", "state_cov", "observation_cov", "selection", "init_mean", "init_cov", "observation_offset")
 
-    def __init__(self, transition, design, state_cov, obs_cov=None, selection=None, init_mean=None, init_cov=None,
-                 obs_offset=None, T=None):
+    def __init__(self, transition, design, state_cov, observation_cov=None, selection=None, init_mean=None, init_cov=None,
+                 observation_offset=None, n_steps=None):
         super().__init__(IdentityTransform(), ContinuousReal(), ContinuousReal())
         self.transition = transition
         self.design = design
         self.state_cov = state_cov
-        self.obs_cov = obs_cov
+        self.observation_cov = observation_cov
         self.selection = selection
         self.init_mean = init_mean
         self.init_cov = init_cov
-        self.obs_offset = obs_offset
-        self.T = None if T is None else int(T)
+        self.observation_offset = observation_offset
+        self.n_steps = None if n_steps is None else int(n_steps)
         for name in self._PARAMS:
             value = getattr(self, name)
             if value is not None:
@@ -111,7 +111,7 @@ class LinearGaussianStateSpace(Distribution):
 
     @property
     def event_shape(self):
-        return () if self.T is None else (self.T, self.n_obs_dims)
+        return () if self.n_steps is None else (self.n_steps, self.n_obs_dims)
 
     @property
     def batch_shape(self):
@@ -123,9 +123,9 @@ class LinearGaussianStateSpace(Distribution):
         return torch.broadcast_shapes(*shapes)
 
     def _length(self):
-        if self.T is None:
-            raise ValueError(f"{type(self).__name__}: give the series length T to sample or to use it as a latent parameter.")
-        return self.T
+        if self.n_steps is None:
+            raise ValueError(f"{type(self).__name__}: give the series length n_steps to sample or to use it as a latent parameter.")
+        return self.n_steps
 
     # ------------------------------------------------------------ system
     def _system(self, batch_extra=()):
@@ -138,14 +138,14 @@ class LinearGaussianStateSpace(Distribution):
         shapes = [tuple(v.shape[: v.ndim - self._param_event_ndims[n]]) for n, v in values.items()]
         B = torch.broadcast_shapes(*shapes, tuple(batch_extra))
         ex = lambda v, e: v.expand(*B, *v.shape[v.ndim - e:]) if v is not None else None
-        H = values.get("obs_cov")
+        H = values.get("observation_cov")
         H = torch.zeros(k, k, dtype=dtype, device=device) if H is None else H
         R = values.get("selection")
         R = torch.eye(m, dtype=dtype, device=device) if R is None else R
         a1 = values.get("init_mean")
         a1 = torch.zeros(m, dtype=dtype, device=device) if a1 is None else a1
         sysm = {"T": ex(Tm, 2), "Z": ex(Z, 2), "Q": ex(Q, 2), "H": ex(H, 2), "R": ex(R, 2), "a1": ex(a1, 1),
-                "P1": ex(values.get("init_cov"), 2), "d": values.get("obs_offset"), "B": B, "values": values}
+                "P1": ex(values.get("init_cov"), 2), "d": values.get("observation_offset"), "B": B, "values": values}
         return sysm
 
     def _prepare(self, y):
@@ -155,7 +155,7 @@ class LinearGaussianStateSpace(Distribution):
             raise ValueError(f"The series must have shape (..., N, {self.n_obs_dims}); got {tuple(y.shape)}.")
         N = y.shape[-2]
         d_shape = ()
-        offset = resolve(self.obs_offset) if self.obs_offset is not None else None
+        offset = resolve(self.observation_offset) if self.observation_offset is not None else None
         sysm = self._system(batch_extra=y.shape[:-2])
         B = sysm["B"]
         dtype = sysm["T"].dtype
@@ -166,8 +166,8 @@ class LinearGaussianStateSpace(Distribution):
         sysm.update(N=N, y=tm(y0), mask=tm(observed.to(dtype)), nan_free=bool(observed.all()))
         if offset is not None:
             if offset.shape[-2] not in (1, N):
-                raise ValueError("obs_offset must have N rows.")
-            sysm["d"] = tm(sysm["values"]["obs_offset"].expand(*offset.shape[:-2], N, offset.shape[-1]))
+                raise ValueError("observation_offset must have N rows.")
+            sysm["d"] = tm(sysm["values"]["observation_offset"].expand(*offset.shape[:-2], N, offset.shape[-1]))
         else:
             sysm["d"] = torch.zeros_like(sysm["y"])
         sysm["RQR"] = sysm["R"] @ sysm["Q"] @ _t(sysm["R"])
@@ -209,12 +209,12 @@ class LinearGaussianStateSpace(Distribution):
             RQRbar = RQRbar + Lam
         RQRbar = 0.5 * (RQRbar + _t(RQRbar))
         grads = {
-            "transition": Tbar, "design": g["Z"], "obs_cov": g["H"],
+            "transition": Tbar, "design": g["Z"], "observation_cov": g["H"],
             "state_cov": _t(R) @ RQRbar @ R, "selection": 2 * RQRbar @ R @ Q,
             "init_mean": g["a"], "init_cov": Pbar,
         }
         d = g["d"].movedim(0, -2)
-        grads["obs_offset"] = d
+        grads["observation_offset"] = d
         ok = s["ok"]
         out = {}
         for name in self._PARAMS:
@@ -222,8 +222,8 @@ class LinearGaussianStateSpace(Distribution):
             if node is None:
                 continue
             value = grads[name]
-            if name == "obs_offset":
-                offset = resolve(self.obs_offset)
+            if name == "observation_offset":
+                offset = resolve(self.observation_offset)
                 if offset.shape[-2] == 1 and s["N"] != 1:
                     value = value.sum(-2, keepdim=True)
             mask = ok.reshape(ok.shape + (1,) * (value.ndim - ok.ndim))
@@ -292,7 +292,7 @@ class LinearGaussianStateSpace(Distribution):
             RQR = s["R"] @ s["Q"] @ _t(s["R"])
             s["P1"] = 0.5 * (lambda X: X + _t(X))(_solve_lyapunov(s["T"], RQR))
         offset = None
-        if self.obs_offset is not None:
+        if self.observation_offset is not None:
             offset = s["d"].expand(*s["B"], N, s["d"].shape[-1]) if s["d"].shape[-2] in (1, N) else s["d"]
         return self._simulate_states(s, n_samples, N, s["a1"], s["P1"], offset, None)
 
@@ -314,10 +314,10 @@ class LinearGaussianStateSpace(Distribution):
             Number of simulated futures per batch element.
         future_offset : torch.Tensor, optional
             Observation offsets :math:`d_t` of the forecast period, shape ``(..., steps, k)``
-            (required when the model has an ``obs_offset``).
+            (required when the model has an ``observation_offset``).
         """
-        if self.obs_offset is not None and future_offset is None:
-            raise ValueError("The model has an obs_offset: give future_offset for the forecast period.")
+        if self.observation_offset is not None and future_offset is None:
+            raise ValueError("The model has an observation_offset: give future_offset for the forecast period.")
         _, s = self._run(y)
         if future_offset is not None:
             future_offset = torch.as_tensor(future_offset, dtype=s["T"].dtype)

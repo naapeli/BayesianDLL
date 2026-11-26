@@ -17,20 +17,20 @@ def _pad_batch(*values):
 
 
 class _SeriesDistribution(Distribution):
-    """Common bookkeeping of the distributions over a series of length ``T`` (the last dimension)."""
+    """Common bookkeeping of the distributions over a series of length ``n_steps`` (the last dimension)."""
 
-    def __init__(self, T):
+    def __init__(self, n_steps):
         super().__init__(IdentityTransform(), ContinuousReal(), ContinuousReal())
-        self.T = None if T is None else int(T)
+        self.n_steps = None if n_steps is None else int(n_steps)
 
     @property
     def event_shape(self):
-        return () if self.T is None else (self.T,)
+        return () if self.n_steps is None else (self.n_steps,)
 
     def _length(self):
-        if self.T is None:
-            raise ValueError(f"{type(self).__name__}: give the series length T to sample or to use it as a latent parameter.")
-        return self.T
+        if self.n_steps is None:
+            raise ValueError(f"{type(self).__name__}: give the series length n_steps to sample or to use it as a latent parameter.")
+        return self.n_steps
 
 
 # ========================= Gaussian random walk =========================
@@ -46,7 +46,7 @@ class GaussianRandomWalk(_SeriesDistribution):
     By default :math:`s_0 = \sigma`, i.e. the walk starts at ``init_mu`` at time 0 with the
     drift applied from the second step on; give ``init_sigma`` for a wider or tighter start.
     All parameters are scalars per series (they broadcast over leading batch dimensions);
-    use it as a prior on a latent series, ``RandomParameter("x", GaussianRandomWalk(sigma, T=100))``,
+    use it as a prior on a latent series, ``RandomParameter("x", GaussianRandomWalk(sigma, n_steps=100))``,
     or as the likelihood of an observed series.
 
     Parameters
@@ -59,12 +59,12 @@ class GaussianRandomWalk(_SeriesDistribution):
         Mean :math:`m_0` of the first value.
     init_sigma : float or torch.Tensor or Parameter, optional
         Standard deviation :math:`s_0` of the first value (default: ``sigma``).
-    T : int, optional
+    n_steps : int, optional
         Series length. Needed for sampling and to give a latent series its shape.
     """
 
-    def __init__(self, sigma, mu=0.0, init_mu=0.0, init_sigma=None, T=None):
-        super().__init__(T)
+    def __init__(self, sigma, mu=0.0, init_mu=0.0, init_sigma=None, n_steps=None):
+        super().__init__(n_steps)
         self.sigma = sigma
         self.mu = mu
         self.init_mu = init_mu
@@ -149,13 +149,13 @@ class GaussianRandomWalk(_SeriesDistribution):
 
 
 # ========================= autoregressive process =========================
-def is_stationary(phi, tol=1e-9):
+def _is_stationary(phi, tol=1e-9):
     """Whether the AR polynomial :math:`1 - \\sum_j \\phi_j z^j` has all roots outside the unit circle (``(...,)`` boolean)."""
     radius = torch.linalg.eigvals(_companion(phi)).abs().amax(-1)
     return radius < 1 - tol
 
 
-class AutoRegressive(_SeriesDistribution):
+class AR(_SeriesDistribution):
     r"""Autoregressive process AR(:math:`p`) over a series :math:`x_1, \dots, x_T` (the last dimension of the value).
 
     .. math::
@@ -170,8 +170,7 @@ class AutoRegressive(_SeriesDistribution):
       of the companion matrix), the rest follow the recursion. This needs a *stationary*
       process: all roots of :math:`1 - \sum_j \phi_j z^j` outside the unit circle, which
       the density enforces by returning ``-inf`` outside the stationary region (see
-      :func:`~BayesianDLL.TimeSeries.is_stationary` and
-      :class:`~BayesianDLL.TimeSeries.StationaryAR` for a parameterisation that stays inside).
+      :class:`~BayesianDLL.Deterministic.StationaryAR` for a parameterisation that stays inside).
       It is a proper distribution, so it can be a prior for a latent series.
     * ``init="conditional"``: the conditional density of :math:`x_{p+1}, \dots, x_T` given the
       first :math:`p` values, which are left unmodelled. It needs no stationarity but is improper
@@ -189,7 +188,7 @@ class AutoRegressive(_SeriesDistribution):
         Innovation standard deviation :math:`\sigma > 0`.
     mu : float or torch.Tensor or Parameter, default 0.0
         Process mean :math:`\mu`.
-    T : int, optional
+    n_steps : int, optional
         Series length. Needed for sampling and to give a latent series its shape.
     init : {"stationary", "conditional"}
         Treatment of the first :math:`p` values, see above.
@@ -197,10 +196,10 @@ class AutoRegressive(_SeriesDistribution):
 
     _param_event_ndims = {"coefficients": 1}
 
-    def __init__(self, coefficients, sigma, mu=0.0, T=None, init="stationary"):
+    def __init__(self, coefficients, sigma, mu=0.0, n_steps=None, init="stationary"):
         if init not in ("stationary", "conditional"):
             raise ValueError("init must be 'stationary' or 'conditional'.")
-        super().__init__(T)
+        super().__init__(n_steps)
         self.coefficients = coefficients
         self.sigma = sigma
         self.mu = mu
@@ -218,7 +217,7 @@ class AutoRegressive(_SeriesDistribution):
 
     def _stationary_part(self, phi, sigma):
         """``(Gamma, ok)``: stationary covariance of the state (unit innovation variance times sigma^2) and its validity."""
-        ok = is_stationary(phi)
+        ok = _is_stationary(phi)
         T = _companion(torch.where(ok.unsqueeze(-1), phi, torch.zeros_like(phi)))
         Q = torch.zeros_like(T)
         Q[..., 0, 0] = 1.0
@@ -331,7 +330,7 @@ class AutoRegressive(_SeriesDistribution):
         batch = self.batch_shape
         _, Gam, ok = self._stationary_part(phi, sigma)
         if not bool(ok.all()):
-            raise ValueError("AutoRegressive sampling needs stationary coefficients.")
+            raise ValueError("AR sampling needs stationary coefficients.")
         chol = torch.linalg.cholesky(Gam).expand(*batch, p, p)
         eps0 = torch.randn(n_samples, *batch, p, 1, dtype=phi.dtype, device=phi.device)
         z = [(chol @ eps0).squeeze(-1)[..., i] for i in range(p)]

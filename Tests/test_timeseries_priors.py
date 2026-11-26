@@ -12,7 +12,8 @@ from scipy.stats import multivariate_normal
 
 from BayesianDLL import Model, ObservedParameter, RandomParameter
 from BayesianDLL.Distributions import HalfNormal, Normal, Uniform
-from BayesianDLL.TimeSeries import AutoRegressive, GaussianRandomWalk, is_stationary
+from BayesianDLL.TimeSeries import AR, GaussianRandomWalk
+from BayesianDLL.TimeSeries._priors import _is_stationary as is_stationary
 from test_vectorized import chain_by_chain, random_values
 
 t = torch.tensor
@@ -43,7 +44,7 @@ def test_random_walk_matches_dense_normal(init_sigma):
     T, sigma, mu, m0 = 7, 0.8, 0.3, -0.5
     s0 = sigma if init_sigma is None else init_sigma
     x = torch.randn(T)
-    d = GaussianRandomWalk(sigma, mu=mu, init_mu=m0, init_sigma=init_sigma, T=T)
+    d = GaussianRandomWalk(sigma, mu=mu, init_mu=m0, init_sigma=init_sigma, n_steps=T)
     mean = m0 + mu * np.arange(T)
     ref = multivariate_normal(mean=mean, cov=grw_covariance(T, sigma, s0)).logpdf(x.numpy())
     assert float(d.log_pdf(x)) == pytest.approx(ref, abs=1e-10)
@@ -57,7 +58,7 @@ def test_random_walk_gradients_match_autograd(init_sigma):
     params = {"sigma": t(0.8), "mu": t(0.3), "init_mu": t(-0.5)}
     if init_sigma:
         params["init_sigma"] = t(init_sigma)
-    make = lambda **p: GaussianRandomWalk(**p, T=6)
+    make = lambda **p: GaussianRandomWalk(**p, n_steps=6)
     gx, gp = autograd_grads(make, x, params)
     d = make(**params)
     torch.testing.assert_close(d.log_pdf_grad(x), gx)
@@ -67,7 +68,7 @@ def test_random_walk_gradients_match_autograd(init_sigma):
 
 
 def test_random_walk_batched_parameters_and_sampling():
-    d = GaussianRandomWalk(t([0.5, 2.0]), mu=t([0.0, 0.1]), T=5)
+    d = GaussianRandomWalk(t([0.5, 2.0]), mu=t([0.0, 0.1]), n_steps=5)
     assert d.batch_shape == (2,) and d.event_shape == (5,)
     s = d.sample(40000)
     assert s.shape == (40000, 2, 5)
@@ -75,7 +76,7 @@ def test_random_walk_batched_parameters_and_sampling():
     torch.testing.assert_close(s.var(0), d.variance(), rtol=0.05, atol=0)
     lp = d.log_pdf(s[:3])
     assert lp.shape == (3, 2)
-    one = GaussianRandomWalk(0.5, mu=0.0, T=5)
+    one = GaussianRandomWalk(0.5, mu=0.0, n_steps=5)
     torch.testing.assert_close(d.log_pdf(s[:3])[:, 0], one.log_pdf(s[:3, 0]))
 
 
@@ -87,7 +88,7 @@ PHIS = [[0.6], [0.5, -0.3], [0.4, 0.2, -0.1], [-0.3, 0.1, 0.2, 0.1]]
 def test_ar_stationary_matches_dense_normal(phi):
     n, sigma, mu = 10, 1.3, 0.7
     x = torch.randn(n)
-    d = AutoRegressive(t(phi), sigma, mu, T=n)
+    d = AR(t(phi), sigma, mu, n_steps=n)
     ref = multivariate_normal(mean=np.full(n, mu), cov=ar_autocovariance(phi, sigma, n)).logpdf(x.numpy())
     assert float(d.log_pdf(x)) == pytest.approx(ref, abs=1e-10)
     assert float(d.variance()[0]) == pytest.approx(ar_autocovariance(phi, sigma, 1)[0, 0], rel=1e-10)
@@ -98,7 +99,7 @@ def test_ar_stationary_matches_dense_normal(phi):
 def test_ar_gradients_match_autograd(phi, init):
     x = torch.randn(2, 12)
     params = {"coefficients": t(phi), "sigma": t(1.3), "mu": t(0.4)}
-    make = lambda coefficients, sigma, mu: AutoRegressive(coefficients, sigma, mu, init=init)
+    make = lambda coefficients, sigma, mu: AR(coefficients, sigma, mu, init=init)
     gx, gp = autograd_grads(make, x, params)
     d = make(**params)
     torch.testing.assert_close(d.log_pdf_grad(x), gx, rtol=1e-9, atol=1e-10)
@@ -111,7 +112,7 @@ def test_ar_gradients_match_autograd(phi, init):
 def test_ar_conditional_equals_least_squares_gaussian_likelihood():
     phi = [0.5, -0.3]
     x = torch.randn(30)
-    d = AutoRegressive(t(phi), 1.1, 0.2, init="conditional")
+    d = AR(t(phi), 1.1, 0.2, init="conditional")
     z = x.numpy() - 0.2
     e = z[2:] - phi[0] * z[1:-1] - phi[1] * z[:-2]
     ref = (-0.5 * np.log(2 * np.pi * 1.1 ** 2) - 0.5 * e ** 2 / 1.1 ** 2).sum()
@@ -121,26 +122,26 @@ def test_ar_conditional_equals_least_squares_gaussian_likelihood():
 def test_ar_outside_stationary_region_is_minus_infinity_with_zero_gradients():
     x = torch.randn(8)
     for phi in ([1.2], [0.5, 0.7], [-1.0]):
-        d = AutoRegressive(t(phi), 1.0)
+        d = AR(t(phi), 1.0)
         assert float(d.log_pdf(x)) == -math.inf
         assert all(torch.all(g == 0) for g in d.log_pdf_param_grads(x).values())
         assert torch.all(d.log_pdf_grad(x) == 0)
         assert not bool(is_stationary(t(phi)))
     assert bool(is_stationary(t([0.5, -0.3])))
     # a conditional likelihood needs no stationarity
-    assert math.isfinite(float(AutoRegressive(t([1.2]), 1.0, init="conditional").log_pdf(x)))
+    assert math.isfinite(float(AR(t([1.2]), 1.0, init="conditional").log_pdf(x)))
 
 
 def test_ar_batched_coefficients_agree_with_a_loop():
     phi = t([[0.6, 0.0], [0.5, -0.3], [-0.2, 0.3]])
     sigma = t([1.0, 0.5, 2.0])
     x = torch.randn(4, 3, 9)
-    d = AutoRegressive(phi, sigma, 0.1, T=9)
+    d = AR(phi, sigma, 0.1, n_steps=9)
     assert d.batch_shape == (3,)
     lp = d.log_pdf(x)
     assert lp.shape == (4, 3)
     for b in range(3):
-        one = AutoRegressive(phi[b], sigma[b], 0.1)
+        one = AR(phi[b], sigma[b], 0.1)
         torch.testing.assert_close(lp[:, b], one.log_pdf(x[:, b]))
         grads = d.log_pdf_param_grads(x)
         torch.testing.assert_close(grads["coefficients"][:, b], one.log_pdf_param_grads(x[:, b])["coefficients"])
@@ -148,7 +149,7 @@ def test_ar_batched_coefficients_agree_with_a_loop():
 
 def test_ar_sampling_reproduces_stationary_moments():
     phi, sigma, mu = [0.6, -0.25], 1.2, 0.5
-    d = AutoRegressive(t(phi), sigma, mu, T=6)
+    d = AR(t(phi), sigma, mu, n_steps=6)
     s = d.sample(60000)
     assert s.shape == (60000, 6)
     cov = ar_autocovariance(phi, sigma, 6)
@@ -159,17 +160,17 @@ def test_ar_sampling_reproduces_stationary_moments():
     entropy = 0.5 * np.linalg.slogdet(2 * np.pi * np.e * cov)[1]
     assert float(d.log_pdf(s).mean()) == pytest.approx(-entropy, abs=0.05)
     with pytest.raises(ValueError):
-        AutoRegressive(t([1.1]), 1.0, T=4).sample(2)
+        AR(t([1.1]), 1.0, n_steps=4).sample(2)
 
 
 def test_series_length_is_needed_for_sampling_only():
-    d = AutoRegressive(t([0.5]), 1.0)
+    d = AR(t([0.5]), 1.0)
     assert d.event_shape == ()
     assert math.isfinite(float(d.log_pdf(torch.randn(5))))
     with pytest.raises(ValueError):
         d.sample(2)
     with pytest.raises(ValueError):
-        AutoRegressive(t([0.5, 0.2]), 1.0, init="conditional").log_pdf(torch.randn(2))
+        AR(t([0.5, 0.2]), 1.0, init="conditional").log_pdf(torch.randn(2))
 
 
 # ============================================================ models
@@ -179,7 +180,7 @@ def ar_model():
         phi = RandomParameter("phi", Uniform(-0.8, 0.8), shape=2)
         sigma = RandomParameter("sigma", HalfNormal(2.0))
         mu = RandomParameter("mu", Normal(0.0, 1.0))
-        ObservedParameter("x", AutoRegressive(phi, sigma, mu, init="conditional"), x)
+        ObservedParameter("x", AR(phi, sigma, mu, init="conditional"), x)
     return model
 
 
@@ -188,7 +189,7 @@ def ar_stationary_model():
     with Model() as model:
         phi = RandomParameter("phi", Uniform(-0.4, 0.4), shape=2)
         sigma = RandomParameter("sigma", HalfNormal(2.0))
-        ObservedParameter("x", AutoRegressive(phi, sigma, 0.2), x)
+        ObservedParameter("x", AR(phi, sigma, 0.2), x)
     return model
 
 
@@ -205,7 +206,7 @@ def latent_series_model():
     y = torch.randn(10, generator=torch.Generator().manual_seed(4))
     with Model() as model:
         sigma = RandomParameter("sigma", HalfNormal(1.0))
-        level = RandomParameter("level", GaussianRandomWalk(sigma, T=10))
+        level = RandomParameter("level", GaussianRandomWalk(sigma, n_steps=10))
         ObservedParameter("y", Normal(level, 0.5), y)
     return model
 
@@ -259,18 +260,18 @@ def _covers(draws, truth, k=3.5):
 
 def test_nuts_recovers_ar2_parameters_with_the_stationary_likelihood():
     truth = t([0.5, -0.3])
-    x = AutoRegressive(truth, 0.8, 1.0, T=400).sample(1)[0]
+    x = AR(truth, 0.8, 1.0, n_steps=400).sample(1)[0]
     with Model() as model:
         phi = RandomParameter("phi", Uniform(-0.9, 0.9), shape=2)
         sigma = RandomParameter("sigma", HalfNormal(2.0))
         mu = RandomParameter("mu", Normal(0.0, 3.0))
-        ObservedParameter("x", AutoRegressive(phi, sigma, mu), x)
+        ObservedParameter("x", AR(phi, sigma, mu), x)
     result = _posterior(model)
     assert _covers(result["phi"], truth) and _covers(result["sigma"], t(0.8)) and _covers(result["mu"], t(1.0))
 
 
 def test_nuts_recovers_random_walk_drift_and_scale():
-    x = GaussianRandomWalk(0.5, mu=0.2, T=300).sample(1)[0]
+    x = GaussianRandomWalk(0.5, mu=0.2, n_steps=300).sample(1)[0]
     with Model() as model:
         sigma = RandomParameter("sigma", HalfNormal(2.0))
         mu = RandomParameter("mu", Normal(0.0, 1.0))
@@ -288,7 +289,7 @@ def test_latent_random_walk_prior_gives_the_conjugate_posterior_mean():
     precision = prior_precision + np.eye(T) / tau ** 2
     mean = np.linalg.solve(precision, y.numpy() / tau ** 2)
     with Model() as model:
-        level = RandomParameter("level", GaussianRandomWalk(sigma, T=T))
+        level = RandomParameter("level", GaussianRandomWalk(sigma, n_steps=T))
         ObservedParameter("y", Normal(level, tau), y)
     result = _posterior(model, n=1500, warmup=500)
     d = result["level"].reshape(-1, T)
@@ -302,6 +303,6 @@ def test_time_series_priors_support_prior_and_posterior_predictive():
     with Model() as model:
         sigma = RandomParameter("sigma", HalfNormal(1.0))
         phi = RandomParameter("phi", Uniform(-0.8, 0.8), shape=1)
-        ObservedParameter("x", AutoRegressive(phi, sigma, T=20), torch.zeros(20))
+        ObservedParameter("x", AR(phi, sigma, n_steps=20), torch.zeros(20))
     result = prior_predicative(300, samples_per_step=1, model=model, progress_bar=False)
     assert result["x"].shape[-1] == 20 and torch.isfinite(result["x"]).all()
