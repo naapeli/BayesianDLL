@@ -24,3 +24,11 @@ Composite, mixture, and truncated probability distribution wrappers.
 .. autoclass:: Ordered
    :members:
    :show-inheritance:
+
+.. autoclass:: Hurdle
+   :members:
+   :show-inheritance:
+
+.. autoclass:: Censored
+   :members:
+   :show-inheritance:

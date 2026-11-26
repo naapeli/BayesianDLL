@@ -114,6 +114,25 @@ def _scalar_derivative(matrix):
     return matrix.unsqueeze(1)
 
 
+def _spectral_frequencies(frequencies):
+    """Angular frequencies as a shared batch ``(1, M, D)``."""
+    return _feature_matrix(frequencies).unsqueeze(0)
+
+
+def _spectral_lengthscale_derivative(value, per_feature):
+    """Shape a spectral-density derivative ``(B, M, D)`` like the length-scale (``(B, 1, M)`` or ``(B, *shape, M)``)."""
+    if value[0].numel() == 1:
+        return per_feature.sum(dim=-1).unsqueeze(1)
+    per_feature = per_feature.movedim(-1, 1)
+    return per_feature.reshape(per_feature.shape[0], *value.shape[1:], per_feature.shape[-1])
+
+
+def _log_lengthscale_volume(lengthscale, features):
+    """``Σ_d log l_d`` ``(B,)`` for a length-scale ``(B, 1 or D)`` (a scalar one counts ``D`` times)."""
+    total = torch.log(lengthscale).sum(dim=-1)
+    return total * features if lengthscale.shape[-1] == 1 else total
+
+
 def _lengthscale_derivative(value, per_feature):
     """Shape a per-feature derivative ``(B, N, M, D)`` like the parameter.
 
@@ -420,6 +439,26 @@ class Kernel(ABC):
             blocks.append(self.batch_input_vjp(block, block, weights, parameter_values))
         return torch.cat(blocks, dim=1)
 
+    # ------------------------------------------------------------------
+    # Spectral density (stationary kernels; Hilbert-space latent GPs)
+    # ------------------------------------------------------------------
+    def spectral_density(self, frequencies, parameter_values=None):
+        r"""Spectral density :math:`S(\boldsymbol{\omega})` ``(M,)`` at angular frequencies ``(M, D)`` or ``(M,)``.
+
+        For a stationary kernel :math:`k(\boldsymbol{\tau}) = (2\pi)^{-D} \int
+        S(\boldsymbol{\omega}) e^{i \boldsymbol{\omega}^\top \boldsymbol{\tau}} d\boldsymbol{\omega}`.
+        Raises ``NotImplementedError`` for kernels without a closed-form spectral density.
+        """
+        return self.batch_spectral_density(_feature_matrix(frequencies), self._single_values(parameter_values))[0]
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        """``(B, M)`` spectral density at shared angular frequencies ``(M, D)``."""
+        raise NotImplementedError(f"{type(self).__name__} has no closed-form spectral density.")
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        """``{name: (B, *parameter_shape, M)}``: derivatives of :meth:`batch_spectral_density`."""
+        raise NotImplementedError(f"{type(self).__name__} has no closed-form spectral density.")
+
     def __add__(self, other):
         return SumKernel(self, other)
 
@@ -579,6 +618,30 @@ class RBF(_StationaryDiagonal, Kernel):
     def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
         _, lengthscale, _, _, covariance = self._geometry(x1, x2, parameter_values)
         return -_radial_input_vjp(cotangent * covariance, x1, x2, 1.0 / lengthscale.square())
+
+    def _spectral(self, frequencies, parameter_values):
+        omega = _spectral_frequencies(frequencies)
+        value, lengthscale = _blengthscale(self.lengthscale, parameter_values, omega, "RBF")
+        variance = _bscalar(self.variance, parameter_values, omega, "variance", "RBF")
+        features = omega.shape[-1]
+        # S(ω) = v (2π)^{D/2} Π_d l_d exp(-½ Σ_d l_d² ω_d²)
+        log_scale = torch.log(variance) + 0.5 * features * math.log(2.0 * math.pi) + _log_lengthscale_volume(lengthscale, features)
+        density = torch.exp(log_scale.unsqueeze(-1) - 0.5 * (omega * lengthscale.unsqueeze(-2)).square().sum(dim=-1))
+        return density, value, lengthscale, variance, omega
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        return self._spectral(frequencies, parameter_values)[0]
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        density, value, lengthscale, variance, omega = self._spectral(frequencies, parameter_values)
+        derivatives = {}
+        if _is_named(self.lengthscale):
+            scale = lengthscale.unsqueeze(-2)
+            per_feature = density.unsqueeze(-1) * (1.0 / scale - scale * omega.square())
+            derivatives[self.lengthscale.name] = _spectral_lengthscale_derivative(value, per_feature)
+        if _is_named(self.variance):
+            _accumulate_derivative(derivatives, self.variance.name, (density / variance.unsqueeze(-1)).unsqueeze(1))
+        return derivatives
 
 
 class Periodic(_StationaryDiagonal, Kernel):
@@ -764,6 +827,37 @@ class Matern(_StationaryDiagonal, Kernel):
         weights = cotangent * variance.reshape(-1, 1, 1) * math.sqrt(2.0 * self.nu) * self._radial(scaled_distance, slope)
         return _radial_input_vjp(weights, x1, x2, 1.0 / lengthscale.square())
 
+    def _spectral(self, frequencies, parameter_values):
+        omega = _spectral_frequencies(frequencies)
+        value, lengthscale = _blengthscale(self.lengthscale, parameter_values, omega, "Matern")
+        variance = _bscalar(self.variance, parameter_values, omega, "variance", "Matern")
+        features, nu = omega.shape[-1], self.nu
+        power = nu + 0.5 * features
+        # S(ω) = v 2^D π^{D/2} Γ(ν + D/2) (2ν)^ν / Γ(ν) Π_d l_d (2ν + Σ_d l_d² ω_d²)^{-(ν + D/2)}
+        constant = (
+            features * math.log(2.0) + 0.5 * features * math.log(math.pi) + math.lgamma(power)
+            - math.lgamma(nu) + nu * math.log(2.0 * nu)
+        )
+        base = 2.0 * nu + (omega * lengthscale.unsqueeze(-2)).square().sum(dim=-1)  # (B, M)
+        log_scale = torch.log(variance) + constant + _log_lengthscale_volume(lengthscale, features)
+        density = torch.exp(log_scale.unsqueeze(-1) - power * torch.log(base))
+        return density, value, lengthscale, variance, omega, base
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        return self._spectral(frequencies, parameter_values)[0]
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        density, value, lengthscale, variance, omega, base = self._spectral(frequencies, parameter_values)
+        derivatives = {}
+        if _is_named(self.lengthscale):
+            scale = lengthscale.unsqueeze(-2)
+            power = 2.0 * self.nu + omega.shape[-1]
+            per_feature = density.unsqueeze(-1) * (1.0 / scale - power * scale * omega.square() / base.unsqueeze(-1))
+            derivatives[self.lengthscale.name] = _spectral_lengthscale_derivative(value, per_feature)
+        if _is_named(self.variance):
+            _accumulate_derivative(derivatives, self.variance.name, (density / variance.unsqueeze(-1)).unsqueeze(1))
+        return derivatives
+
 
 class Matern32(Matern):
     r"""Matérn 3/2 covariance kernel (:math:`\nu = 1.5`).
@@ -865,6 +959,194 @@ class RationalQuadratic(_StationaryDiagonal, Kernel):
         return -_radial_input_vjp(cotangent * covariance / base, x1, x2, 1.0 / lengthscale.square())
 
 
+def _prod_except(values):
+    """``out[..., d] = Π_{d' ≠ d} values[..., d']`` along the last axis (no division)."""
+    ones = torch.ones_like(values[..., :1])
+    prefix = torch.cumprod(torch.cat([ones, values[..., :-1]], dim=-1), dim=-1)
+    suffix = torch.cumprod(torch.cat([values[..., 1:], ones], dim=-1).flip(-1), dim=-1).flip(-1)
+    return prefix * suffix
+
+
+def _per_feature_derivative(value, per_feature):
+    """Shape a derivative ``(B, Q, N, M, D)`` of a ``(Q,)`` or ``(Q, D)`` parameter like the parameter.
+
+    A value shared by the features (``(Q,)`` or ``(Q, 1)``) gets the sum over the
+    features; the result is ``(B, *parameter_shape, N, M)``.
+    """
+    if value[0].numel() == per_feature.shape[1]:
+        per_feature = per_feature.sum(dim=-1)
+    else:
+        per_feature = per_feature.movedim(-1, 2)
+    return per_feature.reshape(per_feature.shape[0], *value.shape[1:], *per_feature.shape[-2:])
+
+
+class SpectralMixture(Kernel):
+    r"""Spectral mixture covariance kernel (Wilson & Adams, 2013).
+
+    A mixture of :math:`Q` Gaussians in the spectral domain gives, with
+    :math:`\boldsymbol{\tau} = \mathbf{x}_1 - \mathbf{x}_2`,
+
+    .. math::
+
+        k(\mathbf{x}_1, \mathbf{x}_2) = \sum_{q=1}^Q w_q \prod_{d=1}^D
+        \exp\left(-\frac{\tau_d^2}{2 l_{qd}^2}\right) \cos\left(2 \pi \mu_{qd} \tau_d\right)
+
+    Component :math:`q` is quasi-periodic with frequency :math:`\mu_{qd}` (period
+    :math:`1 / \mu_{qd}`) and its correlations decay with lengthscale :math:`l_{qd}`;
+    its spectral density is a Gaussian with mean :math:`\pm 2 \pi \mu_{qd}` and standard
+    deviation :math:`1 / l_{qd}` in angular frequency. The kernel is stationary
+    (usable with :class:`~BayesianDLL.GP.ToeplitzGP` and Hilbert-space latent GPs).
+
+    Parameters
+    ----------
+    weights : float or torch.Tensor or Parameter
+        Mixture weights :math:`w_q > 0`, shape ``(Q,)``; ``k(x, x) = Σ_q w_q``.
+    frequencies : float or torch.Tensor or Parameter
+        Frequencies :math:`\mu_{qd} \geq 0`, shape ``(Q,)`` (shared by the features) or ``(Q, D)``.
+    lengthscales : float or torch.Tensor or Parameter
+        Lengthscales :math:`l_{qd} > 0`, shape ``(Q,)`` (shared by the features) or ``(Q, D)``.
+    """
+
+    def __init__(self, weights, frequencies, lengthscales):
+        super().__init__(weights, frequencies, lengthscales)
+        self.weights = weights
+        self.frequencies = frequencies
+        self.lengthscales = lengthscales
+
+    def _mixture(self, reference, parameter_values):
+        """``(w_value, w (B, Q), μ_value, μ (B, Q, 1 or D), l_value, l (B, Q, 1 or D))``."""
+        weights_value = _bparam(self.weights, parameter_values, reference)
+        weights = weights_value.reshape(weights_value.shape[0], -1)
+        count, features = weights.shape[1], reference.shape[-1]
+        result = [weights_value, weights]
+        for parameter, label in ((self.frequencies, "frequencies"), (self.lengthscales, "lengthscales")):
+            value = _bparam(parameter, parameter_values, reference)
+            per_component = value[0].numel() // count if value[0].numel() % count == 0 else 0
+            if per_component not in (1, features):
+                raise ValueError(
+                    f"SpectralMixture {label} must have shape ({count},) or ({count}, {features}) for {count} "
+                    f"components and {features} features; got {tuple(value.shape[1:])}."
+                )
+            result += [value, value.reshape(value.shape[0], count, per_component)]
+        return result
+
+    def _geometry(self, x1, x2, parameter_values):
+        weights_value, weights, frequency_value, frequencies, lengthscale_value, lengthscales = self._mixture(x1, parameter_values)
+        tau = _differences(x1, x2).unsqueeze(1)  # (B, 1, N, M, D)
+        frequency = frequencies[:, :, None, None, :]
+        lengthscale = lengthscales[:, :, None, None, :]
+        scaled = tau / lengthscale  # (B, Q, N, M, D)
+        envelope = torch.exp(-0.5 * scaled.square().sum(dim=-1))  # (B, Q, N, M)
+        phase = 2.0 * torch.pi * frequency * tau
+        cosines = torch.cos(phase)
+        components = envelope * cosines.prod(dim=-1)
+        covariance = (weights[:, :, None, None] * components).sum(dim=1)
+        return {
+            "weights_value": weights_value, "weights": weights, "frequency_value": frequency_value,
+            "frequency": frequency, "lengthscale_value": lengthscale_value, "lengthscale": lengthscale,
+            "tau": tau, "scaled": scaled, "envelope": envelope, "phase": phase, "cosines": cosines,
+            "components": components, "covariance": covariance,
+        }
+
+    def batch_evaluate(self, x1, x2, parameter_values):
+        return self._geometry(x1, x2, parameter_values)["covariance"]
+
+    def batch_derivatives(self, x1, x2, parameter_values):
+        parts = self._geometry(x1, x2, parameter_values)
+        weighted = parts["weights"][:, :, None, None, None]
+        derivatives = {}
+        if _is_named(self.weights):
+            components = parts["components"]
+            _accumulate_derivative(derivatives, self.weights.name,
+                                   components.reshape(components.shape[0], *parts["weights_value"].shape[1:], *components.shape[-2:]))
+        if _is_named(self.lengthscales):
+            # ∂/∂l_qd = w_q k_q τ_d² / l_qd³
+            per_feature = weighted * parts["components"].unsqueeze(-1) * parts["scaled"].square() / parts["lengthscale"]
+            _accumulate_derivative(derivatives, self.lengthscales.name, _per_feature_derivative(parts["lengthscale_value"], per_feature))
+        if _is_named(self.frequencies):
+            # ∂/∂μ_qd = -w_q e_q Π_{d'≠d} cos_qd' sin(2π μ_qd τ_d) 2π τ_d
+            others = _prod_except(parts["cosines"])
+            per_feature = -weighted * parts["envelope"].unsqueeze(-1) * others * torch.sin(parts["phase"]) * (2.0 * torch.pi * parts["tau"])
+            _accumulate_derivative(derivatives, self.frequencies.name, _per_feature_derivative(parts["frequency_value"], per_feature))
+        return derivatives
+
+    def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
+        r"""``∂k/∂x1_d = -Σ_q w_q e_q [k̃_q τ_d / l_qd² + Π_{d'≠d} cos_qd' sin(2π μ_qd τ_d) 2π μ_qd]`` with ``k̃_q = Π_d cos_qd``."""
+        parts = self._geometry(x1, x2, parameter_values)
+        weighted = parts["weights"][:, :, None, None, None]
+        envelope = parts["envelope"].unsqueeze(-1)
+        decay = parts["components"].unsqueeze(-1) * parts["tau"] / parts["lengthscale"].square()
+        oscillation = envelope * _prod_except(parts["cosines"]) * torch.sin(parts["phase"]) * (2.0 * torch.pi * parts["frequency"])
+        per_feature = -(weighted * (decay + oscillation)).sum(dim=1)  # (B, N, M, D)
+        return (cotangent.unsqueeze(-1) * per_feature).sum(dim=-2)
+
+    def batch_diag(self, x, parameter_values, chunk_size=256):
+        weights = self._mixture(x, parameter_values)[1]
+        return weights.sum(dim=-1, keepdim=True).expand(weights.shape[0], x.shape[1])
+
+    def batch_diag_derivatives(self, x, parameter_values, chunk_size=256):
+        """``k(x, x) = Σ_q w_q``: only the weights change the diagonal."""
+        derivatives = {}
+        for parameter in self.parameters:
+            value = _bparam(parameter, parameter_values, x)
+            derivatives[parameter.name] = torch.zeros((1, *value.shape[1:], x.shape[1]), dtype=x.dtype, device=x.device)
+        if _is_named(self.weights):
+            derivatives[self.weights.name] = derivatives[self.weights.name] + 1.0
+        return derivatives
+
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        """Zero: the diagonal ``Σ_q w_q`` does not depend on ``x``."""
+        return _zero_input_vjp(x, cotangent)
+
+    def _spectral(self, frequencies, parameter_values):
+        r"""``S(ω) = Σ_q w_q Π_d g_qd(ω_d)``, ``g = √(2π) l ½ [e⁻ + e⁺]``, ``e^∓ = exp(-½ l² (ω ∓ 2πμ)²)``."""
+        omega = _spectral_frequencies(frequencies)
+        weights_value, weights, frequency_value, frequencies, lengthscale_value, lengthscales = self._mixture(omega, parameter_values)
+        omega = omega.unsqueeze(1)  # (1, 1, M, D)
+        centre = 2.0 * torch.pi * frequencies.unsqueeze(-2)  # (B, Q, 1, 1 or D)
+        lengthscale = lengthscales.unsqueeze(-2)
+        below, above = omega - centre, omega + centre
+        minus = torch.exp(-0.5 * (lengthscale * below).square())
+        plus = torch.exp(-0.5 * (lengthscale * above).square())
+        factors = math.sqrt(2.0 * math.pi) * lengthscale * 0.5 * (minus + plus)  # (B, Q, M, D)
+        products = factors.prod(dim=-1)  # (B, Q, M)
+        density = (weights.unsqueeze(-1) * products).sum(dim=1)
+        return {
+            "density": density, "weights_value": weights_value, "weights": weights, "frequency_value": frequency_value,
+            "lengthscale_value": lengthscale_value, "lengthscale": lengthscale, "below": below, "above": above,
+            "minus": minus, "plus": plus, "factors": factors, "products": products,
+        }
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        return self._spectral(frequencies, parameter_values)["density"]
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        parts = self._spectral(frequencies, parameter_values)
+        weighted = parts["weights"][:, :, None, None] * _prod_except(parts["factors"])  # w_q Π_{d'≠d} g_qd'
+        lengthscale, minus, plus = parts["lengthscale"], parts["minus"], parts["plus"]
+        amplitude = math.sqrt(2.0 * math.pi) * lengthscale * 0.5
+        derivatives = {}
+        if _is_named(self.weights):
+            products = parts["products"]
+            _accumulate_derivative(derivatives, self.weights.name,
+                                   products.reshape(products.shape[0], *parts["weights_value"].shape[1:], products.shape[-1]))
+        if _is_named(self.lengthscales):
+            slope = parts["factors"] / lengthscale - amplitude * lengthscale * (minus * parts["below"].square() + plus * parts["above"].square())
+            per_feature = (weighted * slope).unsqueeze(2)  # (B, Q, 1, M, D)
+            _accumulate_derivative(derivatives, self.lengthscales.name,
+                                   _per_feature_derivative(parts["lengthscale_value"], per_feature).squeeze(-2))
+        if _is_named(self.frequencies):
+            slope = amplitude * lengthscale.square() * 2.0 * torch.pi * (minus * parts["below"] - plus * parts["above"])
+            per_feature = (weighted * slope).unsqueeze(2)
+            _accumulate_derivative(derivatives, self.frequencies.name,
+                                   _per_feature_derivative(parts["frequency_value"], per_feature).squeeze(-2))
+        return derivatives
+
+
+def _accumulate_derivative(derivatives, name, derivative):
+    derivatives[name] = derivatives[name] + derivative if name in derivatives else derivative
+
+
 class Linear(Kernel):
     r"""Linear covariance kernel with offset.
 
@@ -950,6 +1232,22 @@ class SumKernel(Kernel):
         """Sum rule: the parts' diagonal input VJPs added up."""
         return sum(_batch_kernel_diag_input_vjp(kernel, x, cotangent, parameter_values, chunk_size) for kernel in self.kernels)
 
+    def _spectral_parts(self):
+        if not all(isinstance(kernel, Kernel) for kernel in self.kernels):
+            raise NotImplementedError("A sum with a constant or a plain callable has no closed-form spectral density.")
+        return self.kernels
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        """The sum of the parts' spectral densities."""
+        return sum(kernel.batch_spectral_density(frequencies, parameter_values) for kernel in self._spectral_parts())
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        derivatives = {}
+        for kernel in self._spectral_parts():
+            for name, derivative in kernel.batch_spectral_density_derivatives(frequencies, parameter_values).items():
+                _accumulate_derivative(derivatives, name, derivative)
+        return derivatives
+
 
 class ProductKernel(Kernel):
     r"""Elementwise product of covariance kernels :math:`k = k_1 \cdot k_2 \cdot \dots` (also built with ``k1 * k2``).
@@ -1009,6 +1307,192 @@ class ProductKernel(Kernel):
                     weighted = weighted * diagonal
             result = result + _batch_kernel_diag_input_vjp(kernel, x, weighted, parameter_values, chunk_size)
         return result
+
+    def _spectral_parts(self, reference, parameter_values):
+        """``(kernel, scale, constants)``: the one stationary part and the product ``(B,)`` of the constant parts."""
+        stationary = [kernel for kernel in self.kernels if isinstance(kernel, Kernel) and not isinstance(kernel, Constant)]
+        others = [kernel for kernel in self.kernels if not (isinstance(kernel, Kernel) and not isinstance(kernel, Constant))]
+        if len(stationary) != 1 or any(callable(kernel) and not isinstance(kernel, Kernel) for kernel in others):
+            raise NotImplementedError(
+                "Only a product of one stationary kernel and constants has a closed-form spectral density."
+            )
+        values = [
+            _bscalar(kernel.variance, parameter_values, reference, "variance", "Constant") if isinstance(kernel, Constant)
+            else torch.as_tensor(kernel, dtype=reference.dtype, device=reference.device).reshape(1)
+            for kernel in others
+        ]
+        return stationary[0], others, values
+
+    def batch_spectral_density(self, frequencies, parameter_values):
+        """``c S(ω)`` for a product of a stationary kernel with spectral density ``S`` and constants ``c``."""
+        reference = _spectral_frequencies(frequencies)
+        kernel, _, values = self._spectral_parts(reference, parameter_values)
+        density = kernel.batch_spectral_density(frequencies, parameter_values)
+        for value in values:
+            density = value.unsqueeze(-1) * density
+        return density
+
+    def batch_spectral_density_derivatives(self, frequencies, parameter_values):
+        reference = _spectral_frequencies(frequencies)
+        kernel, others, values = self._spectral_parts(reference, parameter_values)
+        density = kernel.batch_spectral_density(frequencies, parameter_values)
+        scale = math.prod(values) if values else torch.ones(1, dtype=reference.dtype, device=reference.device)
+        derivatives = {}
+        for name, derivative in kernel.batch_spectral_density_derivatives(frequencies, parameter_values).items():
+            _accumulate_derivative(derivatives, name, scale.reshape(-1, *([1] * (derivative.ndim - 1))) * derivative)
+        for index, other in enumerate(others):
+            if isinstance(other, Constant) and _is_named(other.variance):
+                rest = density
+                for other_index, value in enumerate(values):
+                    if other_index != index:
+                        rest = value.unsqueeze(-1) * rest
+                _accumulate_derivative(derivatives, other.variance.name, rest.unsqueeze(1))
+        return derivatives
+
+
+def _times_diagonal(derivative, weights):
+    """Multiply a diagonal derivative ``(B, *P, N)`` by weights ``(B, N)`` (broadcasting ``B``)."""
+    return derivative * weights.reshape(weights.shape[0], *([1] * (derivative.ndim - 2)), weights.shape[-1])
+
+
+class ChangePoint(Kernel):
+    r"""Change-point kernel: a smooth switch between two kernels along one input feature.
+
+    .. math::
+
+        k(\mathbf{x}_1, \mathbf{x}_2) = \bar{s}(\mathbf{x}_1) \bar{s}(\mathbf{x}_2) k_1(\mathbf{x}_1, \mathbf{x}_2)
+        + s(\mathbf{x}_1) s(\mathbf{x}_2) k_2(\mathbf{x}_1, \mathbf{x}_2),
+        \quad s(\mathbf{x}) = \sigma\big(a (x_d - c)\big), \quad \bar{s} = 1 - s
+
+    with the logistic sigmoid :math:`\sigma`: :math:`k_1` describes the function
+    before the change point :math:`c` and :math:`k_2` after it, and the steepness
+    :math:`a` sets how abrupt the change is. The functions on the two sides are
+    independent (each kernel is weighted by an outer product of sigmoids).
+
+    Parameters
+    ----------
+    kernel_before : Kernel
+        Kernel :math:`k_1` for :math:`x_d < c`.
+    kernel_after : Kernel
+        Kernel :math:`k_2` for :math:`x_d > c`.
+    location : float or torch.Tensor or Parameter
+        Scalar change-point location :math:`c`.
+    steepness : float or torch.Tensor or Parameter, default 1.0
+        Scalar steepness :math:`a > 0` of the switch (in units of one over the input).
+    dimension : int, default 0
+        The input feature :math:`d` along which the change happens.
+    """
+
+    def __init__(self, kernel_before, kernel_after, location, steepness=1.0, dimension=0):
+        for kernel in (kernel_before, kernel_after):
+            if not isinstance(kernel, Kernel):
+                raise TypeError("ChangePoint kernels must be instances of BayesianDLL.GP.Kernel.")
+        if isinstance(dimension, bool) or not isinstance(dimension, int):
+            raise TypeError("ChangePoint dimension must be an integer.")
+        self.kernels = (kernel_before, kernel_after)
+        self.location = location
+        self.steepness = steepness
+        self.dimension = dimension
+        super().__init__(*kernel_before.parameters, *kernel_after.parameters, location, steepness)
+
+    def _switch(self, x, parameter_values):
+        """``(a, offset, s̄, s)``: steepness ``(B,)``, ``x_d - c``, ``1 - s(x)`` and ``s(x)`` ``(B, N)``."""
+        if not -x.shape[-1] <= self.dimension < x.shape[-1]:
+            raise ValueError(f"ChangePoint dimension {self.dimension} is out of range for {x.shape[-1]} input features.")
+        location = _bscalar(self.location, parameter_values, x, "location", "ChangePoint")
+        steepness = _bscalar(self.steepness, parameter_values, x, "steepness", "ChangePoint")
+        offset = x[..., self.dimension] - location[:, None]
+        scaled = steepness[:, None] * offset
+        return steepness, offset, torch.sigmoid(-scaled), torch.sigmoid(scaled)
+
+    def _parts(self, x1, x2, parameter_values):
+        steepness, offset1, before1, after1 = self._switch(x1, parameter_values)
+        _, offset2, before2, after2 = self._switch(x2, parameter_values)
+        first = self.kernels[0].batch_evaluate(x1, x2, parameter_values)
+        second = self.kernels[1].batch_evaluate(x1, x2, parameter_values)
+        return steepness, (offset1, before1, after1), (offset2, before2, after2), first, second
+
+    def batch_evaluate(self, x1, x2, parameter_values):
+        _, (_, before1, after1), (_, before2, after2), first, second = self._parts(x1, x2, parameter_values)
+        return _outer(before1, before2) * first + _outer(after1, after2) * second
+
+    def batch_derivatives(self, x1, x2, parameter_values):
+        r"""Sub-kernel parameters get ``s̄ s̄ᵀ ⊙ ∂K_1`` and ``s sᵀ ⊙ ∂K_2``.
+
+        With ``t = a s s̄`` and ``r = s s̄ (x_d - c)``: ``∂s/∂c = -t``,
+        ``∂s/∂a = r`` (and ``∂s̄ = -∂s``).
+        """
+        steepness, (offset1, before1, after1), (offset2, before2, after2), first, second = self._parts(x1, x2, parameter_values)
+        derivatives = {}
+        for kernel, weights in zip(self.kernels, (_outer(before1, before2), _outer(after1, after2))):
+            for name, derivative in kernel.batch_derivatives(x1, x2, parameter_values).items():
+                _accumulate_derivative(derivatives, name, _times_matrix(derivative, weights))
+        # d k = (dŝ1 ŝ2ᵀ + ŝ1 dŝ2ᵀ) ⊙ K_1 + (ds1 s2ᵀ + s1 ds2ᵀ) ⊙ K_2 with dŝ = -ds.
+        for parameter, slope1, slope2 in (
+            (self.location, -steepness[:, None] * after1 * before1, -steepness[:, None] * after2 * before2),
+            (self.steepness, after1 * before1 * offset1, after2 * before2 * offset2),
+        ):
+            if _is_named(parameter):
+                derivative = (
+                    -(_outer(slope1, before2) + _outer(before1, slope2)) * first
+                    + (_outer(slope1, after2) + _outer(after1, slope2)) * second
+                )
+                _accumulate_derivative(derivatives, parameter.name, _scalar_derivative(derivative))
+        return derivatives
+
+    def batch_input_vjp(self, x1, x2, cotangent, parameter_values):
+        """The sub-kernels' VJPs with the cotangents ``G ⊙ s̄ s̄ᵀ`` and ``G ⊙ s sᵀ``, plus the switch term on feature ``d``."""
+        steepness, (_, before1, after1), (_, before2, after2), first, second = self._parts(x1, x2, parameter_values)
+        result = self.kernels[0].batch_input_vjp(x1, x2, cotangent * _outer(before1, before2), parameter_values)
+        result = result + self.kernels[1].batch_input_vjp(x1, x2, cotangent * _outer(after1, after2), parameter_values)
+        # ∂s(x1_i)/∂x1_id = a s s̄, so row i gets a s_i s̄_i Σ_j G_ij (s_j K2_ij - s̄_j K1_ij).
+        slope = steepness[:, None] * after1 * before1
+        switch = slope * (cotangent * (after2.unsqueeze(-2) * second - before2.unsqueeze(-2) * first)).sum(dim=-1)
+        return result + switch.unsqueeze(-1) * _unit(x1, self.dimension)
+
+    def batch_diag(self, x, parameter_values, chunk_size=256):
+        _, _, before, after = self._switch(x, parameter_values)
+        first = self.kernels[0].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        second = self.kernels[1].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        return before.square() * first + after.square() * second
+
+    def batch_diag_derivatives(self, x, parameter_values, chunk_size=256):
+        steepness, offset, before, after = self._switch(x, parameter_values)
+        derivatives = {}
+        for kernel, weights in zip(self.kernels, (before.square(), after.square())):
+            for name, derivative in kernel.batch_diag_derivatives(x, parameter_values, chunk_size=chunk_size).items():
+                _accumulate_derivative(derivatives, name, _times_diagonal(derivative, weights))
+        first = self.kernels[0].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        second = self.kernels[1].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        # d diag = 2 ds (s k2 - s̄ k1).
+        for parameter, slope in (
+            (self.location, -steepness[:, None] * after * before),
+            (self.steepness, after * before * offset),
+        ):
+            if _is_named(parameter):
+                _accumulate_derivative(derivatives, parameter.name, (2.0 * slope * (after * second - before * first)).unsqueeze(1))
+        return derivatives
+
+    def batch_diag_input_vjp(self, x, cotangent, parameter_values, chunk_size=256):
+        steepness, _, before, after = self._switch(x, parameter_values)
+        result = self.kernels[0].batch_diag_input_vjp(x, cotangent * before.square(), parameter_values, chunk_size=chunk_size)
+        result = result + self.kernels[1].batch_diag_input_vjp(x, cotangent * after.square(), parameter_values, chunk_size=chunk_size)
+        first = self.kernels[0].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        second = self.kernels[1].batch_diag(x, parameter_values, chunk_size=chunk_size)
+        switch = 2.0 * cotangent * steepness[:, None] * after * before * (after * second - before * first)
+        return result + switch.unsqueeze(-1) * _unit(x, self.dimension)
+
+
+def _outer(a, b):
+    """``(B, N)``, ``(B, M)`` -> ``(B, N, M)``."""
+    return a.unsqueeze(-1) * b.unsqueeze(-2)
+
+
+def _unit(x, dimension):
+    """One-hot row ``(D,)`` selecting input feature ``dimension``."""
+    unit = torch.zeros(x.shape[-1], dtype=x.dtype, device=x.device)
+    unit[dimension] = 1.0
+    return unit
 
 
 def _kernel_parameters(kernel):

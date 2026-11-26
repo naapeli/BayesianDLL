@@ -8,8 +8,9 @@ in turn.
 
 * **NUTS** (``"nuts"``, the automatic choice for continuous parameters) uses
   gradients and adapts its step size and mass matrix. It is the first choice
-  for continuous posteriors. Use ``metric="dense"`` when the posterior has
-  strong linear correlations that no reparameterisation removes.
+  for continuous posteriors. The default ``metric="low_rank"`` also
+  handles strong linear correlations that no reparameterisation removes;
+  ``"dense"`` is the exact alternative for few parameters.
 * **Slice** (``"slice"``) updates one coordinate at a time without gradients
   and needs no tuning. It suits a few continuous parameters whose gradient
   is unavailable or unreliable.

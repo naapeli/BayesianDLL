@@ -9,7 +9,7 @@ The documentation, including the API reference and a gallery of the examples, is
 
 ## Environment
 
-Requires Python >= 3.13 and `uv`.
+Requires Python >= 3.10 and `uv`. ArviZ export (`to_arviz`) needs the optional `arviz` extra (Python >= 3.12).
 
 From the project root:
 

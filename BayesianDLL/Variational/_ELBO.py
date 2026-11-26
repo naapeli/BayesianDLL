@@ -263,7 +263,13 @@ class HandWrittenEntries:
         return self._scores
 
 
-def estimate_elbo(model, pieces, n_samples, scales=None, baseline_owner=None):
+def _prior_terms(model):
+    """The latents whose prior terms form ``log p(theta)`` (latents inside an enumeration group excluded)."""
+    grouped = model._enumeration_group_of
+    return [parameter for name, parameter in model.params.items() if name not in grouped]
+
+
+def estimate_elbo(model, pieces, n_samples, scales=None, baseline_owner=None, kl_weight=1.0):
     """Monte Carlo ELBO and its gradient for a guide made of independent ``pieces``.
 
     Every piece (a :class:`Group` or the :class:`HandWrittenEntries`)
@@ -276,7 +282,30 @@ def estimate_elbo(model, pieces, n_samples, scales=None, baseline_owner=None):
     minus a baseline (leave-one-out mean of the other draws, or a running
     mean of earlier calls stored on ``baseline_owner`` when
     ``n_samples=1``) as their learning signal.
+
+    **KL annealing.** With ``0 < kl_weight = w < 1`` the gradient is that of
+    the annealed objective
+
+    ``E_q[log p(y | theta) + w (log p(theta) + log|d eta / d u| - log q(u))]``,
+
+    where ``log p(theta)`` is the sum of the latents' prior terms in the
+    unconstrained space (an enumeration group's log marginal counts as
+    likelihood) and ``log p(y | theta)`` everything else, including the
+    minibatch scaling. It equals ``w`` times the ELBO of the model whose
+    likelihood is raised to the power ``1 / w``, which is how it is computed:
+    the pieces receive the tempered ``log p`` and its gradient
+    ``grad log p(theta) + grad log p(y | theta) / w``, and their pathwise
+    gradients are multiplied by ``w``; the score-function signal is the
+    annealed sample. The prior gradient takes one extra reverse pass over the
+    prior terms. The returned value is always the ELBO estimate
+    (``kl_weight = 1``) of the same draws.
     """
+    annealed = kl_weight != 1
+    if annealed:
+        if not 0 < kl_weight <= 1:
+            raise ValueError(f"kl_weight must be in (0, 1], got {kl_weight}.")
+        prior_parameters = _prior_terms(model)
+        prior_names = {parameter.name for parameter in prior_parameters}
     grads = {}
     for piece in pieces:
         for key, parameter in piece.variational_parameters().items():
@@ -289,7 +318,7 @@ def estimate_elbo(model, pieces, n_samples, scales=None, baseline_owner=None):
     for piece in pieces:
         names += [name for name in piece.gradient_names() if name not in names]
 
-    values = []
+    values, signals = [], []
     for i in range(n_samples):
         eta, log_jacobian = {}, 0.0
         try:
@@ -300,6 +329,17 @@ def estimate_elbo(model, pieces, n_samples, scales=None, baseline_owner=None):
             with model.temporarily_set_many(eta):
                 log_p = scaled_log_joint(model, scales)
                 model_grads = scaled_log_joint_grad(model, names, scales) if names else {}
+                tempered = log_p
+                if annealed:
+                    # log p(theta) + log p(y | theta) / w and its gradient.
+                    log_prior = model._log_prob_of_terms(prior_parameters, [])
+                    tempered = log_prior + (log_p - log_prior) / kl_weight
+                    if names:
+                        prior_grads = model._reverse_pass(names, active_terms=prior_names)
+                        model_grads = {
+                            name: prior_grads[name] + (model_grads[name] - prior_grads[name]) / kl_weight
+                            for name in names
+                        }
                 for piece in pieces:
                     piece.in_model(i, model_grads)
         finally:
@@ -309,14 +349,18 @@ def estimate_elbo(model, pieces, n_samples, scales=None, baseline_owner=None):
         for piece in pieces:
             log_q = log_q + piece.log_q(i)
         values.append(log_p + log_jacobian - log_q)
+        signals.append(kl_weight * (tempered + log_jacobian - log_q) if annealed else values[-1])
         for piece in pieces:
             piece.accumulate(i, model_grads, grads)
 
     total = sum(values) / n_samples
+    if annealed:
+        for key in grads:
+            grads[key] = kl_weight * grads[key]
 
     scores = [term for piece in pieces for term in piece.score_terms()]
     if scores:
-        detached = torch.stack([torch.as_tensor(v).detach().reshape(()) for v in values])
+        detached = torch.stack([torch.as_tensor(v).detach().reshape(()) for v in signals])
         if n_samples > 1:
             baselines = (detached.sum() - detached) / (n_samples - 1)
         else:

@@ -15,6 +15,9 @@ import math
 import torch
 
 from .._batching import pad_to
+from ._metrics import (check_metric, dense_inverse_metric, identity_low_rank, low_rank_inverse_metric, low_rank_momentum,
+                       low_rank_valid, low_rank_velocity, metric_kind, needs_draws, resolve_metric, select_low_rank,
+                       shrinkage_inverse_metric)
 
 
 _LOG_HALF = math.log(0.5)
@@ -373,9 +376,10 @@ class VectorizedNUTS:
     ``chain_method="parallel"`` is the slice-sampling variant of Hoffman and
     Gelman (2014). Both leave the posterior invariant.
 
-    Step sizes (dual averaging), the inverse metric (``"dense"`` or
-    ``"diag"``, Stan's windowed adaptation with per-chain Welford
-    estimates) and all statistics are per chain. The statistics match those
+    Step sizes (dual averaging), the inverse metric (``metric``: ``"low_rank"``
+    (default), ``"dense"``, ``"diag"``, ``"ledoit_wolf"``, ``"oas"`` or
+    ``"auto"``, see :class:`~BayesianDLL.Samplers.NUTS`; Stan's windowed
+    adaptation with per-chain estimates) and all statistics are per chain. The statistics match those
     of :class:`~BayesianDLL.Samplers.NUTS`: ``step_size``, ``accept_stat``,
     ``tree_depth``, ``n_leapfrog``, ``diverging``, ``energy`` and ``lp``,
     each of shape ``(C,)``. ``log_target`` and ``gradient`` map ``(C, d)`` to
@@ -388,10 +392,9 @@ class VectorizedNUTS:
 
     def __init__(self, log_target, gradient, n_chains, delta=0.8, gamma=0.05, step_size_bar=1, max_depth=10, t0=10,
                  kappa=0.75, H_bar=0, min_step_size=1e-4, max_step_size=100, max_delta=1000.0,
-                 adapt_mass_matrix=True, metric="dense"):
+                 adapt_mass_matrix=True, metric="low_rank"):
         from ._NUTS import _adaptation_windows
-        if metric not in ("diag", "dense"):
-            raise ValueError(f"metric must be 'diag' or 'dense', got {metric!r}.")
+        check_metric(metric)
         self._windows = _adaptation_windows
         self.log_target = log_target
         self.gradient = gradient
@@ -435,11 +438,25 @@ class VectorizedNUTS:
         self._welford_n = 0
         self._welford_mean = None
         self._welford_m2 = None
+        self._window_draws = []
+        self._window_gradients = []
 
-    def _welford_update(self, theta):
+    def _estimator(self, dim):
+        """The estimator used for a state of ``dim`` dimensions (``"auto"`` resolved)."""
+        return resolve_metric(self.metric, dim)
+
+    def _welford_update(self, theta, grad=None):
+        """Add the warmup draws ``(C, d)`` (and gradients) to the current window's statistics."""
+        kind = self._estimator(theta.shape[-1])
+        if needs_draws(kind):
+            self._window_draws.append(theta)
+            if kind == "low_rank":
+                self._window_gradients.append(grad)
+            self._welford_n += 1
+            return
         if self._welford_mean is None:
             self._welford_mean = torch.zeros_like(theta)
-            if self.metric == "dense":
+            if kind == "dense":
                 self._welford_m2 = torch.zeros(*theta.shape, theta.shape[-1], dtype=theta.dtype, device=theta.device)
             else:
                 self._welford_m2 = torch.zeros_like(theta)
@@ -447,16 +464,23 @@ class VectorizedNUTS:
         delta = theta - self._welford_mean
         self._welford_mean = self._welford_mean + delta / self._welford_n
         after = theta - self._welford_mean
-        if self.metric == "dense":
+        if kind == "dense":
             self._welford_m2 = self._welford_m2 + delta.unsqueeze(-1) * after.unsqueeze(-2)
         else:
             self._welford_m2 = self._welford_m2 + delta * after
 
+    def _kind(self):
+        """Representation of the current inverse metric: ``None``, ``"diag"``, ``"dense"`` or ``"low_rank"``."""
+        return metric_kind(self.inv_metric, batch_dims=1)
+
     def _velocity(self, r):
-        if self.inv_metric is None:
+        kind = self._kind()
+        if kind is None:
             return r
-        if self.metric == "dense":
+        if kind == "dense":
             return (self.inv_metric @ r.unsqueeze(-1)).squeeze(-1)
+        if kind == "low_rank":
+            return low_rank_velocity(r, self.inv_metric)
         return self.inv_metric * r
 
     def _kinetic(self, r):
@@ -464,23 +488,37 @@ class VectorizedNUTS:
 
     def _sample_momentum(self, theta):
         z = torch.randn_like(theta)
-        if self.inv_metric is None:
+        kind = self._kind()
+        if kind is None:
             return z
-        if self.metric == "dense":
+        if kind == "dense":
             if self._inv_metric_chol is None:
                 self._inv_metric_chol = torch.linalg.cholesky(self.inv_metric)
             # With M^-1 = L L^T, r = L^-T z has covariance M.
             return torch.linalg.solve_triangular(self._inv_metric_chol.transpose(-2, -1), z.unsqueeze(-1), upper=True).squeeze(-1)
+        if kind == "low_rank":
+            return low_rank_momentum(z, self.inv_metric)
         return z / torch.sqrt(self.inv_metric)
 
     def _end_adaptation_window(self, theta):
         n = self._welford_n
         if n >= 2:
-            covariance = self._welford_m2 / (n - 1)
-            if self.metric == "dense":
-                from ._NUTS import _dense_inverse_metric
-                identity = torch.eye(covariance.shape[-1], dtype=covariance.dtype, device=covariance.device)
-                inv_metric = _dense_inverse_metric(covariance, n)
+            kind = self._estimator(theta.shape[-1])
+            if kind == "low_rank":
+                draws = torch.stack(self._window_draws, dim=-2)
+                gradients = torch.stack(self._window_gradients, dim=-2)
+                previous = self.inv_metric if self.inv_metric is not None else identity_low_rank(theta)
+                try:
+                    metric = low_rank_inverse_metric(draws, gradients)
+                except RuntimeError:  # non-finite draws or gradients
+                    metric = previous
+                self.inv_metric = select_low_rank(low_rank_valid(metric), metric, previous)
+            elif kind in ("ledoit_wolf", "oas", "dense"):
+                if kind == "dense":
+                    inv_metric = dense_inverse_metric(self._welford_m2 / (n - 1), n)
+                else:
+                    inv_metric = shrinkage_inverse_metric(torch.stack(self._window_draws, dim=-2), kind)
+                identity = torch.eye(inv_metric.shape[-1], dtype=inv_metric.dtype, device=inv_metric.device)
                 chol, info = torch.linalg.cholesky_ex(inv_metric)
                 ok = info == 0
                 previous = self.inv_metric if self.inv_metric is not None else identity.expand_as(inv_metric)
@@ -488,7 +526,7 @@ class VectorizedNUTS:
                 self.inv_metric = torch.where(ok[:, None, None], inv_metric, previous)
                 self._inv_metric_chol = torch.where(ok[:, None, None], chol, previous_chol)
             else:
-                self.inv_metric = (n / (n + 5.0)) * covariance + 1e-3 * (5.0 / (n + 5.0))
+                self.inv_metric = (n / (n + 5.0)) * (self._welford_m2 / (n - 1)) + 1e-3 * (5.0 / (n + 5.0))
         self._reset_welford()
         self._restart_dual_averaging(theta)
 
@@ -676,7 +714,7 @@ class VectorizedNUTS:
             iteration = self._warmup_iteration
             self._warmup_iteration += 1
             if self._window_ends and self._window_start <= iteration <= self._window_ends[-1]:
-                self._welford_update(new_theta)
+                self._welford_update(new_theta, new_grad)
                 if iteration in self._window_ends:
                     self._end_adaptation_window(new_theta)
 

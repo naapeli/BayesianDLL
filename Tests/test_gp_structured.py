@@ -392,14 +392,16 @@ def test_kronecker_predictive_matches_exact_gp():
     torch.manual_seed(0)
     kronecker_samples = kronecker_gp_predictive(kronecker, trace, y, new_points, n_samples=3)
     torch.testing.assert_close(kronecker_samples, exact_samples, atol=1e-6, rtol=1e-6)
-    # A new grid is flattened in row-major order.
+    # A new grid (Matheron's rule on the union grid) is flattened in row-major order and has the exact posterior's moments.
     new_grid = [torch.tensor([0.3, 1.2], dtype=DTYPE), torch.tensor([0.1, 0.5, 1.9], dtype=DTYPE)]
     grid_points = torch.cartesian_prod(*new_grid)
     torch.manual_seed(1)
-    from_grid = kronecker_gp_predictive(kronecker, trace, y, new_grid, n_samples=2)
-    torch.manual_seed(1)
-    from_points = exact_gp_predictive(exact, trace, y, grid_points, n_samples=2)
-    torch.testing.assert_close(from_grid, from_points, atol=1e-6, rtol=1e-6)
+    from_grid = kronecker_gp_predictive(kronecker, trace, y, new_grid, n_samples=30000)
+    from_points = exact_gp_predictive(exact, trace, y, grid_points, n_samples=30000)
+    assert from_grid.shape == from_points.shape
+    for draw in range(2):
+        torch.testing.assert_close(from_grid[draw].mean(0), from_points[draw].mean(0), atol=0.05, rtol=0.0)
+        torch.testing.assert_close(torch.cov(from_grid[draw].T), torch.cov(from_points[draw].T), atol=0.06, rtol=0.0)
     # Diagonal mode: same marginal means and variances.
     torch.manual_seed(2)
     diagonal = kronecker_gp_predictive(kronecker, trace, y, new_points, n_samples=20000, diagonal=True)
@@ -677,3 +679,109 @@ def test_kronecker_posterior_predictive_matches_the_dense_posterior(new_grid):
     covariance = k_new - k_cross @ torch.linalg.solve(k_train, k_cross.T)
     torch.testing.assert_close(draws.mean(0), mean, atol=0.02, rtol=0.0)
     torch.testing.assert_close(torch.cov(draws.T), covariance, atol=0.02, rtol=0.0)
+
+
+# ----------------------------------------------------------------------------
+# Toeplitz posterior draws on the regular grid by Matheron's rule (FFT prior draws, Levinson solves)
+# ----------------------------------------------------------------------------
+
+
+def _dense_posterior(kernel, x, y, new, noise, mean, jitter=1e-6):
+    train = kernel(x, x) + (noise + jitter * max(1.0, float(kernel(x[:1], x[:1])) + noise)) * torch.eye(x.shape[0], dtype=DTYPE)
+    cross = kernel(new, x)
+    posterior_mean = mean + cross @ torch.linalg.solve(train, y - mean)
+    return posterior_mean, kernel(new, new) - cross @ torch.linalg.solve(train, cross.T)
+
+
+def _spy_on_matheron(monkeypatch):
+    """Record the results of the grid sampler (``None`` when it declined)."""
+    from BayesianDLL.GP import _structured
+
+    results = []
+    original = _structured._toeplitz_matheron
+
+    def spy(*args, **kwargs):
+        results.append(original(*args, **kwargs))
+        return results[-1]
+
+    monkeypatch.setattr(_structured, "_toeplitz_matheron", spy)
+    return results
+
+
+# The periodic part has no positive semi-definite circulant embedding: the dense conditional is used instead.
+@pytest.mark.parametrize("kernel_name, on_grid", [("rbf", True), ("matern32", True), ("rq_plus_periodic", False)])
+def test_toeplitz_grid_predictive_matches_the_dense_posterior(kernel_name, on_grid, monkeypatch):
+    results = _spy_on_matheron(monkeypatch)
+    ((_, toeplitz), _), x, y = _toeplitz_and_exact(_TOEPLITZ_KERNELS[kernel_name])
+    spacing = float(x[1] - x[0])
+    # Training points, a gap-free interior window, extrapolation on both sides, and a repeated point.
+    new = torch.tensor([-1.0 - 3 * spacing, -1.0, 0.0 + 0.0 * spacing, 1.0, 3.0, 3.0 + 2 * spacing, 3.0 + 2 * spacing], dtype=DTYPE)
+    new[2] = float(x[17])
+    new[3] = float(x[40])
+    trace = {name: torch.tensor([value], dtype=DTYPE).reshape(1, 1, 1) for name, value in
+             (("l", 0.6), ("variance", 1.2), ("noise", 0.08), ("mean", 0.3))}
+    draws = toeplitz_gp_predictive(toeplitz, trace, y, new, n_samples=60000)[0]
+    assert results and all((r is not None) == on_grid for r in results)
+    kernel = _TOEPLITZ_KERNELS[kernel_name](0.6, 1.2)
+    mean, covariance = _dense_posterior(kernel, x, y, new, 0.08, 0.3)
+    torch.testing.assert_close(draws.mean(0), mean, atol=0.02, rtol=0.0)
+    torch.testing.assert_close(torch.cov(draws.T), covariance, atol=0.03, rtol=0.0)
+    # An observation-noise variance is added.
+    noisy = toeplitz_gp_predictive(toeplitz, trace, y, new, n_samples=60000, observation_noise=0.5)[0]
+    torch.testing.assert_close(torch.cov(noisy.T), covariance + 0.5 * torch.eye(new.shape[0], dtype=DTYPE), atol=0.04, rtol=0.0)
+
+
+def test_toeplitz_off_grid_inputs_fall_back_to_the_dense_conditional(monkeypatch):
+    ((_, toeplitz), _), x, y = _toeplitz_and_exact(_TOEPLITZ_KERNELS["rbf"])
+    results = _spy_on_matheron(monkeypatch)
+    trace = {name: torch.tensor([value], dtype=DTYPE).reshape(1, 1, 1) for name, value in
+             (("l", 0.6), ("variance", 1.2), ("noise", 0.08), ("mean", 0.3))}
+    new = torch.tensor([0.0, 0.01 + float(x[3])], dtype=DTYPE)  # the second point is off the grid
+    toeplitz_gp_predictive(toeplitz, trace, y, new, n_samples=2)
+    assert results == [None]
+
+
+def test_toeplitz_posterior_predictive_on_the_grid_uses_matheron():
+    x = torch.linspace(0.0, 4.0, 40, dtype=DTYPE)
+    y = torch.sin(2 * x)
+    with Model() as model:
+        inputs = Data("x", x)
+        function = ToeplitzGP("f", inputs, RBF(0.7, 1.0), noise_variance=0.05)
+        ObservedParameter("y", function, y)
+    spacing = float(x[1] - x[0])
+    new = x[0] + spacing * torch.arange(-8, 49, dtype=DTYPE)
+    inputs.set_value(new)
+    torch.manual_seed(0)
+    draws = model.predict(samples_per_step=30000)["f"][0].reshape(30000, -1)
+    mean, covariance = _dense_posterior(RBF(0.7, 1.0), x, y, new, 0.05, 0.0)
+    torch.testing.assert_close(draws.mean(0), mean, atol=0.03, rtol=0.0)
+    torch.testing.assert_close(draws.var(0), torch.diagonal(covariance), atol=0.03, rtol=0.0)
+
+
+def test_kronecker_grid_predictive_uses_matheron_and_matches_the_dense_posterior():
+    axis_1 = torch.linspace(0.0, 1.0, 4, dtype=DTYPE)
+    axis_2 = torch.linspace(0.0, 2.0, 3, dtype=DTYPE)
+    kernels = [RBF(0.6, 1.3), RBF(0.9)]
+    noise = 0.05
+    y = torch.sin(3 * axis_1)[:, None] * torch.cos(axis_2)[None, :]
+    with Model():
+        function = KroneckerGP("f", [Data("a1", axis_1), Data("a2", axis_2)], kernels, noise_variance=noise, mean=0.2)
+        ObservedParameter("y", function, y)
+    new = [torch.tensor([-0.2, 0.5, 1.3], dtype=DTYPE), torch.tensor([0.4, 2.5], dtype=DTYPE)]
+    torch.manual_seed(0)
+    draws = kronecker_gp_predictive(function, {}, y, new, n_samples=40000, observation_noise=0.3)[0]
+    assert draws.shape == (40000, 6)
+
+    def kron(a, b):
+        return [kernel(u, v) for kernel, u, v in zip(kernels, a, b)]
+
+    k_train = torch.kron(*kron([axis_1, axis_2], [axis_1, axis_2])) + (noise + function.jitter) * torch.eye(12, dtype=DTYPE)
+    k_cross = torch.kron(*kron(new, [axis_1, axis_2]))
+    mean = 0.2 + k_cross @ torch.linalg.solve(k_train, y.reshape(-1) - 0.2)
+    covariance = torch.kron(*kron(new, new)) - k_cross @ torch.linalg.solve(k_train, k_cross.T) + 0.3 * torch.eye(6, dtype=DTYPE)
+    torch.testing.assert_close(draws.mean(0), mean, atol=0.02, rtol=0.0)
+    torch.testing.assert_close(torch.cov(draws.T), covariance, atol=0.03, rtol=0.0)
+    # The dense route for the same points given as a matrix has the same distribution.
+    points = torch.cartesian_prod(*new)
+    dense = kronecker_gp_predictive(function, {}, y, points, n_samples=40000, observation_noise=0.3)[0]
+    torch.testing.assert_close(dense.mean(0), draws.mean(0), atol=0.03, rtol=0.0)

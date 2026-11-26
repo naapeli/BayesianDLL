@@ -153,6 +153,51 @@ def _mvdigamma(a, p):
     return torch.digamma(a.unsqueeze(-1) + (1 - j) / 2).sum(-1)
 
 
+def _betainc(a, b, x, n_iter=300):
+    """Regularised incomplete beta function ``I_x(a, b)`` (modified Lentz continued fraction)."""
+    dtype = torch.promote_types(torch.promote_types(a.dtype, b.dtype), x.dtype)
+    a, b, x = torch.broadcast_tensors(a.to(torch.float64), b.to(torch.float64), x.to(torch.float64))
+    x0 = x.clamp(0, 1)
+    swap = x0 > (a + 1) / (a + b + 2)
+    aa, bb, xx = torch.where(swap, b, a), torch.where(swap, a, b), torch.where(swap, 1 - x0, x0)
+    tiny = 1e-300
+    xs = xx.clamp(min=tiny)
+    log_front = (torch.lgamma(aa + bb) - torch.lgamma(aa) - torch.lgamma(bb)
+                 + aa * torch.log(xs) + bb * torch.log1p(-xx.clamp(max=1 - 1e-16)))
+    c = torch.ones_like(xx)
+    d = 1 - (aa + bb) * xx / (aa + 1)
+    d = 1 / torch.where(d.abs() < tiny, torch.full_like(d, tiny), d)
+    h = d.clone()
+    for m in range(1, n_iter + 1):
+        for step in (0, 1):
+            if step == 0:
+                num = m * (bb - m) * xx / ((aa + 2 * m - 1) * (aa + 2 * m))
+            else:
+                num = -(aa + m) * (aa + bb + m) * xx / ((aa + 2 * m) * (aa + 2 * m + 1))
+            d = 1 + num * d
+            d = 1 / torch.where(d.abs() < tiny, torch.full_like(d, tiny), d)
+            c = 1 + num / c
+            c = torch.where(c.abs() < tiny, torch.full_like(c, tiny), c)
+            h = h * d * c
+        if m % 20 == 0 and bool(((d * c - 1).abs() < 1e-15).all()):
+            break
+    val = torch.exp(log_front) * h / aa
+    val = torch.where(swap, 1 - val, val)
+    val = torch.where(x0 <= 0, torch.zeros_like(val), torch.where(x0 >= 1, torch.ones_like(val), val))
+    return val.to(dtype)
+
+
+def _fd_derivative(f, theta, rel_step=1e-6):
+    """Central finite difference of ``f`` at ``theta`` (float64 internally).
+
+    Used only for derivatives of cumulative distribution functions with respect to shape
+    parameters, which have no closed form (the incomplete gamma and beta functions).
+    """
+    t = theta.to(torch.float64)
+    h = rel_step * t.abs().clamp(min=1.0)
+    return ((f(t + h) - f(t - h)) / (2 * h)).to(theta.dtype)
+
+
 class Distribution(ABC):
     r"""Base class for all probability distributions.
 
@@ -223,6 +268,19 @@ class Distribution(ABC):
         """
         pass
 
+    def log_pdf_param_curvature(self, x):
+        """Fisher information of :meth:`log_pdf` w.r.t. the parameters (positive semi-definite blocks).
+
+        Returns ``{(name_a, name_b): block}`` with the names of
+        :meth:`log_pdf_param_grads`, one entry per unordered pair of parameters
+        (zero blocks are left out); a block has the broadcast shape of
+        ``log_pdf(x)`` followed by the event dimensions of parameter ``a`` and
+        of parameter ``b``. Used by the Gauss-Newton Laplace approximation;
+        ``NotImplementedError`` for distributions without it.
+        """
+        from ._curvature import parameter_curvature
+        return parameter_curvature(self, x)
+
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
         """Draw ``n_samples`` samples of shape ``(n_samples, *batch_shape, *event_shape)``.
 
@@ -235,6 +293,10 @@ class Distribution(ABC):
     def cdf(self, x):
         """Cumulative distribution function ``P(X <= x)`` (where available)."""
         raise NotImplementedError(f"{type(self).__name__} has no closed-form cdf.")
+
+    def sf(self, x):
+        """Survival function ``P(X > x)`` (``1 - cdf`` unless a subclass is more accurate in the tail)."""
+        return 1 - self.cdf(x)
 
     def icdf(self, u):
         """Inverse of :meth:`cdf` for ``u`` in ``(0, 1)`` (where available)."""
@@ -346,6 +408,10 @@ class Normal(Distribution):
         mu, sigma = _as_float(self.mu, self.sigma)
         return torch.special.ndtr((x - mu) / sigma)
 
+    def sf(self, x):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        return torch.special.ndtr(-(x - mu) / sigma)
+
     def icdf(self, u):
         mu, sigma = _as_float(self.mu, self.sigma)
         return mu + sigma * torch.special.ndtri(u)
@@ -430,6 +496,11 @@ class HalfNormal(Distribution):
         sigma = _as_float(self.sigma)
         return sigma * torch.special.ndtri((1 + u) / 2)
 
+    def cdf_param_grads(self, x):
+        sigma = _as_float(self.sigma)
+        t = x / sigma
+        return {self.resolve_name("sigma", self.sigma): -2 * torch.exp(-0.5 * t ** 2 - 0.5 * _LOG_2PI) * t / sigma}
+
 
     def mean(self):
         return _as_float(self.sigma) * math.sqrt(2 / math.pi)
@@ -507,6 +578,16 @@ class LogNormal(Distribution):
     def icdf(self, u):
         mu, sigma = _as_float(self.mu, self.sigma)
         return torch.exp(mu + sigma * torch.special.ndtri(u))
+
+    def sf(self, x):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        return torch.special.ndtr(-(torch.log(x) - mu) / sigma)
+
+    def cdf_param_grads(self, x):
+        mu, sigma = _as_float(self.mu, self.sigma)
+        t = (torch.log(x) - mu) / sigma
+        phi = torch.exp(-0.5 * t ** 2 - 0.5 * _LOG_2PI)
+        return {self.resolve_name("mean", self.mu): -phi / sigma, self.resolve_name("sigma", self.sigma): -phi * t / sigma}
 
 
     def mean(self):
@@ -703,6 +784,17 @@ class Beta(Distribution):
         a, b = _as_float(self.a, self.b)
         return a * torch.sigmoid(-x_unconstrained) - b * torch.sigmoid(x_unconstrained)
 
+    def cdf(self, x):
+        a, b = _as_float(self.a, self.b)
+        return _betainc(a, b, x)
+
+    def cdf_param_grads(self, x):
+        """Shape derivatives of the incomplete beta function by central finite differences."""
+        a, b = _as_float(self.a, self.b)
+        xx = torch.as_tensor(x)
+        return {self.resolve_name("a", self.a): _fd_derivative(lambda t: _betainc(t, b.to(t.dtype), xx), a),
+                self.resolve_name("b", self.b): _fd_derivative(lambda t: _betainc(a.to(t.dtype), t, xx), b)}
+
 
     def mean(self):
         a, b = _as_float(self.a, self.b)
@@ -859,6 +951,19 @@ class Gamma(Distribution):
     def cdf(self, x):
         alpha, beta = _as_float(self.alpha, self.beta)
         return torch.special.gammainc(alpha, beta * x)
+
+    def sf(self, x):
+        alpha, beta = _as_float(self.alpha, self.beta)
+        return torch.special.gammaincc(alpha, beta * x)
+
+    def cdf_param_grads(self, x):
+        """Rate derivative in closed form; the shape derivative by a central finite difference."""
+        alpha, beta = _as_float(self.alpha, self.beta)
+        bx = beta * x
+        pdf = torch.exp(alpha * torch.log(beta) - torch.lgamma(alpha) + torch.xlogy(alpha - 1, x) - bx)
+        d_alpha = _fd_derivative(lambda a: torch.special.gammainc(a, bx.to(a.dtype)), alpha)
+        return {self.resolve_name("alpha", self.alpha): d_alpha + torch.zeros_like(pdf),
+                self.resolve_name("beta", self.beta): pdf * x / beta}
 
 
     def mean(self):
@@ -1341,6 +1446,24 @@ class StudentT(Distribution):
         grad_sigma = -1 / sigma + (nu + 1) * t2 / (sigma * (nu + t2))
         return {self.resolve_name("nu", self.nu): grad_nu, self.resolve_name("mean", self.mu): grad_mu,
                 self.resolve_name("sigma", self.sigma): grad_sigma}
+
+    @staticmethod
+    def _std_cdf(t, nu):
+        tail = 0.5 * _betainc(nu / 2, torch.full_like(nu, 0.5), nu / (nu + t ** 2))
+        return torch.where(t > 0, 1 - tail, tail)
+
+    def cdf(self, x):
+        nu, mu, sigma = _as_float(self.nu, self.mu, self.sigma)
+        return self._std_cdf((x - mu) / sigma, nu)
+
+    def cdf_param_grads(self, x):
+        """Location and scale derivatives in closed form; the degrees-of-freedom derivative by a central finite difference."""
+        nu, mu, sigma = _as_float(self.nu, self.mu, self.sigma)
+        t = (x - mu) / sigma
+        pdf = torch.exp(self.log_pdf(x))
+        d_nu = _fd_derivative(lambda n: self._std_cdf(t.to(n.dtype), n), nu)
+        return {self.resolve_name("nu", self.nu): d_nu + torch.zeros_like(pdf),
+                self.resolve_name("mean", self.mu): -pdf, self.resolve_name("sigma", self.sigma): -pdf * t}
 
 
     def mean(self):
