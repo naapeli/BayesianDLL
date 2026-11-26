@@ -29,9 +29,7 @@ with a decaying learning rate so that both ELBO traces flatten. The warm-up
 lowers the RMS error of the predictive mean from 0.423 to 0.251 in the run
 below, while both guides keep three active units in the last layer. The
 annealed run ends with the *lower* ELBO (-284 against -237): the ELBO scores
-the approximation of the posterior, not the fit to the signal, and the
-unannealed run settles in an optimum that is better in ELBO but smoother
-than the data support. Annealing is a cheap option to try when a mean-field
+the approximation of the posterior, not the fit to the signal. Annealing is a cheap option to try when a mean-field
 fit looks over-smoothed, not a guaranteed gain in the ELBO; the outcome of
 a single run also depends on the seed and the learning rate.
 """
