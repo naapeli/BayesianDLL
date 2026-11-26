@@ -24,13 +24,16 @@ always the true one (:math:`w = 1`), also during the warm-up.
 
 Here a four-hidden-layer network (1 -> 8 -> 8 -> 8 -> 8 -> 1) is fitted to
 the signal :math:`\sin(1.5 x) + 0.5 \sin(3.5 x)` by mean-field VI from the
-same MAP estimate, with and without a 400-epoch warm-up. The warm-up
-lowers the RMS error of the predictive mean (0.364 to 0.292 in the run
-below), but both guides keep the same number of active units in the last
-layer, and after 800 epochs, with both runs still improving, the annealed
-one has the lower ELBO (the ELBO scores the approximation of the posterior,
-not the fit to the signal). Annealing is a cheap option to try when a
-mean-field fit looks over-smoothed, not a guaranteed gain.
+same MAP estimate, with and without a 1000-epoch warm-up, for 3000 epochs
+with a decaying learning rate so that both ELBO traces flatten. The warm-up
+lowers the RMS error of the predictive mean from 0.423 to 0.251 in the run
+below, while both guides keep three active units in the last layer. The
+annealed run ends with the *lower* ELBO (-284 against -237): the ELBO scores
+the approximation of the posterior, not the fit to the signal, and the
+unannealed run settles in an optimum that is better in ELBO but smoother
+than the data support. Annealing is a cheap option to try when a mean-field
+fit looks over-smoothed, not a guaranteed gain in the ELBO; the outcome of
+a single run also depends on the seed and the learning rate.
 """
 
 import math
@@ -88,7 +91,7 @@ torch.manual_seed(0)
 model.find_MAP(lr=0.03, epochs=1500, verbose=False)
 map_values = {name: parameter.constrained_value.clone() for name, parameter in model.params.items()}
 
-epochs, warmup = 800, 400
+epochs, warmup = 3000, 1000
 grid_raw = torch.linspace(-3.0, 3.0, 200, dtype=torch.float64)
 grid = (grid_raw - x_mean) / x_std
 
@@ -99,7 +102,7 @@ for label, annealing in (("no annealing", None), (f"{warmup}-epoch warm-up", war
     torch.manual_seed(1)
     guide = Guide(model, default_family="mean_field", init_scale=0.05)
     start = time.perf_counter()
-    history = BBVI(model, guide, n_samples=4, epochs=epochs, lr=0.01, lrd=0.999, callback_frequency=10, verbose=False, kl_annealing=annealing)
+    history = BBVI(model, guide, n_samples=2, epochs=epochs, lr=0.015, lrd=0.9985, callback_frequency=10, verbose=False, kl_annealing=annealing)
     elapsed = time.perf_counter() - start
     draws = {k: v.flatten(0, 1) for k, v in guide.sample(200).items()}
     outputs = []
@@ -130,7 +133,7 @@ for label, (history, f, weights) in results.items():
     axes[1].plot(weights, "o", color=colors[label], label=label)
     axes[2].plot(grid_raw, f.mean(0), color=colors[label], lw=2, label=label)
 best = max(max(h[-20:]) for h, _, _ in results.values())
-axes[0].set(xlabel="epoch", ylabel="ELBO estimate", ylim=(best - 400, best + 20), title="Optimisation")
+axes[0].set(xlabel="epoch", ylabel="ELBO estimate", ylim=(best - 250, best + 20), title="Optimisation")
 axes[0].legend(fontsize="small", loc="lower right")
 axes[1].axhline(0.0, color="gray", ls=":")
 axes[1].set(xlabel="unit of the last hidden layer", ylabel="posterior mean of its output weight", title="Output weights")
