@@ -2,7 +2,11 @@ Time Series
 ===========
 
 Distributions over whole series, usable as priors on latent series and as likelihoods of observed
-series, and state-space models whose hidden states are integrated out exactly.
+series, and state-space models whose hidden states are integrated out exactly. The special cases of
+SARIMAX (MA, ARMA, ARIMA, seasonal ARIMA) are written with that one class, see its docstring.
+:class:`~BayesianDLL.Deterministic.StationaryAR` and :class:`~BayesianDLL.Deterministic.InvertibleMA`,
+which parameterise stationary AR and invertible MA coefficients, are documented under
+:doc:`Deterministic </api/BayesianDLL.Deterministic>`.
 
 .. currentmodule:: BayesianDLL.TimeSeries
 
@@ -10,34 +14,14 @@ series, and state-space models whose hidden states are integrated out exactly.
    :members:
    :show-inheritance:
 
-.. autoclass:: AutoRegressive
+.. autoclass:: AR
    :members:
    :show-inheritance:
 
-.. autofunction:: is_stationary
-
-.. autoclass:: LinearGaussianStateSpace
+.. autoclass:: StateSpace
    :members:
    :show-inheritance:
 
 .. autoclass:: SARIMAX
    :members:
-   :show-inheritance:
-
-.. autoclass:: SARIMA
-   :show-inheritance:
-
-.. autoclass:: ARIMA
-   :show-inheritance:
-
-.. autoclass:: ARMA
-   :show-inheritance:
-
-.. autoclass:: MovingAverage
-   :show-inheritance:
-
-.. autoclass:: StationaryAR
-   :show-inheritance:
-
-.. autoclass:: InvertibleMA
    :show-inheritance:

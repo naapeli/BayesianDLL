@@ -8,6 +8,9 @@ import torch
 from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
+from BayesianDLL.GP._structured import _kronecker_gp_predictive
+from BayesianDLL.GP._process import _exact_gp_predictive as exact_gp_predictive
+from BayesianDLL.GP._structured import _toeplitz_gp_predictive as toeplitz_gp_predictive
 from BayesianDLL.GP import (
     Constant,
     ExactGP,
@@ -22,10 +25,7 @@ from BayesianDLL.GP import (
     RBF,
     ToeplitzGP,
     WhiteNoise,
-    exact_gp_predictive,
-    kronecker_gp_predictive,
     levinson_solve,
-    toeplitz_gp_predictive,
 )
 
 DTYPE = torch.float64
@@ -390,13 +390,13 @@ def test_kronecker_predictive_matches_exact_gp():
     torch.manual_seed(0)
     exact_samples = exact_gp_predictive(exact, trace, y, new_points, n_samples=3)
     torch.manual_seed(0)
-    kronecker_samples = kronecker_gp_predictive(kronecker, trace, y, new_points, n_samples=3)
+    kronecker_samples = _kronecker_gp_predictive(kronecker, trace, y, new_points, n_samples=3)
     torch.testing.assert_close(kronecker_samples, exact_samples, atol=1e-6, rtol=1e-6)
     # A new grid (Matheron's rule on the union grid) is flattened in row-major order and has the exact posterior's moments.
     new_grid = [torch.tensor([0.3, 1.2], dtype=DTYPE), torch.tensor([0.1, 0.5, 1.9], dtype=DTYPE)]
     grid_points = torch.cartesian_prod(*new_grid)
     torch.manual_seed(1)
-    from_grid = kronecker_gp_predictive(kronecker, trace, y, new_grid, n_samples=30000)
+    from_grid = _kronecker_gp_predictive(kronecker, trace, y, new_grid, n_samples=30000)
     from_points = exact_gp_predictive(exact, trace, y, grid_points, n_samples=30000)
     assert from_grid.shape == from_points.shape
     for draw in range(2):
@@ -404,9 +404,9 @@ def test_kronecker_predictive_matches_exact_gp():
         torch.testing.assert_close(torch.cov(from_grid[draw].T), torch.cov(from_points[draw].T), atol=0.06, rtol=0.0)
     # Diagonal mode: same marginal means and variances.
     torch.manual_seed(2)
-    diagonal = kronecker_gp_predictive(kronecker, trace, y, new_points, n_samples=20000, diagonal=True)
+    diagonal = _kronecker_gp_predictive(kronecker, trace, y, new_points, n_samples=20000, diagonal=True)
     torch.manual_seed(2)
-    full = kronecker_gp_predictive(kronecker, trace, y, new_points, n_samples=20000)
+    full = _kronecker_gp_predictive(kronecker, trace, y, new_points, n_samples=20000)
     torch.testing.assert_close(diagonal.mean(1), full.mean(1), atol=0.03, rtol=0)
     torch.testing.assert_close(diagonal.var(1), full.var(1), atol=0.01, rtol=0.05)
 
@@ -769,7 +769,7 @@ def test_kronecker_grid_predictive_uses_matheron_and_matches_the_dense_posterior
         ObservedParameter("y", function, y)
     new = [torch.tensor([-0.2, 0.5, 1.3], dtype=DTYPE), torch.tensor([0.4, 2.5], dtype=DTYPE)]
     torch.manual_seed(0)
-    draws = kronecker_gp_predictive(function, {}, y, new, n_samples=40000, observation_noise=0.3)[0]
+    draws = _kronecker_gp_predictive(function, {}, y, new, n_samples=40000, observation_noise=0.3)[0]
     assert draws.shape == (40000, 6)
 
     def kron(a, b):
@@ -783,5 +783,5 @@ def test_kronecker_grid_predictive_uses_matheron_and_matches_the_dense_posterior
     torch.testing.assert_close(torch.cov(draws.T), covariance, atol=0.03, rtol=0.0)
     # The dense route for the same points given as a matrix has the same distribution.
     points = torch.cartesian_prod(*new)
-    dense = kronecker_gp_predictive(function, {}, y, points, n_samples=40000, observation_noise=0.3)[0]
+    dense = _kronecker_gp_predictive(function, {}, y, points, n_samples=40000, observation_noise=0.3)[0]
     torch.testing.assert_close(dense.mean(0), draws.mean(0), atol=0.03, rtol=0.0)

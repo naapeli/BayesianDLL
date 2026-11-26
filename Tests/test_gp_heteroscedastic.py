@@ -8,13 +8,13 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
+from BayesianDLL.GP._process import _exact_gp_predictive as exact_gp_predictive
 from BayesianDLL.GP import (
     RBF,
     ExactGP,
     KroneckerGP,
     Matern52,
     ToeplitzGP,
-    exact_gp_predictive,
     stable_cholesky,
 )
 

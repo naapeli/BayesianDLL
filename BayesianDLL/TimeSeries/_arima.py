@@ -1,4 +1,4 @@
-"""ARMA, ARIMA, seasonal ARIMA and SARIMAX likelihoods on the state-space model (Harvey's representation)."""
+"""SARIMAX likelihood on the state-space model (Harvey's representation)."""
 import math
 import torch
 
@@ -6,7 +6,7 @@ from ..Distributions._distributions import Distribution, _as_float
 from ..Distributions._resolve import resolve
 from ..Distributions._transforms import IdentityTransform
 from ..Distributions._state_space import ContinuousReal
-from ._statespace import LinearGaussianStateSpace
+from ._statespace import StateSpace
 
 
 # ------------------------------------------------------------ lag polynomials
@@ -85,7 +85,7 @@ def _difference_matrix(N, coefficients, dtype, device):
     return _difference_matrices[key]
 
 
-def _integrate(w, history, coefficients):
+def _integrate(w, history, coefficients, keep_history=False):
     """Undo the differencing: ``y_t = w_t - sum_{k>=1} c_k y_{t-k}`` started from the raw ``history`` values (last dim)."""
     n = len(coefficients) - 1
     if n == 0:
@@ -96,25 +96,40 @@ def _integrate(w, history, coefficients):
         for k in range(1, n + 1):
             nxt = nxt - coefficients[k] * y[-k]
         y.append(nxt)
-    return torch.stack(y[n:], dim=-1)
+    return torch.stack(y if keep_history else y[n:], dim=-1)
 
 
 class SARIMAX(Distribution):
     r"""Seasonal ARIMA model with exogenous regressors (SARIMAX) as the distribution of a whole series.
 
-    The series :math:`y_t` is differenced, :math:`w_t = (1 - L)^d (1 - L^s)^D y_t`, and the differenced series follows
+    The series :math:`y_t` is differenced, :math:`w_t = (1 - L)^d (1 - L^s)^D y_t`, and the differenced
+    series follows
 
     .. math::
 
-        w_t = \mu + \tilde x_t^\top \beta + u_t, \qquad
+        w_t = \delta + \tilde x_t^\top \beta + u_t, \qquad
         \phi(L)\,\Phi(L^s)\, u_t = \theta(L)\,\Theta(L^s)\, \sigma \varepsilon_t, \quad \varepsilon_t \sim \mathcal{N}(0, 1)
 
     with :math:`\phi(L) = 1 - \sum_i \phi_i L^i`, :math:`\Phi(L^s) = 1 - \sum_j \Phi_j L^{sj}`,
     :math:`\theta(L) = 1 + \sum_i \theta_i L^i`, :math:`\Theta(L^s) = 1 + \sum_j \Theta_j L^{sj}` (the usual
     Box-Jenkins sign convention for the MA part), and :math:`\tilde x_t` the regressors differenced like the series.
-    (MA: ``ar`` and ``seasonal_ar`` empty, ARMA: no seasonal terms or differencing, ARIMA: ``diff > 0``,
-    SARIMA: seasonal terms, SARIMAX: ``exog`` and ``beta``; thin subclasses with the matching signatures are
-    :class:`MovingAverage`, :class:`ARMA`, :class:`ARIMA` and :class:`SARIMA`.)
+
+    **Mean and drift.** Without differencing (``difference = seasonal_difference = 0``) the mean of the series as
+    written is ``mu`` (:math:`\delta = \mu`). With differencing the series has no stationary mean and the data
+    cannot identify a level, so ``mu`` is not allowed; the constant of the *differenced* series is ``drift``
+    (:math:`\delta` = ``drift``, the slope of a linear trend when ``difference = 1``), which in turn needs
+    differencing. This follows R's ``forecast::Arima`` (``include.mean`` only without differencing,
+    ``include.drift`` with it) and statsmodels (the constant of a differenced model is its drift). Simulated
+    differenced series start from zero.
+
+    **Special cases.** Leave arguments out to get the classical models (``y`` is the series, ``n_steps`` its length)::
+
+        SARIMAX(ma=theta, sigma=sigma, mu=mu)                          # MA(q)
+        SARIMAX(ar=phi, ma=theta, sigma=sigma, mu=mu)                  # ARMA(p, q)
+        SARIMAX(ar=phi, ma=theta, sigma=sigma, difference=1, drift=c)  # ARIMA(p, 1, q) with drift
+        SARIMAX(ar=phi, ma=theta, sigma=sigma, seasonal_ar=Phi, seasonal_ma=Theta, period=12,
+                difference=1, seasonal_difference=1)                   # SARIMA(p,1,q)(P,1,Q)_12
+        SARIMAX(ar=phi, sigma=sigma, exog=X, beta=beta)                # regression with AR errors
 
     **Likelihood.** :math:`u_t` is written as a state-space model in Harvey's form: the state has dimension
     :math:`m = \max(p_{tot}, q_{tot} + 1)` (:math:`p_{tot} = p + sP`, :math:`q_{tot} = q + sQ`), the transition matrix has
@@ -122,7 +137,7 @@ class SARIMAX(Distribution):
     superdiagonal, the selection vector is :math:`(1, e_1, \dots, e_{q_{tot}}, 0, \dots)` with :math:`e` the
     coefficients of the product MA polynomial, and the observation picks the first state. The state starts from the
     stationary distribution, so the likelihood is the exact Gaussian likelihood of :math:`w_{d+sD+1}, \dots, w_N`,
-    evaluated with the Kalman filter of :class:`LinearGaussianStateSpace` and its hand-written gradients. The
+    evaluated with the Kalman filter of :class:`StateSpace` and its hand-written gradients. The
     likelihood of the raw series is the likelihood of the differenced series, i.e. it conditions on the first
     :math:`d + sD` observations (differencing is a unit-determinant linear map, so no Jacobian arises).
 
@@ -134,7 +149,7 @@ class SARIMAX(Distribution):
     products of stationary polynomials are stationary). Missing values (``nan``) are allowed; with differencing a
     missing value makes every differenced value that contains it missing, which loses a little information.
 
-    **Sampling.** ``sample`` simulates a series of length ``T`` whose first :math:`d + sD` values are zero and whose
+    **Sampling.** ``sample`` simulates a series of length ``n_steps`` whose first :math:`d + sD` values equal ``mu`` and whose
     differenced series follows the model (the stationary process started from its stationary distribution).
     :meth:`forecast` simulates the future of an observed series exactly (given the observed history).
 
@@ -146,45 +161,53 @@ class SARIMAX(Distribution):
         MA coefficients :math:`\theta_1, \dots, \theta_q`, shape ``(..., q)``.
     sigma : float or torch.Tensor or Parameter
         Innovation standard deviation :math:`\sigma > 0`.
-    mu : float or torch.Tensor or Parameter, default 0.0
-        Mean :math:`\mu` of the differenced series (the drift when differenced).
+    mu : float or torch.Tensor or Parameter, optional
+        Mean :math:`\mu` of the series (default 0); not allowed with differencing (use ``drift``).
     seasonal_ar, seasonal_ma : torch.Tensor or Parameter, optional
         Seasonal coefficients :math:`\Phi_1, \dots, \Phi_P` and :math:`\Theta_1, \dots, \Theta_Q`, shape ``(..., P)`` / ``(..., Q)``.
     beta : torch.Tensor or Parameter, optional
         Regression coefficients of shape ``(..., r)`` (needs ``exog``).
     exog : torch.Tensor or Data, optional
         Regressors of shape ``(N, r)`` (a constant tensor or ``Data``; no gradient is taken with respect to it).
-    diff : int, default 0
+    drift : float or torch.Tensor or Parameter, optional
+        Constant :math:`\delta` of the differenced series; needs ``difference > 0`` or ``seasonal_difference > 0``.
+    difference : int, default 0
         Order :math:`d` of ordinary differencing.
-    seasonal_diff : int, default 0
+    seasonal_difference : int, default 0
         Order :math:`D` of seasonal differencing.
     period : int, optional
         Seasonal period :math:`s`; needed for seasonal terms and seasonal differencing.
-    T : int, optional
+    n_steps : int, optional
         Series length. Needed for sampling and to give a latent series its shape.
     """
 
     _param_event_ndims = {"ar": 1, "ma": 1, "seasonal_ar": 1, "seasonal_ma": 1, "beta": 1, "exog": 2}
 
-    def __init__(self, ar=None, ma=None, sigma=1.0, mu=0.0, seasonal_ar=None, seasonal_ma=None, beta=None, exog=None,
-                 diff=0, seasonal_diff=0, period=None, T=None):
+    def __init__(self, ar=None, ma=None, sigma=1.0, mu=None, *, seasonal_ar=None, seasonal_ma=None, period=None,
+                 difference=0, seasonal_difference=0, drift=None, beta=None, exog=None, n_steps=None):
         super().__init__(IdentityTransform(), ContinuousReal(), ContinuousReal())
-        if (seasonal_ar is not None or seasonal_ma is not None or seasonal_diff) and (period is None or period < 2):
+        if (seasonal_ar is not None or seasonal_ma is not None or seasonal_difference) and (period is None or period < 2):
             raise ValueError("Seasonal terms and seasonal differencing need a period >= 2.")
+        if mu is not None and (difference or seasonal_difference):
+            raise ValueError("A differenced series has no identifiable mean: use drift (the constant of the differenced series) instead of mu.")
+        if mu is None:
+            mu = 0.0
+        if drift is not None and not (difference or seasonal_difference):
+            raise ValueError("drift is the constant of the differenced series: it needs difference > 0 or seasonal_difference > 0.")
         if (beta is None) != (exog is None):
             raise ValueError("Give both beta and exog, or neither.")
         if exog is not None:
             from .._parameters import RandomParameter, DeterministicParameter
             if isinstance(exog, (RandomParameter, DeterministicParameter)):
                 raise ValueError("exog must be constant data (a tensor or Data), not a latent node.")
-        self.ar, self.ma, self.sigma, self.mu = ar, ma, sigma, mu
+        self.ar, self.ma, self.sigma, self.mu, self.drift = ar, ma, sigma, mu, drift
         self.seasonal_ar, self.seasonal_ma = seasonal_ar, seasonal_ma
         self.beta, self.exog = beta, exog
-        self.diff, self.seasonal_diff = int(diff), int(seasonal_diff)
+        self.difference, self.seasonal_difference = int(difference), int(seasonal_difference)
         self.period = None if period is None else int(period)
-        self.T = None if T is None else int(T)
-        self.difference_coefficients = _difference_coefficients(self.diff, self.seasonal_diff, self.period or 1)
-        for p in (ar, ma, sigma, mu, seasonal_ar, seasonal_ma, beta, exog):
+        self.n_steps = None if n_steps is None else int(n_steps)
+        self.difference_coefficients = _difference_coefficients(self.difference, self.seasonal_difference, self.period or 1)
+        for p in (ar, ma, sigma, mu, drift, seasonal_ar, seasonal_ma, beta, exog):
             if p is not None:
                 self.add_dependency(p)
 
@@ -195,25 +218,25 @@ class SARIMAX(Distribution):
 
     @property
     def event_shape(self):
-        return () if self.T is None else (self.T,)
+        return () if self.n_steps is None else (self.n_steps,)
 
     def _length(self):
-        if self.T is None:
-            raise ValueError(f"{type(self).__name__}: give the series length T to sample or to use it as a latent parameter.")
-        return self.T
+        if self.n_steps is None:
+            raise ValueError(f"{type(self).__name__}: give the series length n_steps to sample or to use it as a latent parameter.")
+        return self.n_steps
 
     @property
     def batch_shape(self):
         shapes = []
         for name, node in (("ar", self.ar), ("ma", self.ma), ("seasonal_ar", self.seasonal_ar), ("seasonal_ma", self.seasonal_ma),
-                           ("beta", self.beta), ("exog", self.exog), ("sigma", self.sigma), ("mu", self.mu)):
+                           ("beta", self.beta), ("exog", self.exog), ("sigma", self.sigma), ("mu", self.mu), ("drift", self.drift)):
             if node is not None:
                 shape = resolve(node).shape
                 shapes.append(tuple(shape[: len(shape) - self._param_event_ndims.get(name, 0)]))
         return torch.broadcast_shapes(*shapes)
 
     def _values(self):
-        names = ("ar", "ma", "seasonal_ar", "seasonal_ma", "beta", "exog", "sigma", "mu")
+        names = ("ar", "ma", "seasonal_ar", "seasonal_ma", "beta", "exog", "sigma", "mu", "drift")
         nodes = [getattr(self, n) for n in names]
         present = [n for n, v in zip(names, nodes) if v is not None]
         tensors = _as_float(*[getattr(self, n) for n in present]) if len(present) > 1 else [_as_float(getattr(self, present[0]))]
@@ -223,6 +246,13 @@ class SARIMAX(Distribution):
         for n in ("ar", "ma", "seasonal_ar", "seasonal_ma"):
             values.setdefault(n, empty)
         return values
+
+    def _constant(self, values, like):
+        """The constant of the differenced series, shape ``(..., 1)``: ``mu`` or, with differencing, ``drift``."""
+        node = values["mu"] if self.n_differences == 0 else values.get("drift")
+        if node is None:
+            node = torch.zeros_like(values["mu"])
+        return node.unsqueeze(-1) + torch.zeros(1, dtype=like.dtype, device=like.device)
 
     def _polynomials(self, values):
         s = self.period or 1
@@ -248,7 +278,7 @@ class SARIMAX(Distribution):
         Z = torch.zeros(1, m, dtype=dtype, device=device)
         Z[0, 0] = 1.0
         Q = (sigma ** 2).expand(batch)[..., None, None]
-        return LinearGaussianStateSpace(Tm, Z, Q, selection=R, obs_offset=offset.unsqueeze(-1), T=N), m
+        return StateSpace(Tm, Z, Q, selection=R, observation_offset=offset.unsqueeze(-1), n_steps=N), m
 
     def _prepare(self, y, values):
         y = torch.as_tensor(y).to(values["sigma"].dtype)
@@ -257,7 +287,7 @@ class SARIMAX(Distribution):
             raise ValueError("The series is too short for the differencing.")
         Dm = _difference_matrix(N, self.difference_coefficients, y.dtype, y.device) if self.n_differences else None
         w = y @ Dm.T if Dm is not None else y
-        offset = values["mu"].unsqueeze(-1) + torch.zeros(1, dtype=y.dtype, device=y.device)
+        offset = self._constant(values, y)
         Xd = None
         if self.exog is not None:
             X = values["exog"]
@@ -300,8 +330,11 @@ class SARIMAX(Distribution):
         add("ma", self.ma, g_theta)
         add("seasonal_ma", self.seasonal_ma, g_Theta)
         add("sigma", self.sigma, 2 * sigma * grads["state_cov"][..., 0, 0])
-        g_off = grads["obs_offset"][..., 0]
-        add("mu", self.mu, g_off.sum(-1))
+        g_off = grads["observation_offset"][..., 0]
+        if self.n_differences == 0:
+            add("mu", self.mu, g_off.sum(-1))
+        else:
+            add("drift", self.drift, g_off.sum(-1))
         if self.beta is not None:
             add("beta", self.beta, (Xd.transpose(-1, -2) @ g_off.unsqueeze(-1)).squeeze(-1))
         return out, g, ok, Dm
@@ -321,18 +354,18 @@ class SARIMAX(Distribution):
     def _simulation_system(self, N_w):
         values = self._values()
         c, e = self._polynomials(values)
-        offset = values["mu"].unsqueeze(-1) + torch.zeros(1, dtype=values["sigma"].dtype, device=values["sigma"].device)
+        offset = self._constant(values, values["sigma"])
         return values, c, e, offset
 
     def sample(self, n_samples=1, _reparametrization_trick_grad=False):
-        """Simulate series ``(n_samples, *batch_shape, T)``; the first ``diff + seasonal_diff * period`` values are zero."""
+        """Simulate series ``(n_samples, *batch_shape, n_steps)``; the first ``difference + seasonal_difference * period`` values equal ``mu``."""
         if _reparametrization_trick_grad:
             raise self._no_reparam()
         N = self._length()
         n = self.n_differences
         Nw = N - n
         if Nw < 1:
-            raise ValueError("T is too short for the differencing.")
+            raise ValueError("n_steps is too short for the differencing.")
         values, c, e, offset = self._simulation_system(Nw)
         if self.exog is not None:
             X = values["exog"]
@@ -345,7 +378,7 @@ class SARIMAX(Distribution):
         if n == 0:
             return w
         history = torch.zeros(*w.shape[:-1], n, dtype=w.dtype, device=w.device)
-        return _integrate(w, history, self.difference_coefficients)
+        return _integrate(w, history, self.difference_coefficients, keep_history=True) + values["mu"].unsqueeze(-1)
 
     def forecast(self, y, steps, n_samples=1, future_exog=None):
         """Simulate the continuation of the observed series ``y`` (shape ``(..., N)``) by ``steps`` steps.
@@ -374,7 +407,7 @@ class SARIMAX(Distribution):
         if (self.exog is None) != (future_exog is None):
             raise ValueError("Give future_exog exactly when the model has exog.")
         _, w, Dm, Xd, offset = self._prepare(y, values)
-        future_offset = (values["mu"].unsqueeze(-1) + torch.zeros(steps, dtype=y.dtype, device=y.device))
+        future_offset = self._constant(values, y) + torch.zeros(steps, dtype=y.dtype, device=y.device)
         if self.exog is not None:
             X_all = torch.cat([values["exog"], torch.as_tensor(future_exog, dtype=y.dtype)], dim=-2)
             D_all = _difference_matrix(N + steps, self.difference_coefficients, y.dtype, y.device) if n else None
@@ -386,99 +419,3 @@ class SARIMAX(Distribution):
             return wf
         history = y[..., -n:].expand(*wf.shape[:-1], n)
         return _integrate(wf, history, self.difference_coefficients)
-
-
-class MovingAverage(SARIMAX):
-    r"""Moving-average process MA(:math:`q`): :math:`y_t = \mu + \sigma(\varepsilon_t + \sum_i \theta_i \varepsilon_{t-i})`.
-
-    A :class:`SARIMAX` without AR terms; see there for the likelihood, the gradients and the (invertibility) constraints.
-
-    Parameters
-    ----------
-    ma : torch.Tensor or Parameter
-        MA coefficients of shape ``(..., q)``.
-    sigma : float or torch.Tensor or Parameter
-        Innovation standard deviation.
-    mu : float or torch.Tensor or Parameter, default 0.0
-        Process mean.
-    T : int, optional
-        Series length.
-    """
-
-    def __init__(self, ma, sigma=1.0, mu=0.0, T=None):
-        super().__init__(ma=ma, sigma=sigma, mu=mu, T=T)
-
-
-class ARMA(SARIMAX):
-    r"""ARMA(:math:`p, q`) process: :math:`\phi(L)(y_t - \mu) = \theta(L)\,\sigma \varepsilon_t`.
-
-    A :class:`SARIMAX` without seasonal terms and differencing; see there for the likelihood, the gradients and the
-    stationarity / invertibility constraints.
-
-    Parameters
-    ----------
-    ar : torch.Tensor or Parameter, optional
-        AR coefficients of shape ``(..., p)``.
-    ma : torch.Tensor or Parameter, optional
-        MA coefficients of shape ``(..., q)``.
-    sigma : float or torch.Tensor or Parameter
-        Innovation standard deviation.
-    mu : float or torch.Tensor or Parameter, default 0.0
-        Process mean.
-    T : int, optional
-        Series length.
-    """
-
-    def __init__(self, ar=None, ma=None, sigma=1.0, mu=0.0, T=None):
-        super().__init__(ar=ar, ma=ma, sigma=sigma, mu=mu, T=T)
-
-
-class ARIMA(SARIMAX):
-    r"""ARIMA(:math:`p, d, q`): an ARMA process for the :math:`d`-times differenced series.
-
-    A :class:`SARIMAX` with ``diff`` and no seasonal terms; the likelihood conditions on the first ``diff`` observations.
-
-    Parameters
-    ----------
-    ar, ma : torch.Tensor or Parameter, optional
-        AR and MA coefficients.
-    sigma : float or torch.Tensor or Parameter
-        Innovation standard deviation.
-    diff : int
-        Order of differencing :math:`d`.
-    mu : float or torch.Tensor or Parameter, default 0.0
-        Mean (drift) of the differenced series.
-    T : int, optional
-        Series length.
-    """
-
-    def __init__(self, ar=None, ma=None, sigma=1.0, diff=1, mu=0.0, T=None):
-        super().__init__(ar=ar, ma=ma, sigma=sigma, mu=mu, diff=diff, T=T)
-
-
-class SARIMA(SARIMAX):
-    r"""Seasonal ARIMA :math:`(p, d, q)(P, D, Q)_s`.
-
-    A :class:`SARIMAX` without regressors.
-
-    Parameters
-    ----------
-    ar, ma : torch.Tensor or Parameter, optional
-        Non-seasonal AR and MA coefficients.
-    seasonal_ar, seasonal_ma : torch.Tensor or Parameter, optional
-        Seasonal AR and MA coefficients.
-    sigma : float or torch.Tensor or Parameter
-        Innovation standard deviation.
-    period : int
-        Seasonal period :math:`s`.
-    diff, seasonal_diff : int
-        Orders of ordinary and seasonal differencing.
-    mu : float or torch.Tensor or Parameter, default 0.0
-        Mean (drift) of the differenced series.
-    T : int, optional
-        Series length.
-    """
-
-    def __init__(self, ar=None, ma=None, seasonal_ar=None, seasonal_ma=None, sigma=1.0, period=None, diff=0, seasonal_diff=0, mu=0.0, T=None):
-        super().__init__(ar=ar, ma=ma, sigma=sigma, mu=mu, seasonal_ar=seasonal_ar, seasonal_ma=seasonal_ma,
-                         diff=diff, seasonal_diff=seasonal_diff, period=period, T=T)

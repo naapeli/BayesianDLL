@@ -150,6 +150,13 @@ class KroneckerGP(_GPDistribution):
     The observations have shape ``(n_1, ..., n_P)`` or are flattened in row-major
     order (the order of ``torch.cartesian_prod``). The grid must be complete:
     missing observations break the Kronecker structure.
+
+    Predictions use the standard path of the GP classes: replace the axes with
+    ``Data.set_value`` (a new grid, or the training axes again) and call
+    ``model.predict`` or ``model.posterior_predicative``. The latent draws
+    ``result[name]`` are joint posterior samples on the grid, computed by
+    Matheron's rule on the union of the training and new grids from the
+    factors' eigendecompositions, without forming an ``N x N`` matrix.
     """
 
     def __init__(self, name, grid_inputs, kernels, noise_variance=1e-6, mean=None, jitter=1e-8):
@@ -458,7 +465,7 @@ def _rowwise_contract(rows, tensor):
     return current.reshape(n_new)
 
 
-def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None, diagonal=False):
+def _kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None, diagonal=False):
     r"""Sample predictions of a :class:`KroneckerGP` at new points.
 
     ``inputs`` is either a list with one array per grid factor (a new grid,
@@ -909,7 +916,7 @@ class ToeplitzGP(_GPDistribution):
         return column, diagonal_scale
 
     def _first_column(self, x, parameter_values, noise):
-        """Unbatched first column (used by :func:`toeplitz_gp_predictive`)."""
+        """Unbatched first column (used by :func:`_toeplitz_gp_predictive`)."""
         values = {name: torch.as_tensor(value).unsqueeze(0) for name, value in parameter_values.items()}
         column, diagonal_scale = self._batched_first_column(
             _feature_matrix(x).unsqueeze(0), values, torch.as_tensor(noise).reshape(1)
@@ -1022,7 +1029,7 @@ class ToeplitzGP(_GPDistribution):
         return predictive_mean + torch.randn((n_samples, new.shape[0]), dtype=dtype, device=device) @ factor.transpose(-2, -1)
 
 
-def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
+def _toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
     r"""Sample predictions of a :class:`ToeplitzGP` at arbitrary new 1-D inputs.
 
     New inputs on the training grid are sampled by Matheron's rule (FFT prior

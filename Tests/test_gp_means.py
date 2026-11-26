@@ -8,6 +8,10 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
+from BayesianDLL.GP._structured import _kronecker_gp_predictive
+from BayesianDLL.GP._process import _gp_predictive as gp_predictive
+from BayesianDLL.GP._process import _exact_gp_predictive as exact_gp_predictive
+from BayesianDLL.GP._structured import _toeplitz_gp_predictive as toeplitz_gp_predictive
 from BayesianDLL.GP import (
     RBF,
     ConstantMean,
@@ -20,11 +24,7 @@ from BayesianDLL.GP import (
     SumMean,
     ToeplitzGP,
     ZeroMean,
-    exact_gp_predictive,
-    gp_predictive,
-    kronecker_gp_predictive,
     stable_cholesky,
-    toeplitz_gp_predictive,
 )
 from BayesianDLL.GP._process import _sparse_latent_gp_predictive as sparse_latent_gp_predictive
 
@@ -527,13 +527,13 @@ def test_kronecker_predictive_with_a_linear_mean_matches_a_dense_reference():
         means.append(_linear(new, draw) + cross @ torch.linalg.solve(sigma, y - _linear(points, draw)))
         covariances.append(_rbf(new, new) - cross @ torch.linalg.solve(sigma, cross.T))
     torch.manual_seed(2)
-    actual = kronecker_gp_predictive(gp, trace, y, new, n_samples=2)
+    actual = _kronecker_gp_predictive(gp, trace, y, new, n_samples=2)
     torch.testing.assert_close(actual, _gaussian_reference(means, covariances, 2, 1e-10, seed=2), atol=1e-7, rtol=0)
     # A new grid (one array per factor, sampled by Matheron's rule on the union grid) has the moments of its points
     # in row-major order.
     torch.manual_seed(2)
-    on_grid = kronecker_gp_predictive(gp, trace, y, [grids[0][:2], grids[1]], n_samples=20000)
-    as_points = kronecker_gp_predictive(gp, trace, y, torch.cartesian_prod(grids[0][:2], grids[1]), n_samples=20000)
+    on_grid = _kronecker_gp_predictive(gp, trace, y, [grids[0][:2], grids[1]], n_samples=20000)
+    as_points = _kronecker_gp_predictive(gp, trace, y, torch.cartesian_prod(grids[0][:2], grids[1]), n_samples=20000)
     assert on_grid.shape == as_points.shape
     for draw in range(3):
         torch.testing.assert_close(on_grid[draw].mean(0), as_points[draw].mean(0), atol=0.05, rtol=0.0)

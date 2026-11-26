@@ -28,7 +28,7 @@ What is *not* batched:
   inducing points). It raises, and ``Model.batch`` then falls back to the
   chain-by-chain loop mode with a warning.
 * The predictive functions and ``sample()`` work draw by draw (unbatched),
-  except :func:`gp_predictive` with inducing points, which batches the draws.
+  except :func:`_gp_predictive` with inducing points, which batches the draws.
 
 Learnable inputs
 ----------------
@@ -1375,7 +1375,7 @@ def _draw_count(trace):
     return first.shape[0] * first.shape[1] if first.ndim >= 2 else first.shape[0]
 
 
-def gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
+def _gp_predictive(gp, trace, inputs, n_samples=1, observation_noise=None):
     """Sample latent GP values at new inputs from posterior latent traces.
 
     ``gp`` is a :class:`LatentGP`. ``trace`` may be a ``SamplingResult`` or
@@ -1501,7 +1501,7 @@ def _draw(draws, index):
     return {name: values[index if values.shape[0] > 1 else 0] for name, values in draws.items()}
 
 
-def exact_gp_predictive(
+def _exact_gp_predictive(
     gp,
     trace,
     observed_values,
@@ -1541,7 +1541,7 @@ def exact_gp_predictive(
 
 
 def _dense_exact_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
-    """:func:`exact_gp_predictive` for an ExactGP without inducing points."""
+    """:func:`_exact_gp_predictive` for an ExactGP without inducing points."""
     training_values = gp._training_input_value()
     new_values = _as_tensor(_input_value(inputs))
     if training_values.ndim == 0:
@@ -1623,7 +1623,7 @@ def _dense_exact_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, 
 
 
 def _sparse_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
-    r""":func:`exact_gp_predictive` for an ExactGP with inducing points.
+    r""":func:`_exact_gp_predictive` for an ExactGP with inducing points.
 
     For every hyperparameter draw in ``trace`` the inducing-point posterior
     ``q(u) = N(K_mm Σ_u K_mn Λ⁻¹ r, K_mm Σ_u K_mm)`` with

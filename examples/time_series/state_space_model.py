@@ -2,7 +2,7 @@ r"""
 Smooth Trend with Missing Observations
 ======================================
 
-:class:`~BayesianDLL.TimeSeries.LinearGaussianStateSpace` is the distribution of
+:class:`~BayesianDLL.TimeSeries.StateSpace` is the distribution of
 an observed series :math:`y_t` driven by hidden states,
 
 .. math::
@@ -39,7 +39,7 @@ from BayesianDLL import Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Multiply
 from BayesianDLL.Distributions import HalfNormal
 from BayesianDLL.Evaluation import summary
-from BayesianDLL.TimeSeries import LinearGaussianStateSpace
+from BayesianDLL.TimeSeries import StateSpace
 
 torch.manual_seed(3)
 dtype = torch.float64
@@ -84,7 +84,7 @@ with Model() as model:
     H = Multiply("H", obs_sd, obs_sd)
     ObservedParameter(
         "y",
-        LinearGaussianStateSpace(transition, design, Q, obs_cov=H, selection=selection, init_cov=25.0 * eye),
+        StateSpace(transition, design, Q, observation_cov=H, selection=selection, init_cov=25.0 * eye),
         y_obs.unsqueeze(-1),
     )
 
@@ -107,9 +107,9 @@ slope_sd = result["slope_sd"].reshape(-1)
 obs_sd = result["obs_sd"].reshape(-1)
 keep = torch.linspace(0, len(obs_sd) - 1, 200).long()
 slope_sd, obs_sd = slope_sd[keep], obs_sd[keep]
-posterior = LinearGaussianStateSpace(
+posterior = StateSpace(
     transition, design, (slope_sd ** 2).reshape(-1, 1, 1),
-    obs_cov=(obs_sd ** 2).reshape(-1, 1, 1), selection=selection, init_cov=25.0 * eye,
+    observation_cov=(obs_sd ** 2).reshape(-1, 1, 1), selection=selection, init_cov=25.0 * eye,
 )
 
 out = posterior.filter(y_obs.unsqueeze(-1))

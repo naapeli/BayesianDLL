@@ -10,6 +10,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Bernoulli, Normal
+from BayesianDLL.GP._process import _gp_predictive as gp_predictive
 from BayesianDLL.GP import (
     RBF,
     Constant,
@@ -20,7 +21,6 @@ from BayesianDLL.GP import (
     Matern52,
     Periodic,
     SpectralMixture,
-    gp_predictive,
 )
 
 DTYPE = torch.float64

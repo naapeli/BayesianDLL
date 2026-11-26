@@ -11,7 +11,7 @@ from scipy.stats import multivariate_normal
 
 from BayesianDLL import DeterministicParameter, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Distributions import HalfNormal, Normal, Uniform
-from BayesianDLL.TimeSeries import LinearGaussianStateSpace
+from BayesianDLL.TimeSeries import StateSpace
 from test_vectorized import chain_by_chain, random_values
 
 t = torch.tensor
@@ -25,13 +25,13 @@ def make_system(seed=0, m=3, k=2, r=2):
     H0 = torch.randn(k, k, generator=g)
     return {
         "transition": Tm, "design": torch.randn(k, m, generator=g), "state_cov": Q0 @ Q0.T + 0.2 * torch.eye(r),
-        "obs_cov": H0 @ H0.T + 0.1 * torch.eye(k), "selection": torch.randn(m, r, generator=g),
+        "observation_cov": H0 @ H0.T + 0.1 * torch.eye(k), "selection": torch.randn(m, r, generator=g),
     }
 
 
 def dense_moments(params, N, init_mean=None, init_cov=None, offset=None):
     """Mean and covariance of the stacked series ``(N * k,)`` implied by the model (differentiable)."""
-    Tm, Z, Q, H, R = (params[n] for n in ("transition", "design", "state_cov", "obs_cov", "selection"))
+    Tm, Z, Q, H, R = (params[n] for n in ("transition", "design", "state_cov", "observation_cov", "selection"))
     k = Z.shape[0]
     m, r = Tm.shape[0], Q.shape[0]
     a1 = torch.zeros(m) if init_mean is None else init_mean
@@ -82,12 +82,12 @@ def test_kalman_likelihood_equals_dense_gaussian(missing):
         y[2, 0] = math.nan
         y[4] = math.nan
         y[5, 1] = math.nan
-    d = LinearGaussianStateSpace(**p)
+    d = StateSpace(**p)
     expected = dense_loglik(p, y)
     assert float(d.log_pdf(y)) == pytest.approx(float(expected), abs=1e-9)
     # an independent solution of the stationary covariance equation
     P1 = solve_discrete_lyapunov(p["transition"].numpy(), (p["selection"] @ p["state_cov"] @ p["selection"].T).numpy())
-    given = LinearGaussianStateSpace(**p, init_cov=t(P1))
+    given = StateSpace(**p, init_cov=t(P1))
     assert float(given.log_pdf(y)) == pytest.approx(float(expected), abs=1e-9)
     # dense reference for the observed entries through scipy
     obs = ~np.isnan(y.numpy().reshape(-1))
@@ -99,7 +99,7 @@ def test_kalman_likelihood_with_offset_initial_state_and_explicit_covariance():
     offset = torch.randn(6, 2)
     a1 = torch.randn(3)
     P1 = torch.eye(3) * 0.7
-    d = LinearGaussianStateSpace(**p, init_mean=a1, init_cov=P1, obs_offset=offset)
+    d = StateSpace(**p, init_mean=a1, init_cov=P1, observation_offset=offset)
     expected = dense_loglik(p, y, a1, P1, offset)
     assert float(d.log_pdf(y)) == pytest.approx(float(expected), abs=1e-9)
     # the same through scipy's multivariate normal on the implied covariance
@@ -116,11 +116,11 @@ def test_gradients_match_autograd_of_the_dense_likelihood(missing, explicit_init
         y[3] = math.nan
     offset = torch.randn(6, 2)
     extra = {"init_mean": torch.randn(3), "init_cov": 0.6 * torch.eye(3) + 0.1} if explicit_init else {}
-    leaves = {k: v.clone().requires_grad_(True) for k, v in {**p, **extra, "obs_offset": offset}.items()}
+    leaves = {k: v.clone().requires_grad_(True) for k, v in {**p, **extra, "observation_offset": offset}.items()}
     yl = y.clone().requires_grad_(True)
-    dense = dense_loglik({k: leaves[k] for k in p}, yl, leaves.get("init_mean"), leaves.get("init_cov"), leaves["obs_offset"])
+    dense = dense_loglik({k: leaves[k] for k in p}, yl, leaves.get("init_mean"), leaves.get("init_cov"), leaves["observation_offset"])
     dense.backward()
-    d = LinearGaussianStateSpace(**{k: v.detach() for k, v in leaves.items()})
+    d = StateSpace(**{k: v.detach() for k, v in leaves.items()})
     assert float(d.log_pdf(y)) == pytest.approx(float(dense), abs=1e-9)
     grads = d.log_pdf_param_grads(y)
     for name, leaf in leaves.items():
@@ -134,24 +134,24 @@ def test_unstable_transition_without_initial_covariance_is_minus_infinity():
     p = make_system(3)
     p["transition"] = 1.3 * torch.eye(3)
     y = torch.randn(5, 2)
-    d = LinearGaussianStateSpace(**p)
+    d = StateSpace(**p)
     assert float(d.log_pdf(y)) == -math.inf
     assert all(torch.all(g == 0) for g in d.log_pdf_param_grads(y).values())
     # an explicit initial covariance makes it a valid (non-stationary) model
-    assert math.isfinite(float(LinearGaussianStateSpace(**p, init_cov=torch.eye(3)).log_pdf(y)))
+    assert math.isfinite(float(StateSpace(**p, init_cov=torch.eye(3)).log_pdf(y)))
 
 
 def test_batched_parameters_and_data_agree_with_a_loop():
     ps = [make_system(s) for s in range(3)]
     stacked = {k: torch.stack([p[k] for p in ps]) for k in ps[0]}
     y = torch.randn(4, 3, 6, 2)  # (extra, chains, N, k)
-    d = LinearGaussianStateSpace(**stacked)
+    d = StateSpace(**stacked)
     assert d.batch_shape == (3,)
     lp = d.log_pdf(y)
     assert lp.shape == (4, 3)
     grads = d.log_pdf_param_grads(y)
     for c in range(3):
-        one = LinearGaussianStateSpace(**ps[c])
+        one = StateSpace(**ps[c])
         torch.testing.assert_close(lp[:, c], one.log_pdf(y[:, c]))
         g1 = one.log_pdf_param_grads(y[:, c])
         for name in ps[0]:
@@ -161,7 +161,7 @@ def test_batched_parameters_and_data_agree_with_a_loop():
 def test_filter_returns_predictions_and_innovations():
     p = make_system(4)
     y = torch.randn(5, 2)
-    d = LinearGaussianStateSpace(**p)
+    d = StateSpace(**p)
     out = d.filter(y)
     assert out["predicted_mean"].shape == (6, 3) and out["predicted_cov"].shape == (6, 3, 3)
     assert out["innovations"].shape == (5, 2) and out["innovation_cov"].shape == (5, 2, 2)
@@ -175,7 +175,7 @@ def test_filter_returns_predictions_and_innovations():
 def test_sampling_reproduces_the_implied_covariance_and_log_density_moments():
     p = make_system(5)
     N = 4
-    d = LinearGaussianStateSpace(**p, T=N)
+    d = StateSpace(**p, n_steps=N)
     s = d.sample(80000)
     assert s.shape == (80000, N, 2)
     # implied covariance from the dense representation (reuse the autograd-free dense construction)
@@ -193,7 +193,7 @@ def test_sampling_reproduces_the_implied_covariance_and_log_density_moments():
 def test_forecast_is_the_conditional_distribution_of_future_observations():
     p = make_system(6)
     y = torch.randn(5, 2)
-    d = LinearGaussianStateSpace(**p)
+    d = StateSpace(**p)
     steps = 3
     f = d.forecast(y, steps, n_samples=100000)
     assert f.shape == (100000, steps, 2)
@@ -214,7 +214,7 @@ def test_forecast_with_missing_values_and_batched_posterior_draws():
     y = torch.randn(6, 2)
     y[3, 0] = math.nan
     batched = {k: torch.stack([v, v]) for k, v in p.items()}
-    f = LinearGaussianStateSpace(**batched).forecast(y, 4, n_samples=5)
+    f = StateSpace(**batched).forecast(y, 4, n_samples=5)
     assert f.shape == (5, 2, 4, 2) and torch.isfinite(f).all()
 
 
@@ -225,8 +225,8 @@ def local_level_model(y=None):
     with Model() as model:
         q = RandomParameter("q", HalfNormal(1.0), shape=(1, 1))
         h = RandomParameter("h", HalfNormal(1.0), shape=(1, 1))
-        ObservedParameter("y", LinearGaussianStateSpace(
-            transition=torch.eye(1), design=torch.eye(1), state_cov=q, obs_cov=h, init_mean=torch.zeros(1), init_cov=10 * torch.eye(1)), y)
+        ObservedParameter("y", StateSpace(
+            transition=torch.eye(1), design=torch.eye(1), state_cov=q, observation_cov=h, init_mean=torch.zeros(1), init_cov=10 * torch.eye(1)), y)
     return model
 
 
@@ -236,7 +236,7 @@ def missing_data_model():
     with Model() as model:
         phi = RandomParameter("phi", Uniform(-0.9, 0.9), shape=(1, 1))
         h = RandomParameter("h", HalfNormal(1.0), shape=(1, 1))
-        ObservedParameter("y", LinearGaussianStateSpace(transition=phi, design=torch.eye(1), state_cov=torch.eye(1), obs_cov=h), y)
+        ObservedParameter("y", StateSpace(transition=phi, design=torch.eye(1), state_cov=torch.eye(1), observation_cov=h), y)
     return model
 
 
@@ -245,8 +245,8 @@ def two_state_model():
     with Model() as model:
         a = RandomParameter("a", Normal(0.0, 0.3), shape=(2, 2))
         q = RandomParameter("q", HalfNormal(1.0), shape=(2, 2))
-        ObservedParameter("y", LinearGaussianStateSpace(
-            transition=a, design=torch.eye(2), state_cov=q, obs_cov=0.3 * torch.eye(2), init_cov=torch.eye(2)), y)
+        ObservedParameter("y", StateSpace(
+            transition=a, design=torch.eye(2), state_cov=q, observation_cov=0.3 * torch.eye(2), init_cov=torch.eye(2)), y)
     return model
 
 
@@ -294,7 +294,7 @@ def _posterior(model, n=100, warmup=100, chains=4, seed=5):
 
 def test_nuts_recovers_local_level_variances():
     truth_q, truth_h = 0.4, 0.8
-    sys = LinearGaussianStateSpace(torch.eye(1), torch.eye(1), t([[truth_q]]), t([[truth_h]]), init_mean=torch.zeros(1), init_cov=torch.eye(1), T=30)
+    sys = StateSpace(torch.eye(1), torch.eye(1), t([[truth_q]]), t([[truth_h]]), init_mean=torch.zeros(1), init_cov=torch.eye(1), n_steps=30)
     y = sys.sample(1)[0]
     model = local_level_model(y.reshape(-1))
     result = _posterior(model)
@@ -314,8 +314,8 @@ def test_remembered_forward_pass_is_never_stale():
 
     def model(rho, sd):
         transition = torch.tensor([[rho]], dtype=torch.float64)
-        return LinearGaussianStateSpace(transition, torch.ones(1, 1, dtype=torch.float64),
-                                        torch.tensor([[sd]], dtype=torch.float64), obs_cov=torch.tensor([[0.3]], dtype=torch.float64))
+        return StateSpace(transition, torch.ones(1, 1, dtype=torch.float64),
+                                        torch.tensor([[sd]], dtype=torch.float64), observation_cov=torch.tensor([[0.3]], dtype=torch.float64))
 
     first, second = model(0.5, 1.0), model(0.7, 1.0)
     reference = [first.log_pdf(y), second.log_pdf(y)]
