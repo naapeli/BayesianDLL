@@ -36,7 +36,6 @@ from ._process import (
 )
 from ._structured import (
     KroneckerGP,
-    kronecker_gp_predictive,
     ToeplitzGP,
     toeplitz_gp_predictive,
     levinson_solve,
@@ -69,7 +68,6 @@ __all__ = [
     "gp_predictive",
     "exact_gp_predictive",
     "KroneckerGP",
-    "kronecker_gp_predictive",
     "ToeplitzGP",
     "toeplitz_gp_predictive",
 ]

@@ -157,8 +157,6 @@ class KroneckerGP(_GPDistribution):
     ``result[name]`` are joint posterior samples on the grid, computed by
     Matheron's rule on the union of the training and new grids from the
     factors' eigendecompositions, without forming an ``N x N`` matrix.
-    :func:`kronecker_gp_predictive` is the lower-level function for arbitrary
-    (off-grid) points, pointwise-only draws and an extra observation noise.
     """
 
     def __init__(self, name, grid_inputs, kernels, noise_variance=1e-6, mean=None, jitter=1e-8):
@@ -467,7 +465,7 @@ def _rowwise_contract(rows, tensor):
     return current.reshape(n_new)
 
 
-def kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None, diagonal=False):
+def _kronecker_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None, diagonal=False):
     r"""Sample predictions of a :class:`KroneckerGP` at new points.
 
     ``inputs`` is either a list with one array per grid factor (a new grid,
