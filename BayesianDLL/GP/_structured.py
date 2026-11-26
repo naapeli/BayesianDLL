@@ -916,7 +916,7 @@ class ToeplitzGP(_GPDistribution):
         return column, diagonal_scale
 
     def _first_column(self, x, parameter_values, noise):
-        """Unbatched first column (used by :func:`toeplitz_gp_predictive`)."""
+        """Unbatched first column (used by :func:`_toeplitz_gp_predictive`)."""
         values = {name: torch.as_tensor(value).unsqueeze(0) for name, value in parameter_values.items()}
         column, diagonal_scale = self._batched_first_column(
             _feature_matrix(x).unsqueeze(0), values, torch.as_tensor(noise).reshape(1)
@@ -1029,7 +1029,7 @@ class ToeplitzGP(_GPDistribution):
         return predictive_mean + torch.randn((n_samples, new.shape[0]), dtype=dtype, device=device) @ factor.transpose(-2, -1)
 
 
-def toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
+def _toeplitz_gp_predictive(gp, trace, observed_values, inputs, n_samples=1, observation_noise=None):
     r"""Sample predictions of a :class:`ToeplitzGP` at arbitrary new 1-D inputs.
 
     New inputs on the training grid are sampled by Matheron's rule (FFT prior

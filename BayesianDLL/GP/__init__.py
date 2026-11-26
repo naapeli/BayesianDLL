@@ -29,15 +29,12 @@ from ._means import (
 from ._process import (
     ExactGP,
     LatentGP,
-    exact_gp_predictive,
-    gp_predictive,
     stable_cholesky,
     batched_stable_cholesky,
 )
 from ._structured import (
     KroneckerGP,
     ToeplitzGP,
-    toeplitz_gp_predictive,
     levinson_solve,
 )
 
@@ -65,9 +62,6 @@ __all__ = [
     "SumMean",
     "LatentGP",
     "ExactGP",
-    "gp_predictive",
-    "exact_gp_predictive",
     "KroneckerGP",
     "ToeplitzGP",
-    "toeplitz_gp_predictive",
 ]

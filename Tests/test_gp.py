@@ -15,6 +15,8 @@ from BayesianDLL import (
 )
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Exponential, Normal, Uniform
+from BayesianDLL.GP._process import _gp_predictive as gp_predictive
+from BayesianDLL.GP._process import _exact_gp_predictive as exact_gp_predictive
 from BayesianDLL.GP import (
     Constant,
     ExactGP,
@@ -25,8 +27,6 @@ from BayesianDLL.GP import (
     Periodic,
     RBF,
     WhiteNoise,
-    gp_predictive,
-    exact_gp_predictive,
     Matern52,
     RationalQuadratic,
     stable_cholesky,

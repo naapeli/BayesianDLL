@@ -96,7 +96,7 @@ _, exact_sd_train = exact_posterior(x)
 # %%
 # Comparison
 # ----------
-# ``gp_predictive`` extends each posterior draw of ``f`` at the training
+# ``model.posterior_predicative`` extends each posterior draw of ``f`` at the training
 # inputs to the grid by sampling from the GP conditional.
 
 traces = {"mean-field guide": mean_field, "full-rank guide": full_rank}

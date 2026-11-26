@@ -9,6 +9,9 @@ from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.GP._structured import _kronecker_gp_predictive
+from BayesianDLL.GP._process import _gp_predictive as gp_predictive
+from BayesianDLL.GP._process import _exact_gp_predictive as exact_gp_predictive
+from BayesianDLL.GP._structured import _toeplitz_gp_predictive as toeplitz_gp_predictive
 from BayesianDLL.GP import (
     RBF,
     ConstantMean,
@@ -21,10 +24,7 @@ from BayesianDLL.GP import (
     SumMean,
     ToeplitzGP,
     ZeroMean,
-    exact_gp_predictive,
-    gp_predictive,
     stable_cholesky,
-    toeplitz_gp_predictive,
 )
 from BayesianDLL.GP._process import _sparse_latent_gp_predictive as sparse_latent_gp_predictive
 

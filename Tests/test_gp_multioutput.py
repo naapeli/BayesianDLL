@@ -9,6 +9,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
+from BayesianDLL.GP._process import _exact_gp_predictive as exact_gp_predictive
 from BayesianDLL.GP import (
     RBF,
     ExactGP,
@@ -16,7 +17,6 @@ from BayesianDLL.GP import (
     LatentGP,
     LinearCoregionalization,
     Matern32,
-    exact_gp_predictive,
 )
 
 DTYPE = torch.float64

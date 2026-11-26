@@ -9,6 +9,8 @@ from BayesianDLL import Data, DeterministicParameter, Model, ObservedParameter, 
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
 from BayesianDLL.GP._structured import _kronecker_gp_predictive
+from BayesianDLL.GP._process import _exact_gp_predictive as exact_gp_predictive
+from BayesianDLL.GP._structured import _toeplitz_gp_predictive as toeplitz_gp_predictive
 from BayesianDLL.GP import (
     Constant,
     ExactGP,
@@ -23,9 +25,7 @@ from BayesianDLL.GP import (
     RBF,
     ToeplitzGP,
     WhiteNoise,
-    exact_gp_predictive,
     levinson_solve,
-    toeplitz_gp_predictive,
 )
 
 DTYPE = torch.float64

@@ -303,7 +303,8 @@ def test_predictive_shape_of_a_broadcasting_likelihood_without_plates():
 def test_gp_predictions_condition_on_the_training_data_after_new_inputs():
     """Evaluating the log density after Data.set_value does not replace the training data."""
     from BayesianDLL import Data
-    from BayesianDLL.GP import ExactGP, RBF, exact_gp_predictive
+    from BayesianDLL.GP import ExactGP, RBF
+    from BayesianDLL.GP._process import _exact_gp_predictive as exact_gp_predictive
 
     x_train = torch.linspace(0.0, 3.0, 12, dtype=torch.float64)
     y_train = torch.sin(x_train)
