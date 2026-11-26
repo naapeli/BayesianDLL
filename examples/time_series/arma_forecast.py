@@ -2,12 +2,13 @@
 ARMA(1, 1) with posterior forecasts
 ===================================
 
-A series is simulated from an ARMA(1, 1) process, the coefficients are
+A series is simulated from an ARMA(1, 1) process (a :class:`~BayesianDLL.TimeSeries.SARIMAX`
+with only ``ar`` and ``ma``), the coefficients are
 inferred with NUTS and the series is forecast from the posterior.
 
 The AR and MA coefficients are given through partial autocorrelations in
-:math:`(-1, 1)` (:class:`~BayesianDLL.TimeSeries.StationaryAR` and
-:class:`~BayesianDLL.TimeSeries.InvertibleMA`), which keeps every draw
+:math:`(-1, 1)` (:class:`~BayesianDLL.Deterministic.StationaryAR` and
+:class:`~BayesianDLL.Deterministic.InvertibleMA`), which keeps every draw
 stationary and invertible. The likelihood is the exact Gaussian likelihood of
 the series, evaluated by the Kalman filter with the states integrated out.
 ``forecast`` simulates the continuation exactly given the observed history,
@@ -21,11 +22,12 @@ import torch
 
 from BayesianDLL import Model, ObservedParameter, RandomParameter, sample
 from BayesianDLL.Distributions import HalfNormal, Uniform
-from BayesianDLL.TimeSeries import ARMA, InvertibleMA, StationaryAR
+from BayesianDLL.Deterministic import InvertibleMA, StationaryAR
+from BayesianDLL.TimeSeries import SARIMAX
 
 torch.manual_seed(0)
 truth = dict(ar=0.7, ma=0.4, sigma=1.0)
-y = ARMA(torch.tensor([truth["ar"]]), torch.tensor([truth["ma"]]), truth["sigma"], T=50).sample(1)[0]
+y = SARIMAX(torch.tensor([truth["ar"]]), torch.tensor([truth["ma"]]), truth["sigma"], n_steps=50).sample(1)[0]
 
 with Model() as model:
     r = RandomParameter("r", Uniform(-1, 1), shape=1)
@@ -33,14 +35,14 @@ with Model() as model:
     sigma = RandomParameter("sigma", HalfNormal(2.0))
     phi = StationaryAR("phi", r)
     theta = InvertibleMA("theta", q)
-    ObservedParameter("y", ARMA(phi, theta, sigma), y)
+    ObservedParameter("y", SARIMAX(phi, theta, sigma), y)
 
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     result = sample(80, 80, n_chains=4, model=model, progress_bar=False, seed=1, chain_method="vectorized")
 
 draws = {"phi": result["r"].reshape(-1, 1), "theta": -result["q"].reshape(-1, 1)}  # for a single coefficient the map is phi = r, theta = -q
-posterior = ARMA(draws["phi"], draws["theta"], result["sigma"].reshape(-1))
+posterior = SARIMAX(draws["phi"], draws["theta"], result["sigma"].reshape(-1))
 forecast = posterior.forecast(y, 10, n_samples=1)[0]  # (draws, 10)
 
 fig, ax = plt.subplots(figsize=(7, 3.5))

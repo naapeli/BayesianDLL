@@ -7,23 +7,20 @@ ARMA error. After :math:`d` ordinary and :math:`D` seasonal differences,
 
 .. math::
 
-    w_t = \mu + x_t^\top \beta + u_t, \qquad
+    w_t = \delta + x_t^\top \beta + u_t, \qquad
     \phi(L)\,\Phi(L^s)\, u_t = \theta(L)\,\Theta(L^s)\, \sigma \varepsilon_t,
 
-with seasonal period :math:`s`. The likelihood is the exact Gaussian likelihood
-from the Kalman filter, and the special cases have their own classes:
-:class:`~BayesianDLL.TimeSeries.MovingAverage`,
-:class:`~BayesianDLL.TimeSeries.ARIMA` (differencing, no seasonal terms),
-:class:`~BayesianDLL.TimeSeries.SARIMA` (seasonal terms, no regressors) and
-:class:`~BayesianDLL.TimeSeries.SARIMAX`.
+with seasonal period :math:`s`; :math:`\delta` is ``mu`` without differencing and ``drift`` with it. The
+likelihood is the exact Gaussian likelihood from the Kalman filter. There is only one class: MA, ARMA, ARIMA and
+SARIMA models are the same :class:`~BayesianDLL.TimeSeries.SARIMAX` with the unused arguments left out.
 
 A quarterly series (:math:`s = 4`) is generated from a regression on a known
 regressor plus a seasonal AR(1) error. Four models are fitted to the first 80
 quarters and compared on the next 12: an MA(2), an ARIMA(1, 1, 0), a
 SARIMA(1, 0, 0)(1, 0, 0)\ :sub:`4` and the SARIMAX with the regressor. The
 AR and MA coefficients go through partial autocorrelations
-(:class:`~BayesianDLL.TimeSeries.StationaryAR`,
-:class:`~BayesianDLL.TimeSeries.InvertibleMA`), so every draw is stationary
+(:class:`~BayesianDLL.Deterministic.StationaryAR`,
+:class:`~BayesianDLL.Deterministic.InvertibleMA`), so every draw is stationary
 and invertible. The likelihood is one joint density of the whole series,
 with no pointwise terms for PSIS-LOO to leave out, so the models are compared
 by their forecasts of the held-out quarters. All four are fitted quickly by MAP estimation, and the SARIMAX is then
@@ -34,9 +31,10 @@ import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Model, ObservedParameter, RandomParameter
+from BayesianDLL.Deterministic import InvertibleMA, StationaryAR
 from BayesianDLL.Distributions import HalfNormal, Normal, Uniform
 from BayesianDLL.Evaluation import summary
-from BayesianDLL.TimeSeries import ARIMA, SARIMA, SARIMAX, InvertibleMA, MovingAverage, StationaryAR
+from BayesianDLL.TimeSeries import SARIMAX
 
 torch.manual_seed(11)
 dtype = torch.float64
@@ -50,7 +48,7 @@ truth = dict(mu=2.0, beta=1.2, phi=0.4, Phi=0.6, sigma=0.5)
 tt = torch.arange(T, dtype=dtype)
 x = (1.5 * torch.sin(2 * torch.pi * tt / 40) + torch.randn(T, dtype=dtype)).unsqueeze(-1)
 error = SARIMAX(torch.tensor([truth["phi"]], dtype=dtype), sigma=truth["sigma"],
-                seasonal_ar=torch.tensor([truth["Phi"]], dtype=dtype), period=period, T=T).sample(1)[0]
+                seasonal_ar=torch.tensor([truth["Phi"]], dtype=dtype), period=period, n_steps=T).sample(1)[0]
 y_all = truth["mu"] + truth["beta"] * x[:, 0] + error
 y, x_train, x_future = y_all[:n_train], x[:n_train], x[n_train:]
 y_future = y_all[n_train:]
@@ -72,17 +70,17 @@ def ma2():
         theta = coefficient("theta", InvertibleMA, 2)
         sigma = RandomParameter("sigma", HalfNormal(2.0))
         mu = RandomParameter("mu", Normal(0.0, 5.0))
-        ObservedParameter("y", MovingAverage(theta, sigma, mu), y)
-    return model, lambda d: MovingAverage(d["theta"], d["sigma"], d["mu"])
+        ObservedParameter("y", SARIMAX(ma=theta, sigma=sigma, mu=mu), y)
+    return model, lambda d: SARIMAX(ma=d["theta"], sigma=d["sigma"], mu=d["mu"])
 
 
 def arima110():
     with Model() as model:
         phi = coefficient("phi", StationaryAR, 1)
         sigma = RandomParameter("sigma", HalfNormal(2.0))
-        mu = RandomParameter("mu", Normal(0.0, 1.0))  # drift of the differenced series
-        ObservedParameter("y", ARIMA(phi, None, sigma, diff=1, mu=mu), y)
-    return model, lambda d: ARIMA(d["phi"], None, d["sigma"], diff=1, mu=d["mu"])
+        drift = RandomParameter("drift", Normal(0.0, 1.0))  # constant of the differenced series
+        ObservedParameter("y", SARIMAX(phi, sigma=sigma, difference=1, drift=drift), y)
+    return model, lambda d: SARIMAX(d["phi"], sigma=d["sigma"], difference=1, drift=d["drift"])
 
 
 def sarima():
@@ -91,8 +89,8 @@ def sarima():
         Phi = coefficient("Phi", StationaryAR, 1)
         sigma = RandomParameter("sigma", HalfNormal(2.0))
         mu = RandomParameter("mu", Normal(0.0, 5.0))
-        ObservedParameter("y", SARIMA(phi, None, Phi, None, sigma, period=period, mu=mu), y)
-    return model, lambda d: SARIMA(d["phi"], None, d["Phi"], None, d["sigma"], period=period, mu=d["mu"])
+        ObservedParameter("y", SARIMAX(phi, sigma=sigma, mu=mu, seasonal_ar=Phi, period=period), y)
+    return model, lambda d: SARIMAX(d["phi"], sigma=d["sigma"], mu=d["mu"], seasonal_ar=d["Phi"], period=period)
 
 
 def sarimax():
@@ -102,8 +100,8 @@ def sarimax():
         sigma = RandomParameter("sigma", HalfNormal(2.0))
         mu = RandomParameter("mu", Normal(0.0, 5.0))
         beta = RandomParameter("beta", Normal(0.0, 3.0), shape=1)
-        ObservedParameter("y", SARIMAX(phi, None, sigma, mu, seasonal_ar=Phi, beta=beta, exog=x_train, period=period), y)
-    return model, lambda d: SARIMAX(d["phi"], None, d["sigma"], d["mu"], seasonal_ar=d["Phi"], beta=d["beta"], exog=x_train, period=period)
+        ObservedParameter("y", SARIMAX(phi, sigma=sigma, mu=mu, seasonal_ar=Phi, beta=beta, exog=x_train, period=period), y)
+    return model, lambda d: SARIMAX(d["phi"], sigma=d["sigma"], mu=d["mu"], seasonal_ar=d["Phi"], beta=d["beta"], exog=x_train, period=period)
 
 
 builders = {"MA(2)": ma2, "ARIMA(1,1,0)": arima110, "SARIMA": sarima, "SARIMAX": sarimax}

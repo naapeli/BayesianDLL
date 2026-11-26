@@ -3,9 +3,9 @@ Random Walk and Autoregressive Priors over a Series
 ===================================================
 
 :class:`~BayesianDLL.TimeSeries.GaussianRandomWalk` and
-:class:`~BayesianDLL.TimeSeries.AutoRegressive` are distributions over a whole
+:class:`~BayesianDLL.TimeSeries.AR` are distributions over a whole
 series, so a latent series ``x`` is a single parameter,
-``RandomParameter("x", GaussianRandomWalk(sigma, T=T))``, whose joint density
+``RandomParameter("x", GaussianRandomWalk(sigma, n_steps=T))``, whose joint density
 and gradient are exact. Their parameters (here the step scale) are
 learned together with the series.
 
@@ -17,7 +17,7 @@ learned together with the series.
   come from the stationary distribution (``init="stationary"``), so the
   density is proper and could equally serve as a prior. The coefficients are
   parameterised through partial autocorrelations by
-  :class:`~BayesianDLL.TimeSeries.StationaryAR`, which keeps every draw
+  :class:`~BayesianDLL.Deterministic.StationaryAR`, which keeps every draw
   stationary.
 
 The latent random-walk rate is recovered with a 90% band; for the AR(2) series
@@ -28,10 +28,10 @@ import matplotlib.pyplot as plt
 import torch
 
 from BayesianDLL import Model, ObservedParameter, RandomParameter
-from BayesianDLL.Deterministic import Exp
+from BayesianDLL.Deterministic import Exp, StationaryAR
 from BayesianDLL.Distributions import HalfNormal, Normal, Poisson, Uniform
 from BayesianDLL.Evaluation import summary
-from BayesianDLL.TimeSeries import AutoRegressive, GaussianRandomWalk, StationaryAR
+from BayesianDLL.TimeSeries import AR, GaussianRandomWalk
 
 torch.manual_seed(3)
 dtype = torch.float64
@@ -49,7 +49,7 @@ counts = torch.poisson(torch.exp(log_rate_true))
 
 with Model() as walk_model:
     sigma = RandomParameter("sigma", HalfNormal(0.5))
-    x = RandomParameter("x", GaussianRandomWalk(sigma, init_sigma=3.0, T=T))
+    x = RandomParameter("x", GaussianRandomWalk(sigma, init_sigma=3.0, n_steps=T))
     rate = Exp("rate", x)
     ObservedParameter("counts", Poisson(rate), counts)
 
@@ -65,21 +65,21 @@ print(f"root-mean-square error of the log-rate: {((log_rate.mean(0) - log_rate_t
 # An AR(2) series with a stationary start
 # ---------------------------------------
 # A quasi-periodic AR(2) series is observed directly, so the series itself is
-# the value of the ``AutoRegressive`` distribution and the likelihood is the
+# the value of the ``AR`` distribution and the likelihood is the
 # exact joint density of all ``T`` values, including the stationary
 # distribution of the first two. The coefficients, the innovation scale and the
 # mean are inferred.
 T_ar = 150
 phi_true = torch.tensor([1.2, -0.6], dtype=dtype)
 sigma_true, mu_true = 0.6, 1.0
-y = AutoRegressive(phi_true, sigma_true, mu_true, T=T_ar).sample(1)[0]
+y = AR(phi_true, sigma_true, mu_true, n_steps=T_ar).sample(1)[0]
 
 with Model() as ar_model:
     pacf = RandomParameter("pacf", Uniform(-1.0, 1.0), shape=2)
     phi = StationaryAR("phi", pacf)
     sigma = RandomParameter("sigma", HalfNormal(1.0))
     mu = RandomParameter("mu", Normal(0.0, 3.0))
-    ObservedParameter("y", AutoRegressive(phi, sigma, mu), y)
+    ObservedParameter("y", AR(phi, sigma, mu), y)
 
 ar = ar_model.sample(300, 300, n_chains=4, seed=2, chain_method="vectorized", progress_bar=False)
 print(summary({"phi": ar["phi"], "sigma": ar["sigma"], "mu": ar["mu"]}).to_string())
