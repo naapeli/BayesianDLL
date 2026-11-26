@@ -150,6 +150,15 @@ class KroneckerGP(_GPDistribution):
     The observations have shape ``(n_1, ..., n_P)`` or are flattened in row-major
     order (the order of ``torch.cartesian_prod``). The grid must be complete:
     missing observations break the Kronecker structure.
+
+    Predictions use the standard path of the GP classes: replace the axes with
+    ``Data.set_value`` (a new grid, or the training axes again) and call
+    ``model.predict`` or ``model.posterior_predicative``. The latent draws
+    ``result[name]`` are joint posterior samples on the grid, computed by
+    Matheron's rule on the union of the training and new grids from the
+    factors' eigendecompositions, without forming an ``N x N`` matrix.
+    :func:`kronecker_gp_predictive` is the lower-level function for arbitrary
+    (off-grid) points, pointwise-only draws and an extra observation noise.
     """
 
     def __init__(self, name, grid_inputs, kernels, noise_variance=1e-6, mean=None, jitter=1e-8):
