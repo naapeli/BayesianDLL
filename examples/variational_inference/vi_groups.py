@@ -103,12 +103,12 @@ histories, traces, seconds = {}, {}, {}
 for label, guide in guides.items():
     torch.manual_seed(1)
     start = time.perf_counter()
-    histories[label] = BBVI(model, guide, n_samples=2, epochs=1500, lr=0.03, lrd=0.999, callback_frequency=5, verbose=False)
+    histories[label] = BBVI(model, guide, n_samples=2, epochs=4000, lr=0.03, lrd=0.999, callback_frequency=5, verbose=False)
     seconds[label] = time.perf_counter() - start
     traces[label] = guide.sample(1500)
 
 start = time.perf_counter()
-traces["NUTS"] = model.sample(n_samples=300, warmup_length=300, n_chains=4, progress_bar=False, seed=0,
+traces["NUTS"] = model.sample(n_samples=100, warmup_length=100, n_chains=4, progress_bar=False, seed=0,
                               metric="dense", chain_method="vectorized")
 seconds["NUTS"] = time.perf_counter() - start
 print(f"NUTS: {sum(traces['NUTS'].divergences)} divergences")
@@ -124,11 +124,12 @@ for label, trace in traces.items():
 # Optimisation
 # ------------
 # The ELBO curves are averaged over 40 records. The mean-field and grouped
-# guides converge within a few hundred steps, and the mean-field guide levels
-# off about 2 nats lower: that gap is the KL divergence it pays for ignoring
-# the ``(mu, beta)`` correlation. The all-full-rank guide can represent the
-# same correlation, but it has to learn a 19 x 19 Cholesky factor and reaches
-# the optimum much later.
+# guides level off within a few hundred steps, the mean-field guide about
+# 1.7 nats below the grouped one (-306.5 against -304.8): that gap is mostly
+# the KL divergence it pays for ignoring the ``(mu, beta)`` correlation. The
+# all-full-rank guide has to learn a 19 x 19 Cholesky factor and is the
+# slowest, but after 4000 steps it ends highest (-303.7), as the most
+# flexible of the three families should.
 
 colors = {"all mean-field": "C1", "all full-rank": "C2", "grouped": "C0", "NUTS": "black"}
 fig, ax = plt.subplots(figsize=(8, 4.5), layout="constrained")
@@ -192,7 +193,7 @@ fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), layout="constrained")
 labels = list(traces)
 axes[0].bar(labels, [seconds[label] for label in labels], color=[colors[label] for label in labels])
 axes[0].set_ylabel("seconds")
-axes[0].set_title("Run time (BBVI 1500 steps; NUTS 4 x 600 iterations)")
+axes[0].set_title("Run time (BBVI 4000 steps; NUTS 4 x 200 iterations)")
 axes[1].bar(list(guides), [n_variational_parameters(guide) for guide in guides.values()], color=[colors[label] for label in guides])
 axes[1].set_ylabel("count")
 axes[1].set_title("Variational parameters")

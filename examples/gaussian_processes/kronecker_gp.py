@@ -28,7 +28,7 @@ import torch
 from BayesianDLL import Data, Model, ObservedParameter, RandomParameter, find_MAP
 from BayesianDLL.Deterministic import Exp
 from BayesianDLL.Distributions import Normal
-from BayesianDLL.GP import RBF, ExactGP, KroneckerGP, kronecker_gp_predictive
+from BayesianDLL.GP import RBF, ExactGP, KroneckerGP
 
 
 torch.manual_seed(0)
@@ -76,23 +76,24 @@ print(f"sampling: {elapsed:.1f} s, divergences: {sum(trace.divergences)}, max R-
 # %%
 # The fitted surface
 # ------------------
-# ``kronecker_gp_predictive`` predicts on a list of axes (a new grid) or on
-# arbitrary points. With ``diagonal=True`` it only computes the pointwise
-# variances, which keeps the 3600-point prediction cheap but makes the draws
-# independent across points. With ``diagonal=False`` and a new grid it draws
-# *joint* posterior samples by Matheron's rule on the union of the training
-# and new grids: Kronecker prior draws plus a Kronecker solve, so no
+# Prediction goes through the same path as every other GP: replace the grid
+# axes with ``Data.set_value`` (here with the training axes themselves; a new
+# grid works the same way) and call ``model.posterior_predicative``. The draws
+# are *joint* posterior samples from Matheron's rule on the union of the
+# training and new grids: Kronecker prior draws plus a Kronecker solve, so no
 # 3600 x 3600 covariance is formed. Joint draws are needed for any quantity
 # that mixes grid points, such as the average of the surface.
 
 thinned = trace.thin(15)
-draws = kronecker_gp_predictive(f, thinned, y, [axis_a, axis_b], n_samples=10, diagonal=True)
-draws = draws.reshape(-1, size, size)
-posterior_mean, posterior_sd = draws.mean(0), draws.std(0)
-
 start = time.perf_counter()
-joint = kronecker_gp_predictive(f, thinned, y, [axis_a, axis_b], n_samples=1).reshape(-1, size, size)
+prediction = model.posterior_predicative(thinned, samples_per_step=5, progress_bar=False)
+joint = prediction["f"].reshape(-1, size, size)
 print(f"{joint.shape[0]} joint draws of the 60 x 60 surface in {time.perf_counter() - start:.2f} s")
+posterior_mean, posterior_sd = joint.mean(0), joint.std(0)
+# Shuffling the draws independently at every grid point keeps each point's
+# marginal posterior but destroys the correlation between points.
+order = torch.rand(joint.shape, dtype=joint.dtype).argsort(dim=0)
+pointwise = torch.gather(joint, 0, order)
 
 fig, axes = plt.subplots(1, 5, figsize=(20, 4), layout="constrained")
 extent = (0.0, 1.0, 0.0, 1.0)
@@ -110,9 +111,9 @@ plt.show()
 error = (posterior_mean - truth).abs().mean()
 print(f"mean absolute error of the posterior mean: {error:.3f} (noise sd 0.2)")
 average_joint = joint.mean(dim=(1, 2))
-average_pointwise = draws.mean(dim=(1, 2))
+average_pointwise = pointwise.mean(dim=(1, 2))
 print(f"sd of the surface average: {average_joint.std():.4f} from joint draws, "
-      f"{average_pointwise.std():.4f} from independent pointwise draws (true average {truth.mean():.3f})")
+      f"{average_pointwise.std():.4f} from pointwise-independent draws (true average {truth.mean():.3f})")
 
 # %%
 # Timing against ExactGP
