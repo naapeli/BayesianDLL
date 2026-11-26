@@ -71,8 +71,8 @@ def test_sarimax_regression_with_arma_errors():
 
 CASES = {
     "arma": lambda p: SARIMAX(p["ar"], p["ma"], p["sigma"], p["mu"]),
-    "arima_drift": lambda p: SARIMAX(p["ar"], p["ma"], p["sigma"], p["mu"], difference=1, drift=p["drift"]),
-    "sarima": lambda p: SARIMAX(p["ar"], p["ma"], p["sigma"], p["mu"], seasonal_ar=p["sar"], seasonal_ma=p["sma"], difference=1, period=4,
+    "arima_drift": lambda p: SARIMAX(p["ar"], p["ma"], p["sigma"], difference=1, drift=p["drift"]),
+    "sarima": lambda p: SARIMAX(p["ar"], p["ma"], p["sigma"], seasonal_ar=p["sar"], seasonal_ma=p["sma"], difference=1, period=4,
                                 drift=p["drift"]),
     "sarimax": lambda p: SARIMAX(p["ar"], None, p["sigma"], p["mu"], beta=p["beta"], exog=EXOG()),
 }
@@ -194,15 +194,15 @@ def test_nuts_recovers_arma11():
 
 def test_mu_is_the_series_mean_and_drift_the_constant_of_the_differenced_series():
     x = torch.randn(15).cumsum(0)
-    # differenced: mu is not identified by the likelihood, drift is the differenced mean
-    a = SARIMAX(t([0.3]), None, 1.0, 0.0, difference=1, drift=0.4).log_pdf(x)
-    b = SARIMAX(t([0.3]), None, 1.0, 5.0, difference=1, drift=0.4).log_pdf(x)
-    assert float(a) == pytest.approx(float(b), abs=1e-12)
+    # differenced: no identifiable mean (mu is rejected), drift is the constant of the differenced series
+    with pytest.raises(ValueError, match="drift"):
+        SARIMAX(t([0.3]), None, 1.0, 0.0, difference=1)
+    a = SARIMAX(t([0.3]), None, 1.0, difference=1, drift=0.4).log_pdf(x)
     w = x[1:] - x[:-1]
     assert float(a) == pytest.approx(float(SARIMAX(t([0.3]), None, 1.0, 0.4).log_pdf(w)), abs=1e-9)
     with pytest.raises(ValueError):
         SARIMAX(t([0.3]), None, 1.0, drift=0.1)
-    # simulated differenced series start at mu
-    s = SARIMAX(None, None, 0.1, 7.0, difference=1, drift=0.0, n_steps=5).sample(1)[0]
+    # simulated differenced series start from zero
+    s = SARIMAX(None, None, 0.1, difference=1, drift=0.0, n_steps=5).sample(1)[0]
     assert s.shape == (5,)
-    assert float(s[0]) == pytest.approx(7.0)
+    assert float(s[0]) == pytest.approx(0.0)

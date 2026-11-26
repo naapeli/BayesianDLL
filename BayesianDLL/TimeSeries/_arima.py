@@ -102,7 +102,7 @@ def _integrate(w, history, coefficients, keep_history=False):
 class SARIMAX(Distribution):
     r"""Seasonal ARIMA model with exogenous regressors (SARIMAX) as the distribution of a whole series.
 
-    The series :math:`y_t` is differenced, :math:`w_t = (1 - L)^d (1 - L^s)^D (y_t - \mu)`, and the differenced
+    The series :math:`y_t` is differenced, :math:`w_t = (1 - L)^d (1 - L^s)^D y_t`, and the differenced
     series follows
 
     .. math::
@@ -115,11 +115,12 @@ class SARIMAX(Distribution):
     Box-Jenkins sign convention for the MA part), and :math:`\tilde x_t` the regressors differenced like the series.
 
     **Mean and drift.** Without differencing (``difference = seasonal_difference = 0``) the mean of the series as
-    written is ``mu`` (:math:`\delta = \mu`). With differencing the series has no stationary mean: ``mu`` is then
-    only the level the simulated series starts from (differencing removes a constant, so the likelihood does not
-    depend on it and its gradient is zero), and the constant of the *differenced* series is the separate ``drift``
-    (:math:`\delta` = ``drift``, the slope of a linear trend when ``difference = 1``). ``drift`` is only allowed with
-    differencing.
+    written is ``mu`` (:math:`\delta = \mu`). With differencing the series has no stationary mean and the data
+    cannot identify a level, so ``mu`` is not allowed; the constant of the *differenced* series is ``drift``
+    (:math:`\delta` = ``drift``, the slope of a linear trend when ``difference = 1``), which in turn needs
+    differencing. This follows R's ``forecast::Arima`` (``include.mean`` only without differencing,
+    ``include.drift`` with it) and statsmodels (the constant of a differenced model is its drift). Simulated
+    differenced series start from zero.
 
     **Special cases.** Leave arguments out to get the classical models (``y`` is the series, ``n_steps`` its length)::
 
@@ -160,8 +161,8 @@ class SARIMAX(Distribution):
         MA coefficients :math:`\theta_1, \dots, \theta_q`, shape ``(..., q)``.
     sigma : float or torch.Tensor or Parameter
         Innovation standard deviation :math:`\sigma > 0`.
-    mu : float or torch.Tensor or Parameter, default 0.0
-        Mean :math:`\mu` of the series as written (see above for its role under differencing).
+    mu : float or torch.Tensor or Parameter, optional
+        Mean :math:`\mu` of the series (default 0); not allowed with differencing (use ``drift``).
     seasonal_ar, seasonal_ma : torch.Tensor or Parameter, optional
         Seasonal coefficients :math:`\Phi_1, \dots, \Phi_P` and :math:`\Theta_1, \dots, \Theta_Q`, shape ``(..., P)`` / ``(..., Q)``.
     beta : torch.Tensor or Parameter, optional
@@ -182,11 +183,15 @@ class SARIMAX(Distribution):
 
     _param_event_ndims = {"ar": 1, "ma": 1, "seasonal_ar": 1, "seasonal_ma": 1, "beta": 1, "exog": 2}
 
-    def __init__(self, ar=None, ma=None, sigma=1.0, mu=0.0, *, seasonal_ar=None, seasonal_ma=None, period=None,
+    def __init__(self, ar=None, ma=None, sigma=1.0, mu=None, *, seasonal_ar=None, seasonal_ma=None, period=None,
                  difference=0, seasonal_difference=0, drift=None, beta=None, exog=None, n_steps=None):
         super().__init__(IdentityTransform(), ContinuousReal(), ContinuousReal())
         if (seasonal_ar is not None or seasonal_ma is not None or seasonal_difference) and (period is None or period < 2):
             raise ValueError("Seasonal terms and seasonal differencing need a period >= 2.")
+        if mu is not None and (difference or seasonal_difference):
+            raise ValueError("A differenced series has no identifiable mean: use drift (the constant of the differenced series) instead of mu.")
+        if mu is None:
+            mu = 0.0
         if drift is not None and not (difference or seasonal_difference):
             raise ValueError("drift is the constant of the differenced series: it needs difference > 0 or seasonal_difference > 0.")
         if (beta is None) != (exog is None):
@@ -329,7 +334,6 @@ class SARIMAX(Distribution):
         if self.n_differences == 0:
             add("mu", self.mu, g_off.sum(-1))
         else:
-            add("mu", self.mu, torch.zeros_like(values["mu"]))
             add("drift", self.drift, g_off.sum(-1))
         if self.beta is not None:
             add("beta", self.beta, (Xd.transpose(-1, -2) @ g_off.unsqueeze(-1)).squeeze(-1))
