@@ -329,3 +329,35 @@ def test_remembered_forward_pass_is_never_stale():
         torch.testing.assert_close(gradient, fresh_gradients[name])
     y[3] += 1.0
     assert not torch.equal(first.log_pdf(y), reference[0])
+
+
+def test_numpy_and_torch_backends_agree():
+    # CPU tensors run the recursions in NumPy, other devices in torch; both must give the same results.
+    from BayesianDLL.TimeSeries import _kalman
+
+    g = torch.Generator().manual_seed(3)
+    N, B, m, k = 12, (2,), 3, 2
+    y = torch.randn(N, *B, k, generator=g, dtype=torch.float64)
+    mask = torch.ones(N, *B, k, dtype=torch.float64)
+    mask[4, 0, 1] = 0.0
+    mask[7] = 0.0
+    d = 0.1 * torch.randn(N, *B, k, generator=g, dtype=torch.float64)
+    Tm = 0.4 * torch.randn(*B, m, m, generator=g, dtype=torch.float64)
+    Z = torch.randn(k, m, generator=g, dtype=torch.float64)
+    H = torch.eye(k, dtype=torch.float64).expand(*B, k, k) * 0.5
+    L = torch.randn(*B, m, m, generator=g, dtype=torch.float64)
+    RQR = L @ L.transpose(-1, -2) + torch.eye(m, dtype=torch.float64)
+    a = torch.randn(*B, m, generator=g, dtype=torch.float64)
+    P = 2.0 * torch.eye(m, dtype=torch.float64).expand(*B, m, m)
+    inputs = (y, mask, d, Tm, Z, H, RQR, a, P)
+
+    results = {}
+    for name, xp, convert in (("numpy", _kalman._NumPy, lambda x: x.numpy()), ("torch", _kalman._Torch, lambda x: x)):
+        ll, cache, a_end, P_end = _kalman._kalman_forward(xp, *(convert(x) for x in inputs))
+        grads = _kalman.kalman_backward(cache, mask, Tm)
+        results[name] = (torch.as_tensor(ll), torch.as_tensor(a_end), torch.as_tensor(P_end), grads)
+    for first, second in zip(results["numpy"][:3], results["torch"][:3]):
+        torch.testing.assert_close(first, second)
+    for key, value in results["numpy"][3].items():
+        assert isinstance(value, torch.Tensor)
+        torch.testing.assert_close(value, results["torch"][3][key], msg=key)

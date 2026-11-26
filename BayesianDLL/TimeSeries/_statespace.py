@@ -17,8 +17,8 @@ def _psd_sqrt(A):
     return V * torch.sqrt(w.clamp(min=0)).unsqueeze(-2)
 
 
-def _np(x):
-    return x.detach().cpu().numpy()
+def _detach(x):
+    return x.detach()
 
 
 def _tt(x, like):
@@ -186,12 +186,12 @@ class LinearGaussianStateSpace(Distribution):
 
     def _run(self, y):
         s = self._prepare(y)
-        arrays = [_np(s[n]) for n in ("y", "mask", "d", "T_safe", "Z", "H", "RQR", "a1", "P1")]
+        arrays = [_detach(s[n]) for n in ("y", "mask", "d", "T_safe", "Z", "H", "RQR", "a1", "P1")]
         ll, cache, a_end, P_end = _kalman.kalman_forward(*arrays)
         like = s["T"]
         ll, a_end, P_end = _tt(ll, like), _tt(a_end, like), _tt(P_end, like)
         ok = s["stable"] & torch.isfinite(ll)
-        s.update(cache=cache, a_end=a_end, P_end=P_end, ok=ok, np_mask=arrays[1], np_T=arrays[3])
+        s.update(cache=cache, a_end=a_end, P_end=P_end, ok=ok, k_mask=arrays[1], k_T=arrays[3])
         return torch.where(ok, ll, torch.full_like(ll, -math.inf)), s
 
     # ------------------------------------------------------------ density
@@ -200,7 +200,7 @@ class LinearGaussianStateSpace(Distribution):
 
     def _gradients(self, y):
         ll, s = self._run(y)
-        g = {k: _tt(v, s["T"]) for k, v in _kalman.kalman_backward(s["cache"], s["np_mask"], s["np_T"]).items()}
+        g = {k: _tt(v, s["T"]) for k, v in _kalman.kalman_backward(s["cache"], s["k_mask"], s["k_T"]).items()}
         T, R, Q = s["T"], s["R"], s["Q"]
         RQRbar, Tbar, Pbar = g["RQR"], g["T"], g["P"]
         if s["P1_stationary"]:
